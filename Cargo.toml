@@ -1,0 +1,22 @@
+[package]
+name = "pgfn"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio-postgres = { version = "0.7.12", features = ["with-serde_json-1"] }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.135"
+pg_query = "6.0.0"
+indoc = "2"
+clap = { version = "4.5.26", features = ["derive"] }
+convert_case = "0.7.1"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "macros"] }
+thiserror = "2.0.11"
+anyhow = "1.0.95"
+serde_json_path = "0.7.1"
+serde_path_to_error = "0.1.16"
+regex = "1.11.1"
+testcontainers-modules = { version = "0.11.5", features = ["postgres"] }
