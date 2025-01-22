@@ -1,6 +1,12 @@
 // mod codegen;
 // mod exceptions;
-// mod infer_types;
+mod infer_types;
+mod parse_domain;
+
+pub fn main() {
+    println!("Hello, world!");
+}
+
 // mod parse_explicit_exceptions;
 //
 // use indoc::indoc;
@@ -160,5 +166,3 @@
 //
 //     Ok(())
 // }
-
-mod infer_types;

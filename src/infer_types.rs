@@ -1,9 +1,12 @@
 use heck::{ToPascalCase, ToSnakeCase};
+use itertools::Itertools;
+use pg_query::protobuf::node::Node;
+use postgres_types::{FromSql, ToSql};
 use quote::__private::TokenStream;
 use quote::{quote, ToTokens};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, GenericClient};
 
 const FUNCTION_INTROSPECTION_QUERY: &'static str = r#"
 select distinct on (n.nspname, p.proname)
@@ -13,6 +16,7 @@ select distinct on (n.nspname, p.proname)
     p.proargtypes as arg_oids,
     p.prorettype as return_type,
     p.proretset as returns_set,
+    p.proisstrict as is_strict,
     case when p.proargnames is not null
         -- trim unused arg names
         then (select p.proargnames[:array_length(p.proargtypes, 1)])
@@ -184,6 +188,8 @@ struct PgField {
 /// Uniquely identifies database objects
 type OID = u32;
 
+type SchemaName = String;
+
 #[derive(Debug)]
 enum PgType {
     Array {
@@ -216,6 +222,53 @@ enum PgType {
     Text,
 }
 
+impl PgType {
+    pub fn schema(&self) -> SchemaName {
+        match self {
+            PgType::Composite { schema, .. } => schema,
+            PgType::Enum { schema, .. } => schema,
+            PgType::Array { schema, .. } => schema,
+            PgType::Domain { schema, .. } => schema,
+            PgType::Custom { schema, .. } => schema,
+            _ => "pg_catalog",
+        }
+        .to_owned()
+    }
+
+    fn to_rust_ident(&self, types: &HashMap<OID, PgType>) -> TokenStream {
+        match self {
+            // For user-defined types, qualify with schema name
+            PgType::Domain { schema, name, .. } => {
+                let schema_mod = clean_identifier(schema, CaseType::Snake);
+                let type_name = clean_identifier(name, CaseType::Pascal);
+                quote! { super::#schema_mod::#type_name }
+            }
+            PgType::Composite { schema, name, .. } => {
+                let schema_mod = clean_identifier(schema, CaseType::Snake);
+                let type_name = clean_identifier(name, CaseType::Pascal);
+                quote! { super::#schema_mod::#type_name }
+            }
+            PgType::Enum { schema, name, .. } => {
+                let schema_mod = clean_identifier(schema, CaseType::Snake);
+                let type_name = clean_identifier(name, CaseType::Pascal);
+                quote! { super::#schema_mod::#type_name }
+            }
+            PgType::Array {
+                element_type_oid, ..
+            } => {
+                let inner = types.get(element_type_oid).unwrap().to_rust_ident(types);
+                quote! { Vec<#inner> }
+            }
+            // Built-in types don't need schema qualification
+            PgType::Int32 => quote! { i32 },
+            PgType::Int64 => quote! { i64 },
+            PgType::Bool => quote! { bool },
+            PgType::Text => quote! { String },
+            x => unimplemented!("unknown type {:?}", x),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PgFn {
     schema: String,
@@ -224,6 +277,7 @@ struct PgFn {
     return_type_oid: OID,
     returns_set: bool,
     definition: String,
+    is_strict: bool,
 }
 
 #[derive(Debug)]
@@ -232,29 +286,59 @@ struct PgArg {
     type_oid: OID,
 }
 
+// Inject arbitrary 'create domain x as y' prefix onto the check constraint so it can be parsed by pg_query
+//
 async fn main(db: &Client) -> anyhow::Result<()> {
+    let result = pg_query::parse(
+        "create domain post_with_author as _post_with_author check (
+    (value).post_id is not null and
+    (value).author is not null
+);",
+    )?;
+
     let (fns, type_oids) = fetch_functions(db).await?;
     let types = fetch_types(db, &type_oids).await?;
-    let type_def_code = codegen_types(&types)?;
-    // let fn_code = codegen_fns(&fns, &types)?;
+    let type_def_code = codegen_types(&types);
+    let fn_code = codegen_fns(&fns, &types);
 
-    let syntax_tree = syn::parse2::<syn::File>(type_def_code)?;
-    let formatted = prettyplease::unparse(&syntax_tree);
-    println!("{}", formatted);
+    let out: String = type_def_code
+        .into_iter()
+        .chain(fn_code) // Combine both maps into one iterator
+        .into_grouping_map()
+        .fold(TokenStream::new(), |acc, _, ts| quote! { #acc #ts })
+        .iter()
+        .map(|(schema, tokens)| {
+            let s = clean_identifier(schema.as_str(), CaseType::Snake);
+            prettyplease::unparse(
+                &syn::parse2::<syn::File>(quote! {
+                    mod #s {
+                        #tokens
+                    }
+                })
+                .expect("generated code to parse"),
+            )
+        })
+        .collect();
+
+    println!("{}", out);
 
     Ok(())
 }
 
-async fn fetch_functions(db: &Client) -> anyhow::Result<(Vec<PgFn>, Vec<OID>)> {
+async fn fetch_functions(
+    db: &Client,
+) -> anyhow::Result<(HashMap<SchemaName, Vec<PgFn>>, Vec<OID>)> {
     let fn_rows = db.query(FUNCTION_INTROSPECTION_QUERY, &[]).await?;
 
     let mut type_oids: HashSet<OID> = HashSet::new();
-    let mut pg_fns: Vec<PgFn> = Vec::new();
+    let mut pg_fns: HashMap<SchemaName, Vec<PgFn>> = HashMap::new();
 
     for row in fn_rows {
+        let schema: SchemaName = row.get("schema_name");
         let arg_type_oids: Vec<OID> = row.get("arg_oids");
         let arg_names: Vec<String> = row.get("arg_names");
         let return_type_oid: OID = row.get("return_type");
+        let is_strict: bool = row.get("is_strict");
 
         let args = arg_type_oids
             .iter()
@@ -268,14 +352,21 @@ async fn fetch_functions(db: &Client) -> anyhow::Result<(Vec<PgFn>, Vec<OID>)> {
         type_oids.extend(arg_type_oids);
         type_oids.insert(return_type_oid);
 
-        pg_fns.push(PgFn {
-            schema: row.get("schema_name"),
+        let f = PgFn {
+            schema: schema.clone(),
             name: row.get("function_name"),
             definition: row.get("function_definition"),
             returns_set: row.get("returns_set"),
+            is_strict,
             args,
             return_type_oid,
-        });
+        };
+
+        if let Some(val) = pg_fns.get_mut(&schema) {
+            val.push(f);
+        } else {
+            pg_fns.insert(schema, vec![f]);
+        }
     }
 
     Ok((pg_fns, Vec::from_iter(type_oids)))
@@ -332,6 +423,9 @@ async fn fetch_types(db: &Client, type_oids: &[OID]) -> anyhow::Result<HashMap<O
                 name: name.to_string(),
                 variants: t.get("enum_variants"),
             },
+            'p' => {
+                unimplemented!();
+            }
             x => unimplemented!("ttype not implemented {}", x),
         };
 
@@ -349,10 +443,12 @@ enum CaseType {
 /// Converts an arbitrary postgres identifier to a valid Rust identifier with a given
 /// case. Will ensure any invalid strings are turned into raw identifiers.
 fn clean_identifier(name: &str, case_type: CaseType) -> TokenStream {
-    let name = match case_type {
-        CaseType::Snake => name.to_snake_case(),
-        CaseType::Pascal => name.to_pascal_case(),
-    };
+    let prefix = if starts_with_number(&name) { "_" } else { "" };
+    let name = prefix.to_string()
+        + &match case_type {
+            CaseType::Snake => name.to_snake_case(),
+            CaseType::Pascal => name.to_pascal_case(),
+        };
 
     match syn::parse_str::<syn::Ident>(&name) {
         Ok(ident) => ident.into_token_stream(),
@@ -360,22 +456,8 @@ fn clean_identifier(name: &str, case_type: CaseType) -> TokenStream {
     }
 }
 
-fn to_ident(t: &PgType, types: &HashMap<OID, PgType>) -> TokenStream {
-    match t {
-        PgType::Domain { name, .. } => clean_identifier(name, CaseType::Pascal),
-        PgType::Composite { name, .. } => clean_identifier(name, CaseType::Pascal),
-        PgType::Enum { name, .. } => clean_identifier(name, CaseType::Pascal),
-        PgType::Array {
-            element_type_oid, ..
-        } => {
-            let inner = to_ident(types.get(element_type_oid).unwrap(), types);
-            quote! { Vec<#inner> }
-        }
-        PgType::Int32 => "i32".parse().unwrap(),
-        PgType::Bool => "bool".parse().unwrap(),
-        PgType::Text => "String".parse().unwrap(),
-        x => unimplemented!("unknown ident {:?}", x),
-    }
+fn starts_with_number(s: &str) -> bool {
+    s.chars().next().map(|c| c.is_numeric()).unwrap_or(false)
 }
 
 trait ToRust {
@@ -384,16 +466,19 @@ trait ToRust {
 
 impl ToRust for PgField {
     fn to_rust(&self, types: &HashMap<OID, PgType>) -> TokenStream {
-        let ident = to_ident(types.get(&self.type_oid).unwrap(), types);
+        let ident = types.get(&self.type_oid).unwrap().to_rust_ident(types);
         let field_name = clean_identifier(&self.name, CaseType::Snake);
+        let pg_name = &self.name;
 
         if self.nullable {
             quote! {
-                #field_name: Option<#ident>
+                #[postgres(name = #pg_name)]
+                pub #field_name: Option<#ident>
             }
         } else {
             quote! {
-                #field_name: #ident
+                #[postgres(name = #pg_name)]
+                pub #field_name: #ident
             }
         }
     }
@@ -407,13 +492,35 @@ impl ToRust for PgType {
                 name,
                 fields,
             } => {
-                let name = clean_identifier(name, CaseType::Pascal);
+                let rs_name = clean_identifier(name, CaseType::Pascal);
                 let field_tokens: Vec<TokenStream> =
                     fields.into_iter().map(|f| f.to_rust(types)).collect();
 
+                let field_mappings: Vec<_> = fields
+                    .into_iter()
+                    .map(|f| {
+                        let sql_name = &f.name;
+                        let rs_name = clean_identifier(&f.name, CaseType::Snake);
+
+                        quote! { #rs_name: row.try_get(#sql_name)? }
+                    })
+                    .collect();
+
                 quote! {
-                    struct #name {
+                    #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
+                    #[postgres(name = #name)]
+                    pub struct #rs_name {
                         #(#field_tokens),*
+                    }
+
+                    impl TryFrom<tokio_postgres::Row> for #rs_name {
+                        type Error = tokio_postgres::Error;
+
+                        fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                            Ok(Self {
+                                #(#field_mappings),*
+                            })
+                        }
                     }
                 }
             }
@@ -422,14 +529,23 @@ impl ToRust for PgType {
                 name,
                 variants,
             } => {
-                let name = clean_identifier(name, CaseType::Pascal);
+                let clean_name = clean_identifier(name, CaseType::Pascal);
                 let variants: Vec<TokenStream> = variants
                     .into_iter()
-                    .map(|v| clean_identifier(&v, CaseType::Pascal))
+                    .map(|v| {
+                        let clean_v = clean_identifier(&v, CaseType::Pascal);
+
+                        quote! {
+                            #[postgres(name = #v)]
+                            #clean_v
+                        }
+                    })
                     .collect();
 
                 quote! {
-                    enum #name {
+                    #[derive(Debug, Clone, Copy, postgres_types::FromSql, postgres_types::ToSql)]
+                    #[postgres(name = #name)]
+                    pub enum #clean_name {
                         #(#variants),*
                     }
                 }
@@ -440,41 +556,156 @@ impl ToRust for PgType {
                 type_oid,
                 constraints,
             } => {
-                let name = clean_identifier(name, CaseType::Pascal);
-                let inner = to_ident(types.get(type_oid).unwrap(), types);
+                let clean_name = clean_identifier(name, CaseType::Pascal);
+                let inner = types.get(type_oid).unwrap().to_rust_ident(types);
+
+                // TODO: constraints from the domain are currently not applied to the inner type.
+                // I'd need to generate a new type for the inner type with the constraints
+                // It means that to_rust_ident will need to take constraints?
+                // No, I will need to do a types.get(type_oid) then modify the struct with the domain constraints
 
                 quote! {
-                    struct #name(#inner);
+                    #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
+                    #[postgres(name = #name)]
+                    pub struct #clean_name(#inner);
                 }
             }
-
-            // for base types, we intentionally emit nothing (since they already exist in Rust).
-            x => quote! {},
+            // Skip base types like i32/i64 as they are already-defined primitives
+            PgType::Int32 | PgType::Int64 | PgType::Text | PgType::Bool => quote! {},
+            // No need to create type aliases for arrays. Instead they'll be used as Vec<Inner>
+            PgType::Array { .. } => quote! {},
+            x => unimplemented!("Unhandled PgType {:?}", x),
         }
     }
 }
 
-fn codegen_types(types: &HashMap<OID, PgType>) -> anyhow::Result<TokenStream> {
-    let mut type_streams: Vec<TokenStream> = Vec::new();
-
-    for t in types.values() {
-        let tokens = t.to_rust(types);
-        if !tokens.is_empty() {
-            type_streams.push(tokens);
-        }
-    }
-
-    let r = quote! {
-        mod types {
-            #(#type_streams)*
-        }
-    };
-
-    Ok(r)
+fn codegen_types(types: &HashMap<OID, PgType>) -> HashMap<SchemaName, TokenStream> {
+    types
+        .values()
+        .map(|t| (t.schema(), t.to_rust(types)))
+        .filter(|(_, tokens)| !tokens.is_empty())
+        .into_group_map()
+        .into_iter()
+        .map(|(schema, token_streams)| {
+            (
+                schema,
+                quote! {
+                    #(#token_streams)*
+                },
+            )
+        })
+        .collect()
 }
 
-fn codegen_fns(fns: &[PgFn], types: &HashMap<OID, PgType>) -> anyhow::Result<String> {
-    todo!()
+impl ToRust for PgArg {
+    fn to_rust(&self, types: &HashMap<OID, PgType>) -> TokenStream {
+        let name = clean_identifier(&self.name, CaseType::Snake);
+        let ty = match types.get(&self.type_oid).unwrap() {
+            PgType::Int32 => quote! { i32 },
+            PgType::Int64 => quote! { i64 },
+            PgType::Bool => quote! { bool },
+            PgType::Text => quote! { &str },
+            t @ PgType::Enum { .. } => {
+                // Enums are passed by copy
+                let id = t.to_rust_ident(types);
+                quote! { #id }
+            }
+            t => {
+                let id = t.to_rust_ident(types);
+                quote! { &#id }
+            }
+        };
+
+        quote! {
+            #name: #ty
+        }
+    }
+}
+
+impl ToRust for PgFn {
+    fn to_rust(&self, types: &HashMap<OID, PgType>) -> TokenStream {
+        let clean_name = clean_identifier(&self.name, CaseType::Snake);
+
+        let return_type = {
+            let inner_ty = types
+                .get(&self.return_type_oid)
+                .unwrap()
+                .to_rust_ident(types);
+
+            if self.returns_set {
+                quote! { Vec<#inner_ty> }
+            } else {
+                inner_ty
+            }
+        };
+
+        let args: Vec<TokenStream> = self.args.iter().map(|a| a.to_rust(types)).collect();
+        let arg_names: Vec<TokenStream> = self
+            .args
+            .iter()
+            .map(|a| clean_identifier(&a.name, CaseType::Snake))
+            .collect();
+
+        // TODO: replace with custom error type later
+        let error_type: TokenStream = "tokio_postgres::Error".parse().unwrap();
+
+        // Generate query parameters dynamically ($1, $2, ..., $n)
+        let query_params = (1..=self.args.len())
+            .map(|i| format!("${}", i))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Build the query string
+        let query_string = if self.returns_set {
+            format!(
+                "select * from {}.{}({});",
+                self.schema, self.name, query_params
+            )
+        } else {
+            format!("select {}.{}({});", self.schema, self.name, query_params)
+        };
+
+        let mapping = if self.returns_set {
+            quote! {
+                client
+                    .query(#query_string, &[#(&#arg_names),*])
+                    .await
+                    .and_then(|rows| {
+                        rows.into_iter().map(TryInto::try_into).collect()
+                    })
+            }
+        } else {
+            quote! {
+                client
+                    .query_one(#query_string, &[#(&#arg_names),*])
+                    .await
+                    .and_then(|r| r.try_get(0))
+            }
+        };
+
+        quote! {
+            pub async fn #clean_name(client: &tokio_postgres::Client, #(#args),*) -> Result<#return_type, #error_type> {
+                #mapping
+            }
+        }
+    }
+}
+
+fn codegen_fns(
+    fns: &HashMap<SchemaName, Vec<PgFn>>,
+    types: &HashMap<OID, PgType>,
+) -> HashMap<SchemaName, TokenStream> {
+    fns.iter()
+        .map(|(schema, fns)| {
+            let fn_rust: Vec<TokenStream> = fns.iter().map(|f| f.to_rust(types)).collect();
+            (
+                schema.clone(),
+                quote! {
+                    #(#fn_rust)*
+                },
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -484,57 +715,6 @@ mod tests {
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
     use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
     use tokio_postgres::{Client, NoTls};
-
-    #[tokio::test]
-    async fn test_infer_types() -> anyhow::Result<()> {
-        let db = setup_test_db().await;
-
-        db.client
-            .simple_query(
-                r#"
-                create type a as (
-                    int_field int,
-                    text_field text,
-                    type int[]
-                );
-
-                create type b as (
-                    a_field a
-                );
-
-                create table tab (
-                    id serial primary key
-                );
-
-                create domain b_with_non_null_a as b
-                    check (
-                        (value).a_field is not null
-                    );
-
-                create type test_enum as enum ('enum_variant_1', 'enum_variant_2');
-
-                create function test_fn(arg_a a, num int, ray a[], e test_enum, dom b_with_non_null_a) returns setof tab as $$
-                    begin
-                    return query select * from tab;
-                    end;
-                $$ language plpgsql;
-
-                create schema api;
-
-                 create function api_fn(arg_e test_enum) returns test_enum as $$
-                    begin
-                    return arg_e;
-                    end;
-                $$ language plpgsql;
-
-                "#,
-            )
-            .await?;
-
-        main(&db.client).await?;
-
-        Ok(())
-    }
 
     pub struct TestDb {
         pub client: Client,
@@ -573,15 +753,110 @@ mod tests {
             connection_handle,
         }
     }
+
+    #[tokio::test]
+    async fn hello() {
+        let db = setup_test_db().await;
+
+        db.client
+            .simple_query(
+                r#"
+                create type role as enum ('admin', 'user');
+
+                create table account (
+                    account_id int primary key generated always as identity,
+                    name text not null,
+                    age int,
+                    role role not null
+                );
+
+                create table post (
+                    post_id int primary key generated always as identity,
+                    author_id int not null references account(account_id),
+                    content text
+                );
+
+                create schema api;
+
+                create function api.create_account(name text, age int, role role)
+                returns account as $$
+                declare
+                    result account;
+                begin
+                    insert into account (name, age, role)
+                    values (name, age, role)
+                    returning * into result;
+
+                    return result;
+                end;
+                $$ language plpgsql;
+
+                create function api.find_account_by_id(p_account_id int)
+                returns setof account as $$
+                begin
+                   return query select * from account
+                   where account_id = p_account_id;
+                end;
+                $$ language plpgsql;
+
+                create type api.account_with_posts as (
+                    account_id int,
+                    name text,
+                    age int,
+                    role role,
+                    posts post[]
+                );
+
+                create function api.get_account_with_posts(p_account_id int)
+                returns api.account_with_posts
+                strict language plpgsql as $$
+                declare
+                    result api.account_with_posts;
+                begin
+                    select
+                        a.account_id,
+                        a.name,
+                        a.age,
+                        a.role,
+                        coalesce(array_agg(p order by p.post_id), '{}')
+                    into result
+                    from account a
+                        left join post p on a.account_id = p.author_id
+                    where a.account_id = p_account_id
+                    group by a.account_id, a.name, a.age, a.role;
+
+                    return result;
+                end;
+                $$;
+                "#,
+            )
+            .await
+            .unwrap();
+
+        main(&db.client).await.unwrap();
+        //
+        // let res = api::create_account(&db.client, "Zak", 25, public::Role::Admin)
+        //     .await
+        //     .unwrap();
+        //
+        // let x = api::get_account_with_posts(&db.client, res.account_id)
+        //     .await
+        //     .unwrap();
+
+        // dbg!(x);
+    }
 }
 
-// 1. arrange generated types into schema mods
-// 2. generate function signatures
-// 3. constraint analysis (for domains)
-// 4. exception tracking
+// TODO:
+// 1. Table return types
+// 2. STRICT handling (make all parameters non-null)
+// 3. Fetch functions and fetch types should be refactored to use a fromsql From<Row> implementation.
+// 4. Nullability/cardinality inference for return type?
+// 5. Exception tracking / error enum generation
 
-// instead of using lots of features, just allow overrides using a toml file
-// then the 'features' just merge in default values into the config objection (e.g. numeric -> rust_decimal)
-// config specifies both the mapping AND any imports necessary
+// If it's a `returns setof composite_type` it expands each to a row
+// If it's `returns table(name text, age int, email text)`, it expands to rows
+// If it's `returns record` it's the same thing
 
-// I don't really need a separate mod for types and functions. It should just be per schema.
+// so it's only in that case that we need From<Row> and the try_from
+// I only need this for composite rows, right? What about domains?

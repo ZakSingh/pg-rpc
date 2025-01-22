@@ -24,3 +24,5 @@ quote = "1.0"
 syn = { version = "2.0", features = ["parsing"] }
 heck = "0.5"
 prettyplease = "0.2"
+itertools = "0.14"
+postgres-types = { version = "0.2.8", features = ["derive", "array-impls"] }
