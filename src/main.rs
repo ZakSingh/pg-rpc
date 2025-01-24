@@ -1,7 +1,11 @@
 // mod codegen;
 // mod exceptions;
+mod dummy;
+mod dump;
 mod infer_types;
 mod parse_domain;
+#[cfg(test)]
+mod tests;
 
 pub fn main() {
     println!("Hello, world!");

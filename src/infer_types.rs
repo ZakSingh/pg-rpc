@@ -1,3 +1,5 @@
+use crate::infer_types::CaseType::Snake;
+use crate::parse_domain::non_null_cols_from_checks;
 use heck::{ToPascalCase, ToSnakeCase};
 use itertools::Itertools;
 use pg_query::protobuf::node::Node;
@@ -6,7 +8,8 @@ use quote::__private::TokenStream;
 use quote::{quote, ToTokens};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use tokio_postgres::{Client, GenericClient};
+use syn::parse::Parser;
+use tokio_postgres::{Client, GenericClient, Row};
 
 const FUNCTION_INTROSPECTION_QUERY: &'static str = r#"
 select distinct on (n.nspname, p.proname)
@@ -16,23 +19,26 @@ select distinct on (n.nspname, p.proname)
     p.proargtypes as arg_oids,
     p.prorettype as return_type,
     p.proretset as returns_set,
-    p.proisstrict as is_strict,
     case when p.proargnames is not null
-        -- trim unused arg names
-        then (select p.proargnames[:array_length(p.proargtypes, 1)])
-        else array[]::text[]
-        end as arg_names
+            -- trim unused arg names
+             then (select p.proargnames[:array_length(p.proargtypes, 1)])
+         else array[]::text[]
+        end as arg_names,
+    array(
+            select n > (array_length(p.proargtypes, 1) - p.pronargdefaults)
+            from generate_series(1, array_length(p.proargtypes, 1)) as n
+    ) as has_defaults
 from pg_proc p
-    join pg_namespace n on p.pronamespace = n.oid
-    left join pg_type t on t.oid = any(p.proargtypes)
+         join pg_namespace n on p.pronamespace = n.oid
+         left join pg_type t on t.oid = any(p.proargtypes)
 where p.prokind = 'f'
-    and n.nspname not in ('pg_catalog', 'information_schema')
-    and not exists (
-        select 1
-        from pg_depend d
-        where d.objid = p.oid
-        and d.deptype = 'e'  -- 'e' means it's from an extension
-    )
+  and n.nspname not in ('pg_catalog', 'information_schema')
+  and not exists (
+    select 1
+    from pg_depend d
+    where d.objid = p.oid
+      and d.deptype = 'e'
+)
 order by n.nspname, p.proname;
 "#;
 
@@ -80,15 +86,55 @@ with recursive type_tree as (
                 and not attisdropped
             )
         end as composite_field_types,
-        case
-            when t.typtype = 'c' then (
+case
+        when t.typtype = 'c' then (
+            case when exists (
+                select 1
+                from pg_class c
+                where c.oid = t.typrelid
+                and c.relkind = 'v'
+            ) then (
+                with view_columns as (
+                    select
+                        a.attname,
+                        a.attnum,
+                        coalesce(derived.is_nullable, 'YES') as is_nullable
+                    from pg_attribute a
+                    join pg_class cl on cl.oid = a.attrelid
+                    join pg_namespace ns on ns.oid = cl.relnamespace
+                    left join (
+                        select
+                            vcu.column_name,
+                            vcu.view_name,
+                            vcu.view_schema,
+                            cols.is_nullable
+                        from information_schema.view_column_usage vcu
+                        join information_schema.columns cols on
+                            cols.column_name = vcu.column_name
+                            and cols.table_name = vcu.table_name
+                            and cols.table_schema = vcu.table_schema
+                    ) derived on
+                        derived.column_name = a.attname
+                        and derived.view_name = cl.relname
+                        and derived.view_schema = ns.nspname
+                    where a.attrelid = t.typrelid
+                    and a.attnum > 0
+                    and not a.attisdropped
+                )
+                select array_agg(
+                    case when is_nullable = 'YES' then true else false end
+                    order by attnum
+                )
+                from view_columns
+            ) else (
                 select array_agg(not attnotnull order by attnum)
                 from pg_attribute
                 where attrelid = t.typrelid
                 and attnum > 0
                 and not attisdropped
-            )
-        end as composite_field_nullables
+            ) end
+        )
+    end as composite_field_nullables
     from pg_type t
     join pg_namespace n on t.typnamespace = n.oid
     where t.oid = any($1)
@@ -137,15 +183,55 @@ with recursive type_tree as (
                 and not attisdropped
             )
         end as composite_field_types,
-        case
-            when t.typtype = 'c' then (
+case
+        when t.typtype = 'c' then (
+            case when exists (
+                select 1
+                from pg_class c
+                where c.oid = t.typrelid
+                and c.relkind = 'v'
+            ) then (
+                with view_columns as (
+                    select
+                        a.attname,
+                        a.attnum,
+                        coalesce(derived.is_nullable, 'YES') as is_nullable
+                    from pg_attribute a
+                    join pg_class cl on cl.oid = a.attrelid
+                    join pg_namespace ns on ns.oid = cl.relnamespace
+                    left join (
+                        select
+                            vcu.column_name,
+                            vcu.view_name,
+                            vcu.view_schema,
+                            cols.is_nullable
+                        from information_schema.view_column_usage vcu
+                        join information_schema.columns cols on
+                            cols.column_name = vcu.column_name
+                            and cols.table_name = vcu.table_name
+                            and cols.table_schema = vcu.table_schema
+                    ) derived on
+                        derived.column_name = a.attname
+                        and derived.view_name = cl.relname
+                        and derived.view_schema = ns.nspname
+                    where a.attrelid = t.typrelid
+                    and a.attnum > 0
+                    and not a.attisdropped
+                )
+                select array_agg(
+                    case when is_nullable = 'YES' then true else false end
+                    order by attnum
+                )
+                from view_columns
+            ) else (
                 select array_agg(not attnotnull order by attnum)
                 from pg_attribute
                 where attrelid = t.typrelid
                 and attnum > 0
                 and not attisdropped
-            )
-        end as composite_field_nullables
+            ) end
+        )
+    end as composite_field_nullables
     from pg_type t
     join pg_namespace n on t.typnamespace = n.oid
     join type_tree tt on (
@@ -277,25 +363,16 @@ struct PgFn {
     return_type_oid: OID,
     returns_set: bool,
     definition: String,
-    is_strict: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PgArg {
     name: String,
     type_oid: OID,
+    has_default: bool,
 }
 
-// Inject arbitrary 'create domain x as y' prefix onto the check constraint so it can be parsed by pg_query
-//
 async fn main(db: &Client) -> anyhow::Result<()> {
-    let result = pg_query::parse(
-        "create domain post_with_author as _post_with_author check (
-    (value).post_id is not null and
-    (value).author is not null
-);",
-    )?;
-
     let (fns, type_oids) = fetch_functions(db).await?;
     let types = fetch_types(db, &type_oids).await?;
     let type_def_code = codegen_types(&types);
@@ -338,14 +415,16 @@ async fn fetch_functions(
         let arg_type_oids: Vec<OID> = row.get("arg_oids");
         let arg_names: Vec<String> = row.get("arg_names");
         let return_type_oid: OID = row.get("return_type");
-        let is_strict: bool = row.get("is_strict");
+        let arg_defaults: Vec<bool> = row.get("has_defaults");
 
         let args = arg_type_oids
             .iter()
             .zip(arg_names)
-            .map(|(oid, name)| PgArg {
+            .zip(arg_defaults)
+            .map(|((oid, name), has_default)| PgArg {
                 name: name.clone(),
                 type_oid: *oid,
+                has_default,
             })
             .collect();
 
@@ -357,7 +436,6 @@ async fn fetch_functions(
             name: row.get("function_name"),
             definition: row.get("function_definition"),
             returns_set: row.get("returns_set"),
-            is_strict,
             args,
             return_type_oid,
         };
@@ -447,7 +525,14 @@ fn clean_identifier(name: &str, case_type: CaseType) -> TokenStream {
     let name = prefix.to_string()
         + &match case_type {
             CaseType::Snake => name.to_snake_case(),
-            CaseType::Pascal => name.to_pascal_case(),
+            CaseType::Pascal => {
+                // Preserve _ prefixes (heck removes them for some reason)
+                if name.chars().next() == Some('_') {
+                    "_".to_string().as_str().to_owned() + name.to_pascal_case().as_str()
+                } else {
+                    name.to_pascal_case()
+                }
+            }
         };
 
     match syn::parse_str::<syn::Ident>(&name) {
@@ -524,6 +609,74 @@ impl ToRust for PgType {
                     }
                 }
             }
+            PgType::Domain {
+                schema,
+                name,
+                type_oid,
+                constraints,
+            } => {
+                let rs_name = clean_identifier(name, CaseType::Pascal);
+
+                match types.get(type_oid).unwrap() {
+                    PgType::Composite { fields, .. } => {
+                        // If the domain wraps a composite type, we want to create a new composite type
+                        // with the non-null constraints enforced by the domain rather than creating a new wrapper type.
+                        // TODO: Refactor for DRY
+                        let c: Vec<&str> = constraints.into_iter().map(|s| s.as_str()).collect();
+                        let non_null_cols = non_null_cols_from_checks(&c).unwrap();
+
+                        let field_tokens: Vec<TokenStream> = fields
+                            .into_iter()
+                            .map(|mut f| {
+                                PgField {
+                                    nullable: f.nullable && !non_null_cols.contains(&f.name),
+                                    name: f.name.clone(),
+                                    type_oid: f.type_oid,
+                                }
+                                .to_rust(types)
+                            })
+                            .collect();
+
+                        let field_mappings: Vec<_> = fields
+                            .into_iter()
+                            .map(|f| {
+                                let sql_name = &f.name;
+                                let rs_name = clean_identifier(&f.name, CaseType::Snake);
+
+                                quote! { #rs_name: row.try_get(#sql_name)? }
+                            })
+                            .collect();
+
+                        // TODO: Do I need custom ToSql and FromSql implementations that re-add the wrapper?
+                        quote! {
+                            #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
+                            #[postgres(name = #name)]
+                            pub struct #rs_name {
+                                #(#field_tokens),*
+                            }
+
+                            impl TryFrom<tokio_postgres::Row> for #rs_name {
+                                type Error = tokio_postgres::Error;
+
+                                fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                                    Ok(Self {
+                                        #(#field_mappings),*
+                                    })
+                                }
+                            }
+                        }
+                    }
+                    pg_type => {
+                        // For any type besides composite types, domains are just a wrapper.
+                        let inner = pg_type.to_rust_ident(types);
+                        quote! {
+                            #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
+                            #[postgres(name = #name)]
+                            pub struct #rs_name(#inner);
+                        }
+                    }
+                }
+            }
             PgType::Enum {
                 schema,
                 name,
@@ -548,26 +701,6 @@ impl ToRust for PgType {
                     pub enum #clean_name {
                         #(#variants),*
                     }
-                }
-            }
-            PgType::Domain {
-                schema,
-                name,
-                type_oid,
-                constraints,
-            } => {
-                let clean_name = clean_identifier(name, CaseType::Pascal);
-                let inner = types.get(type_oid).unwrap().to_rust_ident(types);
-
-                // TODO: constraints from the domain are currently not applied to the inner type.
-                // I'd need to generate a new type for the inner type with the constraints
-                // It means that to_rust_ident will need to take constraints?
-                // No, I will need to do a types.get(type_oid) then modify the struct with the domain constraints
-
-                quote! {
-                    #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
-                    #[postgres(name = #name)]
-                    pub struct #clean_name(#inner);
                 }
             }
             // Skip base types like i32/i64 as they are already-defined primitives
@@ -597,6 +730,12 @@ fn codegen_types(types: &HashMap<OID, PgType>) -> HashMap<SchemaName, TokenStrea
         .collect()
 }
 
+impl PgArg {
+    pub fn rs_name(&self) -> TokenStream {
+        clean_identifier(&self.name, CaseType::Snake)
+    }
+}
+
 impl ToRust for PgArg {
     fn to_rust(&self, types: &HashMap<OID, PgType>) -> TokenStream {
         let name = clean_identifier(&self.name, CaseType::Snake);
@@ -616,16 +755,82 @@ impl ToRust for PgArg {
             }
         };
 
-        quote! {
-            #name: #ty
+        if self.has_default {
+            quote! {
+                #name: Option<#ty>
+            }
+        } else {
+            quote! {
+                #name: #ty
+            }
         }
     }
 }
 
 impl ToRust for PgFn {
     fn to_rust(&self, types: &HashMap<OID, PgType>) -> TokenStream {
-        let clean_name = clean_identifier(&self.name, CaseType::Snake);
+        let args: Vec<TokenStream> = self.args.iter().map(|a| a.to_rust(types)).collect();
 
+        // TODO: replace with custom error type later
+        let error_type: TokenStream = "tokio_postgres::Error".parse().unwrap();
+
+        let mapping = {
+            let (opt_args, req_args): (Vec<PgArg>, Vec<PgArg>) =
+                self.args.iter().cloned().partition(|n| n.has_default);
+
+            // Generate required query parameters positionally ($1, $2, ..., $n)
+            let required_query_params = (1..=self.args.len() - opt_args.len())
+                .map(|i| format!("${}", i))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let req_arg_names: Vec<TokenStream> = req_args.iter().map(|a| a.rs_name()).collect();
+            let opt_arg_names: Vec<TokenStream> = opt_args.iter().map(|a| a.rs_name()).collect();
+            let opt_arg_sql_names: Vec<&str> = opt_args.iter().map(|a| a.name.as_str()).collect();
+
+            let query_string = if self.returns_set {
+                format!("select * from {}.{}", self.schema, self.name)
+            } else {
+                format!("select {}.{}", self.schema, self.name)
+            };
+
+            let query = if self.returns_set {
+                quote! {
+                    client
+                        .query(&query, &params)
+                        .await
+                        .and_then(|rows| {
+                            rows.into_iter().map(TryInto::try_into).collect()
+                        })
+                }
+            } else {
+                quote! {
+                    client
+                        .query_one(&query, &params)
+                        .await
+                        .and_then(|r| r.try_get(0))
+                }
+            };
+
+            quote! {
+                let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(&#req_arg_names),*];
+                let mut query = concat!(#query_string, "(", #required_query_params).to_string();
+
+                #(
+                    if let Some(ref value) = #opt_arg_names {
+                        params.push(value);
+                        query.push_str(concat!(", ", #opt_arg_sql_names, ":= $"));
+                        query.push_str(&params.len().to_string());
+                    }
+                )*
+
+                query.push_str(")");
+
+                #query
+            }
+        };
+
+        let rs_fn_name = self.rs_name();
         let return_type = {
             let inner_ty = types
                 .get(&self.return_type_oid)
@@ -639,55 +844,17 @@ impl ToRust for PgFn {
             }
         };
 
-        let args: Vec<TokenStream> = self.args.iter().map(|a| a.to_rust(types)).collect();
-        let arg_names: Vec<TokenStream> = self
-            .args
-            .iter()
-            .map(|a| clean_identifier(&a.name, CaseType::Snake))
-            .collect();
-
-        // TODO: replace with custom error type later
-        let error_type: TokenStream = "tokio_postgres::Error".parse().unwrap();
-
-        // Generate query parameters dynamically ($1, $2, ..., $n)
-        let query_params = (1..=self.args.len())
-            .map(|i| format!("${}", i))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        // Build the query string
-        let query_string = if self.returns_set {
-            format!(
-                "select * from {}.{}({});",
-                self.schema, self.name, query_params
-            )
-        } else {
-            format!("select {}.{}({});", self.schema, self.name, query_params)
-        };
-
-        let mapping = if self.returns_set {
-            quote! {
-                client
-                    .query(#query_string, &[#(&#arg_names),*])
-                    .await
-                    .and_then(|rows| {
-                        rows.into_iter().map(TryInto::try_into).collect()
-                    })
-            }
-        } else {
-            quote! {
-                client
-                    .query_one(#query_string, &[#(&#arg_names),*])
-                    .await
-                    .and_then(|r| r.try_get(0))
-            }
-        };
-
         quote! {
-            pub async fn #clean_name(client: &tokio_postgres::Client, #(#args),*) -> Result<#return_type, #error_type> {
+            pub async fn #rs_fn_name(client: &tokio_postgres::Client, #(#args),*) -> Result<#return_type, #error_type> {
                 #mapping
             }
         }
+    }
+}
+
+impl PgFn {
+    pub fn rs_name(&self) -> TokenStream {
+        clean_identifier(&self.name, CaseType::Snake)
     }
 }
 
@@ -711,48 +878,11 @@ fn codegen_fns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::setup_test_db;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
     use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
     use tokio_postgres::{Client, NoTls};
-
-    pub struct TestDb {
-        pub client: Client,
-        // Store these to keep them in scope
-        #[allow(dead_code)]
-        container: ContainerAsync<Postgres>,
-        #[allow(dead_code)]
-        connection_handle: tokio::task::JoinHandle<Result<(), tokio_postgres::error::Error>>,
-    }
-
-    async fn setup_test_db() -> TestDb {
-        let container = Postgres::default()
-            .with_tag("16-alpine")
-            .start()
-            .await
-            .expect("container to start");
-
-        let connection_string = &format!(
-            "postgres://postgres:postgres@{}:{}/postgres",
-            container.get_host().await.expect("host to be present"),
-            container
-                .get_host_port_ipv4(5432)
-                .await
-                .expect("port to be present")
-        );
-
-        let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
-            .await
-            .expect("connection to be established");
-
-        let connection_handle = tokio::spawn(connection);
-
-        TestDb {
-            client,
-            container,
-            connection_handle,
-        }
-    }
 
     #[tokio::test]
     async fn hello() {
@@ -778,56 +908,12 @@ mod tests {
 
                 create schema api;
 
-                create function api.create_account(name text, age int, role role)
-                returns account as $$
-                declare
-                    result account;
+                create function api.optional_argument(required int, opt_1 int , opt_2 bool)
+                returns int as $$
                 begin
-                    insert into account (name, age, role)
-                    values (name, age, role)
-                    returning * into result;
-
-                    return result;
+                   return 1;
                 end;
                 $$ language plpgsql;
-
-                create function api.find_account_by_id(p_account_id int)
-                returns setof account as $$
-                begin
-                   return query select * from account
-                   where account_id = p_account_id;
-                end;
-                $$ language plpgsql;
-
-                create type api.account_with_posts as (
-                    account_id int,
-                    name text,
-                    age int,
-                    role role,
-                    posts post[]
-                );
-
-                create function api.get_account_with_posts(p_account_id int)
-                returns api.account_with_posts
-                strict language plpgsql as $$
-                declare
-                    result api.account_with_posts;
-                begin
-                    select
-                        a.account_id,
-                        a.name,
-                        a.age,
-                        a.role,
-                        coalesce(array_agg(p order by p.post_id), '{}')
-                    into result
-                    from account a
-                        left join post p on a.account_id = p.author_id
-                    where a.account_id = p_account_id
-                    group by a.account_id, a.name, a.age, a.role;
-
-                    return result;
-                end;
-                $$;
                 "#,
             )
             .await
@@ -849,10 +935,11 @@ mod tests {
 
 // TODO:
 // 1. Table return types
-// 2. STRICT handling (make all parameters non-null)
 // 3. Fetch functions and fetch types should be refactored to use a fromsql From<Row> implementation.
 // 4. Nullability/cardinality inference for return type?
 // 5. Exception tracking / error enum generation
+// 6. Default null parameters
+// 7. Collect comments on functions, arguments, return type, composite types, etc.
 
 // If it's a `returns setof composite_type` it expands each to a row
 // If it's `returns table(name text, age int, email text)`, it expands to rows
