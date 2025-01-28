@@ -1,6 +1,6 @@
+use crate::codegen::ToRust;
+use crate::codegen::{SchemaName, OID};
 use crate::ident::{sql_to_rs_ident, CaseType};
-use crate::infer_types::ToRust;
-use crate::infer_types::{SchemaName, OID};
 use crate::parse_domain::non_null_cols_from_checks;
 use itertools::izip;
 use quote::__private::TokenStream;
@@ -41,6 +41,7 @@ pub enum PgType {
     Int64,
     Bool,
     Text,
+    Timestamptz,
 }
 
 #[derive(Debug)]
@@ -93,6 +94,7 @@ impl PgType {
             PgType::Int64 => quote! { i64 },
             PgType::Bool => quote! { bool },
             PgType::Text => quote! { String },
+            PgType::Timestamptz => quote! { time::OffsetDateTime },
             x => unimplemented!("unknown type {:?}", x),
         }
     }
@@ -110,8 +112,9 @@ impl TryFrom<Row> for PgType {
             'b' => match name.as_ref() {
                 "int4" => PgType::Int32,
                 "int8" => PgType::Int64,
-                "text" => PgType::Text,
+                "text" | "citext" => PgType::Text,
                 "bool" => PgType::Bool,
+                "timestamptz" => PgType::Timestamptz,
                 _ if t.get::<&str, u32>("array_element_type") != 0 => PgType::Array {
                     schema,
                     element_type_oid: t.get("array_element_type"),
@@ -324,7 +327,9 @@ impl ToRust for PgType {
                 }
             }
             // Skip base types like i32/i64 as they are already-defined primitives
-            PgType::Int32 | PgType::Int64 | PgType::Text | PgType::Bool => quote! {},
+            PgType::Int32 | PgType::Int64 | PgType::Text | PgType::Bool | PgType::Timestamptz => {
+                quote! {}
+            }
             // No need to create type aliases for arrays. Instead they'll be used as Vec<Inner>
             PgType::Array { .. } => quote! {},
             x => unimplemented!("Unhandled PgType {:?}", x),

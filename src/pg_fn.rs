@@ -1,9 +1,14 @@
+use crate::codegen::{FunctionName, SchemaName, ToRust, OID};
+use crate::fn_index::FunctionId;
+use crate::fn_src_location::SrcLoc;
 use crate::ident::{sql_to_rs_ident, CaseType};
-use crate::infer_types::{FunctionName, SchemaName, ToRust, OID};
 use crate::pg_type::PgType;
-use crate::pgsql_check::{PgSqlIssue, PgSqlReport};
+use crate::pgsql_check::{line_to_span, PgSqlIssue, PgSqlReport};
+use ariadne::{sources, Config, Label, Report};
 use quote::__private::TokenStream;
 use quote::quote;
+use regex::Regex;
+use std::cmp::max;
 use std::collections::HashMap;
 use tokio_postgres::Row;
 
@@ -33,9 +38,92 @@ impl PgArg {
     }
 }
 
+/// Get the position of the first `$...$` tag
+fn quote_ind(src: &str) -> Option<(&str, usize)> {
+    let re = Regex::new(r"\$.*?\$").unwrap();
+
+    // Find the first match
+    if let Some(matched) = re.find(src) {
+        let s = matched.as_str();
+        Some((s, matched.end()))
+    } else {
+        None
+    }
+}
+
 impl PgFn {
+    pub fn id(&self) -> FunctionId {
+        FunctionId {
+            schema: self.schema.clone(),
+            name: self.name.clone(),
+        }
+    }
+
+    pub fn has_issues(&self) -> bool {
+        !self.issues.is_empty()
+    }
+
     pub fn rs_name(&self) -> TokenStream {
         sql_to_rs_ident(&self.name, CaseType::Snake)
+    }
+
+    // TODO: line numbers are indexed from the start of the body string???
+    // No, postgres collapses the header into ONE LINE, no matter how many arguments there are.
+    // it also uppercases keywords in the header and moves the language to the header
+    // Once you hit the $$ string though, it's exactly what the user entered.
+    // I think line numbers are counted where the line with the opening $$ is line 1?
+
+    /// Retrieve the body (between the `$$`)
+    fn body(&self) -> &str {
+        let (tag, start_ind) = quote_ind(&self.definition).unwrap();
+        let end_ind = self.definition[start_ind..].find(tag).unwrap() + start_ind;
+
+        &self.definition[start_ind..end_ind]
+    }
+
+    fn body_start(&self) -> usize {
+        let (tag, start_ind) = quote_ind(&self.definition).unwrap();
+        start_ind
+    }
+
+    pub fn report(&self, src_loc: &SrcLoc) {
+        let body = self.body();
+        self.issues.iter().for_each(|i| {
+            let line_span = i
+                .statement
+                .as_ref()
+                .and_then(|s| line_to_span(body, s.line_number))
+                .unwrap_or(line_to_span(body, 1).unwrap());
+
+            let query = i
+                .query
+                .as_ref()
+                .and_then(|s| Some((s.text.as_ref(), s.position)));
+
+            let file_name = src_loc.0.to_string_lossy().to_string();
+
+            let body = match query {
+                Some((text, position)) => text,
+                _ => body,
+            };
+
+            let span = match query {
+                Some((_, position)) => position..position,
+                _ => line_span,
+            };
+
+            let cache = sources(vec![(file_name.clone(), body)]);
+
+            Report::build(i.level.into(), (file_name.clone(), span.clone()))
+                .with_code(i.sql_state.as_str())
+                .with_message(self.name.as_str())
+                .with_label(
+                    Label::new((file_name.clone(), span.clone())).with_message(i.message.as_str()),
+                )
+                .finish()
+                .eprint(cache)
+                .unwrap()
+        });
     }
 }
 

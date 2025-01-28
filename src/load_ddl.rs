@@ -1,13 +1,13 @@
-use crate::fn_src_location::{get_function_spans, FunctionId, Span};
+use crate::fn_index::FunctionId;
+use crate::fn_src_location::{get_function_spans, SrcLoc};
+use ariadne::sources;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 /// Combine the sql files into one string ready to be executed
 /// and find the src locations of all functions defined in the files
-pub fn load_ddl(
-    dir: impl AsRef<Path>,
-) -> io::Result<(String, HashMap<FunctionId, (PathBuf, Span)>)> {
+pub fn load_ddl(dir: impl AsRef<Path>) -> io::Result<(String, HashMap<FunctionId, SrcLoc>)> {
     let paths = list_sql_files(dir)?;
     let mut combined = String::new();
     // Lookups will be done via function name, so it should be fnid -> src, path

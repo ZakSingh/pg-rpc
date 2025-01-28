@@ -1,4 +1,4 @@
-use crate::infer_types::{FunctionName, SchemaName, OID};
+use crate::codegen::{FunctionName, SchemaName, OID};
 use crate::pg_fn::PgFn;
 use std::collections::HashMap;
 use tokio_postgres::Client;
@@ -39,5 +39,31 @@ impl FunctionIndex {
             type_oids,
             fn_index,
         })
+    }
+
+    pub fn get_fn(&self, fn_id: &FunctionId) -> Option<&PgFn> {
+        Some(self.fn_index.get(&fn_id.schema)?.get(&fn_id.name)?)
+    }
+}
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct FunctionId {
+    pub schema: String,
+    pub name: String,
+}
+
+impl FunctionId {
+    pub fn new(name: &str) -> Self {
+        if let Some((schema, name)) = name.split_once('.') {
+            Self {
+                schema: schema.to_string(),
+                name: name.to_string(),
+            }
+        } else {
+            Self {
+                schema: "public".to_string(),
+                name: name.to_string(),
+            }
+        }
     }
 }

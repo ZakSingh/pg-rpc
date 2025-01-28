@@ -1,4 +1,4 @@
-use crate::infer_types::OID;
+use crate::codegen::OID;
 use crate::pg_type::PgType;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};

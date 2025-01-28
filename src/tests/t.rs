@@ -1,6 +1,7 @@
-use crate::cli::load_ddl;
+use crate::codegen::codegen;
 use crate::db::Db;
-use crate::infer_types::codegen;
+use crate::load_ddl::load_ddl;
+use crate::run;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -75,11 +76,7 @@ fn test_schema() -> (TempDir, PathBuf) {
 async fn test_t() -> anyhow::Result<()> {
     // Create test folder with sql files
     let (tmp_dir, base_path) = test_schema();
-    let (init_sql, fn_locs) = load_ddl(&base_path)?;
-
-    let db = Db::new(&init_sql).await;
-
-    // let rs_types = generate_rs_types(&db.client).await?;
+    run(&base_path).await?;
 
     Ok(())
 }

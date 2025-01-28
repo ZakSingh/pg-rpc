@@ -2,11 +2,10 @@ use crate::fn_index::FunctionIndex;
 use crate::ident::{sql_to_rs_ident, CaseType};
 use crate::pg_type::PgType;
 use crate::ty_index::TypeIndex;
-use heck::{ToPascalCase, ToSnakeCase};
 use itertools::Itertools;
 use postgres_types::FromSql;
 use quote::__private::TokenStream;
-use quote::{quote, ToTokens};
+use quote::quote;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::error::Error;
@@ -22,7 +21,7 @@ pub type SchemaName = String;
 /// Postgres function identifier
 pub type FunctionName = String;
 
-pub(crate) trait ToRust {
+pub trait ToRust {
     fn to_rust(&self, types: &HashMap<OID, PgType>) -> TokenStream;
 }
 
@@ -95,6 +94,7 @@ fn codegen_fns(fns: &FunctionIndex, types: &TypeIndex) -> HashMap<SchemaName, To
 mod tests {
     use super::*;
     use crate::db::Db;
+    use crate::load_ddl::load_ddl;
 
     #[tokio::test]
     async fn hello() -> anyhow::Result<()> {
@@ -129,7 +129,7 @@ mod tests {
                 create schema api;
 
                 create function api.optional_argument(required int, opt_1 int , opt_2 bool)
-                returns int as $$
+                returns post_with_author as $$
                 begin
                    return 3;
                 end;
@@ -153,7 +153,6 @@ mod tests {
 
 // TODO:
 // 1. Table return types
-// 3. Fetch functions and fetch types should be refactored to use a fromsql From<Row> implementation.
 // 5. Exception tracking / error enum generation
 
 // Need to test with arrays again.
