@@ -65,6 +65,21 @@ mod public {
     }
 }
 mod api {
+    pub async fn create_account(
+        client: &tokio_postgres::Client,
+        email: &str,
+        name: &str,
+        role: super::public::Role,
+        unused: i32,
+    ) -> Result<super::public::Account, tokio_postgres::Error> {
+        let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![
+            & email, & name, & role, & unused
+        ];
+        let mut query = concat!("select api.create_account", "(", "$1, $2, $3, $4")
+            .to_string();
+        query.push_str(")");
+        client.query_one(&query, &params).await.and_then(|r| r.try_get(0))
+    }
     ///fn comment
     pub async fn optional_argument(
         client: &tokio_postgres::Client,
@@ -95,21 +110,6 @@ mod api {
             query.push_str(concat!(", ", "content", ":= $"));
             query.push_str(&params.len().to_string());
         }
-        query.push_str(")");
-        client.query_one(&query, &params).await.and_then(|r| r.try_get(0))
-    }
-    pub async fn create_account(
-        client: &tokio_postgres::Client,
-        email: &str,
-        name: &str,
-        role: super::public::Role,
-        unused: i32,
-    ) -> Result<super::public::Account, tokio_postgres::Error> {
-        let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![
-            & email, & name, & role, & unused
-        ];
-        let mut query = concat!("select api.create_account", "(", "$1, $2, $3, $4")
-            .to_string();
         query.push_str(")");
         client.query_one(&query, &params).await.and_then(|r| r.try_get(0))
     }

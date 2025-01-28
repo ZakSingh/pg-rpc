@@ -4,12 +4,13 @@ use crate::fn_src_location::SrcLoc;
 use crate::ident::{sql_to_rs_ident, CaseType};
 use crate::pg_type::PgType;
 use crate::pgsql_check::{line_to_span, PgSqlIssue, PgSqlReport};
-use ariadne::{sources, Config, Label, Report};
+use ariadne::{sources, Config, Label, LabelAttach, Report};
 use quote::__private::TokenStream;
 use quote::quote;
 use regex::Regex;
 use std::cmp::max;
 use std::collections::HashMap;
+use std::ops::Range;
 use tokio_postgres::Row;
 
 #[derive(Debug)]
@@ -67,12 +68,6 @@ impl PgFn {
         sql_to_rs_ident(&self.name, CaseType::Snake)
     }
 
-    // TODO: line numbers are indexed from the start of the body string???
-    // No, postgres collapses the header into ONE LINE, no matter how many arguments there are.
-    // it also uppercases keywords in the header and moves the language to the header
-    // Once you hit the $$ string though, it's exactly what the user entered.
-    // I think line numbers are counted where the line with the opening $$ is line 1?
-
     /// Retrieve the body (between the `$$`)
     fn body(&self) -> &str {
         let (tag, start_ind) = quote_ind(&self.definition).unwrap();
@@ -100,23 +95,22 @@ impl PgFn {
                 .as_ref()
                 .and_then(|s| Some((s.text.as_ref(), s.position)));
 
+            let (body, span): (&str, Range<usize>) = match query {
+                Some((text, position)) => (text, position..text.len()),
+                _ => (body, line_span),
+            };
+
             let file_name = src_loc.0.to_string_lossy().to_string();
-
-            let body = match query {
-                Some((text, position)) => text,
-                _ => body,
-            };
-
-            let span = match query {
-                Some((_, position)) => position..position,
-                _ => line_span,
-            };
-
             let cache = sources(vec![(file_name.clone(), body)]);
 
             Report::build(i.level.into(), (file_name.clone(), span.clone()))
+                .with_config(
+                    Config::default()
+                        .with_multiline_arrows(false)
+                        .with_tab_width(2),
+                )
                 .with_code(i.sql_state.as_str())
-                .with_message(self.name.as_str())
+                .with_message("in ".to_string() + self.schema.as_str() + "." + self.name.as_str())
                 .with_label(
                     Label::new((file_name.clone(), span.clone())).with_message(i.message.as_str()),
                 )

@@ -8,7 +8,6 @@ use std::path::Path;
 
 mod codegen;
 mod db;
-mod dump;
 mod fn_index;
 mod fn_src_location;
 mod ident;
