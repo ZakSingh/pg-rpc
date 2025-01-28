@@ -38,8 +38,4 @@ Means that `a` and `b` will be `Option`.
 If the `is not null` has an ancestor `or`, the column is `Option`. Otherwise it is non-null.
 
 If the inner type of a domain is a composite type, it should just create a new composite type with the name of the
-domain,
-rather than needing a separate domain type.
-
-Do domains have any purpose for the end user? ALL they can do is add constraints to their inner type. So may as well
-pass it through.
+domain, rather than needing a separate domain type.

@@ -16,6 +16,7 @@
             </node>
             <node kind="database" qname="miniswap">
               <node kind="schema">
+                <name qname="test" />
                 <name qname="api" />
                 <name qname="functions" />
                 <name qname="views" />

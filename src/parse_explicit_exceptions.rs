@@ -1,5 +1,4 @@
 use crate::PgFnBody;
-/// This module parses the pg_query JSON representation of pl/pgsql raise statements into Rust structs.
 use serde::de::{self, MapAccess, Visitor};
 use serde::Deserialize;
 use serde_json::Value;

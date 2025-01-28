@@ -1,0 +1,23 @@
+select distinct on (n.nspname, p.proname) n.nspname                                                           as schema_name,
+                                          p.proname                                                           as function_name,
+                                          p.oid                                                               as oid,
+                                          pg_get_functiondef(p.oid)                                           as function_definition,
+                                          p.proargtypes                                                       as arg_oids,
+                                          p.prorettype                                                        as return_type,
+                                          p.proretset                                                         as returns_set,
+                                          case when p.proargnames is not null
+                                                   then ( select p.proargnames[:array_length(p.proargtypes, 1)] )
+                                               else array []::text[] end                                      as arg_names,
+                                          array(select n > (array_length(p.proargtypes, 1) - p.pronargdefaults)
+                                                from generate_series(1, array_length(p.proargtypes, 1)) as n) as has_defaults,
+                                          d.description                                                       as comment,
+                                          plpgsql_check_function(p.oid, format := 'json')::json               as plpgsql_check
+
+from pg_proc p
+         join pg_namespace n on p.pronamespace = n.oid
+         left join pg_type t on t.oid = any (p.proargtypes)
+         left join pg_description d on d.objoid = p.oid
+where p.prokind = 'f'
+  and n.nspname not in ('pg_catalog', 'information_schema')
+  and not exists ( select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e' )
+order by n.nspname, p.proname;

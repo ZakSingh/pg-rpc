@@ -19,10 +19,13 @@ anyhow = "1.0.95"
 serde_json_path = "0.7.1"
 serde_path_to_error = "0.1.16"
 regex = "1.11.1"
-testcontainers-modules = { version = "0.11.5", features = ["postgres"] }
+testcontainers = { version = "0.23.1" }
 quote = "1.0"
 syn = { version = "2.0", features = ["parsing"] }
 heck = "0.5"
 prettyplease = "0.2"
 itertools = "0.14"
 postgres-types = { version = "0.2.8", features = ["derive", "array-impls"] }
+serde_with = "3.12.0"
+ariadne = "0.5.0"
+tempfile = { version = "3.15.0" }
