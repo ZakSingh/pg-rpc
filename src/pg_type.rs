@@ -42,6 +42,7 @@ pub enum PgType {
     Bool,
     Text,
     Timestamptz,
+    Void,
 }
 
 #[derive(Debug)]
@@ -95,6 +96,7 @@ impl PgType {
             PgType::Bool => quote! { bool },
             PgType::Text => quote! { String },
             PgType::Timestamptz => quote! { time::OffsetDateTime },
+            PgType::Void => quote! { () },
             x => unimplemented!("unknown type {:?}", x),
         }
     }
@@ -157,9 +159,10 @@ impl TryFrom<Row> for PgType {
                 comment,
                 variants: t.get("enum_variants"),
             },
-            'p' => {
-                unimplemented!();
-            }
+            'p' => match name.as_ref() {
+                "void" => PgType::Void,
+                _ => unimplemented!(),
+            },
             x => unimplemented!("ttype not implemented {}", x),
         };
 
@@ -327,7 +330,12 @@ impl ToRust for PgType {
                 }
             }
             // Skip base types like i32/i64 as they are already-defined primitives
-            PgType::Int32 | PgType::Int64 | PgType::Text | PgType::Bool | PgType::Timestamptz => {
+            PgType::Int32
+            | PgType::Int64
+            | PgType::Text
+            | PgType::Bool
+            | PgType::Timestamptz
+            | PgType::Void => {
                 quote! {}
             }
             // No need to create type aliases for arrays. Instead they'll be used as Vec<Inner>

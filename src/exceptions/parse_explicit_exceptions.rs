@@ -100,9 +100,7 @@ impl<'de> Deserialize<'de> for StmtRaise {
                         Field::CondName => {
                             let value: String = map.next_value()?;
                             // First try to parse as a SQL state code
-                            sql_state = if value.len() == 5
-                                && value.chars().all(|c| c.is_ascii_digit())
-                            {
+                            sql_state = if value.len() == 5 {
                                 SqlState::from_code(&value)
                             } else {
                                 // Otherwise treat as a condition name

@@ -3,15 +3,12 @@ create schema api;
 create function api.create_account(
     email citext,
     name text,
-    role role,
-    unused int
-) returns account
-    stable as
+    role role
+) returns account as
 $$
 declare
     account_res account;
 begin
-    -- comment s
     with test_cte as ( select 1 )
     insert
     into account (email, name, role)
@@ -29,21 +26,37 @@ create function api.create_post(
 ) returns post_with_author as
 $$
 declare
-    post_res post;
+    ret post_with_author;
 begin
-    insert into post (account_id, title, content)
-    values (account_id, title, content)
-    returning (post.*, ( select * from account where account.account_id = post.account_id )) into post_res;
+    with new_post as ( insert into post (account_id, title, content) values (account_id, title, content) returning * )
+    select new_post.*, row (a.*)::account as author
+    into strict ret
+    from new_post
+             join account a on a.account_id = new_post.account_id;
 
-    return post_res;
+    return ret;
 end;
 $$ language plpgsql;
 
-create function api.optional_argument(required int, opt_1 int, opt_2 bool) returns post_with_author as
+create function api.deppy(un int) returns int as
 $$
 begin
-    return 3;
+    return un;
 end;
 $$ language plpgsql;
 
-comment on function api.optional_argument(int, int, bool) is 'fn comment';
+create function api.middle(un int) returns int as
+$$
+begin
+    return api.deppy(un);
+end;
+$$ language plpgsql;
+
+create function api.optional_argument(un int) returns int as
+$$
+begin
+    return api.middle(un);
+end;
+$$ language plpgsql;
+
+comment on function api.optional_argument(int) is 'fn comment';

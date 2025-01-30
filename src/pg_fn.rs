@@ -4,12 +4,17 @@ use crate::fn_src_location::SrcLoc;
 use crate::ident::{sql_to_rs_ident, CaseType};
 use crate::pg_type::PgType;
 use crate::pgsql_check::{line_to_span, PgSqlIssue, PgSqlReport};
-use ariadne::{sources, Config, Label, LabelAttach, Report};
+use ariadne::{sources, Config, Label, Report};
+use heck::ToPascalCase;
+use itertools::izip;
+use postgres_types::{FromSql, Json, Type};
 use quote::__private::TokenStream;
 use quote::quote;
 use regex::Regex;
-use std::cmp::max;
-use std::collections::HashMap;
+use serde::Deserialize;
+use serde_with::serde_as;
+use serde_with::DisplayFromStr;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use tokio_postgres::Row;
 
@@ -23,7 +28,8 @@ pub struct PgFn {
     returns_set: bool,
     definition: String,
     comment: Option<String>,
-    issues: Vec<PgSqlIssue>,
+    pub issues: Vec<PgSqlIssue>,
+    dependencies: Vec<Dependency>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +127,35 @@ impl PgFn {
     }
 }
 
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Deserialize)]
+enum SqlOp {
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum DepKind {
+    #[serde(rename = "RELATION")]
+    Relation {
+        #[serde(default)]
+        operations: HashSet<SqlOp>,
+    },
+    #[serde(rename = "FUNCTION")]
+    Function,
+}
+
+#[serde_as]
+#[derive(Debug, Deserialize)]
+struct Dependency {
+    #[serde_as(as = "DisplayFromStr")]
+    oid: OID,
+    #[serde(flatten)]
+    kind: DepKind,
+}
+
 impl TryFrom<Row> for PgFn {
     type Error = tokio_postgres::Error;
 
@@ -129,17 +164,16 @@ impl TryFrom<Row> for PgFn {
         let arg_names: Vec<String> = row.try_get("arg_names")?;
         let arg_defaults: Vec<bool> = row.try_get("has_defaults")?;
 
-        let args = arg_type_oids
-            .iter()
-            .zip(arg_names)
-            .zip(arg_defaults)
-            .map(|((oid, name), has_default)| PgArg {
+        let args: Vec<PgArg> = izip!(arg_type_oids, arg_names, arg_defaults)
+            .map(|(oid, name, has_default)| PgArg {
                 name: name.clone(),
-                type_oid: *oid,
+                type_oid: oid,
                 has_default,
             })
             .collect();
 
+        let dep = row.try_get::<_, Json<Vec<Dependency>>>("dependencies")?.0;
+        dbg!(row.get::<&str, &str>("function_name"), dep);
         Ok(Self {
             oid: row.try_get("oid")?,
             name: row.try_get("function_name")?,
@@ -147,9 +181,13 @@ impl TryFrom<Row> for PgFn {
             definition: row.try_get("function_definition")?,
             returns_set: row.try_get("returns_set")?,
             comment: row.try_get("comment")?,
-            issues: row.try_get::<&str, PgSqlReport>("plpgsql_check")?.issues,
+            issues: row
+                .try_get::<&str, Option<PgSqlReport>>("plpgsql_check")?
+                .map(|r| r.issues)
+                .unwrap_or(Vec::new()),
             args,
             return_type_oid: row.try_get("return_type")?,
+            dependencies: row.try_get::<_, Json<Vec<Dependency>>>("dependencies")?.0,
         })
     }
 }
@@ -207,6 +245,11 @@ impl ToRust for PgFn {
                 format!("select {}.{}", self.schema, self.name)
             };
 
+            if self.return_type_oid == 2278 {
+                // Returns void
+                unimplemented!("Void returning functions not yet supported")
+            }
+
             let query = if self.returns_set {
                 quote! {
                     client
@@ -214,7 +257,7 @@ impl ToRust for PgFn {
                         .await
                         .and_then(|rows| {
                             rows.into_iter().map(TryInto::try_into).collect()
-                        })
+                        }).map_err(Into::into)
                 }
             } else {
                 quote! {
@@ -222,6 +265,7 @@ impl ToRust for PgFn {
                         .query_one(&query, &params)
                         .await
                         .and_then(|r| r.try_get(0))
+                        .map_err(Into::into)
                 }
             };
 
@@ -264,13 +308,25 @@ impl ToRust for PgFn {
             None => quote! {},
         };
 
-        // TODO: replace with custom error type later
-        let error_type: TokenStream = "tokio_postgres::Error".parse().unwrap();
+        let err_enum_name: TokenStream = (self.name.to_pascal_case() + "Error").parse().unwrap();
 
         quote! {
             #comment_macro
-            pub async fn #rs_fn_name(client: &tokio_postgres::Client, #(#args),*) -> Result<#return_type, #error_type> {
+            pub async fn #rs_fn_name(client: &tokio_postgres::Client, #(#args),*) -> Result<#return_type, #err_enum_name> {
                 #fn_body
+            }
+
+            #[derive(Debug)]
+            pub enum #err_enum_name {
+                Other(tokio_postgres::Error)
+            }
+
+            impl From<tokio_postgres::Error> for #err_enum_name {
+                fn from(e: tokio_postgres::Error) -> Self {
+                    match e {
+                        e => #err_enum_name::Other(e),
+                    }
+                }
             }
         }
     }

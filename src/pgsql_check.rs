@@ -1,6 +1,4 @@
-use crate::codegen::OID;
-use crate::fn_src_location::SrcLoc;
-use ariadne::{Report, ReportKind};
+use ariadne::ReportKind;
 use postgres_types::{FromSql, Type};
 use serde::Deserialize;
 use serde_with::serde_as;
@@ -46,8 +44,6 @@ pub struct PgSqlIssue {
 #[serde_as]
 #[derive(Debug, Deserialize)]
 pub struct PgSqlReport {
-    #[serde_as(as = "DisplayFromStr")]
-    function: OID,
     pub issues: Vec<PgSqlIssue>,
 }
 
@@ -58,7 +54,7 @@ impl FromSql<'_> for PgSqlReport {
             let parsed: PgSqlReport = serde_json::from_str(json_str)?;
             Ok(parsed)
         } else {
-            Err("unexpected datatype for MyJsonData".into())
+            Err("unexpected datatype for PgSqlReport".into())
         }
     }
 

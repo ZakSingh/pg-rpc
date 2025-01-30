@@ -3,13 +3,9 @@ use crate::ident::{sql_to_rs_ident, CaseType};
 use crate::pg_type::PgType;
 use crate::ty_index::TypeIndex;
 use itertools::Itertools;
-use postgres_types::FromSql;
 use quote::__private::TokenStream;
 use quote::quote;
-use serde::Deserialize;
 use std::collections::HashMap;
-use std::error::Error;
-use std::ops::{Deref, DerefMut};
 
 /// Postgres object ID
 /// Uniquely identifies database objects

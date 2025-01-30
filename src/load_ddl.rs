@@ -1,6 +1,5 @@
 use crate::fn_index::FunctionId;
 use crate::fn_src_location::{get_function_spans, SrcLoc};
-use ariadne::sources;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::{fs, io};

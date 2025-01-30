@@ -1,11 +1,13 @@
 use crate::codegen::{FunctionName, SchemaName, OID};
 use crate::pg_fn::PgFn;
+use anyhow::Context;
 use std::collections::HashMap;
 use tokio_postgres::Client;
 
 const FUNCTION_INTROSPECTION_QUERY: &'static str =
     include_str!("./queries/function_introspection.sql");
 
+#[derive(Debug)]
 pub struct FunctionIndex {
     pub type_oids: Vec<OID>,
     pub fn_index: HashMap<SchemaName, HashMap<FunctionName, PgFn>>,
@@ -15,7 +17,8 @@ impl FunctionIndex {
     pub async fn new(db: &Client) -> anyhow::Result<Self> {
         let (type_oids, fn_index) = db
             .query(FUNCTION_INTROSPECTION_QUERY, &[])
-            .await?
+            .await
+            .context("Function introspection query failed")?
             .into_iter()
             .try_fold(
                 (Vec::new(), HashMap::new()),
@@ -43,6 +46,10 @@ impl FunctionIndex {
 
     pub fn get_fn(&self, fn_id: &FunctionId) -> Option<&PgFn> {
         Some(self.fn_index.get(&fn_id.schema)?.get(&fn_id.name)?)
+    }
+
+    pub fn fn_count(&self) -> usize {
+        self.fn_index.values().map(|f| f.len()).sum()
     }
 }
 

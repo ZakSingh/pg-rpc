@@ -11,13 +11,17 @@ select distinct on (n.nspname, p.proname) n.nspname                             
                                           array(select n > (array_length(p.proargtypes, 1) - p.pronargdefaults)
                                                 from generate_series(1, array_length(p.proargtypes, 1)) as n) as has_defaults,
                                           d.description                                                       as comment,
-                                          plpgsql_check_function(p.oid, format := 'json')::json               as plpgsql_check
+                                          ( select plpgsql_check_function(p.oid, format := 'json')::json )    as plpgsql_check,
+                                          ( select coalesce(json_agg(dep), '[]'::json)
+                                            from plpgsql_show_dependency_tb(p.oid) as dep )                   as dependencies
 
 from pg_proc p
          join pg_namespace n on p.pronamespace = n.oid
+         join pg_catalog.pg_language l on p.prolang = l.oid
          left join pg_type t on t.oid = any (p.proargtypes)
          left join pg_description d on d.objoid = p.oid
 where p.prokind = 'f'
+  and l.lanname = 'plpgsql'
   and n.nspname not in ('pg_catalog', 'information_schema')
   and not exists ( select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e' )
 order by n.nspname, p.proname;

@@ -1,38 +1,4 @@
 mod public {
-    #[derive(Debug, Clone, Copy, postgres_types::FromSql, postgres_types::ToSql)]
-    #[postgres(name = "role")]
-    pub enum Role {
-        #[postgres(name = "admin")]
-        Admin,
-        #[postgres(name = "user")]
-        User,
-    }
-    #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
-    #[postgres(name = "account")]
-    pub struct Account {
-        #[postgres(name = "account_id")]
-        pub account_id: i32,
-        #[postgres(name = "email")]
-        pub email: String,
-        #[postgres(name = "name")]
-        pub name: String,
-        #[postgres(name = "role")]
-        pub role: super::public::Role,
-        #[postgres(name = "created_at")]
-        pub created_at: time::OffsetDateTime,
-    }
-    impl TryFrom<tokio_postgres::Row> for Account {
-        type Error = tokio_postgres::Error;
-        fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
-            Ok(Self {
-                account_id: row.try_get("account_id")?,
-                email: row.try_get("email")?,
-                name: row.try_get("name")?,
-                role: row.try_get("role")?,
-                created_at: row.try_get("created_at")?,
-            })
-        }
-    }
     #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
     #[postgres(name = "post_with_author")]
     pub struct PostWithAuthor {
@@ -63,38 +29,42 @@ mod public {
             })
         }
     }
+    #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
+    #[postgres(name = "account")]
+    pub struct Account {
+        #[postgres(name = "account_id")]
+        pub account_id: i32,
+        #[postgres(name = "email")]
+        pub email: String,
+        #[postgres(name = "name")]
+        pub name: String,
+        #[postgres(name = "role")]
+        pub role: super::public::Role,
+        #[postgres(name = "created_at")]
+        pub created_at: time::OffsetDateTime,
+    }
+    impl TryFrom<tokio_postgres::Row> for Account {
+        type Error = tokio_postgres::Error;
+        fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+            Ok(Self {
+                account_id: row.try_get("account_id")?,
+                email: row.try_get("email")?,
+                name: row.try_get("name")?,
+                role: row.try_get("role")?,
+                created_at: row.try_get("created_at")?,
+            })
+        }
+    }
+    #[derive(Debug, Clone, Copy, postgres_types::FromSql, postgres_types::ToSql)]
+    #[postgres(name = "role")]
+    pub enum Role {
+        #[postgres(name = "admin")]
+        Admin,
+        #[postgres(name = "user")]
+        User,
+    }
 }
 mod api {
-    pub async fn create_account(
-        client: &tokio_postgres::Client,
-        email: &str,
-        name: &str,
-        role: super::public::Role,
-        unused: i32,
-    ) -> Result<super::public::Account, tokio_postgres::Error> {
-        let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![
-            & email, & name, & role, & unused
-        ];
-        let mut query = concat!("select api.create_account", "(", "$1, $2, $3, $4")
-            .to_string();
-        query.push_str(")");
-        client.query_one(&query, &params).await.and_then(|r| r.try_get(0))
-    }
-    ///fn comment
-    pub async fn optional_argument(
-        client: &tokio_postgres::Client,
-        required: i32,
-        opt_1: i32,
-        opt_2: bool,
-    ) -> Result<super::public::PostWithAuthor, tokio_postgres::Error> {
-        let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![
-            & required, & opt_1, & opt_2
-        ];
-        let mut query = concat!("select api.optional_argument", "(", "$1, $2, $3")
-            .to_string();
-        query.push_str(")");
-        client.query_one(&query, &params).await.and_then(|r| r.try_get(0))
-    }
     pub async fn create_post(
         client: &tokio_postgres::Client,
         account_id: i32,
@@ -110,6 +80,30 @@ mod api {
             query.push_str(concat!(", ", "content", ":= $"));
             query.push_str(&params.len().to_string());
         }
+        query.push_str(")");
+        client.query_one(&query, &params).await.and_then(|r| r.try_get(0))
+    }
+    pub async fn create_account(
+        client: &tokio_postgres::Client,
+        email: &str,
+        name: &str,
+        role: super::public::Role,
+    ) -> Result<super::public::Account, tokio_postgres::Error> {
+        let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![
+            & email, & name, & role
+        ];
+        let mut query = concat!("select api.create_account", "(", "$1, $2, $3")
+            .to_string();
+        query.push_str(")");
+        client.query_one(&query, &params).await.and_then(|r| r.try_get(0))
+    }
+    ///fn comment
+    pub async fn optional_argument(
+        client: &tokio_postgres::Client,
+        un: i32,
+    ) -> Result<i32, tokio_postgres::Error> {
+        let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![& un];
+        let mut query = concat!("select api.optional_argument", "(", "$1").to_string();
         query.push_str(")");
         client.query_one(&query, &params).await.and_then(|r| r.try_get(0))
     }

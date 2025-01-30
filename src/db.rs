@@ -6,7 +6,6 @@ use tokio_postgres::{Client, NoTls};
 
 pub struct Db {
     pub client: Client,
-    // Store these to keep them in scope
     #[allow(dead_code)]
     container: ContainerAsync<Postgres>,
     #[allow(dead_code)]

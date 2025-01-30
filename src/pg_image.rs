@@ -1,6 +1,5 @@
 use std::{borrow::Cow, collections::HashMap};
-use testcontainers::core::{AccessMode, Mount};
-use testcontainers::{core::WaitFor, CopyDataSource, CopyToContainer, Image, ImageExt};
+use testcontainers::{core::WaitFor, CopyDataSource, CopyToContainer, Image};
 
 const NAME: &str = "zaksingh/postgres-plpgsql-check";
 const TAG: &str = "16";
