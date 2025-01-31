@@ -1,9 +1,12 @@
 use crate::codegen::OID;
+use crate::ident::sql_to_rs_ident;
+use crate::ident::CaseType::Pascal;
 use crate::pg_fn::Cmd;
 use crate::pg_id::PgId;
 use anyhow::Context;
 use heck::ToPascalCase;
 use itertools::{izip, Itertools};
+use quote::__private::TokenStream;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use tokio_postgres::error::SqlState;
@@ -53,8 +56,8 @@ impl From<ConstraintKind> for SqlState {
 }
 
 impl Constraint {
-    pub fn rs_name(&self) -> String {
-        self.name.to_pascal_case()
+    pub fn rs_name(&self) -> TokenStream {
+        sql_to_rs_ident(&self.name, Pascal)
     }
 }
 

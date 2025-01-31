@@ -1,18 +1,42 @@
+use crate::codegen::{ToRust, OID};
+use crate::config::Config;
+use crate::ident::sql_to_rs_ident;
+use crate::ident::CaseType::Pascal;
 use crate::pg_fn::extract_queries;
 use crate::pg_fn::{get_rel_deps, Cmd};
+use crate::pg_type::PgType;
 use crate::rel_index::Constraint;
 use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
 use anyhow::anyhow;
+use heck::ToPascalCase;
 use jsonpath_rust::{JsonPath, JsonPathValue};
+use quote::__private::TokenStream;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgException {
     Explicit(SqlState),
     Constraint(Constraint),
     Strict,
-    Cast(String, String), // parsed from 'cannot cast x to y' IntegerStringCast
+    // Cast(String, String), // parsed from 'cannot cast x to y' IntegerStringCast
+}
+
+impl PgException {
+    pub fn rs_name(&self, config: &Config) -> TokenStream {
+        match self {
+            PgException::Explicit(ex) => sql_to_rs_ident(
+                config
+                    .exceptions
+                    .get(ex.code())
+                    .map(|x| x.as_str())
+                    .unwrap_or(ex.code()),
+                Pascal,
+            ),
+            PgException::Strict => "Strict".parse().unwrap(),
+            PgException::Constraint(c) => c.rs_name(),
+        }
+    }
 }
 
 pub fn get_exceptions(
@@ -23,11 +47,11 @@ pub fn get_exceptions(
 
     let constraints: Vec<&Constraint> = get_rel_deps(&queries, rel_index)?
         .iter()
-        .filter(|dep| dep.cmd == Cmd::DML)
+        .filter(|dep| !matches!(dep.cmd, Cmd::Select { cols: _ }))
         .try_fold(Vec::new(), |mut acc, dep| {
             let rel = rel_index
-                .get(&dep.rel_id)
-                .ok_or_else(|| anyhow!("Relation {} not found in index", dep.rel_id))?;
+                .get(&dep.rel_oid)
+                .ok_or_else(|| anyhow!("Relation {} not found in index", dep.rel_oid))?;
 
             acc.extend(rel.constraints.iter());
             Ok::<_, anyhow::Error>(acc)
@@ -98,4 +122,72 @@ fn get_strict_exceptions(parsed: &Value) -> Option<PgException> {
             _ => false,
         })
         .map(|_| PgException::Strict)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::rel_index::PgRel;
+    use pg_query::parse_plpgsql;
+
+    #[test]
+    fn test_strict_exception() {
+        let fn_def = r#"
+        create or replace function raises() returns void as
+        $$
+        declare
+            x int;
+        begin
+            select id into strict x
+            from t;
+        end;
+        $$ language plpgsql;
+        "#;
+
+        let s = get_strict_exceptions(&parse_plpgsql(fn_def).unwrap());
+        assert_eq!(s, Some(PgException::Strict));
+    }
+
+    #[test]
+    fn test_non_strict_exception() {
+        let fn_def = r#"
+        create or replace function raises() returns void as
+        $$
+        declare
+            x int;
+        begin
+            select id into x
+            from t;
+        end;
+        $$ language plpgsql;
+        "#;
+
+        let s = get_strict_exceptions(&parse_plpgsql(fn_def).unwrap());
+        assert_eq!(s, None);
+    }
+
+    #[test]
+    fn test_explicit_raise() -> anyhow::Result<()> {
+        let fn_def = r#"
+        create or replace function raises() returns void as
+        $$
+        begin
+            raise notice 'not an error'; -- should be ignored
+            raise division_by_zero;
+            raise exception 'error two'; -- should default to P0001
+            raise sqlstate '22014';
+            raise unique_violation using message = 'Duplicate user ID: ' || 2;
+            raise 'Duplicate user ID %', 1; -- should default to P0001
+            raise 'hello world' using errcode = 'P0007', detail = 'det', hint = 'hint';
+        end;
+        $$ language plpgsql;
+        "#;
+
+        let exceptions = get_raised_sql_states(&parse_plpgsql(fn_def)?)?;
+
+        dbg!(&exceptions);
+        assert_eq!(exceptions.len(), 5);
+
+        Ok(())
+    }
 }

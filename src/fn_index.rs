@@ -37,7 +37,8 @@ impl FunctionIndex {
             .context("Function introspection query failed")?;
 
         let fns = fn_rows
-            .into_par_iter()
+            // .into_par_iter()
+            .into_iter()
             .map(|row| {
                 (
                     row.get::<_, u32>("oid"),

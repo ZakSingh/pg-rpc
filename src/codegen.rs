@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::fn_index::FunctionIndex;
 use crate::ident::{sql_to_rs_ident, CaseType};
 use crate::pg_fn::PgFn;
@@ -19,13 +20,17 @@ pub type SchemaName = String;
 pub type FunctionName = String;
 
 pub trait ToRust {
-    fn to_rust(&self, types: &HashMap<OID, PgType>) -> TokenStream;
+    fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream;
 }
 
 /// Generate the output file
-pub async fn codegen(fn_index: &FunctionIndex, ty_index: &TypeIndex) -> anyhow::Result<String> {
-    let type_def_code = codegen_types(&ty_index);
-    let fn_code = codegen_fns(&fn_index, &ty_index);
+pub async fn codegen(
+    fn_index: &FunctionIndex,
+    ty_index: &TypeIndex,
+    config: &Config,
+) -> anyhow::Result<String> {
+    let type_def_code = codegen_types(&ty_index, config);
+    let fn_code = codegen_fns(&fn_index, &ty_index, config);
 
     let out: String = type_def_code
         .into_iter()
@@ -49,10 +54,10 @@ pub async fn codegen(fn_index: &FunctionIndex, ty_index: &TypeIndex) -> anyhow::
     Ok(out)
 }
 
-fn codegen_types(type_index: &TypeIndex) -> HashMap<SchemaName, TokenStream> {
+fn codegen_types(type_index: &TypeIndex, config: &Config) -> HashMap<SchemaName, TokenStream> {
     type_index
         .values()
-        .map(|t| (t.schema(), t.to_rust(type_index)))
+        .map(|t| (t.schema(), t.to_rust(type_index, config)))
         .filter(|(_, tokens)| !tokens.is_empty())
         .into_group_map()
         .into_iter()
@@ -68,13 +73,18 @@ fn codegen_types(type_index: &TypeIndex) -> HashMap<SchemaName, TokenStream> {
 }
 
 /// Returns map of schema to token stream containing all fn definitions for that schema
-fn codegen_fns(fns: &FunctionIndex, types: &TypeIndex) -> HashMap<SchemaName, TokenStream> {
+fn codegen_fns(
+    fns: &FunctionIndex,
+    types: &TypeIndex,
+    config: &Config,
+) -> HashMap<SchemaName, TokenStream> {
     let schemas: HashMap<&str, Vec<&PgFn>> = fns.values().into_group_map_by(|f| f.schema.as_str());
 
     schemas
         .into_iter()
         .map(|(schema, fns)| {
-            let fns_rs: Vec<TokenStream> = fns.into_iter().map(|f| f.to_rust(&types)).collect();
+            let fns_rs: Vec<TokenStream> =
+                fns.into_iter().map(|f| f.to_rust(&types, config)).collect();
             (schema.to_string(), quote! { #(#fns_rs)* })
         })
         .collect()

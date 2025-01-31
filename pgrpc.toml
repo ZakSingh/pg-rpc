@@ -1,0 +1,5 @@
+[types]
+ltree = "String"
+
+[exceptions]
+M0001 = "Sample error"

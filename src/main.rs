@@ -1,6 +1,7 @@
 #![feature(iterator_try_collect)]
 
 use crate::codegen::codegen;
+use crate::config::Config;
 use crate::db::Db;
 use crate::fn_index::FunctionIndex;
 use crate::load_ddl::load_ddl;
@@ -13,6 +14,7 @@ use std::fs;
 use std::path::Path;
 
 mod codegen;
+mod config;
 mod db;
 mod exceptions;
 mod fn_index;
@@ -38,11 +40,12 @@ struct Opt {
     #[clap(long, short, value_parser = clap::value_parser!(ClioPath).exists().is_dir(), default_value = "schema")]
     schema_dir: ClioPath,
 
-    /// Function schemas
-    #[clap(long, short)]
-    fn_schemas: Vec<String>,
+    #[clap(long, short, value_parser = clap::value_parser!(ClioPath).exists().is_file(), default_value = "pgrpc.toml")]
+    config_path: ClioPath,
 
-    /// Output file '-' for stdout
+    /// Schemas containing functions we want to generate Rust code for.
+    schemas: Vec<String>,
+
     #[clap(long, short, value_parser, default_value = "src/pgrpc.rs")]
     output: Output,
 }
@@ -50,19 +53,15 @@ struct Opt {
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
     let mut opt = Opt::parse();
+    let conf_str = fs::read_to_string(opt.config_path.path()).expect("Read config file failed");
+    let config: Config = toml::from_str(&conf_str).expect("Failed to parse TOML");
 
-    if !opt.schema_dir.is_dir() {
-        return Err(anyhow::anyhow!("{} is not a directory", &opt.schema_dir));
-    }
-
-    run(opt.schema_dir.path(), opt.output.path()).await?;
+    run(opt.schema_dir.path(), opt.output.path(), &config).await?;
 
     Ok(())
 }
 
-use rayon::iter::ParallelIterator;
-
-pub async fn run(dir: &Path, output_path: &Path) -> anyhow::Result<()> {
+pub async fn run(dir: &Path, output_path: &Path, config: &Config) -> anyhow::Result<()> {
     println!("Generating PgRPC functions...");
 
     let (src, fn_src_map) = load_ddl(dir)?;
@@ -81,7 +80,7 @@ pub async fn run(dir: &Path, output_path: &Path) -> anyhow::Result<()> {
         }
     }
 
-    let code = codegen(&fn_index, &ty_index).await?;
+    let code = codegen(&fn_index, &ty_index, config).await?;
 
     fs::write(output_path, code)?;
 

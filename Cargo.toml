@@ -32,3 +32,4 @@ clio = { version = "0.3.5", features = ["clap-parse"] }
 rayon = "1.10.0"
 jsonpath-rust = "0.7.5"
 phf = { version = "0.11", features = ["macros"] }
+toml = "0.8.19"

@@ -1,4 +1,5 @@
 use crate::codegen::{FunctionName, SchemaName, ToRust, OID};
+use crate::config;
 use crate::exceptions::{get_exceptions, PgException};
 use crate::fn_index::FunctionId;
 use crate::fn_src_location::SrcLoc;
@@ -9,11 +10,14 @@ use crate::pgsql_check::{line_to_span, PgSqlIssue, PgSqlReport};
 use crate::rel_index::{Constraint, PgRel, RelIndex};
 use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
 use anyhow::anyhow;
-use ariadne::{sources, Config, Label, Report};
+use ariadne::{sources, Label, Report};
+use config::Config;
 use heck::ToPascalCase;
 use itertools::{izip, Itertools};
 use jsonpath_rust::{JsonPath, JsonPathValue};
-use pg_query::{parse_plpgsql, ParseResult};
+use pg_query::protobuf::node::Node;
+use pg_query::protobuf::{InsertStmt, OnConflictAction, RangeVar, SelectStmt};
+use pg_query::{parse_plpgsql, NodeEnum, NodeRef, ParseResult};
 use quote::__private::TokenStream;
 use quote::quote;
 use regex::Regex;
@@ -22,7 +26,7 @@ use serde_json::Value;
 use std::cmp::PartialEq;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::ops::Range;
+use std::ops::{Not, Range};
 use tokio_postgres::Row;
 
 #[derive(Debug)]
@@ -125,7 +129,7 @@ impl PgFn {
 
             Report::build(i.level.into(), (file_name.clone(), span.clone()))
                 .with_config(
-                    Config::default()
+                    ariadne::Config::default()
                         .with_multiline_arrows(false)
                         .with_tab_width(2),
                 )
@@ -178,7 +182,7 @@ impl PgFn {
 }
 
 impl ToRust for PgArg {
-    fn to_rust(&self, types: &HashMap<OID, PgType>) -> TokenStream {
+    fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
         let name = sql_to_rs_ident(&self.name, CaseType::Snake);
         let ty = match types.get(&self.type_oid).unwrap() {
             PgType::Int32 => quote! { i32 },
@@ -209,7 +213,7 @@ impl ToRust for PgArg {
 }
 
 impl ToRust for PgFn {
-    fn to_rust(&self, types: &HashMap<OID, PgType>) -> TokenStream {
+    fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
         let fn_body = {
             let (opt_args, req_args): (Vec<PgArg>, Vec<PgArg>) =
                 self.args.iter().cloned().partition(|n| n.has_default);
@@ -274,7 +278,7 @@ impl ToRust for PgFn {
 
         // Build fn signature
         let rs_fn_name = self.rs_name();
-        let args: Vec<TokenStream> = self.args.iter().map(|a| a.to_rust(types)).collect();
+        let args: Vec<TokenStream> = self.args.iter().map(|a| a.to_rust(types, config)).collect();
         let return_type = {
             let inner_ty = types
                 .get(&self.return_type_oid)
@@ -295,6 +299,9 @@ impl ToRust for PgFn {
 
         let err_enum_name: TokenStream = (self.name.to_pascal_case() + "Error").parse().unwrap();
 
+        let err_variants: Vec<TokenStream> =
+            self.exceptions.iter().map(|e| e.rs_name(config)).collect();
+
         quote! {
             #comment_macro
             pub async fn #rs_fn_name(client: &tokio_postgres::Client, #(#args),*) -> Result<#return_type, #err_enum_name> {
@@ -303,6 +310,7 @@ impl ToRust for PgFn {
 
             #[derive(Debug)]
             pub enum #err_enum_name {
+                #(#err_variants(tokio_postgres::Error)),*,
                 Other(tokio_postgres::Error)
             }
 
@@ -317,16 +325,18 @@ impl ToRust for PgFn {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
-    Select,
-    DML,
+    Select { cols: Vec<String> },
+    Update { cols: Vec<String> },
+    Delete,
+    Insert { cols: Vec<String> },
 }
 
 /// A function's dependency on a relation
 #[derive(Debug, Clone)]
 pub struct RelDep {
-    pub(crate) rel_id: OID,
+    pub(crate) rel_oid: OID,
     pub(crate) cmd: Cmd,
 }
 
@@ -342,33 +352,137 @@ pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
         .collect()
 }
 
+fn get_select_deps(stmt: &SelectStmt, rel_index: &RelIndex) -> Vec<RelDep> {
+    Vec::default()
+}
+
+fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Vec<RelDep> {
+    let rel_oid = stmt
+        .relation
+        .as_ref()
+        .map(|r| rel_index.id_to_oid(&PgId::from(r)));
+
+    // if it's an on update do nothing, we don't need the
+    //
+
+    let c =
+        stmt.on_conflict_clause
+            .as_ref()
+            .map(|c| match OnConflictAction::from_i32(c.action).and_then(|a| match a {
+                OnConflictAction::Undefined => None,
+                OnConflictAction::OnconflictNone => None,
+                OnConflictAction::OnconflictNothing => None,
+                OnConflictAction::OnconflictUpdate => {}
+            });
+
+    Vec::default()
+}
+
+fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
+    query
+        .protobuf
+        .nodes()
+        .iter()
+        .flat_map(|(node, _, _, _)| match node.to_enum() {
+            Node::SelectStmt(stmt) => get_select_deps(stmt.as_ref(), rel_index),
+            Node::InsertStmt(stmt) => get_insert_deps(stmt.as_ref(), rel_index),
+            _ => Vec::default(),
+        })
+        .collect()
+}
+
 /// Get the relations the given queries depend upon.
 pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> anyhow::Result<Vec<RelDep>> {
-    Ok(queries
+    let x: Vec<_> = queries
         .iter()
-        .flat_map(|q| {
-            q.dml_tables()
-                .into_iter()
-                .map(|rel_id| (rel_id, Cmd::DML))
-                .chain(
-                    q.select_tables()
-                        .into_iter()
-                        .map(|rel_id| (rel_id, Cmd::Select)),
-                )
-        })
-        .map(|(rel_id, cmd)| {
-            Ok::<_, anyhow::Error>(RelDep {
-                rel_id: rel_index
-                    .id_to_oid(&PgId::from(rel_id.clone()))
-                    .ok_or_else(|| anyhow!("Relation '{}' not in relation index", rel_id))?,
-                cmd,
-            })
-        })
-        .try_collect()?)
+        .flat_map(|q| get_query_deps(q, rel_index))
+        .collect();
+    //
+    // {
+    //         q.protobuf
+    //             .nodes()
+    //             .iter()
+    //             .flat_map(|(node, x, y, z)| match node.to_enum() {
+    //                 Node::InsertStmt(stmt) => {
+    //                     let rel_oid =
+    //                         stmt.relation.map(|r| get_oid_from_r_var(r, &rel_index))??;
+    //
+    //                     let cols: Vec<String> = stmt
+    //                         .cols
+    //                         .iter()
+    //                         .flat_map(|n| n.node.as_ref().unwrap().nodes())
+    //                         .map(|(n, _, ctx, _)| n)
+    //                         .filter_map(|n| match n {
+    //                             NodeRef::ResTarget(t) => Some(t.name.clone()),
+    //                             _ => None,
+    //                         })
+    //                         .collect();
+    //
+    //                     Some(RelDep {
+    //                         rel_oid,
+    //                         cmd: Cmd::Insert { cols },
+    //                     })
+    //                 }
+    //                 Node::UpdateStmt(stmt) => {
+    //                     let rel_oid =
+    //                         stmt.relation.map(|r| get_oid_from_r_var(r, &rel_index))??;
+    //
+    //                     let cols: Vec<String> = stmt
+    //                         .target_list
+    //                         .iter()
+    //                         .flat_map(|n| n.node.as_ref().unwrap().nodes())
+    //                         .map(|(n, _, ctx, _)| n)
+    //                         .filter_map(|n| match n {
+    //                             NodeRef::ResTarget(t) => Some(t.name.clone()),
+    //                             _ => None,
+    //                         })
+    //                         .collect();
+    //
+    //                     Some(RelDep {
+    //                         rel_oid,
+    //                         cmd: Cmd::Update { cols },
+    //                     })
+    //                 }
+    //                 Node::DeleteStmt(stmt) => {
+    //                     let rel_oid =
+    //                         stmt.relation.map(|r| get_oid_from_r_var(r, &rel_index))??;
+    //
+    //                     Some(RelDep {
+    //                         rel_oid,
+    //                         cmd: Cmd::Delete,
+    //                     })
+    //                 }
+    //                 _ => None,
+    //             })
+    //             .collect::<Vec<_>>()
+    //     })
+    //     .collect();
+
+    Ok(x)
+    // Ok(queries
+    //     .iter()
+    //     .flat_map(|q| {
+    //         q.dml_tables()
+    //             .into_iter()
+    //             .map(|rel_id| (rel_id, Cmd::Insert {})
+    //             .chain(
+    //                 q.select_tables()
+    //                     .into_iter()
+    //                     .map(|rel_id| (rel_id, Cmd::Select)),
+    //             )
+    //     })
+    //     .map(|(rel_id, cmd)| {
+    //         Ok::<_, anyhow::Error>(RelDep {
+    //             rel_id: rel_index
+    //                 .id_to_oid(&PgId::from(rel_id.clone()))
+    //                 .ok_or_else(|| anyhow!("Relation '{}' not in relation index", rel_id))?,
+    //             cmd,
+    //         })
+    //     })
+    //     .try_collect()?)
 }
 
 // Each function can be resolved in parallel.
-
 // Could just let recursive fn query get everything... But don't
 // generate the rust code for all of them.
 // Need to ensure we stop on any catalog fns
@@ -379,70 +493,10 @@ pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> anyhow::Re
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::rel_index::PgRel;
+    use crate::pg_fn::{extract_queries, get_rel_deps};
+    use crate::pg_id::PgId;
+    use crate::rel_index::{PgRel, RelIndex};
     use pg_query::parse_plpgsql;
-
-    #[test]
-    fn test_strict_exception() {
-        let fn_def = r#"
-        create or replace function raises() returns void as
-        $$
-        declare
-            x int;
-        begin
-            select id into strict x
-            from t;
-        end;
-        $$ language plpgsql;
-        "#;
-
-        let s = get_strict_exceptions(&parse_plpgsql(fn_def).unwrap());
-        assert_eq!(s, Some(PgException::Strict));
-    }
-
-    #[test]
-    fn test_non_strict_exception() {
-        let fn_def = r#"
-        create or replace function raises() returns void as
-        $$
-        declare
-            x int;
-        begin
-            select id into x
-            from t;
-        end;
-        $$ language plpgsql;
-        "#;
-
-        let s = get_strict_exceptions(&parse_plpgsql(fn_def).unwrap());
-        assert_eq!(s, None);
-    }
-
-    #[test]
-    fn test_explicit_raise() -> anyhow::Result<()> {
-        let fn_def = r#"
-        create or replace function raises() returns void as
-        $$
-        begin
-            raise notice 'not an error'; -- should be ignored
-            raise division_by_zero;
-            raise exception 'error two'; -- should default to P0001
-            raise sqlstate '22014';
-            raise unique_violation using message = 'Duplicate user ID: ' || 2;
-            raise 'Duplicate user ID %', 1; -- should default to P0001
-            raise 'hello world' using errcode = 'P0007', detail = 'det', hint = 'hint';
-        end;
-        $$ language plpgsql;
-        "#;
-
-        let exceptions = get_raised_sql_states(&parse_plpgsql(fn_def)?)?;
-
-        dbg!(&exceptions);
-        assert_eq!(exceptions.len(), 5);
-
-        Ok(())
-    }
 
     #[test]
     fn test_get_rels() -> anyhow::Result<()> {
@@ -450,7 +504,7 @@ mod test {
         create or replace function test() returns void as
         $$
         begin
-            insert into a values ('Example');
+            insert into a (field_1) values ('Example') on conflict do nothing;
             select * from b;
         end;
         $$ language plpgsql;"#;
@@ -478,6 +532,7 @@ mod test {
 
         let queries = extract_queries(&f);
         let rels = get_rel_deps(&queries, &rel_index)?;
+        dbg!(&rels);
         assert_eq!(rels.len(), 2);
 
         Ok(())

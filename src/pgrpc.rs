@@ -1,10 +1,10 @@
 mod api {
-    pub async fn middle(
+    pub async fn deppy(
         client: &tokio_postgres::Client,
         un: i32,
-    ) -> Result<i32, MiddleError> {
+    ) -> Result<i32, DeppyError> {
         let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![& un];
-        let mut query = concat!("select api.middle", "(", "$1").to_string();
+        let mut query = concat!("select api.deppy", "(", "$1").to_string();
         query.push_str(")");
         client
             .query_one(&query, &params)
@@ -13,13 +13,14 @@ mod api {
             .map_err(Into::into)
     }
     #[derive(Debug)]
-    pub enum MiddleError {
+    pub enum DeppyError {
+        P0001(tokio_postgres::Error),
         Other(tokio_postgres::Error),
     }
-    impl From<tokio_postgres::Error> for MiddleError {
+    impl From<tokio_postgres::Error> for DeppyError {
         fn from(e: tokio_postgres::Error) -> Self {
             match e {
-                e => MiddleError::Other(e),
+                e => DeppyError::Other(e),
             }
         }
     }
@@ -39,36 +40,13 @@ mod api {
     }
     #[derive(Debug)]
     pub enum OptionalArgumentError {
+        P0001(tokio_postgres::Error),
         Other(tokio_postgres::Error),
     }
     impl From<tokio_postgres::Error> for OptionalArgumentError {
         fn from(e: tokio_postgres::Error) -> Self {
             match e {
                 e => OptionalArgumentError::Other(e),
-            }
-        }
-    }
-    pub async fn deppy(
-        client: &tokio_postgres::Client,
-        un: i32,
-    ) -> Result<i32, DeppyError> {
-        let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![& un];
-        let mut query = concat!("select api.deppy", "(", "$1").to_string();
-        query.push_str(")");
-        client
-            .query_one(&query, &params)
-            .await
-            .and_then(|r| r.try_get(0))
-            .map_err(Into::into)
-    }
-    #[derive(Debug)]
-    pub enum DeppyError {
-        Other(tokio_postgres::Error),
-    }
-    impl From<tokio_postgres::Error> for DeppyError {
-        fn from(e: tokio_postgres::Error) -> Self {
-            match e {
-                e => DeppyError::Other(e),
             }
         }
     }
@@ -92,12 +70,46 @@ mod api {
     }
     #[derive(Debug)]
     pub enum CreateAccountError {
+        AccountNameCheck(tokio_postgres::Error),
+        AccountPkey(tokio_postgres::Error),
+        AccountEmailKey(tokio_postgres::Error),
+        EmailNotNull(tokio_postgres::Error),
+        NameNotNull(tokio_postgres::Error),
+        RoleNotNull(tokio_postgres::Error),
+        AccountIdNotNull(tokio_postgres::Error),
+        CreatedAtNotNull(tokio_postgres::Error),
+        P0001(tokio_postgres::Error),
         Other(tokio_postgres::Error),
     }
     impl From<tokio_postgres::Error> for CreateAccountError {
         fn from(e: tokio_postgres::Error) -> Self {
             match e {
                 e => CreateAccountError::Other(e),
+            }
+        }
+    }
+    pub async fn middle(
+        client: &tokio_postgres::Client,
+        un: i32,
+    ) -> Result<i32, MiddleError> {
+        let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![& un];
+        let mut query = concat!("select api.middle", "(", "$1").to_string();
+        query.push_str(")");
+        client
+            .query_one(&query, &params)
+            .await
+            .and_then(|r| r.try_get(0))
+            .map_err(Into::into)
+    }
+    #[derive(Debug)]
+    pub enum MiddleError {
+        P0001(tokio_postgres::Error),
+        Other(tokio_postgres::Error),
+    }
+    impl From<tokio_postgres::Error> for MiddleError {
+        fn from(e: tokio_postgres::Error) -> Self {
+            match e {
+                e => MiddleError::Other(e),
             }
         }
     }
@@ -125,6 +137,14 @@ mod api {
     }
     #[derive(Debug)]
     pub enum CreatePostError {
+        PostPkey(tokio_postgres::Error),
+        PostAccountIdFkey(tokio_postgres::Error),
+        AccountIdNotNull(tokio_postgres::Error),
+        TitleNotNull(tokio_postgres::Error),
+        PostIdNotNull(tokio_postgres::Error),
+        CreatedAtNotNull(tokio_postgres::Error),
+        P0001(tokio_postgres::Error),
+        Strict(tokio_postgres::Error),
         Other(tokio_postgres::Error),
     }
     impl From<tokio_postgres::Error> for CreatePostError {
@@ -166,6 +186,14 @@ mod public {
             })
         }
     }
+    #[derive(Debug, Clone, Copy, postgres_types::FromSql, postgres_types::ToSql)]
+    #[postgres(name = "role")]
+    pub enum Role {
+        #[postgres(name = "admin")]
+        Admin,
+        #[postgres(name = "user")]
+        User,
+    }
     #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
     #[postgres(name = "account")]
     pub struct Account {
@@ -191,13 +219,5 @@ mod public {
                 created_at: row.try_get("created_at")?,
             })
         }
-    }
-    #[derive(Debug, Clone, Copy, postgres_types::FromSql, postgres_types::ToSql)]
-    #[postgres(name = "role")]
-    pub enum Role {
-        #[postgres(name = "admin")]
-        Admin,
-        #[postgres(name = "user")]
-        User,
     }
 }

@@ -1,3 +1,4 @@
+use pg_query::protobuf::RangeVar;
 use serde::Deserialize;
 
 /// Namespaced identifier (e.g. `schema.function`)
@@ -26,5 +27,24 @@ impl From<String> for PgId {
             .unwrap_or((None, s));
 
         Self::new(schema, name)
+    }
+}
+
+// for pg_query
+impl From<RangeVar> for PgId {
+    fn from(r: RangeVar) -> Self {
+        Self::new(
+            (!r.schemaname.is_empty()).then_some(r.schemaname),
+            r.relname,
+        )
+    }
+}
+
+impl From<&RangeVar> for PgId {
+    fn from(r: &RangeVar) -> Self {
+        Self::new(
+            (!r.schemaname.is_empty()).then_some(r.schemaname.to_owned()),
+            r.relname.to_owned(),
+        )
     }
 }

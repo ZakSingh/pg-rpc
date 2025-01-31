@@ -1,5 +1,6 @@
 use crate::codegen::ToRust;
 use crate::codegen::{SchemaName, OID};
+use crate::config::Config;
 use crate::ident::{sql_to_rs_ident, CaseType};
 use crate::parse_domain::non_null_cols_from_checks;
 use itertools::izip;
@@ -171,7 +172,7 @@ impl TryFrom<Row> for PgType {
 }
 
 impl ToRust for PgType {
-    fn to_rust(&self, types: &HashMap<OID, PgType>) -> TokenStream {
+    fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
         match self {
             PgType::Composite {
                 schema,
@@ -180,8 +181,10 @@ impl ToRust for PgType {
                 fields,
             } => {
                 let rs_name = sql_to_rs_ident(name, CaseType::Pascal);
-                let field_tokens: Vec<TokenStream> =
-                    fields.into_iter().map(|f| f.to_rust(types)).collect();
+                let field_tokens: Vec<TokenStream> = fields
+                    .into_iter()
+                    .map(|f| f.to_rust(types, config))
+                    .collect();
 
                 let comment_macro = if comment.is_some() {
                     quote! { #[doc=#comment] }
@@ -244,7 +247,7 @@ impl ToRust for PgType {
                                     comment: f.comment.clone(),
                                     type_oid: f.type_oid,
                                 }
-                                .to_rust(types)
+                                .to_rust(types, config)
                             })
                             .collect();
 
@@ -346,7 +349,7 @@ impl ToRust for PgType {
 }
 
 impl ToRust for PgField {
-    fn to_rust(&self, types: &HashMap<OID, PgType>) -> TokenStream {
+    fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
         let ident = types.get(&self.type_oid).unwrap().to_rust_ident(types);
         let field_name = sql_to_rs_ident(&self.name, CaseType::Snake);
         let pg_name = &self.name;
