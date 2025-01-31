@@ -67,12 +67,3 @@ fn test_schema() -> (TempDir, PathBuf) {
 
     (tmp_dir, base_path)
 }
-
-#[tokio::test]
-async fn test_t() -> anyhow::Result<()> {
-    // Create test folder with sql files
-    let (tmp_dir, base_path) = test_schema();
-    run(&base_path).await?;
-
-    Ok(())
-}

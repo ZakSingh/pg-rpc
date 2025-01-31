@@ -1,3 +1,5 @@
+#![feature(iterator_try_collect)]
+
 use crate::codegen::codegen;
 use crate::db::Db;
 use crate::fn_index::FunctionIndex;
@@ -6,22 +8,26 @@ use crate::rel_index::RelIndex;
 use crate::ty_index::TypeIndex;
 use clap::Parser;
 use clio::{ClioPath, Output};
+use rayon::iter::IntoParallelRefIterator;
 use std::fs;
 use std::path::Path;
 
 mod codegen;
 mod db;
+mod exceptions;
 mod fn_index;
 mod fn_src_location;
 mod ident;
 mod load_ddl;
 mod parse_domain;
 mod pg_fn;
+mod pg_id;
 mod pg_image;
 mod pg_type;
 mod pgrpc;
 mod pgsql_check;
 mod rel_index;
+mod sql_state;
 mod tests;
 mod ty_index;
 
@@ -31,6 +37,10 @@ struct Opt {
     /// Postgres schema directory
     #[clap(long, short, value_parser = clap::value_parser!(ClioPath).exists().is_dir(), default_value = "schema")]
     schema_dir: ClioPath,
+
+    /// Function schemas
+    #[clap(long, short)]
+    fn_schemas: Vec<String>,
 
     /// Output file '-' for stdout
     #[clap(long, short, value_parser, default_value = "src/pgrpc.rs")]
@@ -50,6 +60,8 @@ pub async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+use rayon::iter::ParallelIterator;
+
 pub async fn run(dir: &Path, output_path: &Path) -> anyhow::Result<()> {
     println!("Generating PgRPC functions...");
 
@@ -57,17 +69,15 @@ pub async fn run(dir: &Path, output_path: &Path) -> anyhow::Result<()> {
 
     let db = Db::new(&src).await;
 
-    let fn_index = FunctionIndex::new(&db.client).await?;
-    let ty_index = TypeIndex::new(&db.client, &fn_index.type_oids).await?;
-    let rel_index = RelIndex::default();
+    let rel_index = RelIndex::new(&db.client).await?;
+    let fn_index = FunctionIndex::new(&db.client, &rel_index).await?;
+    let ty_index = TypeIndex::new(&db.client, fn_index.get_type_oids().as_slice()).await?;
 
     let mut err_count = 0;
-    for fns in fn_index.fn_index.values() {
-        for f in fns.values() {
-            if f.has_issues() {
-                err_count += f.issues.len();
-                f.report(&fn_src_map.get(&f.id()).unwrap());
-            }
+    for f in fn_index.values() {
+        if f.has_issues() {
+            err_count += f.issues.len();
+            f.report(&fn_src_map.get(&f.id()).unwrap());
         }
     }
 
@@ -81,7 +91,7 @@ pub async fn run(dir: &Path, output_path: &Path) -> anyhow::Result<()> {
 
     println!(
         "✅  {} PgRPC functions written to {}",
-        fn_index.fn_count(),
+        fn_index.len(),
         output_path.display()
     );
 

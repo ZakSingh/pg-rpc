@@ -179,17 +179,17 @@ with recursive type_tree as (
                                          from pg_attribute
                                          where attrelid = ( select typrelid from pg_type where oid = tt.oid )
                                            and attnum > 0 ))) )
-select distinct oid,
-                typname,
-                typtype,
-                schema_name,
-                array_element_type,
-                domain_base_type,
-                domain_composite_constraints,
-                enum_variants,
-                composite_field_names,
-                composite_field_types,
-                composite_field_nullables,
-                type_comment,
-                composite_field_comments
+select distinct on (oid) oid,
+                         typname,
+                         typtype,
+                         schema_name,
+                         array_element_type,
+                         domain_base_type,
+                         domain_composite_constraints,
+                         enum_variants,
+                         composite_field_names,
+                         composite_field_types,
+                         composite_field_nullables,
+                         type_comment,
+                         composite_field_comments
 from type_tree;

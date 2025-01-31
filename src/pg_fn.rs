@@ -1,42 +1,49 @@
 use crate::codegen::{FunctionName, SchemaName, ToRust, OID};
+use crate::exceptions::{get_exceptions, PgException};
 use crate::fn_index::FunctionId;
 use crate::fn_src_location::SrcLoc;
 use crate::ident::{sql_to_rs_ident, CaseType};
+use crate::pg_id::PgId;
 use crate::pg_type::PgType;
 use crate::pgsql_check::{line_to_span, PgSqlIssue, PgSqlReport};
+use crate::rel_index::{Constraint, PgRel, RelIndex};
+use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
+use anyhow::anyhow;
 use ariadne::{sources, Config, Label, Report};
 use heck::ToPascalCase;
-use itertools::izip;
-use postgres_types::{FromSql, Json, Type};
+use itertools::{izip, Itertools};
+use jsonpath_rust::{JsonPath, JsonPathValue};
+use pg_query::{parse_plpgsql, ParseResult};
 use quote::__private::TokenStream;
 use quote::quote;
 use regex::Regex;
 use serde::Deserialize;
-use serde_with::serde_as;
-use serde_with::DisplayFromStr;
+use serde_json::Value;
+use std::cmp::PartialEq;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::ops::Range;
 use tokio_postgres::Row;
 
 #[derive(Debug)]
 pub struct PgFn {
-    oid: OID,
-    pub(crate) schema: SchemaName,
-    pub(crate) name: FunctionName,
-    args: Vec<PgArg>,
-    return_type_oid: OID,
-    returns_set: bool,
-    definition: String,
-    comment: Option<String>,
+    pub oid: OID,
+    pub schema: SchemaName,
+    pub name: FunctionName,
+    pub args: Vec<PgArg>,
+    pub return_type_oid: OID,
+    pub returns_set: bool,
+    pub definition: String,
+    pub comment: Option<String>,
     pub issues: Vec<PgSqlIssue>,
-    dependencies: Vec<Dependency>,
+    pub exceptions: Vec<PgException>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PgArg {
-    name: String,
-    type_oid: OID,
-    has_default: bool,
+    pub name: String,
+    pub type_oid: OID,
+    pub has_default: bool,
 }
 
 impl PgArg {
@@ -74,6 +81,13 @@ impl PgFn {
         sql_to_rs_ident(&self.name, CaseType::Snake)
     }
 
+    /// Get all type OIDs in the function signature (args + return type)
+    pub fn ty_oids(&self) -> Vec<OID> {
+        let mut oids = self.args.iter().map(|a| a.type_oid).collect_vec();
+        oids.push(self.return_type_oid);
+        oids
+    }
+
     /// Retrieve the body (between the `$$`)
     fn body(&self) -> &str {
         let (tag, start_ind) = quote_ind(&self.definition).unwrap();
@@ -83,7 +97,7 @@ impl PgFn {
     }
 
     fn body_start(&self) -> usize {
-        let (tag, start_ind) = quote_ind(&self.definition).unwrap();
+        let (_tag, start_ind) = quote_ind(&self.definition).unwrap();
         start_ind
     }
 
@@ -127,39 +141,8 @@ impl PgFn {
     }
 }
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Deserialize)]
-enum SqlOp {
-    Select,
-    Insert,
-    Update,
-    Delete,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum DepKind {
-    #[serde(rename = "RELATION")]
-    Relation {
-        #[serde(default)]
-        operations: HashSet<SqlOp>,
-    },
-    #[serde(rename = "FUNCTION")]
-    Function,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize)]
-struct Dependency {
-    #[serde_as(as = "DisplayFromStr")]
-    oid: OID,
-    #[serde(flatten)]
-    kind: DepKind,
-}
-
-impl TryFrom<Row> for PgFn {
-    type Error = tokio_postgres::Error;
-
-    fn try_from(row: Row) -> Result<Self, Self::Error> {
+impl PgFn {
+    pub fn from_row(row: Row, rel_index: &RelIndex) -> Result<Self, anyhow::Error> {
         let arg_type_oids: Vec<OID> = row.try_get("arg_oids")?;
         let arg_names: Vec<String> = row.try_get("arg_names")?;
         let arg_defaults: Vec<bool> = row.try_get("has_defaults")?;
@@ -172,13 +155,15 @@ impl TryFrom<Row> for PgFn {
             })
             .collect();
 
-        let dep = row.try_get::<_, Json<Vec<Dependency>>>("dependencies")?.0;
-        dbg!(row.get::<&str, &str>("function_name"), dep);
+        let definition = row.try_get::<_, String>("function_definition")?;
+        let parsed = parse_plpgsql(&definition)?;
+        let exceptions = get_exceptions(&parsed, rel_index)?;
+
         Ok(Self {
             oid: row.try_get("oid")?,
             name: row.try_get("function_name")?,
             schema: row.try_get("schema_name")?,
-            definition: row.try_get("function_definition")?,
+            definition,
             returns_set: row.try_get("returns_set")?,
             comment: row.try_get("comment")?,
             issues: row
@@ -187,7 +172,7 @@ impl TryFrom<Row> for PgFn {
                 .unwrap_or(Vec::new()),
             args,
             return_type_oid: row.try_get("return_type")?,
-            dependencies: row.try_get::<_, Json<Vec<Dependency>>>("dependencies")?.0,
+            exceptions,
         })
     }
 }
@@ -329,5 +314,172 @@ impl ToRust for PgFn {
                 }
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cmd {
+    Select,
+    DML,
+}
+
+/// A function's dependency on a relation
+#[derive(Debug, Clone)]
+pub struct RelDep {
+    pub(crate) rel_id: OID,
+    pub(crate) cmd: Cmd,
+}
+
+/// Extract and parse all SQL queries inside a PlPgSQL function
+pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
+    let query_path = JsonPath::try_from("$..PLpgSQL_expr.query").unwrap();
+
+    query_path
+        .find_slice(fn_json)
+        .into_iter()
+        .map(|x| pg_query::parse(x.to_data().as_str().unwrap()))
+        .flatten() // remove unparsable queries
+        .collect()
+}
+
+/// Get the relations the given queries depend upon.
+pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> anyhow::Result<Vec<RelDep>> {
+    Ok(queries
+        .iter()
+        .flat_map(|q| {
+            q.dml_tables()
+                .into_iter()
+                .map(|rel_id| (rel_id, Cmd::DML))
+                .chain(
+                    q.select_tables()
+                        .into_iter()
+                        .map(|rel_id| (rel_id, Cmd::Select)),
+                )
+        })
+        .map(|(rel_id, cmd)| {
+            Ok::<_, anyhow::Error>(RelDep {
+                rel_id: rel_index
+                    .id_to_oid(&PgId::from(rel_id.clone()))
+                    .ok_or_else(|| anyhow!("Relation '{}' not in relation index", rel_id))?,
+                cmd,
+            })
+        })
+        .try_collect()?)
+}
+
+// Each function can be resolved in parallel.
+
+// Could just let recursive fn query get everything... But don't
+// generate the rust code for all of them.
+// Need to ensure we stop on any catalog fns
+// Currently I'm already fetching all user-defined functions.
+// Solution: try to look up called function in the FnIndex. If it is not there,
+// can fall back to a hardcoded list of exceptions I implement for built-in functions, otherwise
+// return an empty list of exceptions.
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::rel_index::PgRel;
+    use pg_query::parse_plpgsql;
+
+    #[test]
+    fn test_strict_exception() {
+        let fn_def = r#"
+        create or replace function raises() returns void as
+        $$
+        declare
+            x int;
+        begin
+            select id into strict x
+            from t;
+        end;
+        $$ language plpgsql;
+        "#;
+
+        let s = get_strict_exceptions(&parse_plpgsql(fn_def).unwrap());
+        assert_eq!(s, Some(PgException::Strict));
+    }
+
+    #[test]
+    fn test_non_strict_exception() {
+        let fn_def = r#"
+        create or replace function raises() returns void as
+        $$
+        declare
+            x int;
+        begin
+            select id into x
+            from t;
+        end;
+        $$ language plpgsql;
+        "#;
+
+        let s = get_strict_exceptions(&parse_plpgsql(fn_def).unwrap());
+        assert_eq!(s, None);
+    }
+
+    #[test]
+    fn test_explicit_raise() -> anyhow::Result<()> {
+        let fn_def = r#"
+        create or replace function raises() returns void as
+        $$
+        begin
+            raise notice 'not an error'; -- should be ignored
+            raise division_by_zero;
+            raise exception 'error two'; -- should default to P0001
+            raise sqlstate '22014';
+            raise unique_violation using message = 'Duplicate user ID: ' || 2;
+            raise 'Duplicate user ID %', 1; -- should default to P0001
+            raise 'hello world' using errcode = 'P0007', detail = 'det', hint = 'hint';
+        end;
+        $$ language plpgsql;
+        "#;
+
+        let exceptions = get_raised_sql_states(&parse_plpgsql(fn_def)?)?;
+
+        dbg!(&exceptions);
+        assert_eq!(exceptions.len(), 5);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_rels() -> anyhow::Result<()> {
+        let fn_def = r#"
+        create or replace function test() returns void as
+        $$
+        begin
+            insert into a values ('Example');
+            select * from b;
+        end;
+        $$ language plpgsql;"#;
+
+        let f = parse_plpgsql(fn_def)?;
+
+        let mut rel_index = RelIndex::default();
+        rel_index.insert(
+            1,
+            PgRel {
+                oid: 1,
+                id: PgId::new(None, "a".to_string()),
+                constraints: Vec::default(),
+            },
+        );
+
+        rel_index.insert(
+            2,
+            PgRel {
+                oid: 2,
+                id: PgId::new(None, "b".to_string()),
+                constraints: Vec::default(),
+            },
+        );
+
+        let queries = extract_queries(&f);
+        let rels = get_rel_deps(&queries, &rel_index)?;
+        assert_eq!(rels.len(), 2);
+
+        Ok(())
     }
 }

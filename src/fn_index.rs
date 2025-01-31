@@ -1,55 +1,66 @@
-use crate::codegen::{FunctionName, SchemaName, OID};
+use crate::codegen::{SchemaName, OID};
 use crate::pg_fn::PgFn;
+use crate::rel_index::RelIndex;
 use anyhow::Context;
+use itertools::Itertools;
+use rayon::iter::ParallelIterator;
+use rayon::prelude::IntoParallelIterator;
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use tokio_postgres::Client;
 
 const FUNCTION_INTROSPECTION_QUERY: &'static str =
     include_str!("./queries/function_introspection.sql");
 
 #[derive(Debug)]
-pub struct FunctionIndex {
-    pub type_oids: Vec<OID>,
-    pub fn_index: HashMap<SchemaName, HashMap<FunctionName, PgFn>>,
+pub struct FunctionIndex(HashMap<OID, PgFn>);
+
+impl Deref for FunctionIndex {
+    type Target = HashMap<OID, PgFn>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for FunctionIndex {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 impl FunctionIndex {
-    pub async fn new(db: &Client) -> anyhow::Result<Self> {
-        let (type_oids, fn_index) = db
+    pub async fn new(db: &Client, rel_index: &RelIndex) -> anyhow::Result<Self> {
+        let fn_rows = db
             .query(FUNCTION_INTROSPECTION_QUERY, &[])
             .await
-            .context("Function introspection query failed")?
-            .into_iter()
-            .try_fold(
-                (Vec::new(), HashMap::new()),
-                |(mut all_oids, mut index), row| -> anyhow::Result<_> {
-                    let mut oids = row.try_get::<_, Vec<OID>>("arg_oids")?;
-                    oids.push(row.try_get::<_, OID>("return_type")?);
-                    all_oids.extend(oids);
+            .context("Function introspection query failed")?;
 
-                    let f = PgFn::try_from(row)?;
+        let fns = fn_rows
+            .into_par_iter()
+            .map(|row| {
+                (
+                    row.get::<_, u32>("oid"),
+                    PgFn::from_row(row, rel_index).unwrap(),
+                )
+            })
+            .collect();
 
-                    index
-                        .entry(f.schema.clone())
-                        .or_insert_with(HashMap::new)
-                        .insert(f.name.clone(), f);
+        Ok(Self(fns))
+    }
 
-                    Ok((all_oids, index))
-                },
-            )?;
+    pub fn get_type_oids(&self) -> Vec<OID> {
+        self.values().map(|f| f.ty_oids()).flatten().collect()
+    }
 
-        Ok(Self {
-            type_oids,
-            fn_index,
-        })
+    /// Get all the functions in a given schema
+    pub fn get_schema_fns(&self, schema_name: SchemaName) -> Vec<&PgFn> {
+        self.values().filter(|f| f.schema == schema_name).collect()
     }
 
     pub fn get_fn(&self, fn_id: &FunctionId) -> Option<&PgFn> {
-        Some(self.fn_index.get(&fn_id.schema)?.get(&fn_id.name)?)
-    }
-
-    pub fn fn_count(&self) -> usize {
-        self.fn_index.values().map(|f| f.len()).sum()
+        self.values()
+            .find(|f| f.schema == fn_id.schema && f.name == fn_id.name)
     }
 }
 

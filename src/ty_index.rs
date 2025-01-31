@@ -1,5 +1,6 @@
 use crate::codegen::OID;
 use crate::pg_type::PgType;
+use anyhow::Context;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use tokio_postgres::Client;
@@ -27,7 +28,8 @@ impl TypeIndex {
     pub async fn new(db: &Client, type_oids: &[OID]) -> anyhow::Result<Self> {
         let types = db
             .query(TYPES_INTROSPECTION_QUERY, &[&Vec::from_iter(type_oids)])
-            .await?
+            .await
+            .context("Type introspection query failed")?
             .into_iter()
             .map(|row| (row.get("oid"), PgType::try_from(row).unwrap()))
             .collect();
