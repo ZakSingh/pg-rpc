@@ -9,7 +9,6 @@ use crate::rel_index::RelIndex;
 use crate::ty_index::TypeIndex;
 use clap::Parser;
 use clio::{ClioPath, Output};
-use rayon::iter::IntoParallelRefIterator;
 use std::fs;
 use std::path::Path;
 

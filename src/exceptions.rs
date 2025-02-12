@@ -1,14 +1,11 @@
-use crate::codegen::{ToRust, OID};
 use crate::config::Config;
 use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
 use crate::pg_constraint::Constraint;
 use crate::pg_fn::extract_queries;
 use crate::pg_fn::{get_rel_deps, Cmd};
-use crate::pg_type::PgType;
 use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
 use anyhow::anyhow;
-use heck::ToPascalCase;
 use jsonpath_rust::{JsonPath, JsonPathValue};
 use quote::ToTokens;
 use quote::__private::TokenStream;
@@ -48,15 +45,21 @@ pub fn get_exceptions(
 
     let constraints: Vec<&Constraint> = get_rel_deps(&queries, rel_index)?
         .iter()
-        .filter(|dep| !matches!(dep.cmd, Cmd::Select { cols: _ }))
-        .try_fold(Vec::new(), |mut acc, dep| {
-            let rel = rel_index
-                .get(&dep.rel_oid)
-                .ok_or_else(|| anyhow!("Relation {} not found in index", dep.rel_oid))?;
+        .flat_map(|dep| {
+            let rel_oid = dep.rel_oid;
+            let constraints = rel_index.get(&rel_oid).unwrap().constraints.iter();
+            match &dep.cmd {
+                Cmd::Update { cols } => constraints.filter(|c| c.contains_columns(cols)).collect(),
+                Cmd::Insert { cols } => constraints.filter(|c| c.contains_columns(cols)).collect(),
+                Cmd::Delete => constraints
+                    .filter(|c| matches!(c, Constraint::ForeignKey(_)))
+                    .collect(),
+                _ => vec![],
+            }
+        })
+        .collect();
 
-            acc.extend(rel.constraints.iter());
-            Ok::<_, anyhow::Error>(acc)
-        })?;
+    dbg!(&constraints);
 
     let raised_exceptions = get_raised_sql_states(&parsed)?
         .into_iter()

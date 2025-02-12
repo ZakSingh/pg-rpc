@@ -3,8 +3,6 @@ use crate::pg_fn::PgFn;
 use crate::rel_index::RelIndex;
 use anyhow::Context;
 use itertools::Itertools;
-use rayon::iter::ParallelIterator;
-use rayon::prelude::IntoParallelIterator;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use tokio_postgres::Client;

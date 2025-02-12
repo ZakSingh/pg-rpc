@@ -338,16 +338,20 @@ pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
         .collect()
 }
 
-fn get_select_deps(stmt: &SelectStmt, rel_index: &RelIndex) -> RelDep {
-    dbg!(&stmt);
-    RelDep {
-        rel_oid: 0,
-        cmd: Cmd::Delete,
-    }
+fn get_select_deps(stmt: &SelectStmt, rel_index: &RelIndex) -> Option<RelDep> {
+    // a select can be FROM multiple tables joined together, or even selecting from a subquery.
+    // Q: does the subquery end up here?
+    // let Some(rel_oid) = stmt.from_clause
+    // dbg!(&stmt);
+    // RelDep {
+    //     rel_oid: 0,
+    //     cmd: Cmd::Delete,
+    // }
+    None
 }
 
 /// Collect all dependencies from an `insert`.
-fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> RelDep {
+fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
     let Some(rel_oid) = stmt
         .relation
         .as_ref()
@@ -374,17 +378,18 @@ fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> RelDep {
             // all columns must be inserted.
             rel_index
                 .get(&rel_oid)
-                .map(|r| r.column_names())
                 .expect("Referenced relation to be in relation index")
+                .columns
+                .clone()
         } else {
             referenced_cols
         }
     };
 
-    RelDep {
+    Some(RelDep {
         rel_oid,
         cmd: Cmd::Insert { cols },
-    }
+    })
 
     // if it's an on conflict do nothing, we don't need the
     // constraint named in the clause OR all the constraints if omitted
@@ -399,7 +404,7 @@ fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> RelDep {
     //         });
 }
 
-fn get_delete_deps(stmt: &DeleteStmt, rel_index: &RelIndex) -> RelDep {
+fn get_delete_deps(stmt: &DeleteStmt, rel_index: &RelIndex) -> Option<RelDep> {
     let Some(rel_oid) = stmt
         .relation
         .as_ref()
@@ -410,21 +415,138 @@ fn get_delete_deps(stmt: &DeleteStmt, rel_index: &RelIndex) -> RelDep {
         unreachable!("Delete statement without relation")
     };
 
-    RelDep {
+    Some(RelDep {
         rel_oid,
         cmd: Cmd::Delete,
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RelDependency {
+    inserted_cols: Vec<Ustr>,
+    updated_cols: Vec<Ustr>,
+    deleted: bool,
+}
+
+fn analyze_node(node: &NodeRef, rel_index: &RelIndex, rel_deps: &mut HashMap<OID, RelDependency>) {
+    match &node {
+        // Handle INSERT statements
+        NodeRef::InsertStmt(stmt) => {
+            if let Some(relation) = &stmt.relation {
+                let rel_oid = rel_index.id_to_oid(&PgId::from(relation)).unwrap();
+
+                // Get explicitly listed columns
+                for col in &stmt.cols {
+                    if let Some(Node::ResTarget(target)) = &col.node {
+                        rel_deps
+                            .entry(rel_oid)
+                            .or_default()
+                            .inserted_cols
+                            .push(target.name.as_str().into());
+                    }
+                }
+            }
+            //
+            // // Handle SELECT within INSERT
+            // if let Some(select_stmt) = stmt.select_stmt {
+            //     analyze_node(select_stmt, rel_deps);
+            // }
+        }
+        //
+        // // Handle UPDATE statements
+        // Some(Node::UpdateStmt(stmt)) => {
+        //     if let Some(relation) = &stmt.relation {
+        //         let table_name = relation.relname.as_ref().unwrap();
+        //
+        //         // Process target list (SET clause)
+        //         if let Some(target_list) = &stmt.target_list {
+        //             for target in target_list {
+        //                 if let Some(NodeEnum::ResTarget(res)) = &target.node {
+        //                     if let Some(name) = &res.name {
+        //                         access.add_update(table_name, name);
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //
+        //         // Handle WHERE clause
+        //         if let Some(where_clause) = &stmt.where_clause {
+        //             analyze_node(where_clause, access);
+        //         }
+        //     }
+        // }
+        //
+        // // Handle SELECT statements
+        // Some(Node::SelectStmt(stmt)) => {
+        //     // Process target list
+        //     if let Some(target_list) = &stmt.target_list {
+        //         for target in target_list {
+        //             analyze_node(target, access);
+        //         }
+        //     }
+        //
+        //     // Process FROM clause
+        //     if let Some(from_clause) = &stmt.from_clause {
+        //         for item in from_clause {
+        //             analyze_node(item, access);
+        //         }
+        //     }
+        //
+        //     // Process WHERE clause
+        //     if let Some(where_clause) = &stmt.where_clause {
+        //         analyze_node(where_clause, access);
+        //     }
+        //
+        //     // Process HAVING clause
+        //     if let Some(having_clause) = &stmt.having_clause {
+        //         analyze_node(having_clause, access);
+        //     }
+        // }
+        //
+        // // Handle column references
+        // Some(Node::ColumnRef(col_ref)) => {
+        //     if let Some(fields) = &col_ref.fields {
+        //         match fields.len() {
+        //             1 => {
+        //                 // Bare column reference
+        //                 if let Some(NodeEnum::String(col_name)) = &fields[0].node {
+        //                     // We'd need context to know which table this belongs to
+        //                 }
+        //             }
+        //             2 => {
+        //                 // Table qualified column
+        //                 if let (Some(NodeEnum::String(table)), Some(NodeEnum::String(col))) =
+        //                     (&fields[0].node, &fields[1].node)
+        //                 {
+        //                     access.add_select(table, col);
+        //                 }
+        //             }
+        //             _ => {} // Schema qualified or other cases
+        //         }
+        //     }
+        // }
+        //
+        // Recurse into other node types that might contain relevant nodes
+        node => {
+            for (child, _, _, _) in node.to_enum().nodes() {
+                analyze_node(&child, rel_index, rel_deps);
+            }
+        }
     }
 }
 
 fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
+    dbg!(&query.deparse());
+    // let rel_deps = HashMap::default();
+
     query
         .protobuf
         .nodes()
         .iter()
         .filter_map(|(node, _, _, _)| match node.to_enum() {
-            Node::SelectStmt(stmt) => Some(get_select_deps(stmt.as_ref(), rel_index)),
-            Node::InsertStmt(stmt) => Some(get_insert_deps(stmt.as_ref(), rel_index)),
-            Node::DeleteStmt(stmt) => Some(get_delete_deps(stmt.as_ref(), rel_index)),
+            Node::SelectStmt(stmt) => get_select_deps(stmt.as_ref(), rel_index),
+            Node::InsertStmt(stmt) => get_insert_deps(stmt.as_ref(), rel_index),
+            Node::DeleteStmt(stmt) => get_delete_deps(stmt.as_ref(), rel_index),
             _ => None,
         })
         .collect()
@@ -546,9 +668,10 @@ fn quote_ind(src: &str) -> Option<(&str, usize)> {
 mod test {
     use crate::pg_fn::{extract_queries, get_rel_deps};
     use crate::pg_id::PgId;
-    use crate::pg_rel::{Column, PgRel};
+    use crate::pg_rel::PgRel;
     use crate::rel_index::RelIndex;
     use pg_query::parse_plpgsql;
+    use ustr::ustr;
 
     #[test]
     fn test_get_rels() -> anyhow::Result<()> {
@@ -568,9 +691,9 @@ mod test {
             1,
             PgRel {
                 oid: 1,
-                id: PgId::new(None::<&str>, "a"),
+                id: PgId::new(None, ustr("a")),
                 constraints: Vec::default(),
-                columns: vec![Column::new("field_1", false, false)],
+                columns: vec![ustr("field_1")],
             },
         );
 
@@ -578,7 +701,7 @@ mod test {
             2,
             PgRel {
                 oid: 2,
-                id: PgId::new(None::<&str>, "b"),
+                id: PgId::new(None, ustr("b")),
                 constraints: Vec::default(),
                 columns: Vec::default(),
             },
