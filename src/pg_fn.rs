@@ -7,27 +7,26 @@ use crate::ident::{sql_to_rs_ident, CaseType};
 use crate::pg_id::PgId;
 use crate::pg_type::PgType;
 use crate::pgsql_check::{line_to_span, PgSqlIssue, PgSqlReport};
-use crate::rel_index::{Constraint, PgRel, RelIndex};
-use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
-use anyhow::anyhow;
+use crate::rel_index::RelIndex;
 use ariadne::{sources, Label, Report};
 use config::Config;
 use heck::ToPascalCase;
 use itertools::{izip, Itertools};
-use jsonpath_rust::{JsonPath, JsonPathValue};
+use jsonpath_rust::JsonPath;
 use pg_query::protobuf::node::Node;
-use pg_query::protobuf::{InsertStmt, OnConflictAction, RangeVar, SelectStmt};
-use pg_query::{parse_plpgsql, NodeEnum, NodeRef, ParseResult};
+use pg_query::protobuf::{DeleteStmt, InsertStmt, SelectStmt};
+use pg_query::{parse_plpgsql, NodeRef, ParseResult};
 use quote::__private::TokenStream;
 use quote::quote;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 use std::cmp::PartialEq;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::{Not, Range};
 use tokio_postgres::Row;
+use ustr::Ustr;
 
 #[derive(Debug)]
 pub struct PgFn {
@@ -53,19 +52,6 @@ pub struct PgArg {
 impl PgArg {
     pub fn rs_name(&self) -> TokenStream {
         sql_to_rs_ident(&self.name, CaseType::Snake)
-    }
-}
-
-/// Get the position of the first `$...$` tag
-fn quote_ind(src: &str) -> Option<(&str, usize)> {
-    let re = Regex::new(r"\$.*?\$").unwrap();
-
-    // Find the first match
-    if let Some(matched) = re.find(src) {
-        let s = matched.as_str();
-        Some((s, matched.end()))
-    } else {
-        None
     }
 }
 
@@ -327,10 +313,10 @@ impl ToRust for PgFn {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
-    Select { cols: Vec<String> },
-    Update { cols: Vec<String> },
+    Select { cols: Vec<Ustr> },
+    Update { cols: Vec<Ustr> },
+    Insert { cols: Vec<Ustr> },
     Delete,
-    Insert { cols: Vec<String> },
 }
 
 /// A function's dependency on a relation
@@ -352,30 +338,82 @@ pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
         .collect()
 }
 
-fn get_select_deps(stmt: &SelectStmt, rel_index: &RelIndex) -> Vec<RelDep> {
-    Vec::default()
+fn get_select_deps(stmt: &SelectStmt, rel_index: &RelIndex) -> RelDep {
+    dbg!(&stmt);
+    RelDep {
+        rel_oid: 0,
+        cmd: Cmd::Delete,
+    }
 }
 
-fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Vec<RelDep> {
-    let rel_oid = stmt
+/// Collect all dependencies from an `insert`.
+fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> RelDep {
+    let Some(rel_oid) = stmt
         .relation
         .as_ref()
-        .map(|r| rel_index.id_to_oid(&PgId::from(r)));
+        .map(|r| rel_index.id_to_oid(&PgId::from(r)))
+        .flatten()
+    else {
+        // Could not determine what relation was being inserted into
+        unreachable!("Insert statement without relation")
+    };
 
-    // if it's an on update do nothing, we don't need the
-    //
+    let cols: Vec<Ustr> = {
+        let referenced_cols: Vec<Ustr> = stmt
+            .cols
+            .iter()
+            .flat_map(|n| n.node.as_ref().map(|n| n.nodes()).unwrap_or_default())
+            .filter_map(|(n, _, _, _)| match n {
+                NodeRef::ResTarget(t) => Some(t.name.as_str().into()),
+                _ => None,
+            })
+            .collect_vec();
 
-    let c =
-        stmt.on_conflict_clause
-            .as_ref()
-            .map(|c| match OnConflictAction::from_i32(c.action).and_then(|a| match a {
-                OnConflictAction::Undefined => None,
-                OnConflictAction::OnconflictNone => None,
-                OnConflictAction::OnconflictNothing => None,
-                OnConflictAction::OnconflictUpdate => {}
-            });
+        if referenced_cols.is_empty() {
+            // If column names aren't explicitly stated, e.g. `insert into account (1, 'Zak')`,
+            // all columns must be inserted.
+            rel_index
+                .get(&rel_oid)
+                .map(|r| r.column_names())
+                .expect("Referenced relation to be in relation index")
+        } else {
+            referenced_cols
+        }
+    };
 
-    Vec::default()
+    RelDep {
+        rel_oid,
+        cmd: Cmd::Insert { cols },
+    }
+
+    // if it's an on conflict do nothing, we don't need the
+    // constraint named in the clause OR all the constraints if omitted
+    // let c =
+    //     stmt.on_conflict_clause
+    //         .as_ref()
+    //         .map(|c| match OnConflictAction::from_i32(c.action).and_then(|a| match a {
+    //             OnConflictAction::Undefined => None,
+    //             OnConflictAction::OnconflictNone => None,
+    //             OnConflictAction::OnconflictNothing => None,
+    //             OnConflictAction::OnconflictUpdate =>
+    //         });
+}
+
+fn get_delete_deps(stmt: &DeleteStmt, rel_index: &RelIndex) -> RelDep {
+    let Some(rel_oid) = stmt
+        .relation
+        .as_ref()
+        .map(|r| rel_index.id_to_oid(&PgId::from(r)))
+        .flatten()
+    else {
+        // Could not determine what relation was being inserted into
+        unreachable!("Delete statement without relation")
+    };
+
+    RelDep {
+        rel_oid,
+        cmd: Cmd::Delete,
+    }
 }
 
 fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
@@ -383,20 +421,21 @@ fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
         .protobuf
         .nodes()
         .iter()
-        .flat_map(|(node, _, _, _)| match node.to_enum() {
-            Node::SelectStmt(stmt) => get_select_deps(stmt.as_ref(), rel_index),
-            Node::InsertStmt(stmt) => get_insert_deps(stmt.as_ref(), rel_index),
-            _ => Vec::default(),
+        .filter_map(|(node, _, _, _)| match node.to_enum() {
+            Node::SelectStmt(stmt) => Some(get_select_deps(stmt.as_ref(), rel_index)),
+            Node::InsertStmt(stmt) => Some(get_insert_deps(stmt.as_ref(), rel_index)),
+            Node::DeleteStmt(stmt) => Some(get_delete_deps(stmt.as_ref(), rel_index)),
+            _ => None,
         })
         .collect()
 }
 
 /// Get the relations the given queries depend upon.
 pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> anyhow::Result<Vec<RelDep>> {
-    let x: Vec<_> = queries
+    Ok(queries
         .iter()
         .flat_map(|q| get_query_deps(q, rel_index))
-        .collect();
+        .collect())
     //
     // {
     //         q.protobuf
@@ -458,7 +497,6 @@ pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> anyhow::Re
     //     })
     //     .collect();
 
-    Ok(x)
     // Ok(queries
     //     .iter()
     //     .flat_map(|q| {
@@ -491,11 +529,25 @@ pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> anyhow::Re
 // can fall back to a hardcoded list of exceptions I implement for built-in functions, otherwise
 // return an empty list of exceptions.
 
+/// Get the position of the first `$...$` tag
+fn quote_ind(src: &str) -> Option<(&str, usize)> {
+    let re = Regex::new(r"\$.*?\$").unwrap();
+
+    // Find the first match
+    if let Some(matched) = re.find(src) {
+        let s = matched.as_str();
+        Some((s, matched.end()))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::pg_fn::{extract_queries, get_rel_deps};
     use crate::pg_id::PgId;
-    use crate::rel_index::{PgRel, RelIndex};
+    use crate::pg_rel::{Column, PgRel};
+    use crate::rel_index::RelIndex;
     use pg_query::parse_plpgsql;
 
     #[test]
@@ -516,8 +568,9 @@ mod test {
             1,
             PgRel {
                 oid: 1,
-                id: PgId::new(None, "a".to_string()),
+                id: PgId::new(None::<&str>, "a"),
                 constraints: Vec::default(),
+                columns: vec![Column::new("field_1", false, false)],
             },
         );
 
@@ -525,8 +578,9 @@ mod test {
             2,
             PgRel {
                 oid: 2,
-                id: PgId::new(None, "b".to_string()),
+                id: PgId::new(None::<&str>, "b"),
                 constraints: Vec::default(),
+                columns: Vec::default(),
             },
         );
 

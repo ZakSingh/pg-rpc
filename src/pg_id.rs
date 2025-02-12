@@ -1,13 +1,16 @@
 use pg_query::protobuf::RangeVar;
-use serde::Deserialize;
+use ustr::{ustr, Ustr};
 
 /// Namespaced identifier (e.g. `schema.function`)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
-pub struct PgId(String, String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PgId(Ustr, Ustr);
 
 impl PgId {
-    pub fn new(schema_name: Option<String>, name: String) -> Self {
-        Self(schema_name.unwrap_or("public".to_string()), name)
+    pub fn new(schema_name: Option<impl Into<Ustr>>, name: impl Into<Ustr>) -> Self {
+        Self(
+            schema_name.map(|s| s.into()).unwrap_or("public".into()),
+            name.into(),
+        )
     }
 
     pub fn schema(&self) -> &str {
@@ -23,8 +26,8 @@ impl From<String> for PgId {
     fn from(s: String) -> Self {
         let (schema, name) = s
             .split_once(".")
-            .map(|(s, n)| (Some(s.to_string()), n.to_string()))
-            .unwrap_or((None, s));
+            .map(|(s, n)| (Some(ustr(s)), ustr(n)))
+            .unwrap_or((None, ustr(s.as_ref())));
 
         Self::new(schema, name)
     }

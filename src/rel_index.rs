@@ -1,94 +1,14 @@
 use crate::codegen::OID;
-use crate::ident::sql_to_rs_ident;
-use crate::ident::CaseType::Pascal;
-use crate::pg_fn::Cmd;
 use crate::pg_id::PgId;
+use crate::pg_rel::PgRel;
 use anyhow::Context;
-use heck::ToPascalCase;
-use itertools::{izip, Itertools};
-use quote::__private::TokenStream;
+use itertools::Itertools;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use tokio_postgres::error::SqlState;
-use tokio_postgres::{Client, Row};
+use tokio_postgres::Client;
 
 const RELATION_INTROSPECTION_QUERY: &'static str =
     include_str!("./queries/relation_introspection.sql");
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ConstraintKind {
-    Check,
-    ForeignKey,
-    PrimaryKey,
-    Unique,
-    NotNull,
-}
-
-impl From<&str> for ConstraintKind {
-    fn from(s: &str) -> Self {
-        match s {
-            "c" => ConstraintKind::Check,
-            "f" => ConstraintKind::ForeignKey,
-            "p" => ConstraintKind::PrimaryKey,
-            "u" => ConstraintKind::Unique,
-            "n" => ConstraintKind::NotNull,
-            _ => unimplemented!("Unknown constraint kind: {}", s),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Constraint {
-    name: String,
-    kind: ConstraintKind,
-}
-
-impl From<ConstraintKind> for SqlState {
-    fn from(c: ConstraintKind) -> Self {
-        match c {
-            ConstraintKind::Check => SqlState::CHECK_VIOLATION,
-            ConstraintKind::ForeignKey => SqlState::FOREIGN_KEY_VIOLATION,
-            ConstraintKind::PrimaryKey => SqlState::UNIQUE_VIOLATION,
-            ConstraintKind::Unique => SqlState::UNIQUE_VIOLATION,
-            ConstraintKind::NotNull => SqlState::NOT_NULL_VIOLATION,
-        }
-    }
-}
-
-impl Constraint {
-    pub fn rs_name(&self) -> TokenStream {
-        sql_to_rs_ident(&self.name, Pascal)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PgRel {
-    pub(crate) oid: OID,
-    pub(crate) id: PgId,
-    pub(crate) constraints: Vec<Constraint>,
-}
-
-impl TryFrom<Row> for PgRel {
-    type Error = tokio_postgres::Error;
-
-    fn try_from(row: Row) -> Result<Self, Self::Error> {
-        let constraint_names = row.try_get::<_, Vec<&str>>("constraint_names")?;
-        let constraint_types = row.try_get::<_, Vec<&str>>("constraint_types")?;
-
-        let constraints: Vec<Constraint> = izip!(constraint_names, constraint_types)
-            .map(|(name, kind)| Constraint {
-                name: name.to_string(),
-                kind: ConstraintKind::from(kind),
-            })
-            .collect();
-
-        Ok(Self {
-            oid: row.try_get("oid")?,
-            id: PgId::new(row.try_get("schema")?, row.try_get("name")?),
-            constraints,
-        })
-    }
-}
 
 #[derive(Debug, Default)]
 pub struct RelIndex(HashMap<OID, PgRel>);

@@ -2,17 +2,18 @@ use crate::codegen::{ToRust, OID};
 use crate::config::Config;
 use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
+use crate::pg_constraint::Constraint;
 use crate::pg_fn::extract_queries;
 use crate::pg_fn::{get_rel_deps, Cmd};
 use crate::pg_type::PgType;
-use crate::rel_index::Constraint;
 use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
 use anyhow::anyhow;
 use heck::ToPascalCase;
 use jsonpath_rust::{JsonPath, JsonPathValue};
+use quote::ToTokens;
 use quote::__private::TokenStream;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgException {
@@ -34,7 +35,7 @@ impl PgException {
                 Pascal,
             ),
             PgException::Strict => "Strict".parse().unwrap(),
-            PgException::Constraint(c) => c.rs_name(),
+            PgException::Constraint(c) => c.to_token_stream(),
         }
     }
 }
@@ -127,7 +128,6 @@ fn get_strict_exceptions(parsed: &Value) -> Option<PgException> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::rel_index::PgRel;
     use pg_query::parse_plpgsql;
 
     #[test]
