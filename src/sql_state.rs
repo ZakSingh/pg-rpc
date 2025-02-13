@@ -1,4 +1,9 @@
+use crate::ident::sql_to_rs_ident;
+use crate::ident::CaseType::Pascal;
+use crate::pg_constraint::Constraint;
 use phf::phf_map;
+use quote::ToTokens;
+use quote::__private::TokenStream;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 
@@ -37,7 +42,14 @@ impl SqlState {
     }
 }
 
+impl ToTokens for SqlState {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        tokens.extend(sql_to_rs_ident(&self.code(), Pascal))
+    }
+}
+
 // Convert SQL state codes to names
+// TODO: fill in the rest
 pub static SYM_SQL_STATE_TO_CODE: phf::Map<&'static str, SqlState> = phf_map! {
     "unique_violation" => SqlState(tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
     "foreign_key_violation" => SqlState(tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION),

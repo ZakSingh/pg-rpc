@@ -4,6 +4,7 @@ use crate::exceptions::{get_exceptions, PgException};
 use crate::fn_index::FunctionId;
 use crate::fn_src_location::SrcLoc;
 use crate::ident::{sql_to_rs_ident, CaseType};
+use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
 use crate::pg_type::PgType;
 use crate::pgsql_check::{line_to_span, PgSqlIssue, PgSqlReport};
@@ -14,17 +15,15 @@ use heck::ToPascalCase;
 use itertools::{izip, Itertools};
 use jsonpath_rust::JsonPath;
 use pg_query::protobuf::node::Node;
-use pg_query::protobuf::{DeleteStmt, InsertStmt, SelectStmt};
+use pg_query::protobuf::{DeleteStmt, InsertStmt, SelectStmt, UpdateStmt};
 use pg_query::{parse_plpgsql, NodeRef, ParseResult};
 use quote::__private::TokenStream;
-use quote::quote;
+use quote::{quote, ToTokens};
 use regex::Regex;
-use serde::Deserialize;
 use serde_json::Value;
 use std::cmp::PartialEq;
 use std::collections::HashMap;
-use std::hash::Hash;
-use std::ops::{Not, Range};
+use std::ops::Range;
 use tokio_postgres::Row;
 use ustr::Ustr;
 
@@ -84,11 +83,6 @@ impl PgFn {
         let end_ind = self.definition[start_ind..].find(tag).unwrap() + start_ind;
 
         &self.definition[start_ind..end_ind]
-    }
-
-    fn body_start(&self) -> usize {
-        let (_tag, start_ind) = quote_ind(&self.definition).unwrap();
-        start_ind
     }
 
     pub fn report(&self, src_loc: &SrcLoc) {
@@ -168,7 +162,7 @@ impl PgFn {
 }
 
 impl ToRust for PgArg {
-    fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
+    fn to_rust(&self, types: &HashMap<OID, PgType>, _config: &Config) -> TokenStream {
         let name = sql_to_rs_ident(&self.name, CaseType::Snake);
         let ty = match types.get(&self.type_oid).unwrap() {
             PgType::Int32 => quote! { i32 },
@@ -288,22 +282,127 @@ impl ToRust for PgFn {
         let err_variants: Vec<TokenStream> =
             self.exceptions.iter().map(|e| e.rs_name(config)).collect();
 
+        // By SqlState, I can differentiate different error types
+        // but then I still need to get the constraint name.
+
+        let mut custom_handlers = Vec::new();
+        let mut check_handlers = Vec::new();
+        let mut unique_handlers = Vec::new();
+        let mut fk_handlers = Vec::new();
+        let mut not_null_handlers = Vec::new();
+
+        self.exceptions.iter().for_each(|e| match e {
+            PgException::Explicit(sql_state) => {
+                let code = sql_state.code();
+                let sql_state_rs = e.rs_name(config);
+                custom_handlers.push(quote! {
+                    code if code == &tokio_postgres::error::SqlState::from_code(#code) => #err_enum_name::#sql_state_rs(db_error.to_owned())
+                })
+            }
+            PgException::Constraint(constraint) => match constraint {
+                Constraint::Check(check) => {
+                    let constraint_name = check.name.as_str();
+                    let constraint_rs_name = constraint.into_token_stream();
+                    check_handlers.push(quote! {
+                    #constraint_name => #err_enum_name::#constraint_rs_name(db_error.to_owned())
+                    });
+                }
+                Constraint::ForeignKey(fk) => {
+                    let constraint_name = fk.name.as_str();
+                    let constraint_rs_name = constraint.into_token_stream();
+                    fk_handlers.push(quote! {
+                    #constraint_name => #err_enum_name::#constraint_rs_name(db_error.to_owned())
+                    });
+                }
+                Constraint::PrimaryKey(pk) => {}
+                Constraint::Unique(_) => {
+                    let constraint_name = constraint.name().as_str();
+                    let constraint_rs_name = constraint.into_token_stream();
+                    unique_handlers.push(quote! {
+                    #constraint_name => #err_enum_name::#constraint_rs_name(db_error.to_owned())
+                    });
+                }
+                Constraint::NotNull(not_null) => {
+                    let col = not_null.column.as_str();
+                    let constraint_rs_name = constraint.into_token_stream();
+                    not_null_handlers.push(quote! {
+                    #col => #err_enum_name::#constraint_rs_name(db_error.to_owned())
+                    });
+                }
+                _ => {}
+            },
+            _ => {}
+        });
+
+        let checks = if check_handlers.is_empty() {
+            quote! {}
+        } else {
+            quote! {
+                &tokio_postgres::error::SqlState::CHECK_VIOLATION => match db_error.constraint().unwrap() {
+                    #(#check_handlers),*,
+                    _ => #err_enum_name::Other(e)
+                },
+            }
+        };
+
+        let fks = if fk_handlers.is_empty() {
+            quote! {}
+        } else {
+            quote! {
+                &tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION => match db_error.constraint().unwrap() {
+                    #(#fk_handlers),*,
+                    _ => #err_enum_name::Other(e)
+                },
+            }
+        };
+
+        let not_nulls = if not_null_handlers.is_empty() {
+            quote! {}
+        } else {
+            quote! {
+                &tokio_postgres::error::SqlState::NOT_NULL_VIOLATION => match db_error.column().unwrap() {
+                    #(#not_null_handlers),*,
+                    _ => #err_enum_name::Other(e)
+                },
+            }
+        };
+
+        let uniques = if unique_handlers.is_empty() {
+            quote! {}
+        } else {
+            quote! {
+                &tokio_postgres::error::SqlState::UNIQUE_VIOLATION => match db_error.constraint().unwrap() {
+                    #(#unique_handlers),*,
+                    _ => #err_enum_name::Other(e)
+                },
+            }
+        };
+
         quote! {
             #comment_macro
-            pub async fn #rs_fn_name(client: &tokio_postgres::Client, #(#args),*) -> Result<#return_type, #err_enum_name> {
+            pub async fn #rs_fn_name(client: &impl tokio_postgres::GenericClient, #(#args),*) -> Result<#return_type, #err_enum_name> {
                 #fn_body
             }
 
             #[derive(Debug)]
             pub enum #err_enum_name {
-                #(#err_variants(tokio_postgres::Error)),*,
+                #(#err_variants(tokio_postgres::error::DbError)),*,
                 Other(tokio_postgres::Error)
             }
 
             impl From<tokio_postgres::Error> for #err_enum_name {
                 fn from(e: tokio_postgres::Error) -> Self {
-                    match e {
-                        e => #err_enum_name::Other(e),
+                    let Some(db_error) = e.as_db_error() else {
+                        return #err_enum_name::Other(e);
+                    };
+
+                    match db_error.code() {
+                        #(#custom_handlers),*,
+                        #checks
+                        #fks
+                        #not_nulls
+                        #uniques
+                        _ => #err_enum_name::Other(e),
                     }
                 }
             }
@@ -338,15 +437,8 @@ pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
         .collect()
 }
 
-fn get_select_deps(stmt: &SelectStmt, rel_index: &RelIndex) -> Option<RelDep> {
-    // a select can be FROM multiple tables joined together, or even selecting from a subquery.
-    // Q: does the subquery end up here?
-    // let Some(rel_oid) = stmt.from_clause
-    // dbg!(&stmt);
-    // RelDep {
-    //     rel_oid: 0,
-    //     cmd: Cmd::Delete,
-    // }
+fn get_select_deps(_stmt: &SelectStmt, _rel_index: &RelIndex) -> Option<RelDep> {
+    // TODO
     None
 }
 
@@ -411,7 +503,6 @@ fn get_delete_deps(stmt: &DeleteStmt, rel_index: &RelIndex) -> Option<RelDep> {
         .map(|r| rel_index.id_to_oid(&PgId::from(r)))
         .flatten()
     else {
-        // Could not determine what relation was being inserted into
         unreachable!("Delete statement without relation")
     };
 
@@ -421,124 +512,34 @@ fn get_delete_deps(stmt: &DeleteStmt, rel_index: &RelIndex) -> Option<RelDep> {
     })
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct RelDependency {
-    inserted_cols: Vec<Ustr>,
-    updated_cols: Vec<Ustr>,
-    deleted: bool,
-}
+fn get_update_deps(stmt: &UpdateStmt, rel_index: &RelIndex) -> Option<RelDep> {
+    let Some(rel_oid) = stmt
+        .relation
+        .as_ref()
+        .map(|r| rel_index.id_to_oid(&PgId::from(r)))
+        .flatten()
+    else {
+        unreachable!("Update statement without relation")
+    };
 
-fn analyze_node(node: &NodeRef, rel_index: &RelIndex, rel_deps: &mut HashMap<OID, RelDependency>) {
-    match &node {
-        // Handle INSERT statements
-        NodeRef::InsertStmt(stmt) => {
-            if let Some(relation) = &stmt.relation {
-                let rel_oid = rel_index.id_to_oid(&PgId::from(relation)).unwrap();
+    let cols: Vec<Ustr> = stmt
+        .target_list
+        .iter()
+        .flat_map(|n| n.node.as_ref().unwrap().nodes())
+        .map(|(n, _, _, _)| n)
+        .filter_map(|n| match n {
+            NodeRef::ResTarget(t) => Some(t.name.as_str().into()),
+            _ => None,
+        })
+        .collect();
 
-                // Get explicitly listed columns
-                for col in &stmt.cols {
-                    if let Some(Node::ResTarget(target)) = &col.node {
-                        rel_deps
-                            .entry(rel_oid)
-                            .or_default()
-                            .inserted_cols
-                            .push(target.name.as_str().into());
-                    }
-                }
-            }
-            //
-            // // Handle SELECT within INSERT
-            // if let Some(select_stmt) = stmt.select_stmt {
-            //     analyze_node(select_stmt, rel_deps);
-            // }
-        }
-        //
-        // // Handle UPDATE statements
-        // Some(Node::UpdateStmt(stmt)) => {
-        //     if let Some(relation) = &stmt.relation {
-        //         let table_name = relation.relname.as_ref().unwrap();
-        //
-        //         // Process target list (SET clause)
-        //         if let Some(target_list) = &stmt.target_list {
-        //             for target in target_list {
-        //                 if let Some(NodeEnum::ResTarget(res)) = &target.node {
-        //                     if let Some(name) = &res.name {
-        //                         access.add_update(table_name, name);
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //
-        //         // Handle WHERE clause
-        //         if let Some(where_clause) = &stmt.where_clause {
-        //             analyze_node(where_clause, access);
-        //         }
-        //     }
-        // }
-        //
-        // // Handle SELECT statements
-        // Some(Node::SelectStmt(stmt)) => {
-        //     // Process target list
-        //     if let Some(target_list) = &stmt.target_list {
-        //         for target in target_list {
-        //             analyze_node(target, access);
-        //         }
-        //     }
-        //
-        //     // Process FROM clause
-        //     if let Some(from_clause) = &stmt.from_clause {
-        //         for item in from_clause {
-        //             analyze_node(item, access);
-        //         }
-        //     }
-        //
-        //     // Process WHERE clause
-        //     if let Some(where_clause) = &stmt.where_clause {
-        //         analyze_node(where_clause, access);
-        //     }
-        //
-        //     // Process HAVING clause
-        //     if let Some(having_clause) = &stmt.having_clause {
-        //         analyze_node(having_clause, access);
-        //     }
-        // }
-        //
-        // // Handle column references
-        // Some(Node::ColumnRef(col_ref)) => {
-        //     if let Some(fields) = &col_ref.fields {
-        //         match fields.len() {
-        //             1 => {
-        //                 // Bare column reference
-        //                 if let Some(NodeEnum::String(col_name)) = &fields[0].node {
-        //                     // We'd need context to know which table this belongs to
-        //                 }
-        //             }
-        //             2 => {
-        //                 // Table qualified column
-        //                 if let (Some(NodeEnum::String(table)), Some(NodeEnum::String(col))) =
-        //                     (&fields[0].node, &fields[1].node)
-        //                 {
-        //                     access.add_select(table, col);
-        //                 }
-        //             }
-        //             _ => {} // Schema qualified or other cases
-        //         }
-        //     }
-        // }
-        //
-        // Recurse into other node types that might contain relevant nodes
-        node => {
-            for (child, _, _, _) in node.to_enum().nodes() {
-                analyze_node(&child, rel_index, rel_deps);
-            }
-        }
-    }
+    Some(RelDep {
+        rel_oid,
+        cmd: Cmd::Update { cols },
+    })
 }
 
 fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
-    dbg!(&query.deparse());
-    // let rel_deps = HashMap::default();
-
     query
         .protobuf
         .nodes()
@@ -546,6 +547,7 @@ fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
         .filter_map(|(node, _, _, _)| match node.to_enum() {
             Node::SelectStmt(stmt) => get_select_deps(stmt.as_ref(), rel_index),
             Node::InsertStmt(stmt) => get_insert_deps(stmt.as_ref(), rel_index),
+            Node::UpdateStmt(stmt) => get_update_deps(stmt.as_ref(), rel_index),
             Node::DeleteStmt(stmt) => get_delete_deps(stmt.as_ref(), rel_index),
             _ => None,
         })
@@ -553,103 +555,12 @@ fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
 }
 
 /// Get the relations the given queries depend upon.
-pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> anyhow::Result<Vec<RelDep>> {
-    Ok(queries
+pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> Vec<RelDep> {
+    queries
         .iter()
         .flat_map(|q| get_query_deps(q, rel_index))
-        .collect())
-    //
-    // {
-    //         q.protobuf
-    //             .nodes()
-    //             .iter()
-    //             .flat_map(|(node, x, y, z)| match node.to_enum() {
-    //                 Node::InsertStmt(stmt) => {
-    //                     let rel_oid =
-    //                         stmt.relation.map(|r| get_oid_from_r_var(r, &rel_index))??;
-    //
-    //                     let cols: Vec<String> = stmt
-    //                         .cols
-    //                         .iter()
-    //                         .flat_map(|n| n.node.as_ref().unwrap().nodes())
-    //                         .map(|(n, _, ctx, _)| n)
-    //                         .filter_map(|n| match n {
-    //                             NodeRef::ResTarget(t) => Some(t.name.clone()),
-    //                             _ => None,
-    //                         })
-    //                         .collect();
-    //
-    //                     Some(RelDep {
-    //                         rel_oid,
-    //                         cmd: Cmd::Insert { cols },
-    //                     })
-    //                 }
-    //                 Node::UpdateStmt(stmt) => {
-    //                     let rel_oid =
-    //                         stmt.relation.map(|r| get_oid_from_r_var(r, &rel_index))??;
-    //
-    //                     let cols: Vec<String> = stmt
-    //                         .target_list
-    //                         .iter()
-    //                         .flat_map(|n| n.node.as_ref().unwrap().nodes())
-    //                         .map(|(n, _, ctx, _)| n)
-    //                         .filter_map(|n| match n {
-    //                             NodeRef::ResTarget(t) => Some(t.name.clone()),
-    //                             _ => None,
-    //                         })
-    //                         .collect();
-    //
-    //                     Some(RelDep {
-    //                         rel_oid,
-    //                         cmd: Cmd::Update { cols },
-    //                     })
-    //                 }
-    //                 Node::DeleteStmt(stmt) => {
-    //                     let rel_oid =
-    //                         stmt.relation.map(|r| get_oid_from_r_var(r, &rel_index))??;
-    //
-    //                     Some(RelDep {
-    //                         rel_oid,
-    //                         cmd: Cmd::Delete,
-    //                     })
-    //                 }
-    //                 _ => None,
-    //             })
-    //             .collect::<Vec<_>>()
-    //     })
-    //     .collect();
-
-    // Ok(queries
-    //     .iter()
-    //     .flat_map(|q| {
-    //         q.dml_tables()
-    //             .into_iter()
-    //             .map(|rel_id| (rel_id, Cmd::Insert {})
-    //             .chain(
-    //                 q.select_tables()
-    //                     .into_iter()
-    //                     .map(|rel_id| (rel_id, Cmd::Select)),
-    //             )
-    //     })
-    //     .map(|(rel_id, cmd)| {
-    //         Ok::<_, anyhow::Error>(RelDep {
-    //             rel_id: rel_index
-    //                 .id_to_oid(&PgId::from(rel_id.clone()))
-    //                 .ok_or_else(|| anyhow!("Relation '{}' not in relation index", rel_id))?,
-    //             cmd,
-    //         })
-    //     })
-    //     .try_collect()?)
+        .collect()
 }
-
-// Each function can be resolved in parallel.
-// Could just let recursive fn query get everything... But don't
-// generate the rust code for all of them.
-// Need to ensure we stop on any catalog fns
-// Currently I'm already fetching all user-defined functions.
-// Solution: try to look up called function in the FnIndex. If it is not there,
-// can fall back to a hardcoded list of exceptions I implement for built-in functions, otherwise
-// return an empty list of exceptions.
 
 /// Get the position of the first `$...$` tag
 fn quote_ind(src: &str) -> Option<(&str, usize)> {
@@ -708,8 +619,7 @@ mod test {
         );
 
         let queries = extract_queries(&f);
-        let rels = get_rel_deps(&queries, &rel_index)?;
-        dbg!(&rels);
+        let rels = get_rel_deps(&queries, &rel_index);
         assert_eq!(rels.len(), 2);
 
         Ok(())

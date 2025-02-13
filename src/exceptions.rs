@@ -43,7 +43,7 @@ pub fn get_exceptions(
 ) -> anyhow::Result<Vec<PgException>> {
     let queries = extract_queries(&parsed);
 
-    let constraints: Vec<&Constraint> = get_rel_deps(&queries, rel_index)?
+    let constraints: Vec<&Constraint> = get_rel_deps(&queries, rel_index)
         .iter()
         .flat_map(|dep| {
             let rel_oid = dep.rel_oid;
@@ -58,8 +58,6 @@ pub fn get_exceptions(
             }
         })
         .collect();
-
-    dbg!(&constraints);
 
     let raised_exceptions = get_raised_sql_states(&parsed)?
         .into_iter()
@@ -188,7 +186,6 @@ mod test {
 
         let exceptions = get_raised_sql_states(&parse_plpgsql(fn_def)?)?;
 
-        dbg!(&exceptions);
         assert_eq!(exceptions.len(), 5);
 
         Ok(())

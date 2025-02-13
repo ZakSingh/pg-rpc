@@ -175,10 +175,10 @@ impl ToRust for PgType {
     fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
         match self {
             PgType::Composite {
-                schema,
                 name,
                 comment,
                 fields,
+                ..
             } => {
                 let rs_name = sql_to_rs_ident(name, CaseType::Pascal);
                 let field_tokens: Vec<TokenStream> = fields
@@ -222,11 +222,11 @@ impl ToRust for PgType {
                 }
             }
             PgType::Domain {
-                schema,
                 name,
                 comment,
                 type_oid,
                 constraints,
+                ..
             } => {
                 let rs_name = sql_to_rs_ident(name, CaseType::Pascal);
 
@@ -299,10 +299,10 @@ impl ToRust for PgType {
                 }
             }
             PgType::Enum {
-                schema,
                 name,
                 comment,
                 variants,
+                ..
             } => {
                 let rs_enum_name = sql_to_rs_ident(name, CaseType::Pascal);
                 let rs_variants: Vec<TokenStream> = variants

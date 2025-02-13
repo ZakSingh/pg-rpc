@@ -50,10 +50,6 @@ impl RelIndex {
         self.0.values().find(|rel| rel.id == *id)
     }
 
-    pub fn get_by_oid(&self, oid: &OID) -> Option<&PgRel> {
-        self.0.get(oid)
-    }
-
     pub fn id_to_oid(&self, id: &PgId) -> Option<OID> {
         self.get_by_id(id).map(|rel| rel.oid)
     }

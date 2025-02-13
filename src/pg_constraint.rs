@@ -1,6 +1,5 @@
 use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
-use enum_dispatch::enum_dispatch;
 use postgres_types::{FromSql, Type};
 use quote::ToTokens;
 use quote::__private::TokenStream;
@@ -22,11 +21,6 @@ pub enum OnDelete {
     SetNull,
     #[serde(rename = "d")]
     SetDefault,
-}
-
-#[enum_dispatch]
-trait RsName {
-    fn rs_name(&self) -> TokenStream;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
@@ -132,7 +126,7 @@ impl From<Constraint> for SqlState {
             Constraint::PrimaryKey(..) => SqlState::UNIQUE_VIOLATION,
             Constraint::Unique(..) => SqlState::UNIQUE_VIOLATION,
             Constraint::NotNull(..) => SqlState::NOT_NULL_VIOLATION,
-            _ => unimplemented!("No SQLSTATE for DEFAULT constraint"),
+            _ => unreachable!("No SQLSTATE for DEFAULT constraint"),
         }
     }
 }

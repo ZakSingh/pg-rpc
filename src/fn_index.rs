@@ -1,8 +1,9 @@
-use crate::codegen::{SchemaName, OID};
+use crate::codegen::OID;
 use crate::pg_fn::PgFn;
 use crate::rel_index::RelIndex;
 use anyhow::Context;
-use itertools::Itertools;
+use rayon::iter::ParallelIterator;
+use rayon::prelude::IntoParallelIterator;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use tokio_postgres::Client;
@@ -35,8 +36,7 @@ impl FunctionIndex {
             .context("Function introspection query failed")?;
 
         let fns = fn_rows
-            // .into_par_iter()
-            .into_iter()
+            .into_par_iter()
             .map(|row| {
                 (
                     row.get::<_, u32>("oid"),
@@ -50,16 +50,6 @@ impl FunctionIndex {
 
     pub fn get_type_oids(&self) -> Vec<OID> {
         self.values().map(|f| f.ty_oids()).flatten().collect()
-    }
-
-    /// Get all the functions in a given schema
-    pub fn get_schema_fns(&self, schema_name: SchemaName) -> Vec<&PgFn> {
-        self.values().filter(|f| f.schema == schema_name).collect()
-    }
-
-    pub fn get_fn(&self, fn_id: &FunctionId) -> Option<&PgFn> {
-        self.values()
-            .find(|f| f.schema == fn_id.schema && f.name == fn_id.name)
     }
 }
 

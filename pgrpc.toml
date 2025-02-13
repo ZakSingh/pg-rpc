@@ -2,4 +2,4 @@
 ltree = "String"
 
 [exceptions]
-M0001 = "Sample error"
+P0001 = "Sample error"

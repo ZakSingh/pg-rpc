@@ -33,35 +33,6 @@ pub struct Postgres {
 }
 
 impl Postgres {
-    /// Enables the Postgres instance to be used without authentication on host.
-    /// For more information see the description of `POSTGRES_HOST_AUTH_METHOD` in official [docker image](https://hub.docker.com/_/postgres)
-    pub fn with_host_auth(mut self) -> Self {
-        self.env_vars
-            .insert("POSTGRES_HOST_AUTH_METHOD".to_owned(), "trust".to_owned());
-        self
-    }
-
-    /// Sets the db name for the Postgres instance.
-    pub fn with_db_name(mut self, db_name: &str) -> Self {
-        self.env_vars
-            .insert("POSTGRES_DB".to_owned(), db_name.to_owned());
-        self
-    }
-
-    /// Sets the user for the Postgres instance.
-    pub fn with_user(mut self, user: &str) -> Self {
-        self.env_vars
-            .insert("POSTGRES_USER".to_owned(), user.to_owned());
-        self
-    }
-
-    /// Sets the password for the Postgres instance.
-    pub fn with_password(mut self, password: &str) -> Self {
-        self.env_vars
-            .insert("POSTGRES_PASSWORD".to_owned(), password.to_owned());
-        self
-    }
-
     /// Registers sql to be executed automatically when the container starts.
     /// Can be called multiple times to add (not override) scripts.
     ///
