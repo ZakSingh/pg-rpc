@@ -19,7 +19,7 @@ with user_relations as ( select c.oid,
                                              join pg_attribute a on a.attrelid = ur.oid and a.attnum = k ))::json as constraint_info
          from user_relations ur
                   join pg_constraint con on con.conrelid = ur.oid
-         where con.contype not in ('f') -- exclude foreign keys
+         where con.contype not in ('f', 't') -- exclude foreign keys
 
          union all
 

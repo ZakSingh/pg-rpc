@@ -21,6 +21,7 @@ from pg_proc p
          left join pg_description d on d.objoid = p.oid
 where p.prokind = 'f'
   and l.lanname = 'plpgsql'
-  and n.nspname not in ('pg_catalog', 'information_schema')
+  and n.nspname  = any($1)  --not in ('pg_catalog', 'information_schema')
   and not exists ( select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e' )
+  and not exists (select 1 from pg_trigger where tgfoid = p.oid)  -- No triggers
 order by n.nspname, p.proname;

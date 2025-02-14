@@ -43,6 +43,7 @@ pub enum PgType {
     Bool,
     Text,
     Timestamptz,
+    Date,
     Void,
 }
 
@@ -97,6 +98,7 @@ impl PgType {
             PgType::Bool => quote! { bool },
             PgType::Text => quote! { String },
             PgType::Timestamptz => quote! { time::OffsetDateTime },
+            PgType::Date => quote! { time::Date },
             PgType::Void => quote! { () },
             x => unimplemented!("unknown type {:?}", x),
         }
@@ -122,6 +124,7 @@ impl TryFrom<Row> for PgType {
                     schema,
                     element_type_oid: t.get("array_element_type"),
                 },
+                "date" => PgType::Date,
                 x => unimplemented!("base type not implemented {}", x),
             },
             'c' => PgType::Composite {
@@ -162,7 +165,7 @@ impl TryFrom<Row> for PgType {
             },
             'p' => match name.as_ref() {
                 "void" => PgType::Void,
-                _ => unimplemented!(),
+                p => unimplemented!("pseudo type not implemented: {}", p),
             },
             x => unimplemented!("ttype not implemented {}", x),
         };
@@ -204,7 +207,7 @@ impl ToRust for PgType {
 
                 quote! {
                     #comment_macro
-                    #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
+                    #[derive(Clone, Debug, postgres_types::ToSql, postgres_types::FromSql, serde::Serialize, serde::Deserialize)]
                     #[postgres(name = #name)]
                     pub struct #rs_name {
                         #(#field_tokens),*
@@ -270,7 +273,7 @@ impl ToRust for PgType {
 
                         quote! {
                             #comment_macro
-                            #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
+                            #[derive(Clone, Debug, postgres_types::ToSql, postgres_types::FromSql, serde::Serialize, serde::Deserialize)]
                             #[postgres(name = #name)]
                             pub struct #rs_name {
                                 #(#field_tokens),*
@@ -325,7 +328,7 @@ impl ToRust for PgType {
 
                 quote! {
                     #comment_macro
-                    #[derive(Debug, Clone, Copy, postgres_types::FromSql, postgres_types::ToSql)]
+                    #[derive(Debug, Clone, Copy, postgres_types::FromSql, postgres_types::ToSql, serde::Deserialize, serde::Serialize)]
                     #[postgres(name = #name)]
                     pub enum #rs_enum_name {
                         #(#rs_variants),*
@@ -338,6 +341,7 @@ impl ToRust for PgType {
             | PgType::Text
             | PgType::Bool
             | PgType::Timestamptz
+            | PgType::Date
             | PgType::Void => {
                 quote! {}
             }

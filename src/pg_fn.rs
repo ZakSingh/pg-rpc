@@ -15,7 +15,7 @@ use heck::ToPascalCase;
 use itertools::{izip, Itertools};
 use jsonpath_rust::JsonPath;
 use pg_query::protobuf::node::Node;
-use pg_query::protobuf::{DeleteStmt, InsertStmt, SelectStmt, UpdateStmt};
+use pg_query::protobuf::{DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, UpdateStmt};
 use pg_query::{parse_plpgsql, NodeRef, ParseResult};
 use quote::__private::TokenStream;
 use quote::{quote, ToTokens};
@@ -25,7 +25,9 @@ use std::cmp::PartialEq;
 use std::collections::HashMap;
 use std::ops::Range;
 use tokio_postgres::Row;
-use ustr::Ustr;
+use ustr::{Ustr};
+
+const VOID_TYPE_OID: u32 = 2278;
 
 #[derive(Debug)]
 pub struct PgFn {
@@ -83,6 +85,17 @@ impl PgFn {
         let end_ind = self.definition[start_ind..].find(tag).unwrap() + start_ind;
 
         &self.definition[start_ind..end_ind]
+    }
+
+    /// Get the exceptions that could be raised by this function
+    /// Excludes any ruled out through static analysis
+    pub fn exceptions(&self) -> &[PgException] {
+        // self.exceptions.as_slice().iter().filter(|e| match e {
+        //     PgException::Constraint(Constraint::NotNull(not_null_constraint)) => {
+        //         not_null_constraint.column
+        //     }
+        // })
+        unimplemented!()
     }
 
     pub fn report(&self, src_loc: &SrcLoc) {
@@ -194,6 +207,14 @@ impl ToRust for PgArg {
 
 impl ToRust for PgFn {
     fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
+        let err_enum_name: TokenStream = (self.name.to_pascal_case() + "Error").parse().unwrap();
+
+        let return_opt = self.comment.as_ref().is_some_and(|c| c.contains("@pgrpc_return_opt"));
+        if return_opt && !self.returns_set  {
+            panic!("{}: Only set-returning functions can have @pgrpc_return_opt.", self.name)
+        }
+
+
         let fn_body = {
             let (opt_args, req_args): (Vec<PgArg>, Vec<PgArg>) =
                 self.args.iter().cloned().partition(|n| n.has_default);
@@ -214,12 +235,18 @@ impl ToRust for PgFn {
                 format!("select {}.{}", self.schema, self.name)
             };
 
-            if self.return_type_oid == 2278 {
-                // Returns void
-                unimplemented!("Void returning functions not yet supported")
-            }
-
-            let query = if self.returns_set {
+            let query = if return_opt {
+                quote! {
+                    client
+                        .query_opt(&query, &params)
+                        .await
+                        .and_then(|opt_row| match opt_row {
+                            None => Ok(None),
+                            Some(row) => row.try_get(0).map(Some),
+                        })
+                        .map_err(Into::into)
+                }
+            } else if self.returns_set {
                 quote! {
                     client
                         .query(&query, &params)
@@ -227,6 +254,16 @@ impl ToRust for PgFn {
                         .and_then(|rows| {
                             rows.into_iter().map(TryInto::try_into).collect()
                         }).map_err(Into::into)
+                }
+            } else if self.return_type_oid == VOID_TYPE_OID {
+                // Void returning function
+                quote! {
+                    client
+                        .execute(&query, &params)
+                        .await
+                        .map_err(#err_enum_name::from)?;
+
+                    Ok(())
                 }
             } else {
                 quote! {
@@ -259,7 +296,9 @@ impl ToRust for PgFn {
         // Build fn signature
         let rs_fn_name = self.rs_name();
         let args: Vec<TokenStream> = self.args.iter().map(|a| a.to_rust(types, config)).collect();
-        let return_type = {
+        let return_type = if self.return_type_oid == VOID_TYPE_OID {
+            quote! { () }
+        } else {
             let inner_ty = types
                 .get(&self.return_type_oid)
                 .unwrap()
@@ -268,7 +307,12 @@ impl ToRust for PgFn {
             if self.returns_set {
                 quote! { Vec<#inner_ty> }
             } else {
-                inner_ty
+                let return_not_null = self.comment.as_ref().is_some_and(|c| c.contains("@pgrpc_not_null"));
+                if return_not_null {
+                    inner_ty
+                } else {
+                    quote! { Option<#inner_ty> }
+                }
             }
         };
 
@@ -277,13 +321,11 @@ impl ToRust for PgFn {
             None => quote! {},
         };
 
-        let err_enum_name: TokenStream = (self.name.to_pascal_case() + "Error").parse().unwrap();
 
         let err_variants: Vec<TokenStream> =
-            self.exceptions.iter().map(|e| e.rs_name(config)).collect();
-
-        // By SqlState, I can differentiate different error types
-        // but then I still need to get the constraint name.
+            self.exceptions
+              .iter()
+              .map(|e| e.rs_name(config)).collect();
 
         let mut custom_handlers = Vec::new();
         let mut check_handlers = Vec::new();
@@ -314,8 +356,7 @@ impl ToRust for PgFn {
                     #constraint_name => #err_enum_name::#constraint_rs_name(db_error.to_owned())
                     });
                 }
-                Constraint::PrimaryKey(pk) => {}
-                Constraint::Unique(_) => {
+                Constraint::PrimaryKey(_) | Constraint::Unique(_) => {
                     let constraint_name = constraint.name().as_str();
                     let constraint_rs_name = constraint.into_token_stream();
                     unique_handlers.push(quote! {
@@ -378,15 +419,32 @@ impl ToRust for PgFn {
             }
         };
 
+        // println!("{:?}", custom_handlers);
+        let custom = if custom_handlers.is_empty() {
+            quote! {}
+        } else {
+            quote! {
+                #(#custom_handlers),*,
+            }
+        };
+
+        let err_vars = if err_variants.is_empty() {
+            quote! {}
+        } else {
+            quote! { #(#[error(transparent)]#err_variants(tokio_postgres::error::DbError)),*, }
+
+        };
+
         quote! {
             #comment_macro
-            pub async fn #rs_fn_name(client: &impl tokio_postgres::GenericClient, #(#args),*) -> Result<#return_type, #err_enum_name> {
+            pub async fn #rs_fn_name(client: &impl deadpool_postgres::GenericClient, #(#args),*) -> Result<#return_type, #err_enum_name> {
                 #fn_body
             }
 
-            #[derive(Debug)]
+            #[derive(Debug, thiserror::Error)]
             pub enum #err_enum_name {
-                #(#err_variants(tokio_postgres::error::DbError)),*,
+                #err_vars
+                #[error(transparent)]
                 Other(tokio_postgres::Error)
             }
 
@@ -397,12 +455,12 @@ impl ToRust for PgFn {
                     };
 
                     match db_error.code() {
-                        #(#custom_handlers),*,
+                        #custom
                         #checks
                         #fks
                         #not_nulls
                         #uniques
-                        _ => #err_enum_name::Other(e),
+                        _ => #err_enum_name::Other(e)
                     }
                 }
             }
@@ -411,10 +469,30 @@ impl ToRust for PgFn {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictTarget {
+    Columns(Vec<Ustr>),             // ON CONFLICT (col1, col2)
+    Constraint(Ustr),             // ON CONFLICT ON CONSTRAINT constraint_name
+    Any,                            // ON CONFLICT without target
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictAction {
+    DoNothing,
+    DoUpdate,
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictClause {
+    pub target: ConflictTarget,
+    pub action: ConflictAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
     Select { cols: Vec<Ustr> },
     Update { cols: Vec<Ustr> },
-    Insert { cols: Vec<Ustr> },
+    Insert { cols: Vec<Ustr>, on_conflict: Option<ConflictClause> },
     Delete,
 }
 
@@ -477,23 +555,61 @@ fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
             referenced_cols
         }
     };
+    // Parse ON CONFLICT clause if present
+    let on_conflict = stmt.on_conflict_clause.as_ref().map(|conflict| {
+        let action = match OnConflictAction::from_i32(conflict.action).unwrap() {
+            OnConflictAction::OnconflictNothing => ConflictAction::DoNothing,
+            OnConflictAction::OnconflictUpdate => ConflictAction::DoUpdate,
+            _ => unreachable!("Invalid ON CONFLICT action"),
+        };
+
+        // Get conflict target - either columns, constraint name, or none
+        let target = if let Some(infer) = &conflict.infer {
+            // ON CONFLICT (col1, col2)
+            let cols = infer
+              .index_elems
+              .iter()
+              .filter_map(|col| {
+                  col.node.as_ref().map(|n| match n {
+                      Node::InferenceElem(elem) => elem.expr.as_ref().and_then(|e| {
+                          if let Some(Node::ColumnRef(col_ref)) = &e.node {
+                              col_ref.fields.last().and_then(|f| {
+                                  if let Some(Node::String(s)) = &f.node {
+                                      Some(s.sval.as_str().into())
+                                  } else {
+                                      None
+                                  }
+                              })
+                          } else {
+                              None
+                          }
+                      }),
+                      _ => None,
+                  })
+              })
+              .flatten()
+              .collect::<Vec<_>>();
+
+            if !cols.is_empty() {
+                ConflictTarget::Columns(cols)
+            } else {
+                ConflictTarget::Any
+            }
+        } else if let Some(infer) = &conflict.infer {
+            // ON CONFLICT ON CONSTRAINT name
+            ConflictTarget::Constraint(infer.conname.as_str().into())
+        } else {
+            // ON CONFLICT
+            ConflictTarget::Any
+        };
+
+        ConflictClause { target, action }
+    });
 
     Some(RelDep {
         rel_oid,
-        cmd: Cmd::Insert { cols },
+        cmd: Cmd::Insert { cols, on_conflict },
     })
-
-    // if it's an on conflict do nothing, we don't need the
-    // constraint named in the clause OR all the constraints if omitted
-    // let c =
-    //     stmt.on_conflict_clause
-    //         .as_ref()
-    //         .map(|c| match OnConflictAction::from_i32(c.action).and_then(|a| match a {
-    //             OnConflictAction::Undefined => None,
-    //             OnConflictAction::OnconflictNone => None,
-    //             OnConflictAction::OnconflictNothing => None,
-    //             OnConflictAction::OnconflictUpdate =>
-    //         });
 }
 
 fn get_delete_deps(stmt: &DeleteStmt, rel_index: &RelIndex) -> Option<RelDep> {

@@ -3,7 +3,7 @@ use crate::pg_type::PgType;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use tokio_postgres::Client;
+use postgres::Client;
 
 const TYPES_INTROSPECTION_QUERY: &'static str = include_str!("./queries/type_introspection.sql");
 
@@ -25,10 +25,9 @@ impl DerefMut for TypeIndex {
 }
 
 impl TypeIndex {
-    pub async fn new(db: &Client, type_oids: &[OID]) -> anyhow::Result<Self> {
+    pub fn new(db: &mut Client, type_oids: &[OID]) -> anyhow::Result<Self> {
         let types = db
             .query(TYPES_INTROSPECTION_QUERY, &[&Vec::from_iter(type_oids)])
-            .await
             .context("Type introspection query failed")?
             .into_iter()
             .map(|row| (row.get("oid"), PgType::try_from(row).unwrap()))

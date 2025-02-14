@@ -1,5 +1,8 @@
+schemas = ["api"]
+
 [types]
 ltree = "String"
 
 [exceptions]
 P0001 = "Sample error"
+

@@ -5,7 +5,7 @@ use anyhow::Context;
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use tokio_postgres::Client;
+use postgres::Client;
 
 const RELATION_INTROSPECTION_QUERY: &'static str =
     include_str!("./queries/relation_introspection.sql");
@@ -29,10 +29,9 @@ impl DerefMut for RelIndex {
 
 impl RelIndex {
     /// Construct the relation index.
-    pub async fn new(db: &Client) -> anyhow::Result<Self> {
+    pub fn new(db: &mut Client) -> anyhow::Result<Self> {
         let relations = db
             .query(RELATION_INTROSPECTION_QUERY, &[])
-            .await
             .context("Relation introspection query failed")?
             .into_iter()
             .map(|row| {

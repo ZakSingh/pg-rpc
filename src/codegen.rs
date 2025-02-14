@@ -24,11 +24,12 @@ pub trait ToRust {
 }
 
 /// Generate the output file
-pub async fn codegen(
+pub fn codegen(
     fn_index: &FunctionIndex,
     ty_index: &TypeIndex,
     config: &Config,
 ) -> anyhow::Result<String> {
+    let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
     let type_def_code = codegen_types(&ty_index, config);
     let fn_code = codegen_fns(&fn_index, &ty_index, config);
 
@@ -42,7 +43,7 @@ pub async fn codegen(
             let s = sql_to_rs_ident(schema.as_str(), CaseType::Snake);
             prettyplease::unparse(
                 &syn::parse2::<syn::File>(quote! {
-                    mod #s {
+                    pub mod #s {
                         #tokens
                     }
                 })
@@ -51,7 +52,7 @@ pub async fn codegen(
         })
         .collect();
 
-    Ok(out)
+    Ok(warning_ignores.to_string() + &out)
 }
 
 fn codegen_types(type_index: &TypeIndex, config: &Config) -> HashMap<SchemaName, TokenStream> {

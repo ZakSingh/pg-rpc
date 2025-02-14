@@ -1,9 +1,10 @@
 use ariadne::ReportKind;
 use postgres_types::{FromSql, Type};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_with::serde_as;
 use serde_with::DisplayFromStr;
 use std::error::Error;
+use std::str::FromStr;
 
 #[serde_as]
 #[derive(Debug, Deserialize)]
@@ -22,12 +23,33 @@ pub struct PgSqlQuery {
     pub text: String,
 }
 
-#[derive(Debug, Deserialize, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub enum PgSqlLevel {
-    #[serde(rename = "warning extra")]
     Warning,
-    #[serde(rename = "error")]
     Error,
+}
+
+
+impl FromStr for PgSqlLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "warning" | "warning extra" => Ok(PgSqlLevel::Warning),
+            "error" => Ok(PgSqlLevel::Error),
+            s => Err(format!("Unknown PgSqlLevel: {}", s))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PgSqlLevel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+      D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<PgSqlLevel>().map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Deserialize)]

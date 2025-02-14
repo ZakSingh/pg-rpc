@@ -24,6 +24,7 @@ with recursive type_tree as (
                                               and not attisdropped ) end                                          as composite_field_types,
            case when t.typtype = 'c'
                     then (case when exists ( select 1 from pg_class c where c.oid = t.typrelid and c.relkind = 'v' )
+                                   -- first case: composite type is derived from a view
                                    then ( with view_columns as ( select a.attname,
                                                                         a.attnum,
                                                                         coalesce(derived.is_nullable, 'YES') as is_nullable

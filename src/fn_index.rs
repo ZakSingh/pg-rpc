@@ -6,7 +6,7 @@ use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use tokio_postgres::Client;
+use postgres::Client;
 
 const FUNCTION_INTROSPECTION_QUERY: &'static str =
     include_str!("./queries/function_introspection.sql");
@@ -29,10 +29,9 @@ impl DerefMut for FunctionIndex {
 }
 
 impl FunctionIndex {
-    pub async fn new(db: &Client, rel_index: &RelIndex) -> anyhow::Result<Self> {
+    pub fn new(db: &mut Client, rel_index: &RelIndex, schemas: &Vec<String>) -> anyhow::Result<Self> {
         let fn_rows = db
-            .query(FUNCTION_INTROSPECTION_QUERY, &[])
-            .await
+            .query(FUNCTION_INTROSPECTION_QUERY, &[schemas])
             .context("Function introspection query failed")?;
 
         let fns = fn_rows

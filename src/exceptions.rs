@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
 use crate::pg_constraint::Constraint;
-use crate::pg_fn::extract_queries;
+use crate::pg_fn::{extract_queries, ConflictTarget, PgArg};
 use crate::pg_fn::{get_rel_deps, Cmd};
 use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
 use anyhow::anyhow;
@@ -50,7 +50,59 @@ pub fn get_exceptions(
             let constraints = rel_index.get(&rel_oid).unwrap().constraints.iter();
             match &dep.cmd {
                 Cmd::Update { cols } => constraints.filter(|c| c.contains_columns(cols)).collect(),
-                Cmd::Insert { cols } => constraints.filter(|c| c.contains_columns(cols)).collect(),
+                Cmd::Insert { cols, on_conflict } => {
+                    constraints.filter(|c| {
+                        // Filter out constraints that we know will not apply via static analysis.
+
+                        #[cfg(not(feature = "null_tracking"))]
+                        if matches!(c, Constraint::NotNull(..)) {
+                            return false;
+                        }
+
+                        if !c.contains_columns(cols) {
+                            // If the constraint doesn't apply to the columns being inserted,
+                            // we can safely assume it will never occur.
+                            return false;
+                        }
+
+                        // Filter out unique/primary key constraints if they're handled by ON CONFLICT
+                        if let Some(conflict) = on_conflict {
+                            match c {
+                                Constraint::PrimaryKey(pk) => {
+                                    let constraint_cols = &pk.columns;
+                                    match &conflict.target {
+                                        ConflictTarget::Columns(conflict_cols) => {
+                                            !constraint_cols.iter().eq(conflict_cols.iter())
+                                        },
+                                        ConflictTarget::Constraint(name) => {
+                                            c.name().as_str() != name
+                                        },
+                                        ConflictTarget::Any => false,
+                                    }
+                                }
+                                Constraint::Unique(unique) => {
+                                    let constraint_cols = &unique.columns;
+
+                                    match &conflict.target {
+                                        // If specific columns listed, only filter if they match the constraint
+                                        ConflictTarget::Columns(conflict_cols) => {
+                                            !constraint_cols.iter().eq(conflict_cols.iter())
+                                        },
+                                        // If specific constraint named, only filter that one
+                                        ConflictTarget::Constraint(name) => {
+                                            &c.name() != name
+                                        },
+                                        // If no target specified, filter all unique/primary key constraints
+                                        ConflictTarget::Any => false,
+                                    }
+                                }
+                                _ => true,
+                            }
+                        } else {
+                            true
+                        }
+                    }).collect()
+                },
                 Cmd::Delete => constraints
                     .filter(|c| matches!(c, Constraint::ForeignKey(_)))
                     .collect(),
@@ -81,9 +133,13 @@ fn get_raised_sql_states(fn_json: &Value) -> anyhow::Result<HashSet<SqlState>> {
     let code_as_option =
     JsonPath::try_from("$..PLpgSQL_stmt_raise[?(@.elog_level == 21)]..PLpgSQL_raise_option[?(@.opt_type == 0)].expr.PLpgSQL_expr.query")?;
 
-    let err_count = JsonPath::try_from("$..PLpgSQL_stmt_raise[?(@.elog_level == 21)]")?
-        .find_slice(fn_json)
-        .len();
+    let binding = JsonPath::try_from("$..PLpgSQL_stmt_raise[?(@.elog_level == 21)]")?;
+    let errs = binding
+        .find_slice(fn_json);
+
+    let err_count = if errs.first().is_some_and(|e| matches!(e, JsonPathValue::NoValue)) {
+        0
+    } else { errs.len() };
 
     let mut sql_states: HashSet<SqlState> = code_as_option
         .find_slice(fn_json)
