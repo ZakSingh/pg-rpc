@@ -8,58 +8,20 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="945f98b6-7558-4dca-911e-a71f09b8ebf1" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/src/lib.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/.gitignore" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/codeStyles/codeStyleConfig.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources.local.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw/schema/api.GnoBAA.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw/schema/api.GnoBAA.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw/schema/functions.mwef9w.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw/schema/functions.mwef9w.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw/schema/information_schema.FNRwLQ.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw/schema/pg_catalog.0S1ZNQ.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw/schema/public.abK9xQ.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw/schema/public.abK9xQ.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw/schema/test.kkQ2AA.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw/schema/test.kkQ2AA.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw/schema/views.bhqwBg.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/miniswap.ajIBrw/schema/views.bhqwBg.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/testing.EDI3qw.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/testing.EDI3qw/schema/api.GnoBAA.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/testing.EDI3qw/schema/api.GnoBAA.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/testing.EDI3qw/schema/information_schema.FNRwLQ.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/testing.EDI3qw/schema/information_schema.FNRwLQ.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/testing.EDI3qw/schema/pg_catalog.0S1ZNQ.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/testing.EDI3qw/schema/pg_catalog.0S1ZNQ.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/testing.EDI3qw/schema/public.abK9xQ.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/testing.EDI3qw/schema/public.abK9xQ.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/testing.EDI3qw/schema/testing.EDI3qw.meta" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources/4eeedf45-9c19-4383-af03-b9a7b9141277/storage_v2/_src_/database/testing.EDI3qw/schema/testing.EDI3qw.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/modules.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/pgfn.iml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/sqldialects.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/Cargo.lock" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Cargo.lock" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.lock" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/pgrpc.toml" beforeDir="false" afterPath="$PROJECT_DIR$/pgrpc.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/schema/02_api/01_api.sql" beforeDir="false" afterPath="$PROJECT_DIR$/schema/02_api/01_api.sql" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/codegen.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/codegen.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/config.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/config.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/db.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/db.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/exceptions.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/exceptions.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/fn_index.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/fn_index.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/main.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/schema/01_tables/01_account.sql" beforeDir="false" afterPath="$PROJECT_DIR$/schema/01_tables/01_account.sql" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/schema/01_tables/02_post.sql" beforeDir="false" afterPath="$PROJECT_DIR$/schema/01_tables/02_post.sql" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/ident.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/ident.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/lib.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/pg_fn.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/pg_fn.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/pg_rel.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/pg_rel.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/pg_type.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/pg_type.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/pgrpc.rs" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/pgsql_check.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/pgsql_check.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/queries/function_introspection.sql" beforeDir="false" afterPath="$PROJECT_DIR$/src/queries/function_introspection.sql" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/pgrpc.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/pgrpc.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/queries/relation_introspection.sql" beforeDir="false" afterPath="$PROJECT_DIR$/src/queries/relation_introspection.sql" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/queries/type_introspection.sql" beforeDir="false" afterPath="$PROJECT_DIR$/src/queries/type_introspection.sql" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/rel_index.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/rel_index.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ty_index.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/ty_index.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -121,6 +83,11 @@
     "org.rust.cargo.project.model.impl.CargoExternalSystemProjectAware.subscribe.first.balloon": "",
     "org.rust.first.attach.projects": "true",
     "vue.rearranger.settings.migration": "true"
+  },
+  "keyToStringList": {
+    "DatabaseDriversLRU": [
+      "postgresql"
+    ]
   }
 }]]></component>
   <component name="RunManager" selected="Cargo.Run pgrpc">
@@ -175,7 +142,7 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1739413367228</updated>
-      <workItem from="1739413368436" duration="34977000" />
+      <workItem from="1739413368436" duration="90372000" />
     </task>
     <servers />
   </component>

@@ -55,9 +55,6 @@ pub mod public {
     }
 }
 pub mod api {
-    /**
-    @pgrpc_return_null
-*/
     pub async fn get_account_by_email(
         client: &impl deadpool_postgres::GenericClient,
         p_email: &str,

@@ -1,11 +1,11 @@
 use crate::codegen::ToRust;
 use crate::codegen::{SchemaName, OID};
 use crate::config::Config;
-use crate::ident::{sql_to_rs_ident, CaseType};
+use crate::ident::{sql_to_rs_ident, sql_to_rs_string, CaseType};
 use crate::parse_domain::non_null_cols_from_checks;
 use itertools::izip;
 use quote::__private::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use std::collections::HashMap;
 use tokio_postgres::Row;
 
@@ -44,6 +44,7 @@ pub enum PgType {
     Text,
     Timestamptz,
     Date,
+    INet,
     Void,
 }
 
@@ -99,6 +100,7 @@ impl PgType {
             PgType::Text => quote! { String },
             PgType::Timestamptz => quote! { time::OffsetDateTime },
             PgType::Date => quote! { time::Date },
+            PgType::INet => quote! { std::net::IpAddr },
             PgType::Void => quote! { () },
             x => unimplemented!("unknown type {:?}", x),
         }
@@ -125,6 +127,7 @@ impl TryFrom<Row> for PgType {
                     element_type_oid: t.get("array_element_type"),
                 },
                 "date" => PgType::Date,
+                "inet" => PgType::INet,
                 x => unimplemented!("base type not implemented {}", x),
             },
             'c' => PgType::Composite {
@@ -234,7 +237,10 @@ impl ToRust for PgType {
                 let rs_name = sql_to_rs_ident(name, CaseType::Pascal);
 
                 match types.get(type_oid).unwrap() {
-                    PgType::Composite { fields, .. } => {
+                    PgType::Composite { fields, name: pg_inner_name, .. } => {
+                        let rs_dom_name = format_ident!("Dom{}", sql_to_rs_string(name, CaseType::Pascal));
+                        let rs_dom_inner_name = format_ident!("Inner{}", sql_to_rs_string(name, CaseType::Pascal));
+
                         // If the domain wraps a composite type, we want to create a new composite type
                         // with the non-null constraints enforced by the domain rather than creating a new wrapper type.
                         // TODO: Refactor for DRY
@@ -264,7 +270,6 @@ impl ToRust for PgType {
                             })
                             .collect();
 
-                        // TODO: Do I need custom ToSql and FromSql implementations that re-add the wrapper?
                         let comment_macro = if comment.is_some() {
                             quote! { #[doc=#comment] }
                         } else {
@@ -273,10 +278,34 @@ impl ToRust for PgType {
 
                         quote! {
                             #comment_macro
-                            #[derive(Clone, Debug, postgres_types::ToSql, postgres_types::FromSql, serde::Serialize, serde::Deserialize)]
+                            #[derive(Clone, Debug, postgres_types::ToSql, serde::Serialize, serde::Deserialize)]
                             #[postgres(name = #name)]
                             pub struct #rs_name {
                                 #(#field_tokens),*
+                            }
+
+                            /// Internal; used for serialization/deserialization only
+                            #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
+                            #[postgres(name = #pg_inner_name)]
+                            struct #rs_dom_inner_name {
+                                #(#field_tokens),*
+                            }
+
+                            /// Internal; used for serialization/deserialization only
+                            #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
+                            #[postgres(name = #name)]
+                            struct #rs_dom_name(#rs_dom_inner_name);
+
+
+                            /// Dispatch FromSql implementation to internal domain wrapper struct
+                            impl<'a> postgres_types::FromSql<'a> for #rs_name {
+                                fn from_sql(_type: &postgres_types::Type, buf: &'a [u8]) -> std::result::Result<#rs_name, Box<dyn std::error::Error + std::marker::Sync + std::marker::Send>> {
+                                    <#rs_dom_name as postgres_types::FromSql>::from_sql(_type, buf).map(|dom| unsafe { std::mem::transmute::<#rs_dom_inner_name, #rs_name>(dom.0) })
+                                }
+
+                                fn accepts(type_: &postgres_types::Type) -> bool {
+                                    <#rs_dom_name as postgres_types::FromSql>::accepts(type_)
+                                }
                             }
 
                             impl TryFrom<tokio_postgres::Row> for #rs_name {
@@ -294,9 +323,9 @@ impl ToRust for PgType {
                         // For any type besides composite types, domains are just a wrapper.
                         let inner = pg_type.to_rust_ident(types);
                         quote! {
-                            #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
+                            #[derive(Debug, Clone, derive_more::Deref, serde::Serialize, serde::Deserialize, postgres_types::ToSql, postgres_types::FromSql)]
                             #[postgres(name = #name)]
-                            pub struct #rs_name(#inner);
+                            pub struct #rs_name(pub #inner);
                         }
                     }
                 }
@@ -341,6 +370,7 @@ impl ToRust for PgType {
             | PgType::Text
             | PgType::Bool
             | PgType::Timestamptz
+            | PgType::INet
             | PgType::Date
             | PgType::Void => {
                 quote! {}

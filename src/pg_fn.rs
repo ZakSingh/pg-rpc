@@ -489,8 +489,14 @@ pub struct ConflictClause {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Outer
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
-    Select { cols: Vec<Ustr> },
+    Select { cols: Vec<Ustr>, join_type: JoinType },
     Update { cols: Vec<Ustr> },
     Insert { cols: Vec<Ustr>, on_conflict: Option<ConflictClause> },
     Delete,
@@ -515,10 +521,34 @@ pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
         .collect()
 }
 
+/// Get the relations the given queries depend upon.
+pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> Vec<RelDep> {
+    queries
+      .iter()
+      .flat_map(|q| get_query_deps(q, rel_index))
+      .collect()
+}
+
+fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
+    query
+      .protobuf
+      .nodes()
+      .iter()
+      .filter_map(|(node, _, _, _)| match node.to_enum() {
+          Node::SelectStmt(stmt) => get_select_deps(stmt.as_ref(), rel_index),
+          Node::InsertStmt(stmt) => get_insert_deps(stmt.as_ref(), rel_index),
+          Node::UpdateStmt(stmt) => get_update_deps(stmt.as_ref(), rel_index),
+          Node::DeleteStmt(stmt) => get_delete_deps(stmt.as_ref(), rel_index),
+          _ => None,
+      })
+      .collect()
+}
+
 fn get_select_deps(_stmt: &SelectStmt, _rel_index: &RelIndex) -> Option<RelDep> {
     // TODO
     None
 }
+
 
 /// Collect all dependencies from an `insert`.
 fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
@@ -532,6 +562,7 @@ fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
         unreachable!("Insert statement without relation")
     };
 
+    // Collect the inserted column names
     let cols: Vec<Ustr> = {
         let referenced_cols: Vec<Ustr> = stmt
             .cols
@@ -555,6 +586,7 @@ fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
             referenced_cols
         }
     };
+
     // Parse ON CONFLICT clause if present
     let on_conflict = stmt.on_conflict_clause.as_ref().map(|conflict| {
         let action = match OnConflictAction::from_i32(conflict.action).unwrap() {
@@ -655,28 +687,7 @@ fn get_update_deps(stmt: &UpdateStmt, rel_index: &RelIndex) -> Option<RelDep> {
     })
 }
 
-fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
-    query
-        .protobuf
-        .nodes()
-        .iter()
-        .filter_map(|(node, _, _, _)| match node.to_enum() {
-            Node::SelectStmt(stmt) => get_select_deps(stmt.as_ref(), rel_index),
-            Node::InsertStmt(stmt) => get_insert_deps(stmt.as_ref(), rel_index),
-            Node::UpdateStmt(stmt) => get_update_deps(stmt.as_ref(), rel_index),
-            Node::DeleteStmt(stmt) => get_delete_deps(stmt.as_ref(), rel_index),
-            _ => None,
-        })
-        .collect()
-}
 
-/// Get the relations the given queries depend upon.
-pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> Vec<RelDep> {
-    queries
-        .iter()
-        .flat_map(|q| get_query_deps(q, rel_index))
-        .collect()
-}
 
 /// Get the position of the first `$...$` tag
 fn quote_ind(src: &str) -> Option<(&str, usize)> {

@@ -5,9 +5,19 @@ use tokio_postgres::Row;
 use ustr::Ustr;
 
 #[derive(Debug, Clone)]
+pub enum PgRelKind {
+    Table,
+    View {
+        definition: String
+    }
+}
+
+
+#[derive(Debug, Clone)]
 pub struct PgRel {
     pub oid: OID,
     pub id: PgId,
+    pub kind: PgRelKind,
     pub constraints: Vec<Constraint>,
     pub columns: Vec<Ustr>,
 }
@@ -20,6 +30,13 @@ impl TryFrom<Row> for PgRel {
 
         Ok(Self {
             oid: row.try_get::<_, u32>("oid")?,
+            kind: match row.try_get::<_, &str>("kind")?.into() {
+            "r" => PgRelKind::Table,
+            "v" => PgRelKind::View {
+                definition: row.try_get("view_definition")?,
+            },
+            value => unimplemented!("unknown relation kind {}", value)
+            },
             id: PgId::new(
                 row.try_get::<_, Option<&str>>("schema")?.map(|s| s.into()),
                 row.try_get::<_, &str>("name")?.into(),
