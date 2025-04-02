@@ -44,8 +44,6 @@ pub fn run(schema_dir: &Path, output_path: &Path, config_path: &Path) -> anyhow:
   let mut db = Db::new(&src);
 
   let rel_index = RelIndex::new(&mut db.client)?;
-
-
   let fn_index = FunctionIndex::new(&mut db.client, &rel_index, &config.schemas)?;
   let ty_index = TypeIndex::new(&mut db.client, fn_index.get_type_oids().as_slice())?;
 
@@ -53,6 +51,7 @@ pub fn run(schema_dir: &Path, output_path: &Path, config_path: &Path) -> anyhow:
   for f in fn_index.values() {
     if f.has_issues() {
       err_count += f.issues.len();
+      println!("{}", f.name);
       f.report(&fn_src_map.get(&f.id()).unwrap());
     }
   }

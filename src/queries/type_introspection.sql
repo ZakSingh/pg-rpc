@@ -9,6 +9,9 @@ with recursive type_tree as (
            case when t.typtype = 'd' then ( select array_agg(pg_get_constraintdef(c.oid))
                                             from pg_constraint c
                                             where c.contypid = t.oid ) end                                        as domain_composite_constraints,
+           case when t.typtype = 'd' then ( select array_agg(c.conname)
+                                            from pg_constraint c
+                                            where c.contypid = t.oid ) end                                        as domain_constraint_names,
            case when t.typtype = 'e' then ( select array_agg(enumlabel order by enumsortorder)
                                             from pg_enum
                                             where enumtypid = t.oid ) end                                         as enum_variants,
@@ -67,6 +70,9 @@ with recursive type_tree as (
            case when t.typtype = 'd' then ( select array_agg(pg_get_constraintdef(c.oid))
                                             from pg_constraint c
                                             where c.contypid = t.oid ) end                                        as domain_composite_constraints,
+           case when t.typtype = 'd' then ( select array_agg(c.conname)
+                                            from pg_constraint c
+                                            where c.contypid = t.oid ) end                                        as domain_constraint_names,
            case when t.typtype = 'e' then ( select array_agg(enumlabel order by enumsortorder)
                                             from pg_enum
                                             where enumtypid = t.oid ) end                                         as enum_variants,
@@ -157,6 +163,7 @@ select distinct on (oid) oid,
                          array_element_type,
                          domain_base_type,
                          domain_composite_constraints,
+                         domain_constraint_names,
                          enum_variants,
                          composite_field_names,
                          composite_field_types,

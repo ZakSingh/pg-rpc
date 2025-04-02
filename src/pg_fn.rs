@@ -87,16 +87,6 @@ impl PgFn {
         &self.definition[start_ind..end_ind]
     }
 
-    /// Get the exceptions that could be raised by this function
-    /// Excludes any ruled out through static analysis
-    pub fn exceptions(&self) -> &[PgException] {
-        // self.exceptions.as_slice().iter().filter(|e| match e {
-        //     PgException::Constraint(Constraint::NotNull(not_null_constraint)) => {
-        //         not_null_constraint.column
-        //     }
-        // })
-        unimplemented!()
-    }
 
     pub fn report(&self, src_loc: &SrcLoc) {
         let body = self.body();
@@ -349,6 +339,13 @@ impl ToRust for PgFn {
                     #constraint_name => #err_enum_name::#constraint_rs_name(db_error.to_owned())
                     });
                 }
+                Constraint::Domain(dom) => {
+                    let constraint_name = dom.name.as_str();
+                    let constraint_rs_name = constraint.into_token_stream();
+                    check_handlers.push(quote! {
+                        #constraint_name => #err_enum_name::#constraint_rs_name(db_error.to_owned())
+                    })
+                }
                 Constraint::ForeignKey(fk) => {
                     let constraint_name = fk.name.as_str();
                     let constraint_rs_name = constraint.into_token_stream();
@@ -370,6 +367,7 @@ impl ToRust for PgFn {
                     #col => #err_enum_name::#constraint_rs_name(db_error.to_owned())
                     });
                 }
+
                 _ => {}
             },
             _ => {}

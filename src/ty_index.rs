@@ -26,6 +26,7 @@ impl DerefMut for TypeIndex {
 
 impl TypeIndex {
     pub fn new(db: &mut Client, type_oids: &[OID]) -> anyhow::Result<Self> {
+        println!("Loading type index {:?}", Vec::from_iter(type_oids));
         let types = db
             .query(TYPES_INTROSPECTION_QUERY, &[&Vec::from_iter(type_oids)])
             .context("Type introspection query failed")?

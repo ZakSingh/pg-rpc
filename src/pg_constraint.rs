@@ -61,6 +61,12 @@ pub struct DefaultConstraint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct DomainConstraint {
+    pub(crate) name: Ustr,
+    pub column: Ustr
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(tag = "type")]
 pub enum Constraint {
     #[serde(rename = "c")]
@@ -75,6 +81,8 @@ pub enum Constraint {
     NotNull(NotNullConstraint),
     #[serde(rename = "d")]
     Default(DefaultConstraint),
+    #[serde(rename = "domain")]
+    Domain(DomainConstraint)
 }
 
 impl FromSql<'_> for Constraint {
@@ -102,6 +110,7 @@ impl Constraint {
             Constraint::Unique(unique) => unique.name,
             Constraint::NotNull(not_null) => not_null.name,
             Constraint::Default(default) => default.name,
+            Constraint::Domain(domain) => domain.name,
         }
     }
 
@@ -114,6 +123,7 @@ impl Constraint {
             Constraint::Unique(u) => cols.iter().any(|item| u.columns.contains(item)),
             Constraint::NotNull(n) => cols.contains(&n.column),
             Constraint::Default(d) => cols.contains(&d.column),
+            Constraint::Domain(d) => cols.contains(&d.column),
         }
     }
 }
@@ -126,7 +136,8 @@ impl From<Constraint> for SqlState {
             Constraint::PrimaryKey(..) => SqlState::UNIQUE_VIOLATION,
             Constraint::Unique(..) => SqlState::UNIQUE_VIOLATION,
             Constraint::NotNull(..) => SqlState::NOT_NULL_VIOLATION,
-            _ => unreachable!("No SQLSTATE for DEFAULT constraint"),
+            Constraint::Domain(..) => SqlState::CHECK_VIOLATION, // TODO: is this always right?
+            Constraint::Default(..) => unreachable!("No SQLSTATE for DEFAULT constraint"),
         }
     }
 }

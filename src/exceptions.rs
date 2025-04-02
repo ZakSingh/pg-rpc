@@ -11,6 +11,7 @@ use quote::ToTokens;
 use quote::__private::TokenStream;
 use serde_json::Value;
 use std::collections::HashSet;
+use itertools::Itertools;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgException {
@@ -37,6 +38,7 @@ impl PgException {
     }
 }
 
+/// Get exceptions from a function body JSON parse
 pub fn get_exceptions(
     parsed: &Value,
     rel_index: &crate::rel_index::RelIndex,
@@ -56,6 +58,11 @@ pub fn get_exceptions(
 
                         #[cfg(not(feature = "null_tracking"))]
                         if matches!(c, Constraint::NotNull(..)) {
+                            return false;
+                        }
+
+                        // Default constraints can't cause an exception
+                        if matches!(c, Constraint::Default(..)) {
                             return false;
                         }
 
@@ -117,7 +124,8 @@ pub fn get_exceptions(
 
     let exceptions: Vec<PgException> = constraints
         .into_iter()
-        .cloned()
+      .unique_by(|c| c.name())
+      .cloned()
         .map(PgException::Constraint)
         .chain(raised_exceptions)
         .chain(get_strict_exceptions(&parsed).into_iter())

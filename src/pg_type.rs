@@ -7,7 +7,16 @@ use itertools::izip;
 use quote::__private::TokenStream;
 use quote::{format_ident, quote};
 use std::collections::HashMap;
+use std::fmt::Debug;
+use postgres::fallible_iterator::FallibleIterator;
+use postgres_types::FromSql;
 use tokio_postgres::Row;
+
+#[derive(Debug, FromSql)]
+struct DomainConstraint {
+    name: String,
+    definition: String
+}
 
 #[derive(Debug)]
 pub enum PgType {
@@ -31,7 +40,7 @@ pub enum PgType {
         schema: String,
         name: String,
         type_oid: OID,
-        constraints: Vec<String>,
+        constraints: Vec<DomainConstraint>,
         comment: Option<String>,
     },
     Custom {
@@ -40,12 +49,14 @@ pub enum PgType {
     },
     Int32,
     Int64,
+    Numeric,
     Bool,
     Text,
     Timestamptz,
     Date,
     INet,
     Void,
+    Bytea,
 }
 
 #[derive(Debug)]
@@ -96,11 +107,13 @@ impl PgType {
             // Built-in types don't need schema qualification
             PgType::Int32 => quote! { i32 },
             PgType::Int64 => quote! { i64 },
+            PgType::Numeric => quote! { rust_decimal::Decimal },
             PgType::Bool => quote! { bool },
             PgType::Text => quote! { String },
             PgType::Timestamptz => quote! { time::OffsetDateTime },
             PgType::Date => quote! { time::Date },
             PgType::INet => quote! { std::net::IpAddr },
+            PgType::Bytea => quote! { Vec<u8> },
             PgType::Void => quote! { () },
             x => unimplemented!("unknown type {:?}", x),
         }
@@ -119,6 +132,7 @@ impl TryFrom<Row> for PgType {
             'b' => match name.as_ref() {
                 "int4" => PgType::Int32,
                 "int8" => PgType::Int64,
+                "numeric" => PgType::Numeric,
                 "text" | "citext" => PgType::Text,
                 "bool" => PgType::Bool,
                 "timestamptz" => PgType::Timestamptz,
@@ -128,37 +142,57 @@ impl TryFrom<Row> for PgType {
                 },
                 "date" => PgType::Date,
                 "inet" => PgType::INet,
+                "bytea" => PgType::Bytea,
+                "ltree" => PgType::Text,
                 x => unimplemented!("base type not implemented {}", x),
             },
-            'c' => PgType::Composite {
-                schema,
-                name,
-                comment,
-                fields: izip!(
+            'c' => {
+                println!("Composite type: {}", name);
+                println!("{:?}", t.get::<&str, Vec<bool>>("composite_field_nullables"));
+
+                let c = PgType::Composite {
+                    schema,
+                    name,
+                    comment,
+                    fields: izip!(
                     t.get::<&str, Vec<&str>>("composite_field_names"),
                     t.get::<&str, Vec<u32>>("composite_field_types"),
                     t.get::<&str, Vec<bool>>("composite_field_nullables"),
                     t.get::<&str, Vec<Option<String>>>("composite_field_comments")
                 )
-                .map(|(name, ty, nullable, comment)| PgField {
-                    name: name.to_string(),
-                    type_oid: ty,
-                    nullable: nullable
-                        && !comment
-                            .as_ref()
-                            .is_some_and(|c| c.contains("@pgrpc_not_null")),
-                    comment,
-                })
-                .collect(),
+                      .map(|(name, ty, nullable, comment)| {
+                          println!("Field: {}, nullable: {}", name, nullable);
+                          PgField {
+                              name: name.to_string(),
+                              type_oid: ty,
+                              nullable: nullable
+                                && !comment
+                                .as_ref()
+                                .is_some_and(|c| c.contains("@pgrpc_not_null")),
+                              comment,
+                          }
+                      })
+                      .collect(),
+                };
+
+                if let PgType::Composite {fields, ..} = &c {
+                    println!("Composite fields: {:?}", fields);
+                }
+
+                c
             },
-            'd' => PgType::Domain {
-                schema,
-                name,
-                comment,
-                type_oid: t.get("domain_base_type"),
-                constraints: t
-                    .try_get("domain_composite_constraints")
-                    .unwrap_or(Vec::default()),
+            'd' => {
+                let constraints =
+                izip!(t.try_get::<_, Vec<String>>("domain_constraint_names").unwrap_or(Vec::default()), t.try_get::<_, Vec<String>>("domain_composite_constraints")
+                  .unwrap_or(Vec::default())).map(|(name, definition)| DomainConstraint { name, definition }).collect();
+
+                PgType::Domain {
+                    schema,
+                    name,
+                    comment,
+                    type_oid: t.get("domain_base_type"),
+                    constraints
+                }
             },
             'e' => PgType::Enum {
                 schema,
@@ -244,7 +278,7 @@ impl ToRust for PgType {
                         // If the domain wraps a composite type, we want to create a new composite type
                         // with the non-null constraints enforced by the domain rather than creating a new wrapper type.
                         // TODO: Refactor for DRY
-                        let c: Vec<&str> = constraints.into_iter().map(|s| s.as_str()).collect();
+                        let c: Vec<&str> = constraints.into_iter().map(|s| s.definition.as_str()).collect();
                         let non_null_cols = non_null_cols_from_checks(&c).unwrap();
 
                         let field_tokens: Vec<TokenStream> = fields
@@ -372,6 +406,8 @@ impl ToRust for PgType {
             | PgType::Timestamptz
             | PgType::INet
             | PgType::Date
+            | PgType::Bytea
+            | PgType::Numeric
             | PgType::Void => {
                 quote! {}
             }
