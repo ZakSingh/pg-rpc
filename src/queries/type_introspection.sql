@@ -87,40 +87,11 @@ with recursive type_tree as (
                                               and attnum > 0
                                               and not attisdropped ) end                                          as composite_field_types,
            case when t.typtype = 'c'
-                    then (case when exists ( select 1 from pg_class c where c.oid = t.typrelid and c.relkind = 'v' )
-                                   then ( with view_columns as ( select a.attname,
-                                                                        a.attnum,
-                                                                        coalesce(derived.is_nullable, 'YES') as is_nullable
-                                                                 from pg_attribute a
-                                                                          join pg_class cl on cl.oid = a.attrelid
-                                                                          join pg_namespace ns on ns.oid = cl.relnamespace
-                                                                          left join ( select vcu.column_name,
-                                                                                             vcu.view_name,
-                                                                                             vcu.view_schema,
-                                                                                             cols.is_nullable
-                                                                                      from information_schema.view_column_usage vcu
-                                                                                               join information_schema.columns cols
-                                                                                                    on cols.column_name =
-                                                                                                       vcu.column_name and
-                                                                                                       cols.table_name =
-                                                                                                       vcu.table_name and
-                                                                                                       cols.table_schema =
-                                                                                                       vcu.table_schema ) derived
-                                                                                    on derived.column_name =
-                                                                                       a.attname and derived.view_name =
-                                                                                                     cl.relname and
-                                                                                       derived.view_schema = ns.nspname
-                                                                 where a.attrelid = t.typrelid
-                                                                   and a.attnum > 0
-                                                                   and not a.attisdropped )
-                                          select array_agg(case when is_nullable = 'YES' then true else false end
-                                                           order by attnum)
-                                          from view_columns )
-                               else ( select array_agg(not attnotnull order by attnum)
-                                      from pg_attribute
-                                      where attrelid = t.typrelid
-                                        and attnum > 0
-                                        and not attisdropped ) end) end                                           as composite_field_nullables,
+                    then (select array_agg(not attnotnull order by attnum)
+                                     from pg_attribute
+                                     where attrelid = t.typrelid
+                                       and attnum > 0
+                                       and not attisdropped) end                                                  as composite_field_nullables,
            -- Get type comments with different behavior for each type
            case when t.typtype = 'd' then (
                -- Domains: Only get direct comments, never inherit

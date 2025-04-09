@@ -12,6 +12,7 @@ use quote::__private::TokenStream;
 use serde_json::Value;
 use std::collections::HashSet;
 use itertools::Itertools;
+use regex::Regex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgException {
@@ -41,6 +42,7 @@ impl PgException {
 /// Get exceptions from a function body JSON parse
 pub fn get_exceptions(
     parsed: &Value,
+    comment: Option<&String>,
     rel_index: &crate::rel_index::RelIndex,
 ) -> anyhow::Result<Vec<PgException>> {
     let queries = extract_queries(&parsed);
@@ -122,13 +124,16 @@ pub fn get_exceptions(
         .into_iter()
         .map(|sql_state| PgException::Explicit(sql_state));
 
+    let comment_exceptions = comment.map(|c| get_comment_exceptions(c)).unwrap_or_default();
+
     let exceptions: Vec<PgException> = constraints
         .into_iter()
-      .unique_by(|c| c.name())
-      .cloned()
+        .unique_by(|c| c.name())
+        .cloned()
         .map(PgException::Constraint)
         .chain(raised_exceptions)
         .chain(get_strict_exceptions(&parsed).into_iter())
+        .chain(comment_exceptions.into_iter())
         .collect();
 
     Ok(exceptions)
@@ -188,6 +193,13 @@ fn get_strict_exceptions(parsed: &Value) -> Option<PgException> {
             _ => false,
         })
         .map(|_| PgException::Strict)
+}
+
+pub fn get_comment_exceptions(comment: &str) -> Vec<PgException> {
+    let re = Regex::new(r"@pgrpc_throws\s+([a-zA-Z0-9]{5})").unwrap();
+    re.captures_iter(comment)
+      .filter_map(|cap| cap.get(1).map(|m| PgException::Explicit(SqlState::from_code(m.as_str()))))
+      .collect()
 }
 
 #[cfg(test)]

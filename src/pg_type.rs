@@ -57,6 +57,7 @@ pub enum PgType {
     INet,
     Void,
     Bytea,
+    Json
 }
 
 #[derive(Debug)]
@@ -114,6 +115,7 @@ impl PgType {
             PgType::Date => quote! { time::Date },
             PgType::INet => quote! { std::net::IpAddr },
             PgType::Bytea => quote! { Vec<u8> },
+            PgType::Json => quote! { serde_json::Value },
             PgType::Void => quote! { () },
             x => unimplemented!("unknown type {:?}", x),
         }
@@ -144,13 +146,11 @@ impl TryFrom<Row> for PgType {
                 "inet" => PgType::INet,
                 "bytea" => PgType::Bytea,
                 "ltree" => PgType::Text,
+                "json" | "jsonb" => PgType::Json,
                 x => unimplemented!("base type not implemented {}", x),
             },
-            'c' => {
-                println!("Composite type: {}", name);
-                println!("{:?}", t.get::<&str, Vec<bool>>("composite_field_nullables"));
-
-                let c = PgType::Composite {
+            'c' =>
+                 PgType::Composite {
                     schema,
                     name,
                     comment,
@@ -161,7 +161,6 @@ impl TryFrom<Row> for PgType {
                     t.get::<&str, Vec<Option<String>>>("composite_field_comments")
                 )
                       .map(|(name, ty, nullable, comment)| {
-                          println!("Field: {}, nullable: {}", name, nullable);
                           PgField {
                               name: name.to_string(),
                               type_oid: ty,
@@ -173,13 +172,6 @@ impl TryFrom<Row> for PgType {
                           }
                       })
                       .collect(),
-                };
-
-                if let PgType::Composite {fields, ..} = &c {
-                    println!("Composite fields: {:?}", fields);
-                }
-
-                c
             },
             'd' => {
                 let constraints =
@@ -246,6 +238,7 @@ impl ToRust for PgType {
                     #comment_macro
                     #[derive(Clone, Debug, postgres_types::ToSql, postgres_types::FromSql, serde::Serialize, serde::Deserialize)]
                     #[postgres(name = #name)]
+                    #[serde(rename = #name)]
                     pub struct #rs_name {
                         #(#field_tokens),*
                     }
@@ -314,20 +307,23 @@ impl ToRust for PgType {
                             #comment_macro
                             #[derive(Clone, Debug, postgres_types::ToSql, serde::Serialize, serde::Deserialize)]
                             #[postgres(name = #name)]
+                            #[serde(rename = #name)]
                             pub struct #rs_name {
                                 #(#field_tokens),*
                             }
 
                             /// Internal; used for serialization/deserialization only
-                            #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
+                            #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql, serde::Deserialize, serde::Serialize)]
                             #[postgres(name = #pg_inner_name)]
+                            #[serde(rename = #pg_inner_name)]
                             struct #rs_dom_inner_name {
                                 #(#field_tokens),*
                             }
 
                             /// Internal; used for serialization/deserialization only
-                            #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
+                            #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql, serde::Deserialize, serde::Serialize)]
                             #[postgres(name = #name)]
+                            #[serde(rename = #name)]
                             struct #rs_dom_name(#rs_dom_inner_name);
 
 
@@ -359,6 +355,7 @@ impl ToRust for PgType {
                         quote! {
                             #[derive(Debug, Clone, derive_more::Deref, serde::Serialize, serde::Deserialize, postgres_types::ToSql, postgres_types::FromSql)]
                             #[postgres(name = #name)]
+                            #[serde(rename = #name)]
                             pub struct #rs_name(pub #inner);
                         }
                     }
@@ -378,6 +375,7 @@ impl ToRust for PgType {
 
                         quote! {
                             #[postgres(name = #sql_variant)]
+                            #[serde(rename = #sql_variant)]
                             #rs_variant
                         }
                     })
@@ -393,6 +391,7 @@ impl ToRust for PgType {
                     #comment_macro
                     #[derive(Debug, Clone, Copy, postgres_types::FromSql, postgres_types::ToSql, serde::Deserialize, serde::Serialize)]
                     #[postgres(name = #name)]
+                    #[serde(rename = #name)]
                     pub enum #rs_enum_name {
                         #(#rs_variants),*
                     }
@@ -408,6 +407,7 @@ impl ToRust for PgType {
             | PgType::Date
             | PgType::Bytea
             | PgType::Numeric
+            | PgType::Json
             | PgType::Void => {
                 quote! {}
             }
@@ -433,12 +433,14 @@ impl ToRust for PgField {
             quote! {
                 #comment_macro
                 #[postgres(name = #pg_name)]
+                #[serde(rename = #pg_name)]
                 pub #field_name: Option<#ident>
             }
         } else {
             quote! {
                 #comment_macro
                 #[postgres(name = #pg_name)]
+                #[serde(rename = #pg_name)]
                 pub #field_name: #ident
             }
         }

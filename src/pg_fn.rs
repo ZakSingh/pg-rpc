@@ -133,6 +133,7 @@ impl PgFn {
         let arg_type_oids: Vec<OID> = row.try_get("arg_oids")?;
         let arg_names: Vec<String> = row.try_get("arg_names")?;
         let arg_defaults: Vec<bool> = row.try_get("has_defaults")?;
+        let comment: Option<String> = row.try_get("comment")?;
 
         let args: Vec<PgArg> = izip!(arg_type_oids, arg_names, arg_defaults)
             .map(|(oid, name, has_default)| PgArg {
@@ -144,7 +145,7 @@ impl PgFn {
 
         let definition = row.try_get::<_, String>("function_definition")?;
         let parsed = parse_plpgsql(&definition)?;
-        let exceptions = get_exceptions(&parsed, rel_index)?;
+        let exceptions = get_exceptions(&parsed, comment.as_ref(), rel_index)?;
 
         Ok(Self {
             oid: row.try_get("oid")?,
@@ -152,7 +153,7 @@ impl PgFn {
             schema: row.try_get("schema_name")?,
             definition,
             returns_set: row.try_get("returns_set")?,
-            comment: row.try_get("comment")?,
+            comment,
             issues: row
                 .try_get::<&str, Option<PgSqlReport>>("plpgsql_check")?
                 .map(|r| r.issues)
