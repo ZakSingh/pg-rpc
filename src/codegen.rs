@@ -44,6 +44,9 @@ pub fn codegen(
             prettyplease::unparse(
                 &syn::parse2::<syn::File>(quote! {
                     pub mod #s {
+                        use postgres_types::private::BytesMut;
+                        use postgres_types::{IsNull, ToSql, Type};
+                    
                         #tokens
                     }
                 })

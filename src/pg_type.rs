@@ -274,6 +274,7 @@ impl ToRust for PgType {
                         let c: Vec<&str> = constraints.into_iter().map(|s| s.definition.as_str()).collect();
                         let non_null_cols = non_null_cols_from_checks(&c).unwrap();
 
+                        // TODO: strip out 'postgres()
                         let field_tokens: Vec<TokenStream> = fields
                             .into_iter()
                             .map(|f| {
@@ -283,7 +284,7 @@ impl ToRust for PgType {
                                     comment: f.comment.clone(),
                                     type_oid: f.type_oid,
                                 }
-                                .to_rust(types, config)
+                                .to_rust_inner(types, false)
                             })
                             .collect();
 
@@ -305,8 +306,7 @@ impl ToRust for PgType {
 
                         quote! {
                             #comment_macro
-                            #[derive(Clone, Debug, postgres_types::ToSql, serde::Serialize, serde::Deserialize)]
-                            #[postgres(name = #name)]
+                            #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
                             #[serde(rename = #name)]
                             pub struct #rs_name {
                                 #(#field_tokens),*
@@ -346,6 +346,29 @@ impl ToRust for PgType {
                                         #(#field_mappings),*
                                     })
                                 }
+                            }
+
+                            impl ToSql for #rs_name {
+                                fn to_sql(
+                                    &self,
+                                    ty: &Type,
+                                    out: &mut BytesMut,
+                                ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+                                    let inner = unsafe { std::mem::transmute::<#rs_name, #rs_dom_inner_name>(self.clone()) };
+
+                                    let inner_ty = match ty.kind() {
+                                        postgres_types::Kind::Domain(inner) => inner,
+                                        _ => return Err("Expected domain type".into()),
+                                    };
+
+                                    inner.to_sql(inner_ty, out)
+                                }
+
+                                fn accepts(ty: &Type) -> bool {
+                                    // Match domain by name
+                                    ty.name() == #name
+                                }
+                                postgres_types::to_sql_checked!();
                             }
                         }
                     }
@@ -420,6 +443,12 @@ impl ToRust for PgType {
 
 impl ToRust for PgField {
     fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
+        self.to_rust_inner(types, true)
+    }
+}
+
+impl PgField {
+    pub fn to_rust_inner(&self, types: &HashMap<OID, PgType>, include_pg_derive: bool) -> TokenStream {
         let ident = types.get(&self.type_oid).unwrap().to_rust_ident(types);
         let field_name = sql_to_rs_ident(&self.name, CaseType::Snake);
         let pg_name = &self.name;
@@ -429,20 +458,14 @@ impl ToRust for PgField {
             None => quote! {},
         };
 
-        if self.nullable {
-            quote! {
-                #comment_macro
-                #[postgres(name = #pg_name)]
-                #[serde(rename = #pg_name)]
-                pub #field_name: Option<#ident>
-            }
-        } else {
-            quote! {
-                #comment_macro
-                #[postgres(name = #pg_name)]
-                #[serde(rename = #pg_name)]
-                pub #field_name: #ident
-            }
+        let pg_macro = if include_pg_derive { quote! { #[postgres(name = #pg_name)] } } else { quote! {} };
+        let option_macro = if self.nullable { quote! { Option<#ident> } } else { quote! {#ident} };
+
+        quote! {
+            #comment_macro
+            #pg_macro
+            #[serde(rename = #pg_name)]
+            pub #field_name: #option_macro
         }
     }
 }
