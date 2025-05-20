@@ -47,6 +47,7 @@ pub enum PgType {
         schema: String,
         name: String,
     },
+    Int16,
     Int32,
     Int64,
     Numeric,
@@ -106,6 +107,7 @@ impl PgType {
                 quote! { Vec<#inner> }
             }
             // Built-in types don't need schema qualification
+            PgType::Int16 => quote! { i16 },
             PgType::Int32 => quote! { i32 },
             PgType::Int64 => quote! { i64 },
             PgType::Numeric => quote! { rust_decimal::Decimal },
@@ -132,6 +134,7 @@ impl TryFrom<Row> for PgType {
 
         let pg_type = match t.get::<_, i8>("typtype") as u8 as char {
             'b' => match name.as_ref() {
+                "int2" => PgType::Int16,
                 "int4" => PgType::Int32,
                 "int8" => PgType::Int64,
                 "numeric" => PgType::Numeric,
@@ -238,7 +241,6 @@ impl ToRust for PgType {
                     #comment_macro
                     #[derive(Clone, Debug, postgres_types::ToSql, postgres_types::FromSql, serde::Serialize, serde::Deserialize)]
                     #[postgres(name = #name)]
-                    #[serde(rename = #name)]
                     pub struct #rs_name {
                         #(#field_tokens),*
                     }
@@ -307,7 +309,6 @@ impl ToRust for PgType {
                         quote! {
                             #comment_macro
                             #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-                            #[serde(rename = #name)]
                             pub struct #rs_name {
                                 #(#field_tokens),*
                             }
@@ -315,7 +316,6 @@ impl ToRust for PgType {
                             /// Internal; used for serialization/deserialization only
                             #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql, serde::Deserialize, serde::Serialize)]
                             #[postgres(name = #pg_inner_name)]
-                            #[serde(rename = #pg_inner_name)]
                             struct #rs_dom_inner_name {
                                 #(#field_tokens),*
                             }
@@ -323,7 +323,6 @@ impl ToRust for PgType {
                             /// Internal; used for serialization/deserialization only
                             #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql, serde::Deserialize, serde::Serialize)]
                             #[postgres(name = #name)]
-                            #[serde(rename = #name)]
                             struct #rs_dom_name(#rs_dom_inner_name);
 
 
@@ -378,7 +377,6 @@ impl ToRust for PgType {
                         quote! {
                             #[derive(Debug, Clone, derive_more::Deref, serde::Serialize, serde::Deserialize, postgres_types::ToSql, postgres_types::FromSql)]
                             #[postgres(name = #name)]
-                            #[serde(rename = #name)]
                             pub struct #rs_name(pub #inner);
                         }
                     }
@@ -412,9 +410,8 @@ impl ToRust for PgType {
 
                 quote! {
                     #comment_macro
-                    #[derive(Debug, Clone, Copy, postgres_types::FromSql, postgres_types::ToSql, serde::Deserialize, serde::Serialize)]
+                    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, postgres_types::FromSql, postgres_types::ToSql, serde::Deserialize, serde::Serialize)]
                     #[postgres(name = #name)]
-                    #[serde(rename = #name)]
                     pub enum #rs_enum_name {
                         #(#rs_variants),*
                     }
@@ -423,6 +420,7 @@ impl ToRust for PgType {
             // Skip base types like i32/i64 as they are already-defined primitives
             PgType::Int32
             | PgType::Int64
+            | PgType::Int16
             | PgType::Text
             | PgType::Bool
             | PgType::Timestamptz

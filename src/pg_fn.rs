@@ -169,6 +169,7 @@ impl ToRust for PgArg {
     fn to_rust(&self, types: &HashMap<OID, PgType>, _config: &Config) -> TokenStream {
         let name = sql_to_rs_ident(&self.name, CaseType::Snake);
         let ty = match types.get(&self.type_oid).unwrap() {
+            PgType::Int16 => quote! { i16 },
             PgType::Int32 => quote! { i32 },
             PgType::Int64 => quote! { i64 },
             PgType::Bool => quote! { bool },
@@ -427,11 +428,12 @@ impl ToRust for PgFn {
             }
         };
 
+        let error_msg = format!("{} failed: {{0:?}}", rs_fn_name);
+
         let err_vars = if err_variants.is_empty() {
             quote! {}
         } else {
-            quote! { #(#[error(transparent)]#err_variants(tokio_postgres::error::DbError)),*, }
-
+            quote! { #(#[error(#error_msg)]#err_variants(#[source] tokio_postgres::error::DbError)),*, }
         };
 
         quote! {
@@ -443,8 +445,8 @@ impl ToRust for PgFn {
             #[derive(Debug, thiserror::Error)]
             pub enum #err_enum_name {
                 #err_vars
-                #[error(transparent)]
-                Other(tokio_postgres::Error)
+                #[error(#error_msg)]
+                Other(#[source] tokio_postgres::Error)
             }
 
             impl From<tokio_postgres::Error> for #err_enum_name {
@@ -705,7 +707,7 @@ fn quote_ind(src: &str) -> Option<(&str, usize)> {
 mod test {
     use crate::pg_fn::{extract_queries, get_rel_deps};
     use crate::pg_id::PgId;
-    use crate::pg_rel::PgRel;
+    use crate::pg_rel::{PgRel, PgRelKind};
     use crate::rel_index::RelIndex;
     use pg_query::parse_plpgsql;
     use ustr::ustr;
@@ -727,6 +729,7 @@ mod test {
         rel_index.insert(
             1,
             PgRel {
+                kind: PgRelKind::Table,
                 oid: 1,
                 id: PgId::new(None, ustr("a")),
                 constraints: Vec::default(),
@@ -737,6 +740,7 @@ mod test {
         rel_index.insert(
             2,
             PgRel {
+                kind: PgRelKind::Table,
                 oid: 2,
                 id: PgId::new(None, ustr("b")),
                 constraints: Vec::default(),

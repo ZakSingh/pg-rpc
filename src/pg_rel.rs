@@ -32,7 +32,7 @@ impl TryFrom<Row> for PgRel {
             oid: row.try_get::<_, u32>("oid")?,
             kind: match row.try_get::<_, &str>("kind")?.into() {
             "r" => PgRelKind::Table,
-            "v" => PgRelKind::View {
+            "v" | "m" => PgRelKind::View {
                 definition: row.try_get("view_definition")?,
             },
             value => unimplemented!("unknown relation kind {}", value)

@@ -1,7 +1,7 @@
 with recursive user_relations as (
     select c.oid,
            c.relkind::text as kind,
-           case when c.relkind = 'v' then pg_get_viewdef(c.oid) end as view_definition,
+           case when c.relkind in ('v', 'm') then pg_get_viewdef(c.oid) end as view_definition,
            n.nspname as schema_name,
            c.relname as relation_name,
            (select array_agg(a.attname order by a.attnum)
