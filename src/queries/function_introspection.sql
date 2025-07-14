@@ -11,16 +11,21 @@ select distinct on (n.nspname, p.proname) n.nspname                             
                                           array(select n > (array_length(p.proargtypes, 1) - p.pronargdefaults)
                                                 from generate_series(1, array_length(p.proargtypes, 1)) as n) as has_defaults,
                                           d.description                                                       as comment,
-                                          ( select plpgsql_check_function(p.oid, format := 'json')::json )    as plpgsql_check,
-                                          ( select coalesce(json_agg(dep), '[]'::json)
-                                            from plpgsql_show_dependency_tb(p.oid) as dep )                   as dependencies
+                                          l.lanname                                                           as language,
+                                          case when l.lanname = 'plpgsql' 
+                                               then ( select plpgsql_check_function(p.oid, format := 'json')::json )
+                                               else null end                                                   as plpgsql_check,
+                                          case when l.lanname = 'plpgsql'
+                                               then ( select coalesce(json_agg(dep), '[]'::json)
+                                                      from plpgsql_show_dependency_tb(p.oid) as dep )
+                                               else '[]'::json end                                             as dependencies
 from pg_proc p
          join pg_namespace n on p.pronamespace = n.oid
          join pg_catalog.pg_language l on p.prolang = l.oid
          left join pg_type t on t.oid = any (p.proargtypes)
          left join pg_description d on d.objoid = p.oid
 where p.prokind = 'f'
-  and l.lanname = 'plpgsql'
+  and l.lanname in ('plpgsql', 'sql')
   and n.nspname  = any($1)  --not in ('pg_catalog', 'information_schema')
   and not exists ( select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e' )
   and not exists (select 1 from pg_trigger where tgfoid = p.oid)  -- No triggers

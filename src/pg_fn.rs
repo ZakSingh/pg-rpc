@@ -134,6 +134,7 @@ impl PgFn {
         let arg_names: Vec<String> = row.try_get("arg_names")?;
         let arg_defaults: Vec<bool> = row.try_get("has_defaults")?;
         let comment: Option<String> = row.try_get("comment")?;
+        let language: String = row.try_get("language")?;
 
         let args: Vec<PgArg> = izip!(arg_type_oids, arg_names, arg_defaults)
             .map(|(oid, name, has_default)| PgArg {
@@ -144,8 +145,20 @@ impl PgFn {
             .collect();
 
         let definition = row.try_get::<_, String>("function_definition")?;
-        let parsed = parse_plpgsql(&definition)?;
-        let exceptions = get_exceptions(&parsed, comment.as_ref(), rel_index)?;
+        
+        // Only parse and analyze PL/pgSQL functions
+        let (issues, exceptions) = if language == "plpgsql" {
+            let parsed = parse_plpgsql(&definition)?;
+            let exceptions = get_exceptions(&parsed, comment.as_ref(), rel_index)?;
+            let issues = row
+                .try_get::<&str, Option<PgSqlReport>>("plpgsql_check")?
+                .map(|r| r.issues)
+                .unwrap_or(Vec::new());
+            (issues, exceptions)
+        } else {
+            // SQL functions don't need parsing and have no exceptions
+            (Vec::new(), Vec::new())
+        };
 
         Ok(Self {
             oid: row.try_get("oid")?,
@@ -154,10 +167,7 @@ impl PgFn {
             definition,
             returns_set: row.try_get("returns_set")?,
             comment,
-            issues: row
-                .try_get::<&str, Option<PgSqlReport>>("plpgsql_check")?
-                .map(|r| r.issues)
-                .unwrap_or(Vec::new()),
+            issues,
             args,
             return_type_oid: row.try_get("return_type")?,
             exceptions,
