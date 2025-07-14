@@ -1,4 +1,14 @@
-# Justification
+# PgRPC
+
+## Installation
+
+Clone the repository and run `cargo install --path .`.
+
+## Usage
+
+`pgrpc_cli -s {schema_dir} -o {output_file}`
+
+## Justification
 
 Currently it is common to write a 'repository layer' for applications that handles persistence with the database.
 
@@ -25,8 +35,6 @@ API responses. However, it comes with numerous downsides:
    have to parse the JSON on the receiver end.
 3. Lossy. JSON only has one `number` type, so we lose information.
 
-If I have a query that does array aggs,
-
 ## Nullability and CHECK constraints
 
 Columns marked non-null in tables are non-null in the generated Rust code.
@@ -36,6 +44,3 @@ Domains aren't so simple; we have to parse their check constraints to determine 
 Means that `a` and `b` will be `Option`.
 
 If the `is not null` has an ancestor `or`, the column is `Option`. Otherwise it is non-null.
-
-If the inner type of a domain is a composite type, it should just create a new composite type with the name of the
-domain, rather than needing a separate domain type.
