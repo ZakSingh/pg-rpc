@@ -26,8 +26,8 @@ struct Opt {
     #[clap(long, short, value_parser = clap::value_parser!(ClioPath).exists().is_file(), default_value = "pgrpc.toml")]
     config_path: ClioPath,
 
-    #[clap(long, short, value_parser, default_value = "src/pgrpc")]
-    output: Output,
+    #[clap(long, short, value_parser)]
+    output: Option<Output>,
 }
 
 pub fn main() -> anyhow::Result<()> {
@@ -35,9 +35,14 @@ pub fn main() -> anyhow::Result<()> {
 
     println!("Generating PgRPC functions...");
     
-    PgrpcBuilder::from_config_file(opt.config_path.path())?
-        .output_path(opt.output.path().to_path_buf())
-        .build()?;
+    let mut builder = PgrpcBuilder::from_config_file(opt.config_path.path())?;
+    
+    // If CLI output is provided, it overrides config
+    if let Some(output) = opt.output {
+        builder = builder.output_path(output.path().to_path_buf());
+    }
+    
+    builder.build()?;
 
     Ok(())
 }

@@ -1,4 +1,5 @@
 connection_string = "postgres://postgres:postgres@localhost:5432/postgres"
+output_path = "src/generated"
 schemas = ["api"]
 
 [types]

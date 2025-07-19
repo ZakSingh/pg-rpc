@@ -27,6 +27,7 @@ pgrpc = { path = "path/to/pgrpc" }
 Create a `pgrpc.toml` configuration file:
 ```toml
 connection_string = "postgres://postgres:postgres@localhost:5432/mydb"
+output_path = "src/generated"  # Optional - directory for generated files
 schemas = ["public", "api"]
 
 [types]
@@ -38,7 +39,11 @@ P0001 = "Custom application error"
 
 Then run:
 ```bash
-pgrpc_cli -c pgrpc.toml -o src/generated/
+# Uses output_path from config file
+pgrpc_cli -c pgrpc.toml
+
+# Or override the output path
+pgrpc_cli -c pgrpc.toml -o src/custom_path/
 ```
 
 This will create a directory structure with separate files for each schema:
@@ -72,6 +77,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 use pgrpc::PgrpcBuilder;
 
+// Load from config file (uses output_path from config if specified)
+PgrpcBuilder::from_config_file("pgrpc.toml")?
+    .build()?;
+
+// Or configure programmatically
 PgrpcBuilder::new()
     .connection_string("postgres://postgres:postgres@localhost:5432/mydb")
     .schema("public")

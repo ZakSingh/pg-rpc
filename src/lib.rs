@@ -101,7 +101,7 @@ impl PgrpcBuilder {
             schemas: config.schemas,
             types: config.types,
             exceptions: config.exceptions,
-            output_path: None,
+            output_path: config.output_path.map(PathBuf::from),
         })
     }
 
@@ -110,7 +110,7 @@ impl PgrpcBuilder {
     pub fn build(&self) -> anyhow::Result<()> {
         let output_path = self.output_path
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Output path is required"))?;
+            .ok_or_else(|| anyhow::anyhow!("Output path is required. Specify either -o in CLI or output_path in pgrpc.toml"))?;
         
         let start = Instant::now();
         
@@ -124,6 +124,7 @@ impl PgrpcBuilder {
 
         let config = Config {
             connection_string: connection_string.clone(),
+            output_path: None, // Not used in internal Config creation
             schemas: self.schemas.clone(),
             types: self.types.clone(),
             exceptions: self.exceptions.clone(),
