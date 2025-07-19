@@ -46,7 +46,7 @@ pub fn sql_to_rs_string(name: &str, case_type: CaseType) -> String {
     };
 
     match syn::parse_str::<syn::Ident>(&name) {
-        Ok(ident) => name,
+        Ok(_) => name,
         Err(_) => "r#".to_owned() + &name
     }
 }

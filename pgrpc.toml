@@ -1,3 +1,4 @@
+connection_string = "postgres://postgres:postgres@localhost:5432/postgres"
 schemas = ["api"]
 
 [types]
@@ -5,4 +6,3 @@ ltree = "String"
 
 [exceptions]
 P0001 = "Sample error"
-

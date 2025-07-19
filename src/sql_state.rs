@@ -1,6 +1,5 @@
 use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
-use crate::pg_constraint::Constraint;
 use phf::phf_map;
 use quote::ToTokens;
 use quote::__private::TokenStream;

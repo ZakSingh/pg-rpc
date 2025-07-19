@@ -1,6 +1,5 @@
 use crate::config::Config;
 use crate::fn_index::FunctionIndex;
-use crate::ident::{sql_to_rs_ident, CaseType};
 use crate::pg_fn::PgFn;
 use crate::pg_type::PgType;
 use crate::ty_index::TypeIndex;
@@ -23,40 +22,53 @@ pub trait ToRust {
     fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream;
 }
 
-/// Generate the output file
-pub fn codegen(
+/// Generate code split by schema
+pub fn codegen_split(
     fn_index: &FunctionIndex,
     ty_index: &TypeIndex,
     config: &Config,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<HashMap<SchemaName, String>> {
     let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
+    
+    // First, we need to process the code to fix cross-schema references
     let type_def_code = codegen_types(&ty_index, config);
     let fn_code = codegen_fns(&fn_index, &ty_index, config);
 
-    let out: String = type_def_code
+    let schema_code: HashMap<SchemaName, String> = type_def_code
         .into_iter()
-        .chain(fn_code) // Combine both maps into one iterator
+        .chain(fn_code)
         .into_grouping_map()
         .fold(TokenStream::new(), |acc, _, ts| quote! { #acc #ts })
         .iter()
         .map(|(schema, tokens)| {
-            let s = sql_to_rs_ident(schema.as_str(), CaseType::Snake);
-            prettyplease::unparse(
+            // Convert tokens to string first to do replacements
+            let tokens_str = tokens.to_string();
+            
+            // Replace cross-schema references from super:: to crate::
+            // This is a bit hacky but works for now
+            let fixed_tokens_str = tokens_str
+                .replace("super ::", "crate::")
+                .replace("super::", "crate::");
+            
+            // Parse back to tokens
+            let fixed_tokens: TokenStream = fixed_tokens_str.parse().unwrap_or_else(|_| tokens.clone());
+            
+            let code = prettyplease::unparse(
                 &syn::parse2::<syn::File>(quote! {
-                    pub mod #s {
-                        use postgres_types::private::BytesMut;
-                        use postgres_types::{IsNull, ToSql, Type};
+                    use postgres_types::private::BytesMut;
+                    use postgres_types::{IsNull, ToSql, Type};
                     
-                        #tokens
-                    }
+                    #fixed_tokens
                 })
                 .expect("generated code to parse"),
-            )
+            );
+            (schema.clone(), warning_ignores.to_string() + &code)
         })
         .collect();
 
-    Ok(warning_ignores.to_string() + &out)
+    Ok(schema_code)
 }
+
 
 fn codegen_types(type_index: &TypeIndex, config: &Config) -> HashMap<SchemaName, TokenStream> {
     type_index

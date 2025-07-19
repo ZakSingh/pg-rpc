@@ -1,12 +1,106 @@
 # PgRPC
 
+PgRPC generates type-safe Rust bindings for PostgreSQL functions, allowing you to call database functions as if they were native Rust code.
+
 ## Installation
 
-Clone the repository and run `cargo install --path .`.
+### As a CLI tool
+```bash
+cargo install --path .
+```
+
+### As a library
+Add to your `Cargo.toml`:
+```toml
+[dependencies]
+pgrpc = { path = "path/to/pgrpc" }
+
+# Or for build script usage:
+[build-dependencies]
+pgrpc = { path = "path/to/pgrpc" }
+```
 
 ## Usage
 
-`pgrpc_cli -s {schema_dir} -o {output_file}`
+### CLI Usage
+
+Create a `pgrpc.toml` configuration file:
+```toml
+connection_string = "postgres://postgres:postgres@localhost:5432/mydb"
+schemas = ["public", "api"]
+
+[types]
+ltree = "String"
+
+[exceptions]
+P0001 = "Custom application error"
+```
+
+Then run:
+```bash
+pgrpc_cli -c pgrpc.toml -o src/generated/
+```
+
+This will create a directory structure with separate files for each schema:
+```
+src/generated/
+├── mod.rs
+├── public.rs
+├── api.rs
+└── ...
+```
+
+### Library Usage
+
+#### In build.rs
+```rust
+use pgrpc::PgrpcBuilder;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let out_dir = std::env::var("OUT_DIR")?;
+    
+    PgrpcBuilder::from_config_file("pgrpc.toml")?
+        .output_path(format!("{}/pgrpc", out_dir))
+        .build()?;
+    
+    println!("cargo:rerun-if-changed=pgrpc.toml");
+    Ok(())
+}
+```
+
+#### Programmatic Usage
+```rust
+use pgrpc::PgrpcBuilder;
+
+PgrpcBuilder::new()
+    .connection_string("postgres://postgres:postgres@localhost:5432/mydb")
+    .schema("public")
+    .schema("api")
+    .type_mapping("ltree", "String")
+    .exception("P0001", "Custom error")
+    .output_path("src/generated")
+    .build()?;
+```
+
+### Using Generated Code
+
+```rust
+// Include the generated module
+include!(concat!(env!("OUT_DIR"), "/pgrpc/mod.rs"));
+
+// Use the functions
+let result = api::my_function(&client, arg1, arg2).await?;
+```
+
+### Performance Benefits
+
+pgrpc generates separate files for each schema, which provides:
+- **Faster incremental compilation**: Only modified schemas need recompilation
+- **Better IDE performance**: Smaller files for language servers to analyze  
+- **Improved build parallelism**: Rust can compile multiple files concurrently
+- **Reduced memory usage**: Compiler handles smaller compilation units
+
+This is especially beneficial for large databases with many schemas and functions.
 
 ## Justification
 

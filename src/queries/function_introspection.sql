@@ -12,9 +12,6 @@ select distinct on (n.nspname, p.proname) n.nspname                             
                                                 from generate_series(1, array_length(p.proargtypes, 1)) as n) as has_defaults,
                                           d.description                                                       as comment,
                                           l.lanname                                                           as language,
-                                          case when l.lanname = 'plpgsql' 
-                                               then ( select plpgsql_check_function(p.oid, format := 'json')::json )
-                                               else null end                                                   as plpgsql_check,
                                           case when l.lanname = 'plpgsql'
                                                then ( select coalesce(json_agg(dep), '[]'::json)
                                                       from plpgsql_show_dependency_tb(p.oid) as dep )

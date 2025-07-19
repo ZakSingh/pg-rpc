@@ -2,14 +2,11 @@ use crate::codegen::{FunctionName, SchemaName, ToRust, OID};
 use crate::config;
 use crate::exceptions::{get_exceptions, PgException};
 use crate::fn_index::FunctionId;
-use crate::fn_src_location::SrcLoc;
 use crate::ident::{sql_to_rs_ident, CaseType};
 use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
 use crate::pg_type::PgType;
-use crate::pgsql_check::{line_to_span, PgSqlIssue, PgSqlReport};
 use crate::rel_index::RelIndex;
-use ariadne::{sources, Label, Report};
 use config::Config;
 use heck::ToPascalCase;
 use itertools::{izip, Itertools};
@@ -23,7 +20,6 @@ use regex::Regex;
 use serde_json::Value;
 use std::cmp::PartialEq;
 use std::collections::HashMap;
-use std::ops::Range;
 use tokio_postgres::Row;
 use ustr::{Ustr};
 
@@ -39,7 +35,6 @@ pub struct PgFn {
     pub returns_set: bool,
     pub definition: String,
     pub comment: Option<String>,
-    pub issues: Vec<PgSqlIssue>,
     pub exceptions: Vec<PgException>,
 }
 
@@ -64,10 +59,6 @@ impl PgFn {
         }
     }
 
-    pub fn has_issues(&self) -> bool {
-        !self.issues.is_empty()
-    }
-
     pub fn rs_name(&self) -> TokenStream {
         sql_to_rs_ident(&self.name, CaseType::Snake)
     }
@@ -88,44 +79,6 @@ impl PgFn {
     }
 
 
-    pub fn report(&self, src_loc: &SrcLoc) {
-        let body = self.body();
-        self.issues.iter().for_each(|i| {
-            let line_span = i
-                .statement
-                .as_ref()
-                .and_then(|s| line_to_span(body, s.line_number))
-                .unwrap_or(line_to_span(body, 1).unwrap());
-
-            let query = i
-                .query
-                .as_ref()
-                .and_then(|s| Some((s.text.as_ref(), s.position)));
-
-            let (body, span): (&str, Range<usize>) = match query {
-                Some((text, position)) => (text, position..text.len()),
-                _ => (body, line_span),
-            };
-
-            let file_name = src_loc.0.to_string_lossy().to_string();
-            let cache = sources(vec![(file_name.clone(), body)]);
-
-            Report::build(i.level.into(), (file_name.clone(), span.clone()))
-                .with_config(
-                    ariadne::Config::default()
-                        .with_multiline_arrows(false)
-                        .with_tab_width(2),
-                )
-                .with_code(i.sql_state.as_str())
-                .with_message("in ".to_string() + self.schema.as_str() + "." + self.name.as_str())
-                .with_label(
-                    Label::new((file_name.clone(), span.clone())).with_message(i.message.as_str()),
-                )
-                .finish()
-                .eprint(cache)
-                .unwrap()
-        });
-    }
 }
 
 impl PgFn {
@@ -147,17 +100,12 @@ impl PgFn {
         let definition = row.try_get::<_, String>("function_definition")?;
         
         // Only parse and analyze PL/pgSQL functions
-        let (issues, exceptions) = if language == "plpgsql" {
+        let exceptions = if language == "plpgsql" {
             let parsed = parse_plpgsql(&definition)?;
-            let exceptions = get_exceptions(&parsed, comment.as_ref(), rel_index)?;
-            let issues = row
-                .try_get::<&str, Option<PgSqlReport>>("plpgsql_check")?
-                .map(|r| r.issues)
-                .unwrap_or(Vec::new());
-            (issues, exceptions)
+            get_exceptions(&parsed, comment.as_ref(), rel_index)?
         } else {
             // SQL functions don't need parsing and have no exceptions
-            (Vec::new(), Vec::new())
+            Vec::new()
         };
 
         Ok(Self {
@@ -167,7 +115,6 @@ impl PgFn {
             definition,
             returns_set: row.try_get("returns_set")?,
             comment,
-            issues,
             args,
             return_type_oid: row.try_get("return_type")?,
             exceptions,

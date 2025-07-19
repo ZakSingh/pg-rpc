@@ -8,7 +8,6 @@ use quote::__private::TokenStream;
 use quote::{format_ident, quote};
 use std::collections::HashMap;
 use std::fmt::Debug;
-use postgres::fallible_iterator::FallibleIterator;
 use postgres_types::FromSql;
 use tokio_postgres::Row;
 
@@ -440,7 +439,7 @@ impl ToRust for PgType {
 }
 
 impl ToRust for PgField {
-    fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
+    fn to_rust(&self, types: &HashMap<OID, PgType>, _config: &Config) -> TokenStream {
         self.to_rust_inner(types, true)
     }
 }

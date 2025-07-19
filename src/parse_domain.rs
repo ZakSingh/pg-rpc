@@ -198,7 +198,6 @@ fn collect_direct_not_nulls(node: &Node, columns: &mut HashSet<String>) {
 }
 
 mod tests {
-    use super::*;
 
     #[test]
     fn it_works() {
