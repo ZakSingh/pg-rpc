@@ -3,13 +3,149 @@ use crate::codegen::{SchemaName, OID};
 use crate::config::Config;
 use crate::ident::{sql_to_rs_ident, sql_to_rs_string, CaseType};
 use crate::parse_domain::non_null_cols_from_checks;
+// Temporarily inline flatten logic until module import is resolved
+// use crate::flatten::{analyze_flatten_dependencies, FlattenedField};
 use itertools::izip;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use postgres_types::FromSql;
 use postgres::Row;
+
+// Temporarily inline flatten types until module import is resolved
+#[derive(Debug, Clone)]
+pub struct FlattenedField {
+    pub name: String,
+    pub original_path: Vec<String>,
+    pub type_oid: OID,
+    pub nullable: bool,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct FlattenAnalysis {
+    pub flattened_fields: Vec<FlattenedField>,
+    pub _dependencies: HashSet<OID>,
+}
+
+#[derive(Debug)]
+pub enum FlattenError {
+    CyclicDependency(Vec<String>),
+    InvalidFlattenTarget(String),
+    TypeNotFound(OID),
+}
+
+/// Recursive flatten analysis for composite types
+pub fn analyze_flatten_dependencies(
+    composite_type: &PgType,
+    types: &HashMap<OID, PgType>,
+) -> Result<FlattenAnalysis, FlattenError> {
+    let mut visited = HashSet::new();
+    let mut path = Vec::new();
+    let mut dependencies = HashSet::new();
+    
+    let flattened_fields = flatten_composite_recursive(
+        composite_type,
+        types,
+        &mut visited,
+        &mut path,
+        &mut dependencies,
+    )?;
+    
+    Ok(FlattenAnalysis {
+        flattened_fields,
+        _dependencies: dependencies,
+    })
+}
+
+fn flatten_composite_recursive(
+    composite_type: &PgType,
+    types: &HashMap<OID, PgType>,
+    visited: &mut HashSet<String>,
+    path: &mut Vec<String>,
+    dependencies: &mut HashSet<OID>,
+) -> Result<Vec<FlattenedField>, FlattenError> {
+    let type_name = match composite_type {
+        PgType::Composite { name, .. } => name.clone(),
+        _ => return Err(FlattenError::InvalidFlattenTarget(
+            "Only composite types can be flattened".to_string()
+        )),
+    };
+    
+    // Cycle detection
+    if visited.contains(&type_name) {
+        return Err(FlattenError::CyclicDependency(path.clone()));
+    }
+    
+    visited.insert(type_name.clone());
+    path.push(type_name.clone());
+    
+    let mut result = Vec::new();
+    
+    if let PgType::Composite { fields, .. } = composite_type {
+        for field in fields {
+            if field.flatten {
+                // This field should be flattened
+                let field_type = types.get(&field.type_oid)
+                    .ok_or(FlattenError::TypeNotFound(field.type_oid))?;
+                
+                dependencies.insert(field.type_oid);
+                
+                // Recursively flatten this field
+                let sub_fields = flatten_composite_recursive(
+                    field_type,
+                    types,
+                    visited,
+                    path,
+                    dependencies,
+                )?;
+                
+                // Add sub-fields with updated paths and names
+                for sub_field in sub_fields {
+                    let mut new_path = vec![field.name.clone()];
+                    new_path.extend(sub_field.original_path);
+                    
+                    // Generate field name with conflict resolution
+                    let field_name = generate_field_name(&field.name, &sub_field.name);
+                    
+                    result.push(FlattenedField {
+                        name: field_name,
+                        original_path: new_path,
+                        type_oid: sub_field.type_oid,
+                        nullable: field.nullable || sub_field.nullable,
+                        comment: sub_field.comment,
+                    });
+                }
+            } else {
+                // This field should not be flattened, include as-is
+                result.push(FlattenedField {
+                    name: field.name.clone(),
+                    original_path: vec![field.name.clone()],
+                    type_oid: field.type_oid,
+                    nullable: field.nullable,
+                    comment: field.comment.clone(),
+                });
+            }
+        }
+    }
+    
+    path.pop();
+    visited.remove(&type_name);
+    
+    Ok(result)
+}
+
+/// Generate a field name, handling potential conflicts
+fn generate_field_name(parent_name: &str, field_name: &str) -> String {
+    // For now, simple concatenation with underscore
+    // TODO: Implement more sophisticated conflict resolution
+    if parent_name.is_empty() {
+        field_name.to_string()
+    } else {
+        format!("{}_{}", parent_name, field_name)
+    }
+}
 
 #[derive(Debug, FromSql)]
 struct DomainConstraint {
@@ -61,11 +197,12 @@ pub enum PgType {
 }
 
 #[derive(Debug)]
-struct PgField {
-    name: String,
-    type_oid: OID,
-    nullable: bool,
-    comment: Option<String>,
+pub struct PgField {
+    pub name: String,
+    pub type_oid: OID,
+    pub nullable: bool,
+    pub comment: Option<String>,
+    pub flatten: bool,
 }
 
 impl PgType {
@@ -170,7 +307,10 @@ impl TryFrom<Row> for PgType {
                                 && !comment
                                 .as_ref()
                                 .is_some_and(|c| c.contains("@pgrpc_not_null")),
-                              comment,
+                              comment: comment.clone(),
+                              flatten: comment
+                                .as_ref()
+                                .is_some_and(|c| c.contains("@pgrpc_flatten")),
                           }
                       })
                       .collect(),
@@ -216,10 +356,87 @@ impl ToRust for PgType {
                 ..
             } => {
                 let rs_name = sql_to_rs_ident(name, CaseType::Pascal);
-                let field_tokens: Vec<TokenStream> = fields
-                    .into_iter()
-                    .map(|f| f.to_rust(types, config))
-                    .collect();
+                
+                // Check if any fields need flattening
+                let has_flattened_fields = fields.iter().any(|f| f.flatten);
+                
+                let (field_tokens, try_from_impl) = if has_flattened_fields {
+                    // Use flatten analysis for complex field structure
+                    match analyze_flatten_dependencies(self, types) {
+                        Ok(analysis) => {
+                            let field_tokens: Vec<TokenStream> = analysis.flattened_fields
+                                .iter()
+                                .map(|f| generate_flattened_field_token(f, types))
+                                .collect();
+                            
+                            // Generate custom TryFrom implementation for flattened types
+                            let try_from_impl = generate_flattened_try_from_impl(&rs_name, &analysis, fields, types);
+                                
+                            (field_tokens, try_from_impl)
+                        }
+                        Err(_) => {
+                            // Fallback to regular field generation if flattening fails
+                            let field_tokens: Vec<TokenStream> = fields
+                                .into_iter()
+                                .map(|f| f.to_rust(types, config))
+                                .collect();
+
+                            let field_mappings: Vec<_> = fields
+                                .into_iter()
+                                .map(|f| {
+                                    let sql_name = &f.name;
+                                    let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
+
+                                    quote! { #rs_name: row.try_get(#sql_name)? }
+                                })
+                                .collect();
+                                
+                            let try_from_impl = quote! {
+                                impl TryFrom<tokio_postgres::Row> for #rs_name {
+                                    type Error = tokio_postgres::Error;
+
+                                    fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                                        Ok(Self {
+                                            #(#field_mappings),*
+                                        })
+                                    }
+                                }
+                            };
+                            
+                            (field_tokens, try_from_impl)
+                        }
+                    }
+                } else {
+                    // Regular field generation for non-flattened types
+                    let field_tokens: Vec<TokenStream> = fields
+                        .into_iter()
+                        .map(|f| f.to_rust(types, config))
+                        .collect();
+
+                    let field_mappings: Vec<_> = fields
+                        .into_iter()
+                        .map(|f| {
+                            let sql_name = &f.name;
+                            let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
+
+                            quote! { #rs_name: row.try_get(#sql_name)? }
+                        })
+                        .collect();
+                    
+                    let try_from_impl = quote! {
+                        impl TryFrom<tokio_postgres::Row> for #rs_name {
+                            type Error = tokio_postgres::Error;
+
+                            fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                                Ok(Self {
+                                    #(#field_mappings),*
+                                })
+                            }
+                        }
+                    };
+                        
+                    (field_tokens, try_from_impl)
+                };
 
                 let comment_macro = if comment.is_some() {
                     quote! { #[doc=#comment] }
@@ -227,33 +444,15 @@ impl ToRust for PgType {
                     quote! {}
                 };
 
-                let field_mappings: Vec<_> = fields
-                    .into_iter()
-                    .map(|f| {
-                        let sql_name = &f.name;
-                        let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
-
-                        quote! { #rs_name: row.try_get(#sql_name)? }
-                    })
-                    .collect();
-
                 quote! {
                     #comment_macro
-                    #[derive(Clone, Debug, postgres_types::ToSql, postgres_types::FromSql, serde::Serialize, serde::Deserialize)]
+                    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, postgres_types::FromSql, postgres_types::ToSql)]
                     #[postgres(name = #name)]
                     pub struct #rs_name {
                         #(#field_tokens),*
                     }
 
-                    impl TryFrom<tokio_postgres::Row> for #rs_name {
-                        type Error = tokio_postgres::Error;
-
-                        fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
-                            Ok(Self {
-                                #(#field_mappings),*
-                            })
-                        }
-                    }
+                    #try_from_impl
                 }
             }
             PgType::Domain {
@@ -285,6 +484,7 @@ impl ToRust for PgType {
                                     name: f.name.clone(),
                                     comment: f.comment.clone(),
                                     type_oid: f.type_oid,
+                                    flatten: f.flatten,
                                 }
                                 .to_rust_inner(types, false)
                             })
@@ -465,5 +665,443 @@ impl PgField {
             #[serde(rename = #pg_name)]
             pub #field_name: #option_macro
         }
+    }
+}
+
+/// Generate a Rust field token for a flattened field
+fn generate_flattened_field_token(flattened_field: &FlattenedField, types: &HashMap<OID, PgType>) -> TokenStream {
+    let field_name = sql_to_rs_ident(&flattened_field.name, CaseType::Snake);
+    let type_ident = types.get(&flattened_field.type_oid)
+        .unwrap()
+        .to_rust_ident(types);
+    
+    let comment_macro = match flattened_field.comment.as_ref() {
+        Some(comment) => quote! { #[doc=#comment] },
+        None => quote! {},
+    };
+    
+    // Use original field path for PostgreSQL name mapping - for serde JSON compatibility
+    let pg_name = flattened_field.original_path.join(".");
+    
+    let option_macro = if flattened_field.nullable {
+        quote! { Option<#type_ident> }
+    } else {
+        quote! { #type_ident }
+    };
+    
+    quote! {
+        #comment_macro
+        #[serde(rename = #pg_name)]
+        pub #field_name: #option_macro
+    }
+}
+
+/// Generate custom TryFrom implementation for flattened composite types
+fn generate_flattened_try_from_impl(
+    struct_name: &TokenStream,
+    analysis: &FlattenAnalysis,
+    original_fields: &[PgField],
+    types: &HashMap<OID, PgType>
+) -> TokenStream {
+    // Generate field extraction logic for each flattened field
+    let field_extractions: Vec<TokenStream> = analysis.flattened_fields
+        .iter()
+        .map(|flattened_field| {
+            let rs_field_name = sql_to_rs_ident(&flattened_field.name, CaseType::Snake);
+            
+            // Generate the extraction path from the original composite type
+            let extraction_code = generate_field_extraction_code(flattened_field, original_fields, types);
+            
+            quote! {
+                let #rs_field_name = #extraction_code;
+            }
+        })
+        .collect();
+    
+    // Generate the struct construction
+    let field_assignments: Vec<TokenStream> = analysis.flattened_fields
+        .iter()
+        .map(|flattened_field| {
+            let rs_field_name = sql_to_rs_ident(&flattened_field.name, CaseType::Snake);
+            quote! { #rs_field_name }
+        })
+        .collect();
+    
+    quote! {
+        impl TryFrom<tokio_postgres::Row> for #struct_name {
+            type Error = tokio_postgres::Error;
+
+            fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                #(#field_extractions)*
+                
+                Ok(Self {
+                    #(#field_assignments),*
+                })
+            }
+        }
+    }
+}
+
+/// Generate field extraction code for a flattened field from the original composite type
+fn generate_field_extraction_code(
+    flattened_field: &FlattenedField,
+    original_fields: &[PgField],
+    types: &HashMap<OID, PgType>
+) -> TokenStream {
+    if flattened_field.original_path.len() == 1 {
+        // Simple field - direct access from row
+        let field_name = &flattened_field.original_path[0];
+        quote! { row.try_get(#field_name)? }
+    } else {
+        // Nested field - need to extract from composite type
+        let root_field_name = &flattened_field.original_path[0];
+        let sub_field_name = &flattened_field.original_path[1];
+        
+        // Find the root field to get its type
+        if let Some(root_field) = original_fields.iter().find(|f| f.name == *root_field_name) {
+            if let Some(root_type) = types.get(&root_field.type_oid) {
+                // Get the Rust type name for the composite type
+                // When referencing types in the same module, use simple name
+                let composite_type_name = match root_type {
+                    PgType::Composite { name, .. } => {
+                        sql_to_rs_ident(name, CaseType::Pascal)
+                    }
+                    _ => root_type.to_rust_ident(types)
+                };
+                let sub_field_rust_name = sql_to_rs_ident(sub_field_name, CaseType::Snake);
+                
+                // Now that composite types have FromSql, we can extract them properly
+                // Generate nested field access through the composite type
+                quote! {
+                    row.try_get::<_, Option<#composite_type_name>>(#root_field_name)?
+                        .and_then(|c| c.#sub_field_rust_name.clone())
+                }
+            } else {
+                // Fallback if type not found
+                if flattened_field.nullable {
+                    quote! { None }
+                } else {
+                    quote! { Default::default() }
+                }
+            }
+        } else {
+            // Fallback if field not found
+            if flattened_field.nullable {
+                quote! { None }
+            } else {
+                quote! { Default::default() }
+            }
+        }
+    }
+}
+
+
+/// Generate PostgreSQL composite field expansion expression from field path
+/// Examples:
+/// - ["name"] -> "name"
+/// - ["addr", "street"] -> "(addr).street"
+/// - ["addr", "contact", "phone"] -> "((addr).contact).phone"
+fn generate_composite_field_expression(path: &[String]) -> String {
+    if path.len() == 1 {
+        // Simple field access
+        path[0].clone()
+    } else if path.len() == 2 {
+        // Single-level composite field access: (composite_field).sub_field
+        format!("({}).{}", path[0], path[1])
+    } else {
+        // Multi-level composite field access: ((composite_field).sub_composite).final_field
+        let mut expression = format!("({})", path[0]);
+        for field in &path[1..path.len()-1] {
+            expression = format!("({}.{})", expression, field);
+        }
+        format!("{}.{}", expression, path.last().unwrap())
+    }
+}
+
+/// Generate the SELECT clause for a composite type with flattened fields
+/// This creates the SQL that expands composite types using PostgreSQL's (column).* syntax
+pub fn generate_select_clause_for_flattened_type(
+    analysis: &FlattenAnalysis, 
+    table_alias: Option<&str>
+) -> String {
+    let table_prefix = table_alias.map(|alias| format!("{}.", alias)).unwrap_or_default();
+    
+    let field_expressions: Vec<String> = analysis.flattened_fields
+        .iter()
+        .map(|field| {
+            let sql_expr = generate_composite_field_expression(&field.original_path);
+            // Add table alias if provided
+            if let Some(alias) = table_alias {
+                format!("{}{} AS {}", table_prefix, sql_expr, field.name)
+            } else {
+                format!("{} AS {}", sql_expr, field.name)
+            }
+        })
+        .collect();
+    
+    field_expressions.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn create_test_field(name: &str, type_oid: OID, flatten: bool) -> PgField {
+        PgField {
+            name: name.to_string(),
+            type_oid,
+            nullable: true,
+            comment: None,
+            flatten,
+        }
+    }
+    
+    fn create_test_composite(name: &str, fields: Vec<PgField>) -> PgType {
+        PgType::Composite {
+            schema: "public".to_string(),
+            name: name.to_string(),
+            fields,
+            comment: None,
+        }
+    }
+    
+    #[test]
+    fn test_flatten_analysis_simple() {
+        let mut types = HashMap::new();
+        
+        // Create address type
+        let address_type = create_test_composite("address", vec![
+            create_test_field("street", 1, false),
+            create_test_field("city", 2, false),
+        ]);
+        types.insert(100, address_type);
+        
+        // Create person type with flattened address
+        let person_type = create_test_composite("person", vec![
+            create_test_field("name", 3, false),
+            create_test_field("addr", 100, true), // Flatten this
+        ]);
+        
+        let analysis = analyze_flatten_dependencies(&person_type, &types).unwrap();
+        
+        assert_eq!(analysis.flattened_fields.len(), 3);
+        assert_eq!(analysis.flattened_fields[0].name, "name");
+        assert_eq!(analysis.flattened_fields[1].name, "addr_street");
+        assert_eq!(analysis.flattened_fields[2].name, "addr_city");
+        
+        // Check original paths
+        assert_eq!(analysis.flattened_fields[0].original_path, vec!["name"]);
+        assert_eq!(analysis.flattened_fields[1].original_path, vec!["addr", "street"]);
+        assert_eq!(analysis.flattened_fields[2].original_path, vec!["addr", "city"]);
+    }
+    
+    #[test]
+    fn test_flatten_analysis_no_flatten() {
+        let mut types = HashMap::new();
+        
+        // Create simple person type without any flattening
+        let person_type = create_test_composite("person", vec![
+            create_test_field("name", 1, false),
+            create_test_field("age", 2, false),
+        ]);
+        
+        let analysis = analyze_flatten_dependencies(&person_type, &types).unwrap();
+        
+        assert_eq!(analysis.flattened_fields.len(), 2);
+        assert_eq!(analysis.flattened_fields[0].name, "name");
+        assert_eq!(analysis.flattened_fields[1].name, "age");
+        
+        // All fields should have simple original paths
+        assert_eq!(analysis.flattened_fields[0].original_path, vec!["name"]);
+        assert_eq!(analysis.flattened_fields[1].original_path, vec!["age"]);
+    }
+    
+    #[test]
+    fn test_flatten_analysis_error_cases() {
+        let types = HashMap::new();
+        
+        // Try to flatten a field that references a non-existent type
+        let person_type = create_test_composite("person", vec![
+            create_test_field("name", 1, false),
+            create_test_field("addr", 999, true), // Type 999 doesn't exist
+        ]);
+        
+        let result = analyze_flatten_dependencies(&person_type, &types);
+        assert!(result.is_err());
+        
+        // Try to flatten a non-composite type
+        let mut types = HashMap::new();
+        types.insert(100, PgType::Text);  // Text is not a composite type
+        
+        let person_type = create_test_composite("person", vec![
+            create_test_field("name", 1, false),
+            create_test_field("description", 100, true), // Try to flatten text
+        ]);
+        
+        let result = analyze_flatten_dependencies(&person_type, &types);
+        assert!(result.is_err());
+    }
+    
+    #[test]
+    fn test_composite_field_expression_generation() {
+        // Test simple field access
+        assert_eq!(
+            generate_composite_field_expression(&["name".to_string()]),
+            "name"
+        );
+        
+        // Test single-level composite field access
+        assert_eq!(
+            generate_composite_field_expression(&["addr".to_string(), "street".to_string()]),
+            "(addr).street"
+        );
+        
+        // Test multi-level composite field access
+        assert_eq!(
+            generate_composite_field_expression(&[
+                "addr".to_string(), 
+                "contact".to_string(), 
+                "phone".to_string()
+            ]),
+            "((addr).contact).phone"
+        );
+        
+        // Test deeper nesting
+        assert_eq!(
+            generate_composite_field_expression(&[
+                "person".to_string(),
+                "addr".to_string(),
+                "contact".to_string(),
+                "emergency".to_string(),
+                "phone".to_string()
+            ]),
+            "((((person).addr).contact).emergency).phone"
+        );
+    }
+    
+    #[test]
+    fn test_select_clause_generation() {
+        let mut types = HashMap::new();
+        
+        // Create address type
+        let address_type = create_test_composite("address", vec![
+            create_test_field("street", 1, false),
+            create_test_field("city", 2, false),
+        ]);
+        types.insert(100, address_type);
+        
+        // Create person type with flattened address
+        let person_type = create_test_composite("person", vec![
+            create_test_field("name", 3, false),
+            create_test_field("addr", 100, true), // Flatten this
+        ]);
+        
+        let analysis = analyze_flatten_dependencies(&person_type, &types).unwrap();
+        
+        // Test without table alias
+        let select_clause = generate_select_clause_for_flattened_type(&analysis, None);
+        assert_eq!(
+            select_clause,
+            "name AS name, (addr).street AS addr_street, (addr).city AS addr_city"
+        );
+        
+        // Test with table alias
+        let select_clause_with_alias = generate_select_clause_for_flattened_type(&analysis, Some("p"));
+        assert_eq!(
+            select_clause_with_alias,
+            "p.name AS name, p.(addr).street AS addr_street, p.(addr).city AS addr_city"
+        );
+    }
+    
+    #[test]
+    fn test_nested_select_clause_generation() {
+        let mut types = HashMap::new();
+        
+        // Create contact_info type
+        let contact_type = create_test_composite("contact_info", vec![
+            create_test_field("phone", 1, false),
+            create_test_field("email", 2, false),
+        ]);
+        types.insert(200, contact_type);
+        
+        // Create address type with flattened contact
+        let address_type = create_test_composite("address", vec![
+            create_test_field("street", 3, false),
+            create_test_field("city", 4, false),
+            create_test_field("contact", 200, true), // Flatten this
+        ]);
+        types.insert(100, address_type);
+        
+        // Create person type with flattened address (which contains flattened contact)
+        let person_type = create_test_composite("person", vec![
+            create_test_field("name", 5, false),
+            create_test_field("addr", 100, true), // Flatten this
+        ]);
+        
+        let analysis = analyze_flatten_dependencies(&person_type, &types).unwrap();
+        
+        let select_clause = generate_select_clause_for_flattened_type(&analysis, Some("t"));
+        
+        // Should generate: 
+        // t.name AS name, 
+        // t.(addr).street AS addr_street, 
+        // t.(addr).city AS addr_city, 
+        // t.((addr).contact).phone AS addr_contact_phone, 
+        // t.((addr).contact).email AS addr_contact_email
+        assert!(select_clause.contains("t.name AS name"));
+        assert!(select_clause.contains("t.(addr).street AS addr_street"));
+        assert!(select_clause.contains("t.(addr).city AS addr_city"));
+        assert!(select_clause.contains("t.((addr).contact).phone AS addr_contact_phone"));
+        assert!(select_clause.contains("t.((addr).contact).email AS addr_contact_email"));
+    }
+    
+    #[test]
+    fn test_flattened_try_from_generation() {
+        let mut types = HashMap::new();
+        
+        // Create address type
+        let address_type = create_test_composite("address", vec![
+            create_test_field("street", 1, false),
+            create_test_field("city", 1, false),
+        ]);
+        types.insert(100, address_type);
+        
+        // Add text type
+        types.insert(1, PgType::Text);
+        
+        // Create person type with flattened address
+        let person_type = create_test_composite("person", vec![
+            create_test_field("name", 1, false),
+            create_test_field("addr", 100, true), // Flatten this
+        ]);
+        
+        let config = Config {
+            connection_string: None,
+            output_path: None,
+            schemas: vec![],
+            types: HashMap::new(),
+            exceptions: HashMap::new(),
+        };
+        
+        // Generate Rust code
+        let generated = person_type.to_rust(&types, &config);
+        let generated_str = generated.to_string();
+        
+        println!("Generated TryFrom code:\n{}", generated_str);
+        
+        // Verify that the generated code contains expected elements
+        assert!(generated_str.contains("pub struct Person"));
+        assert!(generated_str.contains("name : Option < String >"));
+        assert!(generated_str.contains("addr_street : Option < String >"));
+        assert!(generated_str.contains("addr_city : Option < String >"));
+        assert!(generated_str.contains("impl TryFrom < tokio_postgres :: Row > for Person"));
+        assert!(generated_str.contains("try_get (\"name\")"));
+        assert!(generated_str.contains("try_get (\"addr\")"));
+        
+        // Verify the flattened field extraction logic
+        assert!(generated_str.contains("let addr_street"));
+        assert!(generated_str.contains("let addr_city"));
+        assert!(generated_str.contains("composite . and_then (| c | c . street)"));
+        assert!(generated_str.contains("composite . and_then (| c | c . city)"));
     }
 }

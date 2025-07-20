@@ -182,7 +182,15 @@ impl ToRust for PgFn {
             let opt_arg_names: Vec<TokenStream> = opt_args.iter().map(|a| a.rs_name()).collect();
             let opt_arg_sql_names: Vec<&str> = opt_args.iter().map(|a| a.name.as_str()).collect();
 
-            let query_string = if self.returns_set {
+            // Check if return type needs special handling
+            let return_pg_type = types.get(&self.return_type_oid);
+            let needs_expansion = if let Some(PgType::Composite { fields, .. }) = return_pg_type {
+                fields.iter().any(|f| f.flatten)
+            } else {
+                false
+            };
+            
+            let query_string = if self.returns_set || needs_expansion {
                 format!("select * from {}.{}", self.schema, self.name)
             } else {
                 format!("select {}.{}", self.schema, self.name)
@@ -219,12 +227,54 @@ impl ToRust for PgFn {
                     Ok(())
                 }
             } else {
-                quote! {
-                    client
-                        .query_one(&query, &params)
-                        .await
-                        .and_then(|r| r.try_get(0))
-                        .map_err(Into::into)
+                // Check if return type is a composite type with custom TryFrom
+                let return_pg_type = types.get(&self.return_type_oid).unwrap();
+                match return_pg_type {
+                    PgType::Composite { fields, .. } => {
+                        // Check if any fields have flatten annotation
+                        let has_flatten = fields.iter().any(|f| f.flatten);
+                        if has_flatten {
+                            // For composite types with flatten, we use SELECT * FROM function()
+                            // which expands the composite type into columns that our TryFrom can handle
+                            let return_not_null = self.comment.as_ref().is_some_and(|c| c.contains("@pgrpc_not_null"));
+                            if return_not_null {
+                                quote! {
+                                    client
+                                        .query_one(&query, &params)
+                                        .await
+                                        .and_then(|r| r.try_into())
+                                        .map_err(Into::into)
+                                }
+                            } else {
+                                quote! {
+                                    client
+                                        .query_one(&query, &params)
+                                        .await
+                                        .and_then(|r| Ok(Some(r.try_into()?)))
+                                        .map_err(Into::into)
+                                }
+                            }
+                        } else {
+                            // Regular composite types can use try_get
+                            quote! {
+                                client
+                                    .query_one(&query, &params)
+                                    .await
+                                    .and_then(|r| r.try_get(0))
+                                    .map_err(Into::into)
+                            }
+                        }
+                    }
+                    _ => {
+                        // Non-composite types use try_get
+                        quote! {
+                            client
+                                .query_one(&query, &params)
+                                .await
+                                .and_then(|r| r.try_get(0))
+                                .map_err(Into::into)
+                        }
+                    }
                 }
             };
 
@@ -540,6 +590,7 @@ fn quote_ind(src: &str) -> Option<(&str, usize)> {
         None
     }
 }
+
 
 #[cfg(test)]
 mod test {

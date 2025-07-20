@@ -15,6 +15,7 @@ mod codegen;
 mod config;
 mod db;
 mod exceptions;
+mod flatten;
 mod fn_index;
 mod ident;
 mod parse_domain;

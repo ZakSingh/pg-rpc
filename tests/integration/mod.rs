@@ -9,6 +9,10 @@ pub mod codegen_tests;
 pub mod error_tests;
 pub mod workflow_tests;
 pub mod trigger_tests;
+pub mod flatten_tests;
+pub mod function_flatten_tests;
+pub mod compile_helpers;
+pub mod composite_fromsql_tests;
 
 /// Global container instance that's shared across all tests
 static INIT: Once = Once::new();
