@@ -6,7 +6,7 @@ use quote::__private::TokenStream;
 use serde::Deserialize;
 use smallvec::SmallVec;
 use std::error::Error;
-use tokio_postgres::error::SqlState;
+use postgres::error::SqlState;
 use ustr::Ustr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]

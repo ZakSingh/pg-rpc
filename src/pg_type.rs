@@ -9,7 +9,7 @@ use quote::{format_ident, quote};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use postgres_types::FromSql;
-use tokio_postgres::Row;
+use postgres::Row;
 
 #[derive(Debug, FromSql)]
 struct DomainConstraint {
@@ -124,7 +124,7 @@ impl PgType {
 }
 
 impl TryFrom<Row> for PgType {
-    type Error = tokio_postgres::Error;
+    type Error = postgres::Error;
 
     fn try_from(t: Row) -> Result<Self, Self::Error> {
         let name: String = t.get("typname");

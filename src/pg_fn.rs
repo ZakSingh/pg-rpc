@@ -20,7 +20,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::cmp::PartialEq;
 use std::collections::HashMap;
-use tokio_postgres::Row;
+use postgres::Row;
 use ustr::{Ustr};
 
 const VOID_TYPE_OID: u32 = 2278;

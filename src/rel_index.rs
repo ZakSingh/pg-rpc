@@ -35,7 +35,7 @@ impl RelIndex {
             .context("Relation introspection query failed")?
             .into_iter()
             .map(|row| {
-                Ok::<_, tokio_postgres::Error>((
+                Ok::<_, postgres::Error>((
                     row.try_get::<_, u32>("oid")?,
                     PgRel::try_from(row)?,
                 ))

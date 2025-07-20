@@ -1,7 +1,7 @@
 use crate::codegen::OID;
 use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
-use tokio_postgres::Row;
+use postgres::Row;
 use ustr::Ustr;
 
 #[derive(Debug, Clone)]
@@ -23,7 +23,7 @@ pub struct PgRel {
 }
 
 impl TryFrom<Row> for PgRel {
-    type Error = tokio_postgres::Error;
+    type Error = postgres::Error;
 
     fn try_from(row: Row) -> Result<Self, Self::Error> {
         let constraints = row.try_get::<_, Vec<Constraint>>("constraints")?;
