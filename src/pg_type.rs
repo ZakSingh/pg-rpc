@@ -764,7 +764,7 @@ fn generate_field_extraction_code(
                 // When referencing types in the same module, use simple name
                 let composite_type_name = match root_type {
                     PgType::Composite { name, .. } => {
-                        sql_to_rs_ident(name, CaseType::Pascal)
+                        sql_to_rs_ident(&name, CaseType::Pascal)
                     }
                     _ => root_type.to_rust_ident(types)
                 };
@@ -1081,6 +1081,7 @@ mod tests {
             schemas: vec![],
             types: HashMap::new(),
             exceptions: HashMap::new(),
+            task_queue: None,
         };
         
         // Generate Rust code

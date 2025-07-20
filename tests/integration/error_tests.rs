@@ -265,3 +265,54 @@ fn test_database_error_fallback() {
         assert!(errors_content.contains("_ => PgRpcError::Database(e)"));
     });
 }
+
+#[test]
+fn test_custom_exception_ergonomics() {
+    with_isolated_database_and_container(|_client, _container, conn_string| {
+        let _temp_dir = create_test_project(conn_string);
+        let project_dir = _temp_dir.path();
+        
+        // Generate with custom exceptions using the builder API
+        PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .output_path(&project_dir.join("src/generated"))
+            .schema("public")
+            .schema("api")
+            .exception("P0001", "Custom application error")
+            .exception("P0002", "Invalid user input")
+            .exception("P0003", "Business rule violation")
+            .build()
+            .expect("Code generation should succeed");
+        
+        let errors_content = std::fs::read_to_string(project_dir.join("src/generated/errors.rs"))
+            .expect("Should read errors.rs");
+        
+        // Check that custom exception variants are generated with ergonomic names
+        assert!(errors_content.contains("CustomApplicationError(String)"));
+        assert!(errors_content.contains("InvalidUserInput(String)"));
+        assert!(errors_content.contains("BusinessRuleViolation(String)"));
+        
+        // Check that helper methods are generated for custom exceptions
+        assert!(errors_content.contains("is_custom_application_error"));
+        assert!(errors_content.contains("get_custom_application_error_message"));
+        assert!(errors_content.contains("is_invalid_user_input"));
+        assert!(errors_content.contains("get_invalid_user_input_message"));
+        assert!(errors_content.contains("is_business_rule_violation"));
+        assert!(errors_content.contains("get_business_rule_violation_message"));
+        
+        // Check that the From implementation maps SQL codes to custom variants
+        assert!(errors_content.contains("tokio_postgres::error::SqlState::from_code(\"P0001\")"));
+        assert!(errors_content.contains("tokio_postgres::error::SqlState::from_code(\"P0002\")"));
+        assert!(errors_content.contains("tokio_postgres::error::SqlState::from_code(\"P0003\")"));
+        
+        // Check that the generated code maps to the correct variants
+        assert!(errors_content.contains("PgRpcError::CustomApplicationError(message)"));
+        assert!(errors_content.contains("PgRpcError::InvalidUserInput(message)"));
+        assert!(errors_content.contains("PgRpcError::BusinessRuleViolation(message)"));
+        
+        // Check that error messages include custom descriptions in the #[error] attributes
+        assert!(errors_content.contains("#[error(\"Custom application error\" \": {0}\")]"));
+        assert!(errors_content.contains("#[error(\"Invalid user input\" \": {0}\")]"));
+        assert!(errors_content.contains("#[error(\"Business rule violation\" \": {0}\")]"));
+    });
+}

@@ -1,18 +1,20 @@
 use crate::config::Config;
 use crate::exceptions::PgException;
+use crate::ident::{sql_to_rs_ident, CaseType::Pascal};
 use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
 use crate::rel_index::RelIndex;
-use quote::quote;
+use quote::{quote, format_ident};
 use proc_macro2::TokenStream;
 use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 use heck::ToPascalCase;
 
 /// Collects all constraints from all tables and groups them by table
 pub fn collect_table_constraints(rel_index: &RelIndex) -> HashMap<PgId, Vec<Constraint>> {
     let mut table_constraints: HashMap<PgId, Vec<Constraint>> = HashMap::new();
     
-    for rel in rel_index.values() {
+    for rel in rel_index.deref().values() {
         if !rel.constraints.is_empty() {
             table_constraints.insert(rel.id.clone(), rel.constraints.clone());
         }
@@ -109,16 +111,32 @@ pub fn generate_unified_error(
         });
     }
     
-    // Add custom SQL state exceptions
-    let mut custom_variants = HashSet::new();
+    // Add custom SQL state exceptions from config
+    let mut config_variants = HashSet::new();
+    for (_sql_code, description) in &config.exceptions {
+        let variant_name = sql_to_rs_ident(description, Pascal);
+        if config_variants.insert(variant_name.to_string()) {
+            error_variants.push(quote! {
+                #[error(#description ": {0}")]
+                #variant_name(String)
+            });
+        }
+    }
+    
+    // Add any custom SQL state exceptions not already covered by config
+    let mut additional_custom_variants = HashSet::new();
     for exception in custom_exceptions {
-        if let PgException::Explicit(_sql_state) = exception {
-            let variant_name = exception.rs_name(config);
-            if custom_variants.insert(variant_name.to_string()) {
-                error_variants.push(quote! {
-                    #[error("custom error")]
-                    #variant_name(#[source] tokio_postgres::error::DbError)
-                });
+        if let PgException::Explicit(sql_state) = exception {
+            let sql_code = sql_state.code();
+            // Skip if already handled by config
+            if !config.exceptions.contains_key(sql_code) {
+                let variant_name = exception.rs_name(config);
+                if additional_custom_variants.insert(variant_name.to_string()) {
+                    error_variants.push(quote! {
+                        #[error("SQL state {}: {{0}}", #sql_code)]
+                        #variant_name(String)
+                    });
+                }
             }
         }
     }
@@ -165,10 +183,15 @@ pub fn generate_unified_error(
         }
     };
     
+    // Generate helper methods for the error type
+    let helper_methods = generate_helper_methods(table_constraints, config);
+
     quote! {
         #error_enum_def
         
         #from_impl
+        
+        #helper_methods
     }
 }
 
@@ -251,15 +274,31 @@ fn generate_from_impl_arms(
         }
     }
     
-    // Process custom exceptions
+    // Process custom exceptions from config first
+    for (sql_code, description) in &config.exceptions {
+        let variant_name = sql_to_rs_ident(description, Pascal);
+        custom_arms.push(quote! {
+            code if code == &tokio_postgres::error::SqlState::from_code(#sql_code) => {
+                let message = db_error.message().to_string();
+                PgRpcError::#variant_name(message)
+            }
+        });
+    }
+    
+    // Process any additional custom exceptions not covered by config
     for exception in custom_exceptions {
         if let PgException::Explicit(sql_state) = exception {
             let code = sql_state.code();
-            let variant_name = exception.rs_name(config);
-            custom_arms.push(quote! {
-                code if code == &tokio_postgres::error::SqlState::from_code(#code) => 
-                    PgRpcError::#variant_name(db_error.to_owned())
-            });
+            // Skip if already handled by config
+            if !config.exceptions.contains_key(code) {
+                let variant_name = exception.rs_name(config);
+                custom_arms.push(quote! {
+                    code if code == &tokio_postgres::error::SqlState::from_code(#code) => {
+                        let message = db_error.message().to_string();
+                        PgRpcError::#variant_name(message)
+                    }
+                });
+            }
         }
     }
     
@@ -318,6 +357,71 @@ fn generate_from_impl_arms(
     let combined_arms = all_arms.into_iter().collect::<TokenStream>();
     
     combined_arms
+}
+
+/// Generates helper methods for the PgRpcError enum
+fn generate_helper_methods(
+    table_constraints: &HashMap<PgId, Vec<Constraint>>,
+    config: &Config,
+) -> TokenStream {
+    let mut methods = Vec::new();
+    
+    // Generate helper methods for custom exceptions from config
+    for (_sql_code, description) in &config.exceptions {
+        let method_name = format_ident!("is_{}", sql_to_rs_ident(description, crate::ident::CaseType::Snake).to_string());
+        let variant_name = sql_to_rs_ident(description, Pascal);
+        
+        methods.push(quote! {
+            #[doc = concat!("Returns true if this error is a ", #description, " error")]
+            pub fn #method_name(&self) -> bool {
+                matches!(self, PgRpcError::#variant_name(_))
+            }
+        });
+        
+        let get_method_name = format_ident!("get_{}_message", sql_to_rs_ident(description, crate::ident::CaseType::Snake).to_string());
+        methods.push(quote! {
+            #[doc = concat!("Returns the error message if this is a ", #description, " error")]
+            pub fn #get_method_name(&self) -> Option<&str> {
+                match self {
+                    PgRpcError::#variant_name(msg) => Some(msg),
+                    _ => None,
+                }
+            }
+        });
+    }
+    
+    // Generate general helper methods
+    let constraint_arms: Vec<TokenStream> = table_constraints
+        .keys()
+        .map(|table_id| {
+            let table_name_pascal = table_id.name().to_pascal_case();
+            let variant_name = format_ident!("{}Constraint", table_name_pascal);
+            quote! { PgRpcError::#variant_name(_, _) }
+        })
+        .collect();
+
+    methods.push(quote! {
+        /// Returns true if this error is related to a database constraint violation
+        pub fn is_constraint_violation(&self) -> bool {
+            match self {
+                #(#constraint_arms)|* => true,
+                _ => false,
+            }
+        }
+    });
+    
+    methods.push(quote! {
+        /// Returns true if this error is a generic database error
+        pub fn is_database_error(&self) -> bool {
+            matches!(self, PgRpcError::Database(_))
+        }
+    });
+    
+    quote! {
+        impl PgRpcError {
+            #(#methods)*
+        }
+    }
 }
 
 #[cfg(test)]
@@ -379,7 +483,9 @@ mod tests {
         
         let custom_exceptions = HashSet::new();
         
-        let config = Config::default();
+        let mut config = Config::default();
+        config.exceptions.insert("P0001".to_string(), "Custom application error".to_string());
+        config.exceptions.insert("P0002".to_string(), "Invalid user input".to_string());
         
         // Generate unified error
         let error_code = generate_unified_error(&table_constraints, &custom_exceptions, &config);
@@ -390,6 +496,17 @@ mod tests {
         assert!(code_str.contains("UsersConstraint"));
         assert!(code_str.contains("Database"));
         assert!(code_str.contains("impl From < tokio_postgres :: Error > for PgRpcError"));
+        
+        // Check that custom exception variants are generated
+        assert!(code_str.contains("CustomApplicationError"));
+        assert!(code_str.contains("InvalidUserInput"));
+        
+        // Check that helper methods are generated
+        assert!(code_str.contains("impl PgRpcError"));
+        assert!(code_str.contains("is_custom_application_error"));
+        assert!(code_str.contains("get_custom_application_error_message"));
+        assert!(code_str.contains("is_constraint_violation"));
+        assert!(code_str.contains("is_database_error"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
-use crate::codegen::{FunctionName, SchemaName, ToRust, OID};
+use crate::codegen::ToRust;
+use crate::codegen::{FunctionName, SchemaName, OID};
 use crate::config;
 use crate::exceptions::{get_exceptions_with_triggers, PgException};
 use crate::fn_index::FunctionId;
@@ -19,6 +20,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::cmp::PartialEq;
 use std::collections::HashMap;
+use std::ops::Deref;
 use postgres::Row;
 use ustr::{Ustr};
 
@@ -464,6 +466,7 @@ fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
             // If column names aren't explicitly stated, e.g. `insert into account (1, 'Zak')`,
             // all columns must be inserted.
             rel_index
+                .deref()
                 .get(&rel_oid)
                 .expect("Referenced relation to be in relation index")
                 .columns

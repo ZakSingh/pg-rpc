@@ -12,6 +12,7 @@ use quote::ToTokens;
 use proc_macro2::TokenStream;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::ops::Deref;
 use itertools::Itertools;
 use regex::Regex;
 
@@ -69,7 +70,7 @@ pub fn get_exceptions_with_triggers(
         .iter()
         .flat_map(|dep| {
             let rel_oid = dep.rel_oid;
-            let constraints = rel_index.get(&rel_oid).unwrap().constraints.iter();
+            let constraints = rel_index.deref().get(&rel_oid).unwrap().constraints.iter();
             match &dep.cmd {
                 Cmd::Update { cols } => constraints.filter(|c| c.contains_columns(cols)).collect(),
                 Cmd::Insert { cols, on_conflict } => {

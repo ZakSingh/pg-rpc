@@ -1,17 +1,18 @@
 #![feature(iterator_try_collect)]
 
 use crate::codegen::codegen_split;
-use crate::config::Config;
+use crate::config::{Config, TaskQueueConfig};
 use crate::db::Db;
 use crate::fn_index::FunctionIndex;
 use crate::rel_index::RelIndex;
 use crate::ty_index::TypeIndex;
+use crate::task_index::{TaskIndex, generate_task_enum};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-mod codegen;
+mod types;
 mod config;
 mod db;
 mod exceptions;
@@ -30,6 +31,8 @@ mod tests;
 mod trigger_index;
 mod ty_index;
 mod unified_error;
+pub(crate) mod task_index;
+mod codegen;
 
 /// Builder for configuring and running pgrpc code generation
 pub struct PgrpcBuilder {
@@ -38,6 +41,7 @@ pub struct PgrpcBuilder {
     types: HashMap<String, String>,
     exceptions: HashMap<String, String>,
     output_path: Option<PathBuf>,
+    task_queue: Option<TaskQueueConfig>,
 }
 
 impl Default for PgrpcBuilder {
@@ -55,6 +59,7 @@ impl PgrpcBuilder {
             types: HashMap::new(),
             exceptions: HashMap::new(),
             output_path: None,
+            task_queue: None,
         }
     }
 
@@ -105,6 +110,7 @@ impl PgrpcBuilder {
             types: config.types,
             exceptions: config.exceptions,
             output_path: config.output_path.map(PathBuf::from),
+            task_queue: config.task_queue,
         })
     }
 
@@ -135,6 +141,7 @@ impl PgrpcBuilder {
             schemas: self.schemas.clone(),
             types: self.types.clone(),
             exceptions: self.exceptions.clone(),
+            task_queue: self.task_queue.clone(),
         };
 
         let mut db = Db::new(&connection_string)?;
@@ -155,20 +162,70 @@ impl PgrpcBuilder {
             fs::write(&file_path, code)?;
         }
         
+        // Generate task enum if task queue is configured
+        let mut final_schema_files = schema_files.clone();
+        if let Some(task_config) = &config.task_queue {
+            match generate_task_code(&mut db.client, task_config, &ty_index, &config) {
+                Ok(Some(task_code)) => {
+                    let task_file_path = output_path.join("tasks.rs");
+                    fs::write(&task_file_path, &task_code)?;
+                    final_schema_files.insert("tasks".to_string(), task_code);
+                }
+                Ok(None) => {
+                    // No task types found, skip task generation
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to generate task queue types: {}", e);
+                }
+            }
+        }
+        
         // Generate and write mod.rs
-        let mod_content = generate_mod_file(&schema_files);
+        let mod_content = generate_mod_file(&final_schema_files);
         fs::write(output_path.join("mod.rs"), mod_content)?;
         
         let duration = start.elapsed().as_secs_f64();
         println!(
             "✅  PgRPC functions written to {} ({} files) in {:.2}s",
             output_path.display(),
-            schema_files.len() + 1, // +1 for mod.rs
+            final_schema_files.len() + 1, // +1 for mod.rs
             duration
         );
 
         Ok(())
     }
+}
+
+/// Generate task queue code if task types are found
+fn generate_task_code(
+    db_client: &mut postgres::Client,
+    task_config: &TaskQueueConfig,
+    ty_index: &TypeIndex,
+    config: &Config,
+) -> anyhow::Result<Option<String>> {
+    let task_index = TaskIndex::new(db_client, task_config)?;
+    
+    if task_index.is_empty() {
+        return Ok(None);
+    }
+    
+    let task_enum_code = generate_task_enum(&task_index, ty_index, config);
+    let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
+    
+    let task_code = prettyplease::unparse(
+        &syn::parse2::<syn::File>(quote::quote! {
+            use serde_json;
+            use chrono;
+            use uuid;
+            use rust_decimal;
+            use std::net::IpAddr;
+            
+            #task_enum_code
+        })
+        .expect("task enum code to parse"),
+    );
+    
+    Ok(Some(warning_ignores.to_string() + &task_code))
 }
 
 fn generate_mod_file(schema_files: &HashMap<String, String>) -> String {

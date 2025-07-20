@@ -54,7 +54,7 @@ impl FunctionIndex {
     }
 
     pub fn get_type_oids(&self) -> Vec<OID> {
-        self.values().map(|f| f.ty_oids()).flatten().collect()
+        self.deref().values().map(|f| f.ty_oids()).flatten().collect()
     }
 }
 

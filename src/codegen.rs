@@ -6,11 +6,6 @@ use crate::ty_index::TypeIndex;
 use crate::rel_index::RelIndex;
 use crate::unified_error;
 use crate::exceptions::PgException;
-use itertools::Itertools;
-use proc_macro2::TokenStream;
-use quote::quote;
-use std::collections::{HashMap, HashSet};
-
 /// Postgres object ID
 /// Uniquely identifies database objects
 pub type OID = u32;
@@ -20,6 +15,11 @@ pub type SchemaName = String;
 
 /// Postgres function identifier
 pub type FunctionName = String;
+use itertools::Itertools;
+use proc_macro2::TokenStream;
+use quote::quote;
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 
 pub trait ToRust {
     fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream;
@@ -74,6 +74,7 @@ pub fn codegen_split(
         })
         .collect();
     
+
     // Add the error types as a separate module
     schema_code.insert(
         "errors".to_string(),
@@ -86,6 +87,7 @@ pub fn codegen_split(
 
 fn codegen_types(type_index: &TypeIndex, config: &Config) -> HashMap<SchemaName, TokenStream> {
     type_index
+        .deref()
         .values()
         .map(|t| (t.schema(), t.to_rust(type_index, config)))
         .filter(|(_, tokens)| !tokens.is_empty())
@@ -113,7 +115,7 @@ fn generate_unified_errors(
     
     // Collect all custom exceptions from functions
     let mut all_exceptions = HashSet::new();
-    for pg_fn in fn_index.values() {
+    for pg_fn in fn_index.deref().values() {
         all_exceptions.extend(pg_fn.exceptions.iter().cloned());
     }
     
@@ -139,7 +141,7 @@ fn codegen_fns(
     config: &Config,
     _all_exceptions: &HashSet<PgException>,
 ) -> HashMap<SchemaName, TokenStream> {
-    let schemas: HashMap<&str, Vec<&PgFn>> = fns.values().into_group_map_by(|f| f.schema.as_str());
+    let schemas: HashMap<&str, Vec<&PgFn>> = fns.deref().values().into_group_map_by(|f| f.schema.as_str());
 
     schemas
         .into_iter()
@@ -150,3 +152,4 @@ fn codegen_fns(
         })
         .collect()
 }
+
