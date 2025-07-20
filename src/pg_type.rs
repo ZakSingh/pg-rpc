@@ -196,6 +196,7 @@ impl TryFrom<Row> for PgType {
             },
             'p' => match name.as_ref() {
                 "void" => PgType::Void,
+                "trigger" => PgType::Void, // Trigger functions return pseudo-type, treat as void
                 p => unimplemented!("pseudo type not implemented: {}", p),
             },
             x => unimplemented!("ttype not implemented {}", x),

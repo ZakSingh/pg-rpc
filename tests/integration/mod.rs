@@ -2,11 +2,13 @@ use std::sync::{Mutex, Once};
 use testcontainers_modules::{postgres as postgres_module, testcontainers::runners::SyncRunner};
 use postgres::{Client, NoTls};
 use indoc::indoc;
+use uuid::Uuid;
 
 pub mod schema_tests;
 pub mod codegen_tests;
 pub mod error_tests;
 pub mod workflow_tests;
+pub mod trigger_tests;
 
 /// Global container instance that's shared across all tests
 static INIT: Once = Once::new();
@@ -55,9 +57,36 @@ impl PostgresTestContainer {
         self.port
     }
 
-    /// Create a new database connection
+    /// Create a new database connection to the default postgres database
     pub fn connect(&self) -> Result<Client, postgres::Error> {
         Client::connect(&self.connection_string, NoTls)
+    }
+    
+    /// Get connection string for the admin postgres database
+    pub fn admin_connection_string(&self) -> &str {
+        &self.connection_string
+    }
+    
+    /// Create a new isolated database and return its name
+    pub fn create_test_database(&self) -> Result<String, postgres::Error> {
+        let db_name = format!("test_{}", Uuid::new_v4().to_string().replace('-', "_"));
+        let mut admin_client = self.connect()?;
+        admin_client.execute(&format!("CREATE DATABASE \"{}\"", db_name), &[])?;
+        Ok(db_name)
+    }
+    
+    /// Get connection string for a specific database
+    pub fn database_connection_string(&self, db_name: &str) -> String {
+        format!(
+            "postgres://postgres:postgres@{}:{}/{}",
+            self.host, self.port, db_name
+        )
+    }
+    
+    /// Connect to a specific database
+    pub fn connect_to_database(&self, db_name: &str) -> Result<Client, postgres::Error> {
+        let conn_string = self.database_connection_string(db_name);
+        Client::connect(&conn_string, NoTls)
     }
 }
 
@@ -88,16 +117,21 @@ pub fn execute_sql(client: &mut Client, sql: &str) -> Result<(), postgres::Error
 
 /// Load and execute all schema files in order
 pub fn setup_test_schema(client: &mut Client) -> Result<(), postgres::Error> {
-    // Execute init script (skip if there's an error - extension might already exist)
+    // Execute init script - create extension if not exists
     let init_sql = std::fs::read_to_string("schema/00_init.sql")
         .expect("Failed to read init SQL file");
-    // Ignore error if extension already exists
-    let _ = execute_sql(client, &init_sql);
+    execute_sql(client, &init_sql)?;
 
-    // Execute table scripts - only account.sql has actual table definitions
+    // Create the role enum type manually to avoid conflicts
+    let _ = execute_sql(client, "CREATE TYPE role AS ENUM ('admin', 'user')");
+    
+    // Execute table scripts - account.sql has table definitions
     let account_sql = std::fs::read_to_string("schema/01_tables/01_account.sql")
         .expect("Failed to read account SQL file");
-    execute_sql(client, &account_sql)?;
+    // Skip the first line (CREATE TYPE) as we already handled it
+    let lines: Vec<&str> = account_sql.lines().collect();
+    let table_sql = lines[1..].join("\n");
+    execute_sql(client, &table_sql)?;
 
     // Create a proper post table for testing
     let post_table_sql = indoc! {"
@@ -130,20 +164,39 @@ pub fn setup_test_schema(client: &mut Client) -> Result<(), postgres::Error> {
 
 /// Clean up the database between tests
 pub fn cleanup_database(client: &mut Client) -> Result<(), postgres::Error> {
-    // Drop all tables and functions in the schemas instead of dropping the schemas
-    let cleanup_sql = indoc! {"
-        DROP SCHEMA IF EXISTS test_schema CASCADE;
-        DROP SCHEMA IF EXISTS api CASCADE;
-        DROP TABLE IF EXISTS new_table CASCADE;
-        DROP TABLE IF EXISTS test_table CASCADE;
-        DROP TABLE IF EXISTS post CASCADE;
-        DROP TABLE IF EXISTS login_details CASCADE;
-        DROP TABLE IF EXISTS account CASCADE;
-        DROP TYPE IF EXISTS role CASCADE;
-        DROP EXTENSION IF EXISTS citext CASCADE;
-    "};
+    // Drop all objects more thoroughly to avoid conflicts
+    // Execute each drop separately to continue on errors
+    let drop_commands = vec![
+        // Drop views first
+        "DROP VIEW IF EXISTS account_view CASCADE",
+        "DROP VIEW IF EXISTS post_with_author CASCADE",
+        
+        // Drop trigger test tables
+        "DROP TABLE IF EXISTS test_trigger_table CASCADE",
+        "DROP TABLE IF EXISTS multi_trigger_table CASCADE", 
+        "DROP TABLE IF EXISTS event_specific_table CASCADE",
+        "DROP TABLE IF EXISTS error_code_table CASCADE",
+        
+        // Drop regular test tables
+        "DROP TABLE IF EXISTS new_table CASCADE",
+        "DROP TABLE IF EXISTS test_table CASCADE", 
+        "DROP TABLE IF EXISTS post CASCADE",
+        "DROP TABLE IF EXISTS login_details CASCADE",
+        "DROP TABLE IF EXISTS account CASCADE",
+        
+        // Drop schemas (this will cascade to functions)
+        "DROP SCHEMA IF EXISTS trigger_api CASCADE",
+        "DROP SCHEMA IF EXISTS api CASCADE",
+        "DROP SCHEMA IF EXISTS test_schema CASCADE",
+        
+        // Drop custom types
+        "DROP TYPE IF EXISTS role CASCADE",
+    ];
     
-    execute_sql(client, cleanup_sql)?;
+    for cmd in drop_commands {
+        // Ignore errors on individual drops - some objects might not exist
+        let _ = execute_sql(client, cmd);
+    }
     
     // Recreate the test schema
     setup_test_schema(client)?;
@@ -151,24 +204,63 @@ pub fn cleanup_database(client: &mut Client) -> Result<(), postgres::Error> {
     Ok(())
 }
 
-/// Create a test database connection and ensure clean state
-pub fn with_clean_database<F, R>(test_fn: F) -> R 
+/// Create a test database connection with isolated database
+pub fn with_isolated_database<F, R>(test_fn: F) -> R 
 where 
     F: FnOnce(&mut Client) -> R,
 {
     let container = get_test_container();
-    let mut client = container.connect().expect("Failed to connect to test database");
     
-    // Clean database before test
-    cleanup_database(&mut client).expect("Failed to clean database");
+    // Create a new isolated database for this test
+    let db_name = container.create_test_database()
+        .expect("Failed to create test database");
+    
+    // Connect to the isolated database
+    let mut client = container.connect_to_database(&db_name)
+        .expect("Failed to connect to test database");
+    
+    // Set up the schema in the fresh database
+    setup_test_schema(&mut client).expect("Failed to setup test schema");
     
     // Run the test
     let result = test_fn(&mut client);
     
-    // Note: We could clean up after test too, but it's not strictly necessary
-    // since we clean before each test
+    // Note: Database will be cleaned up when container shuts down
+    // No explicit cleanup needed since each test gets its own database
     
     result
+}
+
+/// Create a test database connection with isolated database and provide container access
+pub fn with_isolated_database_and_container<F, R>(test_fn: F) -> R 
+where 
+    F: FnOnce(&mut Client, &PostgresTestContainer, &str) -> R,
+{
+    let container = get_test_container();
+    
+    // Create a new isolated database for this test
+    let db_name = container.create_test_database()
+        .expect("Failed to create test database");
+    
+    // Connect to the isolated database
+    let mut client = container.connect_to_database(&db_name)
+        .expect("Failed to connect to test database");
+    
+    // Set up the schema in the fresh database
+    setup_test_schema(&mut client).expect("Failed to setup test schema");
+    
+    // Run the test with access to client, container, and connection string
+    let result = test_fn(&mut client, container, &container.database_connection_string(&db_name));
+    
+    result
+}
+
+/// Legacy function for backwards compatibility during transition
+pub fn with_clean_database<F, R>(test_fn: F) -> R 
+where 
+    F: FnOnce(&mut Client) -> R,
+{
+    with_isolated_database(test_fn)
 }
 
 #[cfg(test)]
@@ -188,7 +280,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Ignore by default since it requires Docker
     fn test_container_setup() {
         let container = get_test_container();
         let mut client = container.connect().expect("Should connect to database");
@@ -203,9 +294,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Ignore by default since it requires Docker
     fn test_schema_setup() {
-        with_clean_database(|client| {
+        with_isolated_database(|client| {
             // Test that our schema setup worked
             let rows = client.query(
                 "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", 
@@ -224,9 +314,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Ignore by default since it requires Docker
     fn test_api_schema_setup() {
-        with_clean_database(|client| {
+        with_isolated_database(|client| {
             // Test that API functions exist
             let rows = client.query(
                 "SELECT routine_name FROM information_schema.routines WHERE routine_schema = 'api'",

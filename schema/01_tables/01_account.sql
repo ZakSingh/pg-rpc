@@ -1,4 +1,4 @@
-create type role as enum ('admin', 'user');
+CREATE TYPE role AS ENUM ('admin', 'user');
 create table account
 (
     account_id serial primary key,

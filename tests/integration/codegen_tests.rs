@@ -37,11 +37,8 @@ fn test_code_generation(conn_string: &str, schemas: &[&str]) -> HashMap<String, 
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_basic_code_generation() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         let generated = test_code_generation(conn_string, &["public", "api"]);
         
@@ -59,11 +56,8 @@ fn test_basic_code_generation() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_enum_generation() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         // Need api schema to trigger type generation through function usage
         let generated = test_code_generation(conn_string, &["public", "api"]);
@@ -82,11 +76,8 @@ fn test_enum_generation() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_struct_generation() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         // Try generating with both schemas since api.get_account_by_email returns account type
         let generated = test_code_generation(conn_string, &["public", "api"]);
@@ -129,11 +120,8 @@ fn test_struct_generation() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_function_generation() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         let generated = test_code_generation(conn_string, &["api"]);
         
@@ -155,11 +143,8 @@ fn test_function_generation() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_error_generation() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         let generated = test_code_generation(conn_string, &["public"]);
         
@@ -186,11 +171,8 @@ fn test_error_generation() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_constraint_enum_details() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         let generated = test_code_generation(conn_string, &["public"]);
         
@@ -214,11 +196,8 @@ fn test_constraint_enum_details() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_cross_schema_references() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         let generated = test_code_generation(conn_string, &["public", "api"]);
         
@@ -232,11 +211,8 @@ fn test_cross_schema_references() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_view_generation() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         // Need api schema to trigger type generation
         let generated = test_code_generation(conn_string, &["public", "api"]);

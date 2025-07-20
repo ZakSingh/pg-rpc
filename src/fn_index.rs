@@ -1,6 +1,7 @@
 use crate::codegen::OID;
 use crate::pg_fn::PgFn;
 use crate::rel_index::RelIndex;
+use crate::trigger_index::TriggerIndex;
 use anyhow::Context;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
@@ -29,7 +30,12 @@ impl DerefMut for FunctionIndex {
 }
 
 impl FunctionIndex {
-    pub fn new(db: &mut Client, rel_index: &RelIndex, schemas: &Vec<String>) -> anyhow::Result<Self> {
+    pub fn new(
+        db: &mut Client, 
+        rel_index: &RelIndex, 
+        trigger_index: &TriggerIndex,
+        schemas: &Vec<String>
+    ) -> anyhow::Result<Self> {
         let fn_rows = db
             .query(FUNCTION_INTROSPECTION_QUERY, &[schemas])
             .context("Function introspection query failed")?;
@@ -39,7 +45,7 @@ impl FunctionIndex {
             .map(|row| {
                 (
                     row.get::<_, u32>("oid"),
-                    PgFn::from_row(row, rel_index).unwrap(),
+                    PgFn::from_row(row, rel_index, Some(trigger_index)).unwrap(),
                 )
             })
             .collect();

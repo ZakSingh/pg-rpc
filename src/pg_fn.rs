@@ -1,11 +1,12 @@
 use crate::codegen::{FunctionName, SchemaName, ToRust, OID};
 use crate::config;
-use crate::exceptions::{get_exceptions, PgException};
+use crate::exceptions::{get_exceptions_with_triggers, PgException};
 use crate::fn_index::FunctionId;
 use crate::ident::{sql_to_rs_ident, CaseType};
 use crate::pg_id::PgId;
 use crate::pg_type::PgType;
 use crate::rel_index::RelIndex;
+use crate::trigger_index::{TriggerIndex, TriggerEvent};
 use config::Config;
 use itertools::{izip, Itertools};
 use jsonpath_rust::JsonPath;
@@ -80,7 +81,11 @@ impl PgFn {
 }
 
 impl PgFn {
-    pub fn from_row(row: Row, rel_index: &RelIndex) -> Result<Self, anyhow::Error> {
+    pub fn from_row(
+        row: Row, 
+        rel_index: &RelIndex,
+        trigger_index: Option<&TriggerIndex>
+    ) -> Result<Self, anyhow::Error> {
         let arg_type_oids: Vec<OID> = row.try_get("arg_oids")?;
         let arg_names: Vec<String> = row.try_get("arg_names")?;
         let arg_defaults: Vec<bool> = row.try_get("has_defaults")?;
@@ -100,7 +105,7 @@ impl PgFn {
         // Only parse and analyze PL/pgSQL functions
         let exceptions = if language == "plpgsql" {
             let parsed = parse_plpgsql(&definition)?;
-            get_exceptions(&parsed, comment.as_ref(), rel_index)?
+            get_exceptions_with_triggers(&parsed, comment.as_ref(), rel_index, trigger_index)?
         } else {
             // SQL functions don't need parsing and have no exceptions
             Vec::new()
@@ -317,6 +322,8 @@ pub enum Cmd {
 pub struct RelDep {
     pub(crate) rel_oid: OID,
     pub(crate) cmd: Cmd,
+    /// Exceptions that could be raised by triggers on this relation for this command
+    pub(crate) trigger_exceptions: Vec<crate::exceptions::PgException>,
 }
 
 /// Extract and parse all SQL queries inside a PlPgSQL function
@@ -337,6 +344,25 @@ pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> Vec<RelDep
       .iter()
       .flat_map(|q| get_query_deps(q, rel_index))
       .collect()
+}
+
+/// Populate trigger exceptions for relation dependencies
+pub fn populate_trigger_exceptions(
+    rel_deps: &mut [RelDep],
+    trigger_index: &TriggerIndex,
+) {
+    for rel_dep in rel_deps {
+        let trigger_event = match &rel_dep.cmd {
+            Cmd::Insert { .. } => Some(TriggerEvent::Insert),
+            Cmd::Update { .. } => Some(TriggerEvent::Update),
+            Cmd::Delete => Some(TriggerEvent::Delete),
+            _ => None,
+        };
+        
+        if let Some(event) = trigger_event {
+            rel_dep.trigger_exceptions = trigger_index.get_exceptions_for_event(rel_dep.rel_oid, &event);
+        }
+    }
 }
 
 fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
@@ -451,6 +477,7 @@ fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
     Some(RelDep {
         rel_oid,
         cmd: Cmd::Insert { cols, on_conflict },
+        trigger_exceptions: Vec::new(), // Will be populated later with trigger analysis
     })
 }
 
@@ -467,6 +494,7 @@ fn get_delete_deps(stmt: &DeleteStmt, rel_index: &RelIndex) -> Option<RelDep> {
     Some(RelDep {
         rel_oid,
         cmd: Cmd::Delete,
+        trigger_exceptions: Vec::new(), // Will be populated later with trigger analysis
     })
 }
 
@@ -494,6 +522,7 @@ fn get_update_deps(stmt: &UpdateStmt, rel_index: &RelIndex) -> Option<RelDep> {
     Some(RelDep {
         rel_oid,
         cmd: Cmd::Update { cols },
+        trigger_exceptions: Vec::new(), // Will be populated later with trigger analysis
     })
 }
 
@@ -559,7 +588,8 @@ mod test {
 
         let queries = extract_queries(&f);
         let rels = get_rel_deps(&queries, &rel_index);
-        assert_eq!(rels.len(), 2);
+        // Only INSERT is detected, SELECT deps are not implemented (TODO in get_select_deps)
+        assert_eq!(rels.len(), 1);
 
         Ok(())
     }

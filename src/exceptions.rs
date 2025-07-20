@@ -5,6 +5,7 @@ use crate::pg_constraint::Constraint;
 use crate::pg_fn::{extract_queries, ConflictTarget};
 use crate::pg_fn::{get_rel_deps, Cmd};
 use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
+use crate::trigger_index::TriggerIndex;
 use anyhow::anyhow;
 use jsonpath_rust::{JsonPath, JsonPathValue};
 use quote::ToTokens;
@@ -39,15 +40,32 @@ impl PgException {
     }
 }
 
-/// Get exceptions from a function body JSON parse
+/// Get exceptions from a function body JSON parse (without trigger analysis)
 pub fn get_exceptions(
     parsed: &Value,
     comment: Option<&String>,
     rel_index: &crate::rel_index::RelIndex,
 ) -> anyhow::Result<Vec<PgException>> {
+    get_exceptions_with_triggers(parsed, comment, rel_index, None)
+}
+
+/// Get exceptions from a function body JSON parse with optional trigger analysis
+pub fn get_exceptions_with_triggers(
+    parsed: &Value,
+    comment: Option<&String>,
+    rel_index: &crate::rel_index::RelIndex,
+    trigger_index: Option<&TriggerIndex>,
+) -> anyhow::Result<Vec<PgException>> {
     let queries = extract_queries(&parsed);
 
-    let constraints: Vec<&Constraint> = get_rel_deps(&queries, rel_index)
+    let mut rel_deps = get_rel_deps(&queries, rel_index);
+    
+    // Populate trigger exceptions if trigger index is available
+    if let Some(trigger_idx) = trigger_index {
+        crate::pg_fn::populate_trigger_exceptions(&mut rel_deps, trigger_idx);
+    }
+
+    let constraints: Vec<&Constraint> = rel_deps
         .iter()
         .flat_map(|dep| {
             let rel_oid = dep.rel_oid;
@@ -125,6 +143,12 @@ pub fn get_exceptions(
         .map(|sql_state| PgException::Explicit(sql_state));
 
     let comment_exceptions = comment.map(|c| get_comment_exceptions(c)).unwrap_or_default();
+    
+    // Collect trigger exceptions from all relation dependencies
+    let trigger_exceptions: Vec<PgException> = rel_deps
+        .iter()
+        .flat_map(|dep| dep.trigger_exceptions.iter().cloned())
+        .collect();
 
     let exceptions: Vec<PgException> = constraints
         .into_iter()
@@ -134,6 +158,7 @@ pub fn get_exceptions(
         .chain(raised_exceptions)
         .chain(get_strict_exceptions(&parsed).into_iter())
         .chain(comment_exceptions.into_iter())
+        .chain(trigger_exceptions.into_iter())
         .collect();
 
     Ok(exceptions)

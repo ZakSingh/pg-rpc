@@ -1,1 +1,1 @@
-create extension if not exists citext;
+CREATE EXTENSION IF NOT EXISTS citext;

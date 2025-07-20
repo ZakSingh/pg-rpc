@@ -5,11 +5,8 @@ use indoc::indoc;
 
 /// Test the complete workflow from schema to working generated code
 #[test]
-#[ignore] // Requires Docker
 fn test_complete_workflow() {
-    with_clean_database(|client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|client, _container, conn_string| {
         
         // Step 1: Add some test data to work with
         client.execute(
@@ -63,11 +60,8 @@ fn test_complete_workflow() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_multiple_schema_workflow() {
-    with_clean_database(|client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|client, _container, conn_string| {
         
         // Create additional schema for testing
         execute_sql(client, indoc! {"
@@ -125,11 +119,8 @@ fn test_multiple_schema_workflow() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_configuration_options() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         // Test with custom type mappings
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -158,11 +149,8 @@ fn test_configuration_options() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_error_handling_workflow() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         // Generate code
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -198,11 +186,8 @@ fn test_error_handling_workflow() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_incremental_schema_changes() {
-    with_clean_database(|client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|client, _container, conn_string| {
         
         // Initial generation
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -263,11 +248,8 @@ fn test_incremental_schema_changes() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_view_and_function_workflow() {
-    with_clean_database(|client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|client, _container, conn_string| {
         
         // Add some test data
         let account_id: i32 = client.query_one(

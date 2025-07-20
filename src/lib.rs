@@ -26,6 +26,7 @@ mod pg_type;
 mod rel_index;
 mod sql_state;
 mod tests;
+mod trigger_index;
 mod ty_index;
 mod unified_error;
 
@@ -137,7 +138,8 @@ impl PgrpcBuilder {
 
         let mut db = Db::new(&connection_string)?;
         let rel_index = RelIndex::new(&mut db.client)?;
-        let fn_index = FunctionIndex::new(&mut db.client, &rel_index, &config.schemas)?;
+        let trigger_index = trigger_index::TriggerIndex::new(&mut db.client, &rel_index, &config.schemas)?;
+        let fn_index = FunctionIndex::new(&mut db.client, &rel_index, &trigger_index, &config.schemas)?;
         let ty_index = TypeIndex::new(&mut db.client, fn_index.get_type_oids().as_slice())?;
         
         let schema_files = codegen_split(&fn_index, &ty_index, &rel_index, &config)?;

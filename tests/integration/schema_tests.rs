@@ -2,15 +2,10 @@ use super::*;
 use pgrpc::*;
 
 #[test]
-#[ignore] // Requires Docker
 fn test_schema_introspection() {
-    with_clean_database(|client| {
-        // Create a PgrpcBuilder and test schema introspection
-        let container = get_test_container();
-        let conn_string = container.connection_string();
-        
+    with_isolated_database_and_container(|client, container, conn_string| {
         // Test that we can connect and introspect the schema
-        let builder = PgrpcBuilder::new()
+        let _builder = PgrpcBuilder::new()
             .connection_string(conn_string)
             .schema("public")
             .schema("api");
@@ -38,9 +33,8 @@ fn test_schema_introspection() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_constraint_discovery() {
-    with_clean_database(|client| {
+    with_isolated_database(|client| {
         // Test that we can discover constraints properly
         let rows = client.query(
             indoc! {"
@@ -82,9 +76,8 @@ fn test_constraint_discovery() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_function_discovery() {
-    with_clean_database(|client| {
+    with_isolated_database(|client| {
         // Test that API functions are discoverable
         let rows = client.query(
             indoc! {"
@@ -112,9 +105,8 @@ fn test_function_discovery() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_enum_type_discovery() {
-    with_clean_database(|client| {
+    with_isolated_database(|client| {
         // Test that custom enum types are discoverable
         let rows = client.query(
             indoc! {"
@@ -143,9 +135,8 @@ fn test_enum_type_discovery() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_composite_type_discovery() {
-    with_clean_database(|client| {
+    with_isolated_database(|client| {
         // Test that composite types (like table types) are discoverable
         let rows = client.query(
             indoc! {"

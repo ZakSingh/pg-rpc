@@ -75,11 +75,8 @@ fn create_test_project(conn_string: &str) -> TempDir {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_error_enum_generation() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         let _temp_dir = setup_generated_code(conn_string);
         let generated_dir = _temp_dir.path();
@@ -109,11 +106,8 @@ fn test_error_enum_generation() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_constraint_violation_mapping() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         let _temp_dir = setup_generated_code(conn_string);
         let generated_dir = _temp_dir.path();
@@ -134,11 +128,8 @@ fn test_constraint_violation_mapping() {
 }
 
 #[test]
-#[ignore] // Requires Docker 
 fn test_generated_code_compiles() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         let _temp_dir = create_test_project(conn_string);
         let project_dir = _temp_dir.path();
@@ -160,11 +151,8 @@ fn test_generated_code_compiles() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_error_enum_has_proper_traits() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         let _temp_dir = setup_generated_code(conn_string);
         let generated_dir = _temp_dir.path();
@@ -185,11 +173,8 @@ fn test_error_enum_has_proper_traits() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_constraint_enum_coverage() {
-    with_clean_database(|client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|client, _container, conn_string| {
         
         // First, let's see what constraints actually exist in the database
         let constraint_rows = client.query(
@@ -243,11 +228,8 @@ fn test_constraint_enum_coverage() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_functions_use_unified_error() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         let _temp_dir = setup_generated_code(conn_string);
         let generated_dir = _temp_dir.path();
@@ -267,11 +249,8 @@ fn test_functions_use_unified_error() {
 }
 
 #[test]
-#[ignore] // Requires Docker
 fn test_database_error_fallback() {
-    with_clean_database(|_client| {
-        let container = get_test_container();
-        let conn_string = container.connection_string();
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         
         let _temp_dir = setup_generated_code(conn_string);
         let generated_dir = _temp_dir.path();

@@ -17,6 +17,7 @@ mod pg_type;
 mod rel_index;
 mod sql_state;
 mod tests;
+mod trigger_index;
 mod ty_index;
 mod unified_error;
 use pgrpc::PgrpcBuilder;
