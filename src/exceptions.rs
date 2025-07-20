@@ -8,13 +8,13 @@ use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
 use anyhow::anyhow;
 use jsonpath_rust::{JsonPath, JsonPathValue};
 use quote::ToTokens;
-use quote::__private::TokenStream;
+use proc_macro2::TokenStream;
 use serde_json::Value;
 use std::collections::HashSet;
 use itertools::Itertools;
 use regex::Regex;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PgException {
     Explicit(SqlState),
     Constraint(Constraint),

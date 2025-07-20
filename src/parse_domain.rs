@@ -198,6 +198,8 @@ fn collect_direct_not_nulls(node: &Node, columns: &mut HashSet<String>) {
 }
 
 mod tests {
+    use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn it_works() {

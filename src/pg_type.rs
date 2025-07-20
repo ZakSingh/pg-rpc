@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::ident::{sql_to_rs_ident, sql_to_rs_string, CaseType};
 use crate::parse_domain::non_null_cols_from_checks;
 use itertools::izip;
-use quote::__private::TokenStream;
+use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use std::collections::HashMap;
 use std::fmt::Debug;

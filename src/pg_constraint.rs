@@ -2,7 +2,7 @@ use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
 use postgres_types::{FromSql, Type};
 use quote::ToTokens;
-use quote::__private::TokenStream;
+use proc_macro2::TokenStream;
 use serde::Deserialize;
 use smallvec::SmallVec;
 use std::error::Error;

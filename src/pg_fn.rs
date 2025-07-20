@@ -3,19 +3,17 @@ use crate::config;
 use crate::exceptions::{get_exceptions, PgException};
 use crate::fn_index::FunctionId;
 use crate::ident::{sql_to_rs_ident, CaseType};
-use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
 use crate::pg_type::PgType;
 use crate::rel_index::RelIndex;
 use config::Config;
-use heck::ToPascalCase;
 use itertools::{izip, Itertools};
 use jsonpath_rust::JsonPath;
 use pg_query::protobuf::node::Node;
 use pg_query::protobuf::{DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, UpdateStmt};
 use pg_query::{parse_plpgsql, NodeRef, ParseResult};
-use quote::__private::TokenStream;
-use quote::{quote, ToTokens};
+use proc_macro2::TokenStream;
+use quote::quote;
 use regex::Regex;
 use serde_json::Value;
 use std::cmp::PartialEq;
@@ -156,7 +154,8 @@ impl ToRust for PgArg {
 
 impl ToRust for PgFn {
     fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
-        let err_enum_name: TokenStream = (self.name.to_pascal_case() + "Error").parse().unwrap();
+        // Use the unified error type from the errors module
+        let err_type: TokenStream = quote! { crate::errors::PgRpcError };
 
         let return_opt = self.comment.as_ref().is_some_and(|c| c.contains("@pgrpc_return_opt"));
         if return_opt && !self.returns_set  {
@@ -210,7 +209,7 @@ impl ToRust for PgFn {
                     client
                         .execute(&query, &params)
                         .await
-                        .map_err(#err_enum_name::from)?;
+                        .map_err(Into::into)?;
 
                     Ok(())
                 }
@@ -270,157 +269,10 @@ impl ToRust for PgFn {
             None => quote! {},
         };
 
-
-        let err_variants: Vec<TokenStream> =
-            self.exceptions
-              .iter()
-              .map(|e| e.rs_name(config)).collect();
-
-        let mut custom_handlers = Vec::new();
-        let mut check_handlers = Vec::new();
-        let mut unique_handlers = Vec::new();
-        let mut fk_handlers = Vec::new();
-        let mut not_null_handlers = Vec::new();
-
-        self.exceptions.iter().for_each(|e| match e {
-            PgException::Explicit(sql_state) => {
-                let code = sql_state.code();
-                let sql_state_rs = e.rs_name(config);
-                custom_handlers.push(quote! {
-                    code if code == &tokio_postgres::error::SqlState::from_code(#code) => #err_enum_name::#sql_state_rs(db_error.to_owned())
-                })
-            }
-            PgException::Constraint(constraint) => match constraint {
-                Constraint::Check(check) => {
-                    let constraint_name = check.name.as_str();
-                    let constraint_rs_name = constraint.into_token_stream();
-                    check_handlers.push(quote! {
-                    #constraint_name => #err_enum_name::#constraint_rs_name(db_error.to_owned())
-                    });
-                }
-                Constraint::Domain(dom) => {
-                    let constraint_name = dom.name.as_str();
-                    let constraint_rs_name = constraint.into_token_stream();
-                    check_handlers.push(quote! {
-                        #constraint_name => #err_enum_name::#constraint_rs_name(db_error.to_owned())
-                    })
-                }
-                Constraint::ForeignKey(fk) => {
-                    let constraint_name = fk.name.as_str();
-                    let constraint_rs_name = constraint.into_token_stream();
-                    fk_handlers.push(quote! {
-                    #constraint_name => #err_enum_name::#constraint_rs_name(db_error.to_owned())
-                    });
-                }
-                Constraint::PrimaryKey(_) | Constraint::Unique(_) => {
-                    let constraint_name = constraint.name().as_str();
-                    let constraint_rs_name = constraint.into_token_stream();
-                    unique_handlers.push(quote! {
-                    #constraint_name => #err_enum_name::#constraint_rs_name(db_error.to_owned())
-                    });
-                }
-                Constraint::NotNull(not_null) => {
-                    let col = not_null.column.as_str();
-                    let constraint_rs_name = constraint.into_token_stream();
-                    not_null_handlers.push(quote! {
-                    #col => #err_enum_name::#constraint_rs_name(db_error.to_owned())
-                    });
-                }
-
-                _ => {}
-            },
-            _ => {}
-        });
-
-        let checks = if check_handlers.is_empty() {
-            quote! {}
-        } else {
-            quote! {
-                &tokio_postgres::error::SqlState::CHECK_VIOLATION => match db_error.constraint().unwrap() {
-                    #(#check_handlers),*,
-                    _ => #err_enum_name::Other(e)
-                },
-            }
-        };
-
-        let fks = if fk_handlers.is_empty() {
-            quote! {}
-        } else {
-            quote! {
-                &tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION => match db_error.constraint().unwrap() {
-                    #(#fk_handlers),*,
-                    _ => #err_enum_name::Other(e)
-                },
-            }
-        };
-
-        let not_nulls = if not_null_handlers.is_empty() {
-            quote! {}
-        } else {
-            quote! {
-                &tokio_postgres::error::SqlState::NOT_NULL_VIOLATION => match db_error.column().unwrap() {
-                    #(#not_null_handlers),*,
-                    _ => #err_enum_name::Other(e)
-                },
-            }
-        };
-
-        let uniques = if unique_handlers.is_empty() {
-            quote! {}
-        } else {
-            quote! {
-                &tokio_postgres::error::SqlState::UNIQUE_VIOLATION => match db_error.constraint().unwrap() {
-                    #(#unique_handlers),*,
-                    _ => #err_enum_name::Other(e)
-                },
-            }
-        };
-
-        // println!("{:?}", custom_handlers);
-        let custom = if custom_handlers.is_empty() {
-            quote! {}
-        } else {
-            quote! {
-                #(#custom_handlers),*,
-            }
-        };
-
-        let error_msg = format!("{} failed: {{0:?}}", rs_fn_name);
-
-        let err_vars = if err_variants.is_empty() {
-            quote! {}
-        } else {
-            quote! { #(#[error(#error_msg)]#err_variants(#[source] tokio_postgres::error::DbError)),*, }
-        };
-
         quote! {
             #comment_macro
-            pub async fn #rs_fn_name(client: &impl deadpool_postgres::GenericClient, #(#args),*) -> Result<#return_type, #err_enum_name> {
+            pub async fn #rs_fn_name(client: &impl deadpool_postgres::GenericClient, #(#args),*) -> Result<#return_type, #err_type> {
                 #fn_body
-            }
-
-            #[derive(Debug, thiserror::Error)]
-            pub enum #err_enum_name {
-                #err_vars
-                #[error(#error_msg)]
-                Other(#[source] tokio_postgres::Error)
-            }
-
-            impl From<tokio_postgres::Error> for #err_enum_name {
-                fn from(e: tokio_postgres::Error) -> Self {
-                    let Some(db_error) = e.as_db_error() else {
-                        return #err_enum_name::Other(e);
-                    };
-
-                    match db_error.code() {
-                        #custom
-                        #checks
-                        #fks
-                        #not_nulls
-                        #uniques
-                        _ => #err_enum_name::Other(e)
-                    }
-                }
             }
         }
     }

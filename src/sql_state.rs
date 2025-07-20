@@ -2,7 +2,7 @@ use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
 use phf::phf_map;
 use quote::ToTokens;
-use quote::__private::TokenStream;
+use proc_macro2::TokenStream;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 

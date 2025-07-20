@@ -12,10 +12,7 @@ select distinct on (n.nspname, p.proname) n.nspname                             
                                                 from generate_series(1, array_length(p.proargtypes, 1)) as n) as has_defaults,
                                           d.description                                                       as comment,
                                           l.lanname                                                           as language,
-                                          case when l.lanname = 'plpgsql'
-                                               then ( select coalesce(json_agg(dep), '[]'::json)
-                                                      from plpgsql_show_dependency_tb(p.oid) as dep )
-                                               else '[]'::json end                                             as dependencies
+                                          '[]'::json                                                       as dependencies
 from pg_proc p
          join pg_namespace n on p.pronamespace = n.oid
          join pg_catalog.pg_language l on p.prolang = l.oid

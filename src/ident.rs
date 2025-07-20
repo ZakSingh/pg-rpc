@@ -1,6 +1,6 @@
 use heck::{ToPascalCase, ToSnakeCase};
 use quote::ToTokens;
-use quote::__private::TokenStream;
+use proc_macro2::TokenStream;
 
 pub enum CaseType {
     Snake,

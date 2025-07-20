@@ -18,6 +18,7 @@ mod rel_index;
 mod sql_state;
 mod tests;
 mod ty_index;
+mod unified_error;
 use pgrpc::PgrpcBuilder;
 
 #[derive(Parser)]

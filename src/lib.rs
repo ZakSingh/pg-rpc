@@ -27,6 +27,7 @@ mod rel_index;
 mod sql_state;
 mod tests;
 mod ty_index;
+mod unified_error;
 
 /// Builder for configuring and running pgrpc code generation
 pub struct PgrpcBuilder {
@@ -97,7 +98,7 @@ impl PgrpcBuilder {
         let config: Config = toml::from_str(&conf_str)?;
         
         Ok(Self {
-            connection_string: Some(config.connection_string),
+            connection_string: config.connection_string,
             schemas: config.schemas,
             types: config.types,
             exceptions: config.exceptions,
@@ -114,28 +115,32 @@ impl PgrpcBuilder {
         
         let start = Instant::now();
         
-        let connection_string = self.connection_string
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Connection string is required"))?;
+        let connection_string = if let Some(conn_str) = &self.connection_string {
+            conn_str.clone()
+        } else if let Ok(env_conn_str) = std::env::var("DATABASE_URL") {
+            env_conn_str
+        } else {
+            return Err(anyhow::anyhow!("Connection string is required. Provide it via config file, builder method, or DATABASE_URL environment variable"));
+        };
         
         if self.schemas.is_empty() {
             return Err(anyhow::anyhow!("At least one schema must be specified"));
         }
 
         let config = Config {
-            connection_string: connection_string.clone(),
+            connection_string: Some(connection_string.clone()),
             output_path: None, // Not used in internal Config creation
             schemas: self.schemas.clone(),
             types: self.types.clone(),
             exceptions: self.exceptions.clone(),
         };
 
-        let mut db = Db::new(&config.connection_string)?;
+        let mut db = Db::new(&connection_string)?;
         let rel_index = RelIndex::new(&mut db.client)?;
         let fn_index = FunctionIndex::new(&mut db.client, &rel_index, &config.schemas)?;
         let ty_index = TypeIndex::new(&mut db.client, fn_index.get_type_oids().as_slice())?;
         
-        let schema_files = codegen_split(&fn_index, &ty_index, &config)?;
+        let schema_files = codegen_split(&fn_index, &ty_index, &rel_index, &config)?;
         
         // Create output directory if it doesn't exist
         fs::create_dir_all(output_path)?;
