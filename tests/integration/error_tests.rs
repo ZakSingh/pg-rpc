@@ -311,8 +311,8 @@ fn test_custom_exception_ergonomics() {
         assert!(errors_content.contains("PgRpcError::BusinessRuleViolation(message)"));
         
         // Check that error messages include custom descriptions in the #[error] attributes
-        assert!(errors_content.contains("#[error(\"Custom application error\" \": {0}\")]"));
-        assert!(errors_content.contains("#[error(\"Invalid user input\" \": {0}\")]"));
-        assert!(errors_content.contains("#[error(\"Business rule violation\" \": {0}\")]"));
+        assert!(errors_content.contains("#[error(\"{}: {0}\", \"Custom application error\")]"));
+        assert!(errors_content.contains("#[error(\"{}: {0}\", \"Invalid user input\")]"));
+        assert!(errors_content.contains("#[error(\"{}: {0}\", \"Business rule violation\")]"));
     });
 }

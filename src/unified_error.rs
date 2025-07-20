@@ -117,7 +117,7 @@ pub fn generate_unified_error(
         let variant_name = sql_to_rs_ident(description, Pascal);
         if config_variants.insert(variant_name.to_string()) {
             error_variants.push(quote! {
-                #[error(#description ": {0}")]
+                #[error("{}: {0}", #description)]
                 #variant_name(String)
             });
         }

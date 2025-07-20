@@ -8,8 +8,9 @@ use postgres::Client;
 use proc_macro2::TokenStream;
 use quote::{quote, format_ident};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
+use log::warn;
 
 const TASK_INTROSPECTION_QUERY: &'static str = include_str!("./queries/task_introspection.sql");
 
@@ -62,17 +63,32 @@ impl TaskIndex {
                 let fields: Vec<TaskField> = serde_json::from_value::<Vec<Value>>(fields_json)
                     .context("Failed to parse fields JSON")?
                     .into_iter()
-                    .map(|field_json: Value| -> Result<TaskField, serde_json::Error> {
-                        Ok(TaskField {
-                            name: field_json["name"].as_str().unwrap().to_string(),
-                            type_oid: field_json["type_oid"].as_u64().unwrap() as u32,
-                            postgres_type: field_json["postgres_type"].as_str().unwrap().to_string(),
-                            position: field_json["position"].as_i64().unwrap() as i32,
-                            not_null: field_json["not_null"].as_bool().unwrap(),
-                            comment: field_json["comment"].as_str().map(|s| s.to_string()),
-                        })
+                    .filter_map(|field_json: Value| {
+                        // Extract all required fields, logging and skipping if any are missing
+                        let name = field_json["name"].as_str();
+                        let type_oid = field_json["type_oid"].as_u64();
+                        let postgres_type = field_json["postgres_type"].as_str();
+                        let position = field_json["position"].as_i64();
+                        let not_null = field_json["not_null"].as_bool();
+                        
+                        match (name, type_oid, postgres_type, position, not_null) {
+                            (Some(n), Some(t), Some(pt), Some(p), Some(nn)) => {
+                                Some(TaskField {
+                                    name: n.to_string(),
+                                    type_oid: t as u32,
+                                    postgres_type: pt.to_string(),
+                                    position: p as i32,
+                                    not_null: nn,
+                                    comment: field_json["comment"].as_str().map(|s| s.to_string()),
+                                })
+                            }
+                            _ => {
+                                warn!("Skipping malformed task field JSON: {:?}", field_json);
+                                None
+                            }
+                        }
                     })
-                    .try_collect()?;
+                    .collect();
 
                 Ok::<_, anyhow::Error>((
                     task_name.clone(),
@@ -104,18 +120,22 @@ pub fn generate_task_enum(
     task_index: &TaskIndex,
     type_index: &TypeIndex,
     config: &Config,
-) -> TokenStream {
+) -> (TokenStream, HashSet<String>) {
+    let mut referenced_schemas =HashSet::new();
+    
     if task_index.is_empty() {
-        return TokenStream::new();
+        return (TokenStream::new(), referenced_schemas);
     }
 
     let task_config = config.task_queue.as_ref().expect("Task queue config should be present");
     
-    // Generate enum variants
+    // Generate enum variants and collect referenced schemas
     let variants: Vec<TokenStream> = task_index
         .values()
         .map(|task_type| {
-            generate_task_variant(task_type, type_index, config)
+            let (variant, schemas) = generate_task_variant(task_type, type_index, config);
+            referenced_schemas.extend(schemas);
+            variant
         })
         .collect();
 
@@ -155,7 +175,7 @@ pub fn generate_task_enum(
         task_schema, full_table_name, task_name_column, payload_column, task_schema
     );
 
-    quote! {
+    let enum_code = quote! {
         #[doc = #enum_doc]
         #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
         #[serde(tag = #task_name_column, content = #payload_column)]
@@ -174,7 +194,7 @@ pub fn generate_task_enum(
             /// Deserialize a task payload from database row data
             pub fn from_database_row(task_name: &str, payload: serde_json::Value) -> Result<Self, serde_json::Error> {
                 match task_name {
-                    #(#from_arms),*
+                    #(#from_arms),*,
                     _ => Err(serde_json::Error::custom(format!("Unknown task: {}", task_name))),
                 }
             }
@@ -194,7 +214,9 @@ pub fn generate_task_enum(
                 #payload_column
             }
         }
-    }
+    };
+    
+    (enum_code, referenced_schemas)
 }
 
 /// Generate a single task variant
@@ -202,7 +224,8 @@ fn generate_task_variant(
     task_type: &TaskType,
     type_index: &TypeIndex,
     _config: &Config,
-) -> TokenStream {
+) -> (TokenStream, std::collections::HashSet<String>) {
+    let mut referenced_schemas = std::collections::HashSet::new();
     let variant_name = format_ident!("{}", sql_to_rs_string(&task_type.task_name, CaseType::Pascal));
     let task_name = &task_type.task_name;
     
@@ -213,7 +236,9 @@ fn generate_task_variant(
             
             // Look up the PostgreSQL type in our type index to get the Rust type
             let rust_type = if let Some(pg_type) = type_index.get(&field.type_oid) {
-                pg_type.to_rust_ident(type_index)
+                let (type_tokens, schemas) = pg_type.to_rust_ident_with_schemas(type_index);
+                referenced_schemas.extend(schemas);
+                type_tokens
             } else {
                 // Fallback to a basic type mapping
                 map_postgres_type_to_rust(&field.postgres_type)
@@ -223,12 +248,14 @@ fn generate_task_variant(
         })
         .collect();
 
-    quote! {
+    let variant = quote! {
         #[serde(rename = #task_name)]
         #variant_name {
             #(#fields),*
         }
-    }
+    };
+    
+    (variant, referenced_schemas)
 }
 
 /// Basic PostgreSQL to Rust type mapping for task fields

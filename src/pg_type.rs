@@ -258,6 +258,56 @@ impl PgType {
             x => unimplemented!("unknown type {:?}", x),
         }
     }
+
+    /// Get the Rust type identifier and collect referenced schemas
+    pub fn to_rust_ident_with_schemas(&self, types: &HashMap<OID, PgType>) -> (TokenStream, HashSet<String>) {
+        let mut schemas = HashSet::new();
+        
+        let tokens = match self {
+            // For user-defined types, use schema-qualified name without super::
+            PgType::Domain { schema, name, .. } => {
+                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
+                let type_name = sql_to_rs_ident(name, CaseType::Pascal);
+                schemas.insert(schema_mod.to_string());
+                quote! { #schema_mod::#type_name }
+            }
+            PgType::Composite { schema, name, .. } => {
+                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
+                let type_name = sql_to_rs_ident(name, CaseType::Pascal);
+                schemas.insert(schema_mod.to_string());
+                quote! { #schema_mod::#type_name }
+            }
+            PgType::Enum { schema, name, .. } => {
+                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
+                let type_name = sql_to_rs_ident(name, CaseType::Pascal);
+                schemas.insert(schema_mod.to_string());
+                quote! { #schema_mod::#type_name }
+            }
+            PgType::Array {
+                element_type_oid, ..
+            } => {
+                let (inner, inner_schemas) = types.get(element_type_oid).unwrap().to_rust_ident_with_schemas(types);
+                schemas.extend(inner_schemas);
+                quote! { Vec<#inner> }
+            }
+            // Built-in types don't need schema qualification
+            PgType::Int16 => quote! { i16 },
+            PgType::Int32 => quote! { i32 },
+            PgType::Int64 => quote! { i64 },
+            PgType::Numeric => quote! { rust_decimal::Decimal },
+            PgType::Bool => quote! { bool },
+            PgType::Text => quote! { String },
+            PgType::Timestamptz => quote! { time::OffsetDateTime },
+            PgType::Date => quote! { time::Date },
+            PgType::INet => quote! { std::net::IpAddr },
+            PgType::Bytea => quote! { Vec<u8> },
+            PgType::Json => quote! { serde_json::Value },
+            PgType::Void => quote! { () },
+            x => unimplemented!("unknown type {:?}", x),
+        };
+        
+        (tokens, schemas)
+    }
 }
 
 impl TryFrom<Row> for PgType {

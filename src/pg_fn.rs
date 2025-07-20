@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use postgres::Row;
 use ustr::{Ustr};
+use log::warn;
 
 const VOID_TYPE_OID: u32 = 2278;
 
@@ -385,7 +386,16 @@ pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
     query_path
         .find_slice(fn_json)
         .into_iter()
-        .map(|x| pg_query::parse(x.to_data().as_str().unwrap()))
+        .filter_map(|x| {
+            let data = x.to_data();
+            match data.as_str() {
+                Some(query_str) => Some(pg_query::parse(query_str)),
+                None => {
+                    warn!("Failed to extract query string from JSON value: {:?}", data);
+                    None
+                }
+            }
+        })
         .flatten() // remove unparsable queries
         .collect()
 }
@@ -447,7 +457,9 @@ fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
         .flatten()
     else {
         // Could not determine what relation was being inserted into
-        unreachable!("Insert statement without relation")
+        // This can happen with CTEs, temp tables, or relations not in our index
+        warn!("Skipping INSERT statement dependency analysis: {stmt:?}");
+        return None;
     };
 
     // Collect the inserted column names

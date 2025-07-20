@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use proc_macro2::TokenStream;
+use quote::quote;
 
 mod types;
 mod config;
@@ -96,6 +98,52 @@ impl PgrpcBuilder {
     /// Set the output directory for the generated code
     pub fn output_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.output_path = Some(path.into());
+        self
+    }
+
+    /// Enable task queue generation with default configuration
+    pub fn enable_task_queue(mut self, schema: impl Into<String>) -> Self {
+        self.task_queue = Some(TaskQueueConfig {
+            schema: schema.into(),
+            task_name_column: "task_name".to_string(),
+            payload_column: "payload".to_string(),
+            table_schema: None,
+            table_name: None,
+        });
+        self
+    }
+
+    /// Configure the task queue table schema (defaults to "mq")
+    pub fn task_queue_table_schema(mut self, schema: impl Into<String>) -> Self {
+        let task_config = self.task_queue.get_or_insert(TaskQueueConfig::default());
+        task_config.table_schema = Some(schema.into());
+        self
+    }
+
+    /// Configure the task queue table name (defaults to "task")
+    pub fn task_queue_table_name(mut self, name: impl Into<String>) -> Self {
+        let task_config = self.task_queue.get_or_insert(TaskQueueConfig::default());
+        task_config.table_name = Some(name.into());
+        self
+    }
+
+    /// Configure the task name column (defaults to "task_name")
+    pub fn task_queue_task_name_column(mut self, column: impl Into<String>) -> Self {
+        let task_config = self.task_queue.get_or_insert(TaskQueueConfig::default());
+        task_config.task_name_column = column.into();
+        self
+    }
+
+    /// Configure the payload column (defaults to "payload")
+    pub fn task_queue_payload_column(mut self, column: impl Into<String>) -> Self {
+        let task_config = self.task_queue.get_or_insert(TaskQueueConfig::default());
+        task_config.payload_column = column.into();
+        self
+    }
+
+    /// Configure the complete task queue settings at once
+    pub fn task_queue(mut self, config: TaskQueueConfig) -> Self {
+        self.task_queue = Some(config);
         self
     }
 
@@ -209,11 +257,22 @@ fn generate_task_code(
         return Ok(None);
     }
     
-    let task_enum_code = generate_task_enum(&task_index, ty_index, config);
+    let (task_enum_code, referenced_schemas) = generate_task_enum(&task_index, ty_index, config);
     let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
+    
+    // Generate use statements for referenced schemas
+    let schema_imports: Vec<TokenStream> = referenced_schemas
+        .into_iter()
+        .map(|schema| {
+            let schema_ident = quote::format_ident!("{}", schema);
+            quote! { use super::#schema_ident; }
+        })
+        .collect();
     
     let task_code = prettyplease::unparse(
         &syn::parse2::<syn::File>(quote::quote! {
+            #(#schema_imports)*
+
             use serde_json;
             use chrono;
             use uuid;
