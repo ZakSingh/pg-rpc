@@ -431,6 +431,52 @@ impl TryFrom<Row> for PgType {
     }
 }
 
+/// Determines additional derives and custom implementations for domain types based on the inner type
+fn determine_domain_traits(inner_type: &PgType, domain_name: &TokenStream) -> (Vec<TokenStream>, Vec<TokenStream>) {
+    let mut derives = Vec::new();
+    let mut impls = Vec::new();
+
+    // Always add these useful traits for all domain types
+    derives.push(quote! { PartialEq });
+    derives.push(quote! { Eq });
+    derives.push(quote! { Hash });
+
+    match inner_type {
+        // Copy types - add Copy and ordering traits
+        PgType::Int16 | PgType::Int32 | PgType::Int64 | PgType::Bool => {
+            derives.push(quote! { Copy });
+            derives.push(quote! { PartialOrd });
+            derives.push(quote! { Ord });
+        },
+        
+        // String types - add ordering traits and custom Display impl
+        PgType::Text => {
+            derives.push(quote! { PartialOrd });
+            derives.push(quote! { Ord });
+            
+            // Custom Display implementation that delegates to inner String
+            impls.push(quote! {
+                impl std::fmt::Display for #domain_name {
+                    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        self.0.fmt(f)
+                    }
+                }
+            });
+        },
+        
+        // Other orderable types - add ordering traits but not Copy
+        PgType::Numeric | PgType::Timestamptz | PgType::Date => {
+            derives.push(quote! { PartialOrd });
+            derives.push(quote! { Ord });
+        },
+        
+        // For all other types, just the basic traits (PartialEq, Eq, Hash) are sufficient
+        _ => {},
+    }
+
+    (derives, impls)
+}
+
 impl ToRust for PgType {
     fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
         match self {
@@ -692,10 +738,21 @@ impl ToRust for PgType {
                     pg_type => {
                         // For any type besides composite types, domains are just a wrapper.
                         let inner = pg_type.to_rust_ident(types);
+                        let (additional_derives, custom_impls) = determine_domain_traits(pg_type, &rs_name);
+                        
+                        let base_derives = quote! { Debug, Clone, derive_more::Deref, serde::Serialize, serde::Deserialize, postgres_types::ToSql, postgres_types::FromSql };
+                        let all_derives = if additional_derives.is_empty() {
+                            base_derives
+                        } else {
+                            quote! { #base_derives, #(#additional_derives),* }
+                        };
+
                         quote! {
-                            #[derive(Debug, Clone, derive_more::Deref, serde::Serialize, serde::Deserialize, postgres_types::ToSql, postgres_types::FromSql)]
+                            #[derive(#all_derives)]
                             #[postgres(name = #name)]
                             pub struct #rs_name(pub #inner);
+                            
+                            #(#custom_impls)*
                         }
                     }
                 }
@@ -1223,5 +1280,81 @@ mod tests {
         assert!(generated_str.contains("let addr_city"));
         assert!(generated_str.contains("composite . and_then (| c | c . street)"));
         assert!(generated_str.contains("composite . and_then (| c | c . city)"));
+    }
+
+    #[test]
+    fn test_domain_smart_derives() {
+        use std::collections::HashMap;
+        
+        let mut types = HashMap::new();
+        
+        // Test int32 domain (should get Copy + ordering traits)
+        types.insert(1, PgType::Int32);
+        let int_domain = PgType::Domain {
+            schema: "public".to_string(),
+            name: "user_id".to_string(),
+            type_oid: 1,
+            constraints: vec![],
+            comment: None,
+        };
+        
+        let generated = int_domain.to_rust(&types, &Config::default());
+        let code_str = generated.to_string();
+        
+        // Should have Copy trait for int types
+        assert!(code_str.contains("Copy"));
+        assert!(code_str.contains("PartialEq"));
+        assert!(code_str.contains("Eq"));
+        assert!(code_str.contains("Hash"));
+        assert!(code_str.contains("PartialOrd"));
+        assert!(code_str.contains("Ord"));
+        
+        // Test text domain (should get Display impl + ordering traits)
+        types.insert(2, PgType::Text);
+        let text_domain = PgType::Domain {
+            schema: "public".to_string(),
+            name: "user_name".to_string(),
+            type_oid: 2,
+            constraints: vec![],
+            comment: None,
+        };
+        
+        let generated = text_domain.to_rust(&types, &Config::default());
+        let code_str = generated.to_string();
+        
+        // Should NOT have Copy trait for String types
+        assert!(!code_str.contains("Copy"));
+        // Should have Display impl
+        assert!(code_str.contains("impl std :: fmt :: Display for UserName"));
+        assert!(code_str.contains("self . 0 . fmt (f)"));
+        assert!(code_str.contains("PartialEq"));
+        assert!(code_str.contains("Eq"));
+        assert!(code_str.contains("Hash"));
+        assert!(code_str.contains("PartialOrd"));
+        assert!(code_str.contains("Ord"));
+        
+        // Test numeric domain (should get ordering but not Copy)
+        types.insert(3, PgType::Numeric);
+        let numeric_domain = PgType::Domain {
+            schema: "public".to_string(),
+            name: "price".to_string(),
+            type_oid: 3,
+            constraints: vec![],
+            comment: None,
+        };
+        
+        let generated = numeric_domain.to_rust(&types, &Config::default());
+        let code_str = generated.to_string();
+        
+        // Should NOT have Copy trait for Decimal types
+        assert!(!code_str.contains("Copy"));
+        // Should NOT have Display impl (only for text)
+        assert!(!code_str.contains("impl std :: fmt :: Display for Price"));
+        // Should have ordering traits
+        assert!(code_str.contains("PartialEq"));
+        assert!(code_str.contains("Eq")); 
+        assert!(code_str.contains("Hash"));
+        assert!(code_str.contains("PartialOrd"));
+        assert!(code_str.contains("Ord"));
     }
 }

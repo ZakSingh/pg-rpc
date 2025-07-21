@@ -15,14 +15,9 @@
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Cargo.lock" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.lock" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/pgrpc.toml" beforeDir="false" afterPath="$PROJECT_DIR$/pgrpc.toml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/codegen.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/codegen.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/lib.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/pg_fn.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/pg_fn.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/pg_type.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/pg_type.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/queries/function_introspection.sql" beforeDir="false" afterPath="$PROJECT_DIR$/src/queries/function_introspection.sql" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/queries/task_introspection.sql" beforeDir="false" afterPath="$PROJECT_DIR$/src/queries/task_introspection.sql" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/task_index.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/task_index.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/unified_error.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/unified_error.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -253,6 +248,7 @@
       <workItem from="1752797466731" duration="197000" />
       <workItem from="1752941251489" duration="15233000" />
       <workItem from="1752965222740" duration="63097000" />
+      <workItem from="1753128896171" duration="3593000" />
     </task>
     <servers />
   </component>

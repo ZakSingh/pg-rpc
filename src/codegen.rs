@@ -78,6 +78,7 @@ pub fn codegen_split(
                     use postgres_types::private::BytesMut;
                     use postgres_types::{IsNull, ToSql, Type};
                     use rust_decimal::Decimal;
+                    use bon::builder;
                     
                     #tokens
                 })

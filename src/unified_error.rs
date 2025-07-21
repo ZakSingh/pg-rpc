@@ -424,6 +424,111 @@ fn generate_helper_methods(
             matches!(self, PgRpcError::Database(_))
         }
     });
+
+    // Generate column name helper method
+    let constraint_column_arms: Vec<TokenStream> = table_constraints
+        .keys()
+        .map(|table_id| {
+            let table_name_pascal = table_id.name().to_pascal_case();
+            let variant_name = format_ident!("{}Constraint", table_name_pascal);
+            quote! { PgRpcError::#variant_name(_, db_error) => db_error.column() }
+        })
+        .collect();
+
+    methods.push(quote! {
+        /// Returns the column name from the underlying PostgreSQL error, if available
+        pub fn column(&self) -> Option<&str> {
+            match self {
+                #(#constraint_column_arms,)*
+                PgRpcError::Database(e) => e.as_db_error().and_then(|db_error| db_error.column()),
+                _ => None,
+            }
+        }
+    });
+
+    // Generate constraint name helper method  
+    let constraint_name_arms: Vec<TokenStream> = table_constraints
+        .keys()
+        .map(|table_id| {
+            let table_name_pascal = table_id.name().to_pascal_case();
+            let variant_name = format_ident!("{}Constraint", table_name_pascal);
+            quote! { PgRpcError::#variant_name(_, db_error) => db_error.constraint() }
+        })
+        .collect();
+
+    methods.push(quote! {
+        /// Returns the constraint name from the underlying PostgreSQL error, if available
+        pub fn constraint(&self) -> Option<&str> {
+            match self {
+                #(#constraint_name_arms,)*
+                PgRpcError::Database(e) => e.as_db_error().and_then(|db_error| db_error.constraint()),
+                _ => None,
+            }
+        }
+    });
+
+    // Generate table name helper method
+    let constraint_table_arms: Vec<TokenStream> = table_constraints
+        .keys()
+        .map(|table_id| {
+            let table_name_pascal = table_id.name().to_pascal_case();
+            let variant_name = format_ident!("{}Constraint", table_name_pascal);
+            quote! { PgRpcError::#variant_name(_, db_error) => db_error.table() }
+        })
+        .collect();
+
+    methods.push(quote! {
+        /// Returns the table name from the underlying PostgreSQL error, if available
+        pub fn table(&self) -> Option<&str> {
+            match self {
+                #(#constraint_table_arms,)*
+                PgRpcError::Database(e) => e.as_db_error().and_then(|db_error| db_error.table()),
+                _ => None,
+            }
+        }
+    });
+
+    // Generate message helper method
+    let constraint_message_arms: Vec<TokenStream> = table_constraints
+        .keys()
+        .map(|table_id| {
+            let table_name_pascal = table_id.name().to_pascal_case();
+            let variant_name = format_ident!("{}Constraint", table_name_pascal);
+            quote! { PgRpcError::#variant_name(_, db_error) => Some(db_error.message()) }
+        })
+        .collect();
+
+    methods.push(quote! {
+        /// Returns the error message from the underlying PostgreSQL error, if available
+        pub fn message(&self) -> Option<&str> {
+            match self {
+                #(#constraint_message_arms,)*
+                PgRpcError::Database(e) => e.as_db_error().map(|db_error| db_error.message()),
+                _ => None,
+            }
+        }
+    });
+
+    // Generate code helper method
+    let constraint_code_arms: Vec<TokenStream> = table_constraints
+        .keys()
+        .map(|table_id| {
+            let table_name_pascal = table_id.name().to_pascal_case();
+            let variant_name = format_ident!("{}Constraint", table_name_pascal);
+            quote! { PgRpcError::#variant_name(_, db_error) => Some(db_error.code()) }
+        })
+        .collect();
+
+    methods.push(quote! {
+        /// Returns the SQL state code from the underlying PostgreSQL error, if available
+        pub fn code(&self) -> Option<&tokio_postgres::error::SqlState> {
+            match self {
+                #(#constraint_code_arms,)*
+                PgRpcError::Database(e) => e.as_db_error().map(|db_error| db_error.code()),
+                _ => None,
+            }
+        }
+    });
     
     quote! {
         impl PgRpcError {
@@ -515,6 +620,11 @@ mod tests {
         assert!(code_str.contains("get_custom_application_error_message"));
         assert!(code_str.contains("is_constraint_violation"));
         assert!(code_str.contains("is_database_error"));
+        assert!(code_str.contains("fn column"));
+        assert!(code_str.contains("fn constraint"));
+        assert!(code_str.contains("fn table"));
+        assert!(code_str.contains("fn message"));
+        assert!(code_str.contains("fn code"));
     }
 
     #[test]

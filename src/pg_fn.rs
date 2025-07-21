@@ -51,7 +51,13 @@ pub struct PgArg {
 
 impl PgArg {
     pub fn rs_name(&self) -> TokenStream {
-        sql_to_rs_ident(&self.name, CaseType::Snake)
+        // Strip 'p_' prefix if present for cleaner Rust parameter names
+        let clean_name = if self.name.starts_with("p_") {
+            &self.name[2..]
+        } else {
+            &self.name
+        };
+        sql_to_rs_ident(clean_name, CaseType::Snake)
     }
     
     /// Returns whether this argument needs an additional `&` when passed to the params vector
@@ -192,7 +198,13 @@ impl PgFn {
 
 impl ToRust for PgArg {
     fn to_rust(&self, types: &HashMap<OID, PgType>, _config: &Config) -> TokenStream {
-        let name = sql_to_rs_ident(&self.name, CaseType::Snake);
+        // Strip 'p_' prefix if present for cleaner Rust parameter names
+        let clean_name = if self.name.starts_with("p_") {
+            &self.name[2..]
+        } else {
+            &self.name
+        };
+        let name = sql_to_rs_ident(clean_name, CaseType::Snake);
         let ty = match types.get(&self.type_oid).unwrap() {
             PgType::Int16 => quote! { i16 },
             PgType::Int32 => quote! { i32 },
@@ -511,10 +523,18 @@ impl ToRust for PgFn {
             quote! {}
         };
 
+        // Add #[bon::builder] attribute if function has 3 or more parameters (excluding client)
+        let builder_attr = if self.args.len() >= 3 {
+            quote! { #[builder] }
+        } else {
+            quote! {}
+        };
+
         quote! {
             #struct_def
             
             #comment_macro
+            #builder_attr
             pub async fn #rs_fn_name(client: &impl deadpool_postgres::GenericClient, #(#args),*) -> Result<#return_type, #err_type> {
                 #fn_body
             }
