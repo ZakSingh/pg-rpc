@@ -189,6 +189,15 @@ pub fn generate_unified_error(
                 }
             }
         }
+
+        // Also support deadpool_postgres re-exported error type
+        impl From<deadpool_postgres::tokio_postgres::Error> for PgRpcError {
+            fn from(e: deadpool_postgres::tokio_postgres::Error) -> Self {
+                // Convert to the base tokio_postgres::Error and delegate
+                let base_error: tokio_postgres::Error = e;
+                PgRpcError::from(base_error)
+            }
+        }
     };
     
     // Generate helper methods for the error type

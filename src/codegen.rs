@@ -76,7 +76,8 @@ pub fn codegen_split(
                     #(#schema_imports)*
                     
                     use postgres_types::private::BytesMut;
-                    use postgres_types::{IsNull, Type, ToSql, FromSql};
+                    use postgres_types::{ToSql, FromSql};
+                    use deadpool_postgres::tokio_postgres::types::{IsNull, Type};
                     use rust_decimal::Decimal;
                     
                     #tokens

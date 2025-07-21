@@ -1,6 +1,6 @@
 use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
-use postgres_types::{FromSql, Type};
+use postgres::types::{FromSql, Type};
 use quote::ToTokens;
 use proc_macro2::TokenStream;
 use serde::Deserialize;

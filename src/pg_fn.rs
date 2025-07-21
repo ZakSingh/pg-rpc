@@ -282,7 +282,7 @@ impl ToRust for PgFn {
             };
 
             quote! {
-                let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(&#req_arg_names),*];
+                let mut params: Vec<&(dyn ToSql + Sync)> = vec![#(&#req_arg_names),*];
                 let mut query = concat!(#query_string, "(", #required_query_params).to_string();
 
                 #(
