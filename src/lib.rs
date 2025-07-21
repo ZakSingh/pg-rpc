@@ -274,7 +274,7 @@ fn generate_task_code(
             #(#schema_imports)*
 
             use serde_json;
-            use chrono;
+            use time;
             use uuid;
             use rust_decimal;
             use std::net::IpAddr;

@@ -139,15 +139,23 @@ pub fn generate_task_enum(
         })
         .collect();
 
+    let task_name_column = &task_config.task_name_column;
+    let payload_column = &task_config.payload_column;
+
     // Generate match arms for from_database_row
     let from_arms: Vec<TokenStream> = task_index
         .values()
         .map(|task_type| {
             let task_name = &task_type.task_name;
-            let variant_name = format_ident!("{}", sql_to_rs_string(task_name, CaseType::Pascal));
             
             quote! {
-                #task_name => serde_json::from_value(payload).map(TaskPayload::#variant_name)
+                #task_name => {
+                    let tagged_value = serde_json::json!({
+                        #task_name_column: task_name,
+                        #payload_column: payload
+                    });
+                    serde_json::from_value(tagged_value)
+                }
             }
         })
         .collect();
@@ -164,9 +172,6 @@ pub fn generate_task_enum(
             }
         })
         .collect();
-
-    let task_name_column = &task_config.task_name_column;
-    let payload_column = &task_config.payload_column;
     let full_table_name = task_config.get_full_table_name();
     let task_schema = &task_config.schema;
 
@@ -195,7 +200,14 @@ pub fn generate_task_enum(
             pub fn from_database_row(task_name: &str, payload: serde_json::Value) -> Result<Self, serde_json::Error> {
                 match task_name {
                     #(#from_arms),*,
-                    _ => Err(serde_json::Error::custom(format!("Unknown task: {}", task_name))),
+                    _ => {
+                        // Create a JSON object that will fail to deserialize into TaskPayload
+                        let error_json = serde_json::json!({
+                            #task_name_column: format!("__unknown_task_{}", task_name),
+                            #payload_column: {}
+                        });
+                        serde_json::from_value(error_json)
+                    }
                 }
             }
             
@@ -271,9 +283,9 @@ fn map_postgres_type_to_rust(postgres_type: &str) -> TokenStream {
         "numeric" | "decimal" => quote! { rust_decimal::Decimal },
         "json" | "jsonb" => quote! { serde_json::Value },
         "uuid" => quote! { uuid::Uuid },
-        "timestamp" | "timestamptz" => quote! { chrono::DateTime<chrono::Utc> },
-        "date" => quote! { chrono::NaiveDate },
-        "time" => quote! { chrono::NaiveTime },
+        "timestamp" | "timestamptz" => quote! { time::OffsetDateTime },
+        "date" => quote! { time::Date },
+        "time" => quote! { time::Time },
         "bytea" => quote! { Vec<u8> },
         "inet" => quote! { std::net::IpAddr },
         _ => {

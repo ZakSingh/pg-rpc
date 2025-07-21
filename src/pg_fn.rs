@@ -163,7 +163,7 @@ impl ToRust for PgArg {
 impl ToRust for PgFn {
     fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
         // Use the unified error type from the errors module
-        let err_type: TokenStream = quote! { crate::errors::PgRpcError };
+        let err_type: TokenStream = quote! { super::errors::PgRpcError };
 
         let return_opt = self.comment.as_ref().is_some_and(|c| c.contains("@pgrpc_return_opt"));
         if return_opt && !self.returns_set  {
@@ -202,30 +202,30 @@ impl ToRust for PgFn {
             let query = if return_opt {
                 quote! {
                     client
-                        .query_opt(&query, &params)
+                        .query_opt(&query, &params[..])
                         .await
                         .and_then(|opt_row| match opt_row {
                             None => Ok(None),
                             Some(row) => row.try_get(0).map(Some),
                         })
-                        .map_err(Into::into)
+                        .map_err(#err_type::from)
                 }
             } else if self.returns_set {
                 quote! {
                     client
-                        .query(&query, &params)
+                        .query(&query, &params[..])
                         .await
                         .and_then(|rows| {
                             rows.into_iter().map(TryInto::try_into).collect()
-                        }).map_err(Into::into)
+                        }).map_err(#err_type::from)
                 }
             } else if self.return_type_oid == VOID_TYPE_OID {
                 // Void returning function
                 quote! {
                     client
-                        .execute(&query, &params)
+                        .execute(&query, &params[..])
                         .await
-                        .map_err(Into::into)?;
+                        .map_err(#err_type::from)?;
 
                     Ok(())
                 }
@@ -243,28 +243,28 @@ impl ToRust for PgFn {
                             if return_not_null {
                                 quote! {
                                     client
-                                        .query_one(&query, &params)
+                                        .query_one(&query, &params[..])
                                         .await
                                         .and_then(|r| r.try_into())
-                                        .map_err(Into::into)
+                                        .map_err(#err_type::from)
                                 }
                             } else {
                                 quote! {
                                     client
-                                        .query_one(&query, &params)
+                                        .query_one(&query, &params[..])
                                         .await
                                         .and_then(|r| Ok(Some(r.try_into()?)))
-                                        .map_err(Into::into)
+                                        .map_err(#err_type::from)
                                 }
                             }
                         } else {
                             // Regular composite types can use try_get
                             quote! {
                                 client
-                                    .query_one(&query, &params)
+                                    .query_one(&query, &params[..])
                                     .await
                                     .and_then(|r| r.try_get(0))
-                                    .map_err(Into::into)
+                                    .map_err(#err_type::from)
                             }
                         }
                     }
@@ -272,10 +272,10 @@ impl ToRust for PgFn {
                         // Non-composite types use try_get
                         quote! {
                             client
-                                .query_one(&query, &params)
+                                .query_one(&query, &params[..])
                                 .await
                                 .and_then(|r| r.try_get(0))
-                                .map_err(Into::into)
+                                .map_err(#err_type::from)
                         }
                     }
                 }

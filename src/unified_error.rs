@@ -11,12 +11,20 @@ use std::ops::Deref;
 use heck::ToPascalCase;
 
 /// Collects all constraints from all tables and groups them by table
+/// Only includes constraints that will generate enum variants (excludes Default constraints)
 pub fn collect_table_constraints(rel_index: &RelIndex) -> HashMap<PgId, Vec<Constraint>> {
     let mut table_constraints: HashMap<PgId, Vec<Constraint>> = HashMap::new();
     
     for rel in rel_index.deref().values() {
-        if !rel.constraints.is_empty() {
-            table_constraints.insert(rel.id.clone(), rel.constraints.clone());
+        // Filter out constraints that won't generate enum variants
+        let non_default_constraints: Vec<Constraint> = rel.constraints
+            .iter()
+            .filter(|constraint| !matches!(constraint, Constraint::Default(_)))
+            .cloned()
+            .collect();
+        
+        if !non_default_constraints.is_empty() {
+            table_constraints.insert(rel.id.clone(), non_default_constraints);
         }
     }
     
@@ -117,7 +125,7 @@ pub fn generate_unified_error(
         let variant_name = sql_to_rs_ident(description, Pascal);
         if config_variants.insert(variant_name.to_string()) {
             error_variants.push(quote! {
-                #[error("{}: {0}", #description)]
+                #[error("{description}: {0}", description = #description)]
                 #variant_name(String)
             });
         }

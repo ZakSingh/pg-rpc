@@ -387,7 +387,22 @@ impl TryFrom<Row> for PgType {
             'p' => match name.as_ref() {
                 "void" => PgType::Void,
                 "trigger" => PgType::Void, // Trigger functions return pseudo-type, treat as void
-                p => unimplemented!("pseudo type not implemented: {}", p),
+                "record" => {
+                    eprintln!("DEBUG: Encountered 'record' pseudo type in schema '{}', type name '{}'", schema, name);
+                    eprintln!("DEBUG: This is typically a function return type for functions returning anonymous record types");
+                    PgType::Void // Treat record pseudo-type as void for now
+                },
+                p => {
+                    eprintln!("ERROR: Unhandled pseudo type encountered:");
+                    eprintln!("  Type name: {}", name);
+                    eprintln!("  Schema: {}", schema);
+                    eprintln!("  Pseudo type: {}", p);
+                    eprintln!("  Type category: p (pseudo)");
+                    if let Ok(oid) = t.try_get::<_, u32>("oid") {
+                        eprintln!("  OID: {}", oid);
+                    }
+                    unimplemented!("pseudo type not implemented: {}", p)
+                },
             },
             x => unimplemented!("ttype not implemented {}", x),
         };
