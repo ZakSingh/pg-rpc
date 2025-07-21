@@ -165,6 +165,9 @@ impl PgrpcBuilder {
 
     /// Generate and write the code to the specified output directory
     pub fn build(&self) -> anyhow::Result<()> {
+        // Initialize env_logger if not already initialized
+        let _ = env_logger::try_init();
+        
         let output_path = self.output_path
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Output path is required. Specify either -o in CLI or output_path in pgrpc.toml"))?;
@@ -196,7 +199,17 @@ impl PgrpcBuilder {
         let rel_index = RelIndex::new(&mut db.client)?;
         let trigger_index = trigger_index::TriggerIndex::new(&mut db.client, &rel_index, &config.schemas)?;
         let fn_index = FunctionIndex::new(&mut db.client, &rel_index, &trigger_index, &config.schemas)?;
-        let ty_index = TypeIndex::new(&mut db.client, fn_index.get_type_oids().as_slice())?;
+        
+        // Collect type OIDs from both functions and task types
+        let mut type_oids = fn_index.get_type_oids();
+        
+        // If task queue is configured, collect task type OIDs as well
+        if let Some(task_config) = &config.task_queue {
+            let task_type_oids = task_index::collect_task_type_oids(&mut db.client, task_config)?;
+            type_oids.extend(task_type_oids);
+        }
+        
+        let ty_index = TypeIndex::new(&mut db.client, type_oids.as_slice())?;
         
         let schema_files = codegen_split(&fn_index, &ty_index, &rel_index, &config)?;
         

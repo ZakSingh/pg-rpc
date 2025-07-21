@@ -12,7 +12,10 @@ select distinct on (n.nspname, p.proname) n.nspname                             
                                                 from generate_series(1, array_length(p.proargtypes, 1)) as n) as has_defaults,
                                           d.description                                                       as comment,
                                           l.lanname                                                           as language,
-                                          '[]'::json                                                       as dependencies
+                                          '[]'::json                                                       as dependencies,
+                                          p.proargmodes                                                       as arg_modes,
+                                          p.proallargtypes                                                    as all_arg_types,
+                                          p.proargnames                                                       as all_arg_names
 from pg_proc p
          join pg_namespace n on p.pronamespace = n.oid
          join pg_catalog.pg_language l on p.prolang = l.oid

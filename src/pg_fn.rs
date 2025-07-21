@@ -26,6 +26,7 @@ use ustr::{Ustr};
 use log::warn;
 
 const VOID_TYPE_OID: u32 = 2278;
+const RECORD_TYPE_OID: u32 = 2249;
 
 #[derive(Debug)]
 pub struct PgFn {
@@ -33,6 +34,7 @@ pub struct PgFn {
     pub schema: SchemaName,
     pub name: FunctionName,
     pub args: Vec<PgArg>,
+    pub out_args: Vec<PgArg>,
     pub return_type_oid: OID,
     pub returns_set: bool,
     pub definition: String,
@@ -51,6 +53,27 @@ impl PgArg {
     pub fn rs_name(&self) -> TokenStream {
         sql_to_rs_ident(&self.name, CaseType::Snake)
     }
+    
+    /// Returns whether this argument needs an additional `&` when passed to the params vector
+    pub fn needs_reference(&self, types: &HashMap<OID, PgType>) -> bool {
+        match types.get(&self.type_oid) {
+            Some(PgType::Int16) | Some(PgType::Int32) | Some(PgType::Int64) | Some(PgType::Bool) => true, // Primitive types need refs
+            Some(PgType::Text) => true, // Function param is &str, need &&str for ToSql vector
+            Some(PgType::Enum { .. }) => true, // Enums are passed by value, need reference
+            Some(_) => true, // Domain types, composite types need references for ToSql
+            None => true, // Unknown types (like std::net::IpAddr) need references
+        }
+    }
+    
+    /// Returns the appropriate reference for this argument in the params vector
+    pub fn param_reference(&self, types: &HashMap<OID, PgType>) -> TokenStream {
+        let name = self.rs_name();
+        if self.needs_reference(types) {
+            quote! { &#name }
+        } else {
+            quote! { #name }
+        }
+    }
 }
 
 impl PgFn {
@@ -64,10 +87,15 @@ impl PgFn {
     pub fn rs_name(&self) -> TokenStream {
         sql_to_rs_ident(&self.name, CaseType::Snake)
     }
+    
+    pub fn return_table_struct_name(&self) -> TokenStream {
+        sql_to_rs_ident(&format!("{}_row", &self.name), CaseType::Pascal)
+    }
 
     /// Get all type OIDs in the function signature (args + return type)
     pub fn ty_oids(&self) -> Vec<OID> {
         let mut oids = self.args.iter().map(|a| a.type_oid).collect_vec();
+        oids.extend(self.out_args.iter().map(|a| a.type_oid));
         oids.push(self.return_type_oid);
         oids
     }
@@ -94,14 +122,47 @@ impl PgFn {
         let arg_defaults: Vec<bool> = row.try_get("has_defaults")?;
         let comment: Option<String> = row.try_get("comment")?;
         let language: String = row.try_get("language")?;
+        
+        // Get additional fields for OUT parameters
+        let arg_modes: Option<Vec<i8>> = row.try_get("arg_modes")?;
+        let all_arg_types: Option<Vec<OID>> = row.try_get("all_arg_types")?;
+        let all_arg_names: Option<Vec<String>> = row.try_get("all_arg_names")?;
 
-        let args: Vec<PgArg> = izip!(arg_type_oids, arg_names, arg_defaults)
-            .map(|(oid, name, has_default)| PgArg {
-                name: name.clone(),
-                type_oid: oid,
-                has_default,
-            })
-            .collect();
+        let mut args: Vec<PgArg> = Vec::new();
+        let mut out_args: Vec<PgArg> = Vec::new();
+        
+        // If we have arg_modes, parse IN/OUT parameters separately
+        if let (Some(modes), Some(types), Some(names)) = (arg_modes, all_arg_types, all_arg_names) {
+            for (i, ((mode, &type_oid), name)) in modes.iter().zip(types.iter()).zip(names.iter()).enumerate() {
+                match *mode {
+                    105 | 98 => { // 'i' (IN) or 'b' (INOUT) parameters
+                        args.push(PgArg {
+                            name: name.clone(),
+                            type_oid,
+                            has_default: arg_defaults.get(args.len()).copied().unwrap_or(false),
+                        });
+                    }
+                    _ => {} // Skip for now
+                }
+                
+                if *mode == 111 || *mode == 98 || *mode == 116 { // 'o' (OUT), 'b' (INOUT), or 't' (TABLE) parameters
+                    out_args.push(PgArg {
+                        name: name.clone(),
+                        type_oid,
+                        has_default: false,
+                    });
+                }
+            }
+        } else {
+            // Fallback to original logic if no modes
+            args = izip!(arg_type_oids, arg_names, arg_defaults)
+                .map(|(oid, name, has_default)| PgArg {
+                    name: name.clone(),
+                    type_oid: oid,
+                    has_default,
+                })
+                .collect();
+        }
 
         let definition = row.try_get::<_, String>("function_definition")?;
         
@@ -122,6 +183,7 @@ impl PgFn {
             returns_set: row.try_get("returns_set")?,
             comment,
             args,
+            out_args,
             return_type_oid: row.try_get("return_type")?,
             exceptions,
         })
@@ -169,6 +231,9 @@ impl ToRust for PgFn {
         if return_opt && !self.returns_set  {
             panic!("{}: Only set-returning functions can have @pgrpc_return_opt.", self.name)
         }
+        
+        // Check if this is a RETURN TABLE function
+        let is_return_table = self.return_type_oid == RECORD_TYPE_OID && !self.out_args.is_empty();
 
 
         let fn_body = {
@@ -182,8 +247,8 @@ impl ToRust for PgFn {
                 .join(", ");
 
             let req_arg_names: Vec<TokenStream> = req_args.iter().map(|a| a.rs_name()).collect();
+            let req_arg_refs: Vec<TokenStream> = req_args.iter().map(|a| a.param_reference(types)).collect();
             let opt_arg_names: Vec<TokenStream> = opt_args.iter().map(|a| a.rs_name()).collect();
-            let opt_arg_sql_names: Vec<&str> = opt_args.iter().map(|a| a.name.as_str()).collect();
 
             // Check if return type needs special handling
             let return_pg_type = types.get(&self.return_type_oid);
@@ -202,7 +267,7 @@ impl ToRust for PgFn {
             let query = if return_opt {
                 quote! {
                     client
-                        .query_opt(&query, &params[..])
+                        .query_opt(&query, &params)
                         .await
                         .and_then(|opt_row| match opt_row {
                             None => Ok(None),
@@ -211,23 +276,53 @@ impl ToRust for PgFn {
                         .map_err(#err_type::from)
                 }
             } else if self.returns_set {
-                quote! {
-                    client
-                        .query(&query, &params[..])
-                        .await
-                        .and_then(|rows| {
-                            rows.into_iter().map(TryInto::try_into).collect()
-                        }).map_err(#err_type::from)
+                if self.return_type_oid == VOID_TYPE_OID {
+                    // Void set-returning function - just return vec of units
+                    quote! {
+                        client
+                            .query(&query, &params)
+                            .await
+                            .map(|rows| vec![(); rows.len()])
+                            .map_err(#err_type::from)
+                    }
+                } else if is_return_table {
+                    // RETURN TABLE functions need row conversion
+                    quote! {
+                        client
+                            .query(&query, &params)
+                            .await
+                            .and_then(|rows| {
+                                rows.into_iter().map(TryInto::try_into).collect()
+                            }).map_err(#err_type::from)
+                    }
+                } else {
+                    quote! {
+                        client
+                            .query(&query, &params)
+                            .await
+                            .and_then(|rows| {
+                                rows.into_iter().map(TryInto::try_into).collect()
+                            }).map_err(#err_type::from)
+                    }
                 }
             } else if self.return_type_oid == VOID_TYPE_OID {
                 // Void returning function
                 quote! {
                     client
-                        .execute(&query, &params[..])
+                        .execute(&query, &params)
                         .await
                         .map_err(#err_type::from)?;
 
                     Ok(())
+                }
+            } else if is_return_table {
+                // Non-set RETURN TABLE function (single row)
+                quote! {
+                    client
+                        .query_one(&query, &params)
+                        .await
+                        .and_then(|r| r.try_into())
+                        .map_err(#err_type::from)
                 }
             } else {
                 // Check if return type is a composite type with custom TryFrom
@@ -243,7 +338,7 @@ impl ToRust for PgFn {
                             if return_not_null {
                                 quote! {
                                     client
-                                        .query_one(&query, &params[..])
+                                        .query_one(&query, &params)
                                         .await
                                         .and_then(|r| r.try_into())
                                         .map_err(#err_type::from)
@@ -251,7 +346,7 @@ impl ToRust for PgFn {
                             } else {
                                 quote! {
                                     client
-                                        .query_one(&query, &params[..])
+                                        .query_one(&query, &params)
                                         .await
                                         .and_then(|r| Ok(Some(r.try_into()?)))
                                         .map_err(#err_type::from)
@@ -261,7 +356,7 @@ impl ToRust for PgFn {
                             // Regular composite types can use try_get
                             quote! {
                                 client
-                                    .query_one(&query, &params[..])
+                                    .query_one(&query, &params)
                                     .await
                                     .and_then(|r| r.try_get(0))
                                     .map_err(#err_type::from)
@@ -272,7 +367,7 @@ impl ToRust for PgFn {
                         // Non-composite types use try_get
                         quote! {
                             client
-                                .query_one(&query, &params[..])
+                                .query_one(&query, &params)
                                 .await
                                 .and_then(|r| r.try_get(0))
                                 .map_err(#err_type::from)
@@ -281,21 +376,58 @@ impl ToRust for PgFn {
                 }
             };
 
-            quote! {
-                let mut params: Vec<&(dyn ToSql + Sync)> = vec![#(&#req_arg_names),*];
-                let mut query = concat!(#query_string, "(", #required_query_params).to_string();
-
-                #(
-                    if let Some(ref value) = #opt_arg_names {
-                        params.push(value);
-                        query.push_str(concat!(", ", #opt_arg_sql_names, ":= $"));
-                        query.push_str(&params.len().to_string());
+            if !opt_args.is_empty() {
+                // Generate code for functions with optional parameters using string building
+                let opt_param_handling: Vec<TokenStream> = opt_args.iter().enumerate().map(|(i, arg)| {
+                    let arg_name = arg.rs_name();
+                    let param_index = req_args.len() + i + 1;
+                    // We need to use as_ref() to avoid moving the value out of the Option
+                    let param_ref = if arg.needs_reference(types) {
+                        quote! { val }  // val is already a reference from as_ref()
+                    } else {
+                        quote! { *val } // Dereference to get the value
+                    };
+                    quote! {
+                        if let Some(val) = #arg_name.as_ref() {
+                            params.push(#param_ref);
+                            optional_parts.push(format!("{} := ${}", stringify!(#arg_name), params.len()));
+                        }
                     }
-                )*
+                }).collect();
 
-                query.push_str(")");
+                quote! {
+                    let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#req_arg_refs),*];
+                    let mut optional_parts = Vec::new();
+                    
+                    #(#opt_param_handling)*
+                    
+                    let query = if optional_parts.is_empty() {
+                        if params.is_empty() {
+                            format!("{}()", #query_string)
+                        } else {
+                            format!("{}({})", #query_string, #required_query_params)
+                        }
+                    } else {
+                        let optional_clause = optional_parts.join(", ");
+                        if params.len() == optional_parts.len() {
+                            // Only optional parameters
+                            format!("{}({})", #query_string, optional_clause)
+                        } else {
+                            // Both required and optional parameters
+                            format!("{}({}, {})", #query_string, #required_query_params, optional_clause)
+                        }
+                    };
 
-                #query
+                    #query
+                }
+            } else {
+                // Simple case with only required parameters
+                quote! {
+                    let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#req_arg_refs),*];
+                    let query = format!("{}({})", #query_string, #required_query_params);
+
+                    #query
+                }
             }
         };
 
@@ -304,6 +436,14 @@ impl ToRust for PgFn {
         let args: Vec<TokenStream> = self.args.iter().map(|a| a.to_rust(types, config)).collect();
         let return_type = if self.return_type_oid == VOID_TYPE_OID {
             quote! { () }
+        } else if is_return_table {
+            // For RETURN TABLE functions, use the generated struct
+            let struct_name = self.return_table_struct_name();
+            if self.returns_set {
+                quote! { Vec<#struct_name> }
+            } else {
+                quote! { #struct_name }
+            }
         } else {
             let inner_ty = types
                 .get(&self.return_type_oid)
@@ -327,7 +467,53 @@ impl ToRust for PgFn {
             None => quote! {},
         };
 
+        // Generate struct for RETURN TABLE functions
+        let struct_def = if is_return_table {
+            let struct_name = self.return_table_struct_name();
+            let field_names: Vec<TokenStream> = self.out_args.iter()
+                .map(|arg| sql_to_rs_ident(&arg.name, CaseType::Snake))
+                .collect();
+            let field_types: Vec<TokenStream> = self.out_args.iter().map(|arg| {
+                match types.get(&arg.type_oid).unwrap() {
+                    PgType::Int16 => quote! { i16 },
+                    PgType::Int32 => quote! { i32 },
+                    PgType::Int64 => quote! { i64 },
+                    PgType::Bool => quote! { bool },
+                    PgType::Text => quote! { String },
+                    t => {
+                        let id = t.to_rust_ident(types);
+                        quote! { #id }
+                    }
+                }
+            }).collect();
+            
+            let field_indices: Vec<usize> = (0..self.out_args.len()).collect();
+            
+            quote! {
+                #[derive(Debug, Clone)]
+                pub struct #struct_name {
+                    #(pub #field_names: #field_types),*
+                }
+                
+                impl TryFrom<tokio_postgres::Row> for #struct_name {
+                    type Error = tokio_postgres::Error;
+                    
+                    fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                        Ok(Self {
+                            #(
+                                #field_names: row.try_get(#field_indices)?,
+                            )*
+                        })
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+
         quote! {
+            #struct_def
+            
             #comment_macro
             pub async fn #rs_fn_name(client: &impl deadpool_postgres::GenericClient, #(#args),*) -> Result<#return_type, #err_type> {
                 #fn_body

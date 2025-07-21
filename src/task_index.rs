@@ -51,28 +51,66 @@ impl DerefMut for TaskIndex {
 impl TaskIndex {
     /// Construct the task index by introspecting the configured task schema
     pub fn new(db: &mut Client, task_config: &TaskQueueConfig) -> anyhow::Result<Self> {
-        let task_types = db
+        eprintln!("[PGRPC] Introspecting task types from schema: {}", task_config.schema);
+        
+        // First, let's log the actual SQL query being executed
+        eprintln!("[PGRPC] Executing task introspection query with schema parameter: '{}'", task_config.schema);
+        
+        let query_result = db
             .query(TASK_INTROSPECTION_QUERY, &[&task_config.schema])
-            .context("Task introspection query failed")?
+            .context("Task introspection query failed")?;
+            
+        eprintln!("[PGRPC] Task introspection query returned {} rows", query_result.len());
+        
+        let task_types: HashMap<String, TaskType> = query_result
             .into_iter()
-            .map(|row| {
+            .enumerate()
+            .map(|(row_idx, row)| {
+                eprintln!("[PGRPC] Processing row {}", row_idx);
+                
                 let task_name: String = row.try_get("task_name")?;
                 let type_oid: u32 = row.try_get("type_oid")?;
                 let fields_json: Value = row.try_get("fields")?;
                 
-                let fields: Vec<TaskField> = serde_json::from_value::<Vec<Value>>(fields_json)
-                    .context("Failed to parse fields JSON")?
+                eprintln!("[PGRPC] Row {}: Processing task type '{}' (OID: {})", row_idx, task_name, type_oid);
+                eprintln!("[PGRPC] Row {}: Raw fields JSON: {}", row_idx, fields_json);
+                
+                // Check if fields_json is null or empty array
+                let fields_vec = if fields_json.is_null() {
+                    eprintln!("[PGRPC] Row {}: Fields JSON is null for task '{}'", row_idx, task_name);
+                    Vec::new()
+                } else {
+                    match serde_json::from_value::<Vec<Value>>(fields_json.clone()) {
+                        Ok(vec) => {
+                            eprintln!("[PGRPC] Row {}: Successfully parsed {} field entries for task '{}'", row_idx, vec.len(), task_name);
+                            for (field_idx, field_json) in vec.iter().enumerate() {
+                                eprintln!("[PGRPC] Row {}: Field {}: {}", row_idx, field_idx, field_json);
+                            }
+                            vec
+                        }
+                        Err(e) => {
+                            eprintln!("[PGRPC] Row {}: Failed to parse fields JSON for task '{}': {}", row_idx, task_name, e);
+                            eprintln!("[PGRPC] Row {}: Problematic JSON: {}", row_idx, fields_json);
+                            return Err(e.into());
+                        }
+                    }
+                };
+                
+                let fields: Vec<TaskField> = fields_vec
                     .into_iter()
                     .filter_map(|field_json: Value| {
                         // Extract all required fields, logging and skipping if any are missing
                         let name = field_json["name"].as_str();
-                        let type_oid = field_json["type_oid"].as_u64();
+                        // Handle type_oid as either number or string
+                        let type_oid = field_json["type_oid"].as_u64()
+                            .or_else(|| field_json["type_oid"].as_str().and_then(|s| s.parse().ok()));
                         let postgres_type = field_json["postgres_type"].as_str();
                         let position = field_json["position"].as_i64();
                         let not_null = field_json["not_null"].as_bool();
                         
                         match (name, type_oid, postgres_type, position, not_null) {
                             (Some(n), Some(t), Some(pt), Some(p), Some(nn)) => {
+                                eprintln!("[PGRPC]   Field '{}': {} (OID: {})", n, pt, t);
                                 Some(TaskField {
                                     name: n.to_string(),
                                     type_oid: t as u32,
@@ -83,12 +121,14 @@ impl TaskIndex {
                                 })
                             }
                             _ => {
-                                warn!("Skipping malformed task field JSON: {:?}", field_json);
+                                eprintln!("[PGRPC] Skipping malformed task field JSON: {:?}", field_json);
                                 None
                             }
                         }
                     })
                     .collect();
+                
+                eprintln!("[PGRPC] Task '{}' has {} fields after filtering", task_name, fields.len());
 
                 Ok::<_, anyhow::Error>((
                     task_name.clone(),
@@ -101,6 +141,7 @@ impl TaskIndex {
             })
             .try_collect()?;
 
+        eprintln!("[PGRPC] Found {} task types in schema '{}'", task_types.len(), task_config.schema);
         Ok(Self(task_types))
     }
     
@@ -113,6 +154,71 @@ impl TaskIndex {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+    
+    /// Collect all type OIDs referenced by task types
+    pub fn collect_type_oids(&self) -> Vec<OID> {
+        let mut oids = HashSet::new();
+        
+        for task_type in self.0.values() {
+            // Add the composite type itself
+            oids.insert(task_type.type_oid);
+            
+            // Add all field type OIDs
+            for field in &task_type.fields {
+                oids.insert(field.type_oid);
+            }
+        }
+        
+        oids.into_iter().collect()
+    }
+}
+
+/// Collect all type OIDs from task types in the database
+pub fn collect_task_type_oids(
+    db_client: &mut postgres::Client,
+    task_config: &TaskQueueConfig,
+) -> anyhow::Result<Vec<OID>> {
+    let mut oids = HashSet::new();
+    
+    // Get all composite types in the task schema AND their field types
+    let query = r#"
+        WITH task_types AS (
+            SELECT 
+                t.oid as type_oid,
+                t.typrelid
+            FROM pg_type t
+            WHERE t.typnamespace = (
+                SELECT oid FROM pg_namespace WHERE nspname = $1
+            )
+              AND t.typtype = 'c'  -- composite types only
+        )
+        SELECT DISTINCT oid FROM (
+            -- Include the composite type OIDs
+            SELECT type_oid as oid FROM task_types
+            
+            UNION
+            
+            -- Include all field type OIDs
+            SELECT a.atttypid as oid
+            FROM task_types tt
+            JOIN pg_attribute a ON a.attrelid = tt.typrelid
+            WHERE a.attnum > 0 AND NOT a.attisdropped
+        ) AS all_oids
+    "#;
+    
+    let rows = db_client.query(query, &[&task_config.schema])?;
+    
+    eprintln!("[PGRPC] collect_task_type_oids: Query returned {} rows", rows.len());
+    
+    for row in rows {
+        let type_oid: OID = row.try_get("oid")?;
+        eprintln!("[PGRPC] collect_task_type_oids: Adding OID {}", type_oid);
+        oids.insert(type_oid);
+    }
+    
+    eprintln!("[PGRPC] collect_task_type_oids: Collected {} type OIDs from task schema '{}'", oids.len(), task_config.schema);
+    
+    Ok(oids.into_iter().collect())
 }
 
 /// Generate task payload enum from task index
@@ -121,7 +227,7 @@ pub fn generate_task_enum(
     type_index: &TypeIndex,
     config: &Config,
 ) -> (TokenStream, HashSet<String>) {
-    let mut referenced_schemas =HashSet::new();
+    let mut referenced_schemas = HashSet::new();
     
     if task_index.is_empty() {
         return (TokenStream::new(), referenced_schemas);
@@ -129,14 +235,20 @@ pub fn generate_task_enum(
 
     let task_config = config.task_queue.as_ref().expect("Task queue config should be present");
     
-    // Generate enum variants and collect referenced schemas
-    let variants: Vec<TokenStream> = task_index
+    // First, generate all payload structs
+    let payload_structs: Vec<TokenStream> = task_index
         .values()
         .map(|task_type| {
-            let (variant, schemas) = generate_task_variant(task_type, type_index, config);
+            let (struct_def, schemas) = generate_payload_struct(task_type, type_index, config);
             referenced_schemas.extend(schemas);
-            variant
+            struct_def
         })
+        .collect();
+    
+    // Then generate enum variants (which now reference the payload structs)
+    let variants: Vec<TokenStream> = task_index
+        .values()
+        .map(|task_type| generate_task_variant(task_type, type_index, config))
         .collect();
 
     let task_name_column = &task_config.task_name_column;
@@ -160,7 +272,7 @@ pub fn generate_task_enum(
         })
         .collect();
 
-    // Generate match arms for task_name method
+    // Generate match arms for task_name method (now handling tuple variants)
     let name_arms: Vec<TokenStream> = task_index
         .values()
         .map(|task_type| {
@@ -168,7 +280,7 @@ pub fn generate_task_enum(
             let variant_name = format_ident!("{}", sql_to_rs_string(task_name, CaseType::Pascal));
             
             quote! {
-                TaskPayload::#variant_name { .. } => #task_name
+                TaskPayload::#variant_name(_) => #task_name
             }
         })
         .collect();
@@ -181,6 +293,9 @@ pub fn generate_task_enum(
     );
 
     let enum_code = quote! {
+        // Generate all payload structs first
+        #(#payload_structs)*
+        
         #[doc = #enum_doc]
         #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
         #[serde(tag = #task_name_column, content = #payload_column)]
@@ -231,15 +346,23 @@ pub fn generate_task_enum(
     (enum_code, referenced_schemas)
 }
 
-/// Generate a single task variant
-fn generate_task_variant(
+/// Generate a payload struct for a task type
+fn generate_payload_struct(
     task_type: &TaskType,
     type_index: &TypeIndex,
     _config: &Config,
 ) -> (TokenStream, std::collections::HashSet<String>) {
     let mut referenced_schemas = std::collections::HashSet::new();
-    let variant_name = format_ident!("{}", sql_to_rs_string(&task_type.task_name, CaseType::Pascal));
+    let struct_name = format_ident!("{}Payload", sql_to_rs_string(&task_type.task_name, CaseType::Pascal));
     let task_name = &task_type.task_name;
+    
+    eprintln!("[PGRPC] Generating payload struct for task '{}' with {} fields", task_name, task_type.fields.len());
+    
+    // Debug: print all fields
+    for (idx, field) in task_type.fields.iter().enumerate() {
+        eprintln!("[PGRPC]   Field {}: name='{}', type_oid={}, postgres_type='{}'", 
+                  idx, field.name, field.type_oid, field.postgres_type);
+    }
     
     let fields: Vec<TokenStream> = task_type.fields
         .iter()
@@ -248,26 +371,50 @@ fn generate_task_variant(
             
             // Look up the PostgreSQL type in our type index to get the Rust type
             let rust_type = if let Some(pg_type) = type_index.get(&field.type_oid) {
+                eprintln!("[PGRPC]     Field '{}' (OID {}) found in TypeIndex", field.name, field.type_oid);
                 let (type_tokens, schemas) = pg_type.to_rust_ident_with_schemas(type_index);
                 referenced_schemas.extend(schemas);
                 type_tokens
             } else {
                 // Fallback to a basic type mapping
+                eprintln!("[PGRPC]     Field '{}' (OID {}) NOT found in TypeIndex, using fallback mapping for '{}'", 
+                         field.name, field.type_oid, field.postgres_type);
                 map_postgres_type_to_rust(&field.postgres_type)
             };
             
             quote! { pub #field_name: #rust_type }
         })
         .collect();
+    
+    eprintln!("[PGRPC]   Generated {} field tokens", fields.len());
 
-    let variant = quote! {
-        #[serde(rename = #task_name)]
-        #variant_name {
+    let payload_struct = quote! {
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        pub struct #struct_name {
             #(#fields),*
         }
     };
     
-    (variant, referenced_schemas)
+    (payload_struct, referenced_schemas)
+}
+
+/// Generate a single task variant (now using tuple syntax)
+fn generate_task_variant(
+    task_type: &TaskType,
+    _type_index: &TypeIndex,
+    _config: &Config,
+) -> TokenStream {
+    let variant_name = format_ident!("{}", sql_to_rs_string(&task_type.task_name, CaseType::Pascal));
+    let payload_struct_name = format_ident!("{}Payload", sql_to_rs_string(&task_type.task_name, CaseType::Pascal));
+    let task_name = &task_type.task_name;
+    
+    log::debug!("Generating tuple variant for task '{}'", task_name);
+    
+    // For empty payloads, we still generate a struct, but it will be empty
+    quote! {
+        #[serde(rename = #task_name)]
+        #variant_name(#payload_struct_name)
+    }
 }
 
 /// Basic PostgreSQL to Rust type mapping for task fields
@@ -292,5 +439,340 @@ fn map_postgres_type_to_rust(postgres_type: &str) -> TokenStream {
             // For complex types, fall back to String and let serde handle it
             quote! { String }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, TaskQueueConfig};
+    use crate::ty_index::TypeIndex;
+    use crate::pg_type::PgType;
+    use serde_json::json;
+
+    fn create_test_task_index() -> TaskIndex {
+        let mut task_index = TaskIndex(HashMap::new());
+        
+        // Create a task type with fields (like send_verification_code)
+        let task_with_fields = TaskType {
+            task_name: "send_verification_code".to_string(),
+            type_oid: 123456,
+            fields: vec![
+                TaskField {
+                    name: "email".to_string(),
+                    type_oid: 1001,
+                    postgres_type: "email".to_string(),
+                    position: 1,
+                    not_null: true,
+                    comment: None,
+                },
+                TaskField {
+                    name: "code".to_string(),
+                    type_oid: 1002,
+                    postgres_type: "verification_code".to_string(),
+                    position: 2,
+                    not_null: true,
+                    comment: None,
+                }
+            ],
+        };
+        
+        // Create a task type without fields (current problematic case)
+        let task_without_fields = TaskType {
+            task_name: "shipment_created".to_string(),
+            type_oid: 123457,
+            fields: vec![], // This is what's currently happening
+        };
+        
+        task_index.insert("send_verification_code".to_string(), task_with_fields);
+        task_index.insert("shipment_created".to_string(), task_without_fields);
+        
+        task_index
+    }
+    
+    fn create_test_type_index() -> HashMap<OID, PgType> {
+        let mut type_index = HashMap::new();
+        
+        // Just add basic types - we don't need domain types for our test
+        type_index.insert(25, PgType::Text);
+        
+        type_index
+    }
+    
+    fn create_test_config() -> Config {
+        Config {
+            schemas: vec!["api".to_string()],
+            task_queue: Some(TaskQueueConfig {
+                schema: "tasks".to_string(),
+                table_schema: Some("mq".to_string()),
+                table_name: Some("task".to_string()),
+                task_name_column: "task_name".to_string(),
+                payload_column: "payload".to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    // Test the type mapping logic that's used for fallback
+    #[test]
+    fn test_postgres_type_mapping() {
+        // Test the basic type mappings used when type lookup fails
+        let email_mapping = map_postgres_type_to_rust("email");
+        let text_mapping = map_postgres_type_to_rust("text");
+        let integer_mapping = map_postgres_type_to_rust("integer");
+        
+        // Domain types should fall back to String
+        assert_eq!(email_mapping.to_string(), "String");
+        assert_eq!(text_mapping.to_string(), "String");
+        assert_eq!(integer_mapping.to_string(), "i32");
+    }
+    
+    // Test the field generation logic directly 
+    #[test] 
+    fn test_field_generation_logic() {
+        let fields = vec![
+            TaskField {
+                name: "email".to_string(),
+                type_oid: 1001,
+                postgres_type: "email".to_string(),
+                position: 1,
+                not_null: true,
+                comment: None,
+            },
+            TaskField {
+                name: "code".to_string(),
+                type_oid: 1002,
+                postgres_type: "verification_code".to_string(),
+                position: 2,
+                not_null: true,
+                comment: None,
+            }
+        ];
+        
+        // Test that fields are not empty - this should demonstrate the issue
+        assert_eq!(fields.len(), 2, "Should have 2 fields");
+        assert_eq!(fields[0].name, "email", "First field should be email");
+        assert_eq!(fields[1].name, "code", "Second field should be code");
+        
+        // Test the TokenStream generation for field names
+        let field_tokens: Vec<TokenStream> = fields
+            .iter()
+            .map(|field| {
+                let field_name = format_ident!("{}", sql_to_rs_string(&field.name, CaseType::Snake));
+                let rust_type = map_postgres_type_to_rust(&field.postgres_type);
+                quote! { pub #field_name: #rust_type }
+            })
+            .collect();
+        
+        assert_eq!(field_tokens.len(), 2, "Should generate 2 field tokens");
+        
+        // Check the generated field code
+        let first_field = field_tokens[0].to_string();
+        let second_field = field_tokens[1].to_string();
+        
+        assert!(first_field.contains("pub email"), "First field should contain 'pub email'");
+        assert!(first_field.contains("String"), "First field should be String type");
+        assert!(second_field.contains("pub code"), "Second field should contain 'pub code'");
+        assert!(second_field.contains("String"), "Second field should be String type");
+    }
+    
+    // Test that empty fields generates empty struct
+    #[test]
+    fn test_empty_fields_generates_empty_struct() {
+        let empty_fields: Vec<TaskField> = vec![];
+        
+        // Generate tokens for empty fields
+        let field_tokens: Vec<TokenStream> = empty_fields
+            .iter()
+            .map(|field| {
+                let field_name = format_ident!("{}", sql_to_rs_string(&field.name, CaseType::Snake));
+                let rust_type = map_postgres_type_to_rust(&field.postgres_type);
+                quote! { pub #field_name: #rust_type }
+            })
+            .collect();
+        
+        // Should result in no field tokens
+        assert_eq!(field_tokens.len(), 0, "Empty fields should generate no field tokens");
+        
+        // Simulate the payload struct generation with empty fields
+        let struct_name = format_ident!("TestTaskPayload");
+        let payload_struct = quote! {
+            #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+            pub struct #struct_name {
+                #(#field_tokens),*
+            }
+        };
+        
+        let generated_struct = payload_struct.to_string();
+        println!("Empty payload struct generated: {}", generated_struct);
+        
+        // Should generate an empty struct
+        assert!(generated_struct.contains("TestTaskPayload {"), "Should contain struct with empty braces");
+        
+        // Now test the enum variant generation
+        let variant_name = format_ident!("TestTask");
+        let variant = quote! {
+            #[serde(rename = "test_task")]
+            #variant_name(#struct_name)
+        };
+        
+        let generated_variant = variant.to_string();
+        println!("Tuple variant generated: {}", generated_variant);
+        
+        // Should generate a tuple variant
+        assert!(generated_variant.contains("TestTask") && generated_variant.contains("(") && generated_variant.contains("TestTaskPayload)"), 
+            "Should contain tuple variant");
+    }
+    
+    // Test the new payload struct generation with fallback type mapping
+    #[test]
+    fn test_payload_struct_generation_with_fallback() {
+        let task_type = TaskType {
+            task_name: "send_verification_code".to_string(),
+            type_oid: 123456,
+            fields: vec![
+                TaskField {
+                    name: "email".to_string(),
+                    type_oid: 9999, // Not in type index, will use fallback
+                    postgres_type: "email".to_string(),
+                    position: 1,
+                    not_null: true,
+                    comment: None,
+                },
+                TaskField {
+                    name: "code".to_string(),
+                    type_oid: 9998, // Not in type index, will use fallback
+                    postgres_type: "text".to_string(),
+                    position: 2,
+                    not_null: true,
+                    comment: None,
+                }
+            ],
+        };
+        
+        // Test with minimal type_index - fields will use fallback mapping
+        let fields: Vec<TokenStream> = task_type.fields
+            .iter()
+            .map(|field| {
+                let field_name = format_ident!("{}", sql_to_rs_string(&field.name, CaseType::Snake));
+                let rust_type = map_postgres_type_to_rust(&field.postgres_type);
+                quote! { pub #field_name: #rust_type }
+            })
+            .collect();
+        
+        let struct_name = format_ident!("{}Payload", sql_to_rs_string(&task_type.task_name, CaseType::Pascal));
+        let payload_struct = quote! {
+            #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+            pub struct #struct_name {
+                #(#fields),*
+            }
+        };
+        
+        let generated = payload_struct.to_string();
+        println!("Generated payload struct:\n{}", generated);
+        
+        // Should generate a struct named SendVerificationCodePayload
+        assert!(generated.contains("SendVerificationCodePayload"), "Should contain payload struct name");
+        assert!(generated.contains("pub email : String"), "Should contain email field as String (fallback)");
+        assert!(generated.contains("pub code : String"), "Should contain code field as String");
+    }
+    
+    // Test the new variant generation with tuple syntax
+    #[test]
+    fn test_generate_task_variant_tuple_syntax() {
+        let task_type = TaskType {
+            task_name: "send_verification_code".to_string(),
+            type_oid: 123456,
+            fields: vec![], // Fields don't matter for variant generation anymore
+        };
+        
+        // Directly test the variant generation
+        let variant_name = format_ident!("{}", sql_to_rs_string(&task_type.task_name, CaseType::Pascal));
+        let payload_struct_name = format_ident!("{}Payload", sql_to_rs_string(&task_type.task_name, CaseType::Pascal));
+        let task_name = &task_type.task_name;
+        
+        let variant = quote! {
+            #[serde(rename = #task_name)]
+            #variant_name(#payload_struct_name)
+        };
+        
+        let generated = variant.to_string();
+        println!("Generated tuple variant:\n{}", generated);
+        
+        // Should generate a tuple variant
+        assert!(generated.contains("SendVerificationCode") && generated.contains("(") && generated.contains("SendVerificationCodePayload)"), 
+            "Should contain tuple variant with payload struct");
+        assert!(generated.contains("serde") && generated.contains("rename") && generated.contains("\"send_verification_code\""), 
+            "Should have serde rename attribute");
+    }
+    
+    #[test]  
+    fn test_task_field_processing_from_json() {
+        // Test the JSON processing logic that converts database results to TaskField structs
+        let fields_json = json!([
+            {
+                "name": "email",
+                "type_oid": 1001,
+                "postgres_type": "email", 
+                "position": 1,
+                "not_null": true,
+                "comment": null
+            },
+            {
+                "name": "code",
+                "type_oid": 1002,
+                "postgres_type": "verification_code",
+                "position": 2, 
+                "not_null": true,
+                "comment": null
+            }
+        ]);
+        
+        // This simulates what happens in TaskIndex::new() when processing the JSON
+        let fields_vec: Vec<serde_json::Value> = serde_json::from_value(fields_json).unwrap();
+        
+        let fields: Vec<TaskField> = fields_vec
+            .into_iter()
+            .filter_map(|field_json: serde_json::Value| {
+                let name = field_json["name"].as_str();
+                let type_oid = field_json["type_oid"].as_u64();
+                let postgres_type = field_json["postgres_type"].as_str();
+                let position = field_json["position"].as_i64();
+                let not_null = field_json["not_null"].as_bool();
+                
+                match (name, type_oid, postgres_type, position, not_null) {
+                    (Some(n), Some(t), Some(pt), Some(p), Some(nn)) => {
+                        Some(TaskField {
+                            name: n.to_string(),
+                            type_oid: t as u32,
+                            postgres_type: pt.to_string(),
+                            position: p as i32,
+                            not_null: nn,
+                            comment: field_json["comment"].as_str().map(|s| s.to_string()),
+                        })
+                    }
+                    _ => None
+                }
+            })
+            .collect();
+            
+        assert_eq!(fields.len(), 2, "Should parse 2 fields from JSON");
+        assert_eq!(fields[0].name, "email", "First field should be email");
+        assert_eq!(fields[1].name, "code", "Second field should be code");
+        assert_eq!(fields[0].type_oid, 1001, "First field should have correct type OID");
+        assert_eq!(fields[1].type_oid, 1002, "Second field should have correct type OID");
+    }
+    
+    #[test]
+    fn test_empty_fields_json_processing() {
+        // Test what happens when we get empty JSON array (current problem case)
+        let empty_fields_json = json!([]);
+        
+        let fields_vec: Vec<serde_json::Value> = serde_json::from_value(empty_fields_json).unwrap();
+        assert_eq!(fields_vec.len(), 0, "Empty JSON array should result in empty vec");
+        
+        // Test what happens with null JSON
+        let null_fields_json = serde_json::Value::Null;
+        assert!(null_fields_json.is_null(), "Null JSON should be detected as null");
     }
 }

@@ -7,3 +7,8 @@ ltree = "String"
 
 [exceptions]
 P0001 = "Sample error"
+
+[task_queue]
+schema = "tasks"
+task_name_column = "task_name"
+payload_column = "payload"

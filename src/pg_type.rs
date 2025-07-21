@@ -193,7 +193,8 @@ pub enum PgType {
     INet,
     Void,
     Bytea,
-    Json
+    Json,
+    Record
 }
 
 #[derive(Debug)]
@@ -213,6 +214,7 @@ impl PgType {
             PgType::Array { schema, .. } => schema,
             PgType::Domain { schema, .. } => schema,
             PgType::Custom { schema, .. } => schema,
+            PgType::Record => "pg_catalog",
             _ => "pg_catalog",
         }
         .to_owned()
@@ -255,6 +257,7 @@ impl PgType {
             PgType::Bytea => quote! { Vec<u8> },
             PgType::Json => quote! { serde_json::Value },
             PgType::Void => quote! { () },
+            PgType::Record => quote! { tokio_postgres::Row },
             x => unimplemented!("unknown type {:?}", x),
         }
     }
@@ -303,6 +306,7 @@ impl PgType {
             PgType::Bytea => quote! { Vec<u8> },
             PgType::Json => quote! { serde_json::Value },
             PgType::Void => quote! { () },
+            PgType::Record => quote! { tokio_postgres::Row },
             x => unimplemented!("unknown type {:?}", x),
         };
         
@@ -338,32 +342,52 @@ impl TryFrom<Row> for PgType {
                 "json" | "jsonb" => PgType::Json,
                 x => unimplemented!("base type not implemented {}", x),
             },
-            'c' =>
-                 PgType::Composite {
-                    schema,
-                    name,
-                    comment,
-                    fields: izip!(
-                    t.get::<&str, Vec<&str>>("composite_field_names"),
-                    t.get::<&str, Vec<u32>>("composite_field_types"),
-                    t.get::<&str, Vec<bool>>("composite_field_nullables"),
-                    t.get::<&str, Vec<Option<String>>>("composite_field_comments")
-                )
-                      .map(|(name, ty, nullable, comment)| {
-                          PgField {
-                              name: name.to_string(),
-                              type_oid: ty,
-                              nullable: nullable
-                                && !comment
-                                .as_ref()
-                                .is_some_and(|c| c.contains("@pgrpc_not_null")),
-                              comment: comment.clone(),
-                              flatten: comment
-                                .as_ref()
-                                .is_some_and(|c| c.contains("@pgrpc_flatten")),
-                          }
-                      })
-                      .collect(),
+            'c' => {
+                // Check if composite_field_names is NULL (happens when composite type has no fields)
+                let field_names_opt: Option<Vec<&str>> = t.try_get("composite_field_names").ok();
+                
+                if field_names_opt.is_none() || field_names_opt.as_ref().map(|v| v.is_empty()).unwrap_or(true) {
+                    // Handle composite types with no fields
+                    let type_oid: u32 = t.get("oid");
+                    eprintln!("WARNING: Composite type '{}.{}' (OID: {}) has no fields defined.", schema, name, type_oid);
+                    if schema == "tasks" {
+                        eprintln!("  This appears to be a task type. Make sure the corresponding payload type is defined in the database.");
+                        eprintln!("  Example: CREATE TYPE tasks.{} AS (field1 type1, field2 type2, ...);", name);
+                    }
+                    PgType::Composite {
+                        schema,
+                        name,
+                        comment,
+                        fields: vec![],
+                    }
+                } else {
+                    PgType::Composite {
+                        schema,
+                        name,
+                        comment,
+                        fields: izip!(
+                            field_names_opt.unwrap(),
+                            t.get::<&str, Vec<u32>>("composite_field_types"),
+                            t.get::<&str, Vec<bool>>("composite_field_nullables"),
+                            t.get::<&str, Vec<Option<String>>>("composite_field_comments")
+                        )
+                        .map(|(name, ty, nullable, comment)| {
+                            PgField {
+                                name: name.to_string(),
+                                type_oid: ty,
+                                nullable: nullable
+                                    && !comment
+                                    .as_ref()
+                                    .is_some_and(|c| c.contains("@pgrpc_not_null")),
+                                comment: comment.clone(),
+                                flatten: comment
+                                    .as_ref()
+                                    .is_some_and(|c| c.contains("@pgrpc_flatten")),
+                            }
+                        })
+                        .collect(),
+                    }
+                }
             },
             'd' => {
                 let constraints =
@@ -387,11 +411,7 @@ impl TryFrom<Row> for PgType {
             'p' => match name.as_ref() {
                 "void" => PgType::Void,
                 "trigger" => PgType::Void, // Trigger functions return pseudo-type, treat as void
-                "record" => {
-                    eprintln!("DEBUG: Encountered 'record' pseudo type in schema '{}', type name '{}'", schema, name);
-                    eprintln!("DEBUG: This is typically a function return type for functions returning anonymous record types");
-                    PgType::Void // Treat record pseudo-type as void for now
-                },
+                "record" => PgType::Record,
                 p => {
                     eprintln!("ERROR: Unhandled pseudo type encountered:");
                     eprintln!("  Type name: {}", name);
@@ -586,10 +606,43 @@ impl ToRust for PgType {
                             }
 
                             /// Internal; used for serialization/deserialization only
-                            #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql, serde::Deserialize, serde::Serialize)]
-                            #[postgres(name = #name)]
+                            #[derive(Debug, serde::Deserialize, serde::Serialize)]
                             struct #rs_dom_name(#rs_dom_inner_name);
 
+
+                            /// Manual FromSql implementation for domain wrapper that handles domain unwrapping
+                            impl<'a> postgres_types::FromSql<'a> for #rs_dom_name {
+                                fn from_sql(ty: &postgres_types::Type, buf: &'a [u8]) -> std::result::Result<#rs_dom_name, Box<dyn std::error::Error + std::marker::Sync + std::marker::Send>> {
+                                    // Key fix: unwrap domain types as per PR #1189
+                                    let actual_type = match ty.kind() {
+                                        postgres_types::Kind::Domain(inner) => inner,
+                                        _ => ty
+                                    };
+                                    <#rs_dom_inner_name as postgres_types::FromSql>::from_sql(actual_type, buf).map(#rs_dom_name)
+                                }
+
+                                fn accepts(ty: &postgres_types::Type) -> bool {
+                                    ty.name() == #name
+                                }
+                            }
+
+                            /// Manual ToSql implementation for domain wrapper
+                            impl postgres_types::ToSql for #rs_dom_name {
+                                fn to_sql(&self, ty: &postgres_types::Type, out: &mut postgres_types::private::BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+                                    // For domains, we need to get the inner type
+                                    let inner_ty = match ty.kind() {
+                                        postgres_types::Kind::Domain(inner) => inner,
+                                        _ => return Err("Expected domain type".into()),
+                                    };
+                                    self.0.to_sql(inner_ty, out)
+                                }
+
+                                fn accepts(ty: &postgres_types::Type) -> bool {
+                                    ty.name() == #name
+                                }
+
+                                postgres_types::to_sql_checked!();
+                            }
 
                             /// Dispatch FromSql implementation to internal domain wrapper struct
                             impl<'a> postgres_types::FromSql<'a> for #rs_name {
@@ -612,12 +665,12 @@ impl ToRust for PgType {
                                 }
                             }
 
-                            impl ToSql for #rs_name {
+                            impl postgres_types::ToSql for #rs_name {
                                 fn to_sql(
                                     &self,
-                                    ty: &Type,
-                                    out: &mut BytesMut,
-                                ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+                                    ty: &postgres_types::Type,
+                                    out: &mut postgres_types::private::BytesMut,
+                                ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
                                     let inner = unsafe { std::mem::transmute::<#rs_name, #rs_dom_inner_name>(self.clone()) };
 
                                     let inner_ty = match ty.kind() {
@@ -628,7 +681,7 @@ impl ToRust for PgType {
                                     inner.to_sql(inner_ty, out)
                                 }
 
-                                fn accepts(ty: &Type) -> bool {
+                                fn accepts(ty: &postgres_types::Type) -> bool {
                                     // Match domain by name
                                     ty.name() == #name
                                 }
@@ -694,7 +747,8 @@ impl ToRust for PgType {
             | PgType::Bytea
             | PgType::Numeric
             | PgType::Json
-            | PgType::Void => {
+            | PgType::Void
+            | PgType::Record => {
                 quote! {}
             }
             // No need to create type aliases for arrays. Instead they'll be used as Vec<Inner>
