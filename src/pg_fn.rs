@@ -308,13 +308,31 @@ impl ToRust for PgFn {
                             }).map_err(#err_type::from)
                     }
                 } else {
-                    quote! {
-                        client
-                            .query(&query, &params)
-                            .await
-                            .and_then(|rows| {
-                                rows.into_iter().map(TryInto::try_into).collect()
-                            }).map_err(#err_type::from)
+                    // Check if return type is composite or primitive
+                    let return_pg_type = types.get(&self.return_type_oid).unwrap();
+                    match return_pg_type {
+                        PgType::Composite { .. } => {
+                            // Composite types use TryInto
+                            quote! {
+                                client
+                                    .query(&query, &params)
+                                    .await
+                                    .and_then(|rows| {
+                                        rows.into_iter().map(TryInto::try_into).collect()
+                                    }).map_err(#err_type::from)
+                            }
+                        }
+                        _ => {
+                            // Primitive types use try_get(0)
+                            quote! {
+                                client
+                                    .query(&query, &params)
+                                    .await
+                                    .and_then(|rows| {
+                                        rows.into_iter().map(|row| row.try_get(0)).collect()
+                                    }).map_err(#err_type::from)
+                            }
+                        }
                     }
                 }
             } else if self.return_type_oid == VOID_TYPE_OID {
@@ -864,5 +882,117 @@ mod test {
         assert_eq!(rels.len(), 1);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_setof_primitive_codegen() {
+        use crate::pg_type::PgType;
+        use crate::pg_fn::PgFn;
+        use crate::codegen::ToRust;
+        use std::collections::HashMap;
+
+        // Create a function that returns SETOF text
+        let pg_fn = PgFn {
+            oid: 1234,
+            schema: "public".to_string(),
+            name: "get_names".to_string(),
+            args: vec![],
+            out_args: vec![],
+            returns_set: true,
+            return_type_oid: 25, // TEXT OID
+            comment: None,
+            definition: "".to_string(),
+            exceptions: vec![],
+        };
+
+        // Create type index with Text type
+        let mut types = HashMap::new();
+        types.insert(25, PgType::Text);
+        
+        // Create a simple config
+        let config = crate::config::Config {
+            connection_string: None,
+            output_path: None,
+            schemas: vec!["public".to_string()],
+            types: HashMap::new(),
+            exceptions: HashMap::new(),
+            task_queue: None,
+        };
+
+        // Generate the code
+        let generated = pg_fn.to_rust(&types, &config);
+        let generated_str = generated.to_string();
+
+        // Verify that for primitive SETOF return types, we use row.try_get(0)
+        assert!(generated_str.contains("rows . into_iter () . map (| row | row . try_get (0)) . collect ()"));
+        // Should NOT contain TryInto::try_into for primitive types
+        assert!(!generated_str.contains("TryInto :: try_into"));
+    }
+
+    #[test]
+    fn test_setof_composite_codegen() {
+        use crate::pg_type::{PgType, PgField};
+        use crate::pg_fn::PgFn;
+        use crate::codegen::ToRust;
+        use std::collections::HashMap;
+
+        // Create a function that returns SETOF composite_type
+        let pg_fn = PgFn {
+            oid: 1234,
+            schema: "public".to_string(),
+            name: "get_users".to_string(),
+            args: vec![],
+            out_args: vec![],
+            returns_set: true,
+            return_type_oid: 1000, // Custom composite type OID
+            comment: None,
+            definition: "".to_string(),
+            exceptions: vec![],
+        };
+
+        // Create type index with a composite type
+        let mut types = HashMap::new();
+        types.insert(1000, PgType::Composite {
+            schema: "public".to_string(),
+            name: "user_type".to_string(),
+            fields: vec![
+                PgField {
+                    name: "id".to_string(),
+                    type_oid: 23, // INT4
+                    nullable: false,
+                    comment: None,
+                    flatten: false,
+                },
+                PgField {
+                    name: "name".to_string(),
+                    type_oid: 25, // TEXT
+                    nullable: true,
+                    comment: None,
+                    flatten: false,
+                },
+            ],
+            comment: None,
+        });
+        types.insert(23, PgType::Int32);
+        types.insert(25, PgType::Text);
+        
+        // Create a simple config
+        let config = crate::config::Config {
+            connection_string: None,
+            output_path: None,
+            schemas: vec!["public".to_string()],
+            types: HashMap::new(),
+            exceptions: HashMap::new(),
+            task_queue: None,
+        };
+
+        // Generate the code
+        let generated = pg_fn.to_rust(&types, &config);
+        let generated_str = generated.to_string();
+
+        // Verify that for composite SETOF return types, we use TryInto::try_into
+        assert!(generated_str.contains("rows . into_iter () . map (TryInto :: try_into) . collect ()"));
+        // Should NOT contain try_get(0) for composite types
+        assert!(!generated_str.contains("row . try_get (0)"));
     }
 }

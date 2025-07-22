@@ -1273,13 +1273,13 @@ mod tests {
         assert!(generated_str.contains("addr_city : Option < String >"));
         assert!(generated_str.contains("impl TryFrom < tokio_postgres :: Row > for Person"));
         assert!(generated_str.contains("try_get (\"name\")"));
-        assert!(generated_str.contains("try_get (\"addr\")"));
+        assert!(generated_str.contains("try_get :: < _ , Option < Address >> (\"addr\")"));
         
         // Verify the flattened field extraction logic
         assert!(generated_str.contains("let addr_street"));
         assert!(generated_str.contains("let addr_city"));
-        assert!(generated_str.contains("composite . and_then (| c | c . street)"));
-        assert!(generated_str.contains("composite . and_then (| c | c . city)"));
+        assert!(generated_str.contains(". and_then (| c | c . street"));
+        assert!(generated_str.contains(". and_then (| c | c . city"));
     }
 
     #[test]

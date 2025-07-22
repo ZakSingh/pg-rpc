@@ -216,11 +216,19 @@ impl PgrpcBuilder {
         // Create output directory if it doesn't exist
         fs::create_dir_all(output_path)?;
         
+        // Track how many files were written vs unchanged
+        let mut files_written = 0;
+        let mut files_unchanged = 0;
+        
         // Write each schema file
         for (schema, code) in &schema_files {
             let schema_name = crate::ident::sql_to_rs_ident(schema, crate::ident::CaseType::Snake).to_string();
             let file_path = output_path.join(format!("{}.rs", schema_name));
-            fs::write(&file_path, code)?;
+            if write_if_changed(&file_path, code)? {
+                files_written += 1;
+            } else {
+                files_unchanged += 1;
+            }
         }
         
         // Generate task enum if task queue is configured
@@ -229,7 +237,11 @@ impl PgrpcBuilder {
             match generate_task_code(&mut db.client, task_config, &ty_index, &config) {
                 Ok(Some(task_code)) => {
                     let task_file_path = output_path.join("tasks.rs");
-                    fs::write(&task_file_path, &task_code)?;
+                    if write_if_changed(&task_file_path, &task_code)? {
+                        files_written += 1;
+                    } else {
+                        files_unchanged += 1;
+                    }
                     final_schema_files.insert("tasks".to_string(), task_code);
                 }
                 Ok(None) => {
@@ -243,13 +255,28 @@ impl PgrpcBuilder {
         
         // Generate and write mod.rs
         let mod_content = generate_mod_file(&final_schema_files);
-        fs::write(output_path.join("mod.rs"), mod_content)?;
+        if write_if_changed(&output_path.join("mod.rs"), &mod_content)? {
+            files_written += 1;
+        } else {
+            files_unchanged += 1;
+        }
         
         let duration = start.elapsed().as_secs_f64();
+        let total_files = files_written + files_unchanged;
+        
+        // Create a detailed message based on what was updated
+        let update_message = if files_unchanged == 0 {
+            format!("{} files written", files_written)
+        } else if files_written == 0 {
+            format!("{} files unchanged", files_unchanged)
+        } else {
+            format!("{} files updated, {} unchanged", files_written, files_unchanged)
+        };
+        
         println!(
-            "✅  PgRPC functions written to {} ({} files) in {:.2}s",
-            output_path.display(),
-            final_schema_files.len() + 1, // +1 for mod.rs
+            "✅  PgRPC: {} ({} total) in {:.2}s",
+            update_message,
+            total_files,
             duration
         );
 
@@ -313,5 +340,28 @@ fn generate_mod_file(schema_files: &HashMap<String, String>) -> String {
         .collect();
     
     mod_declarations.join("\n") + "\n"
+}
+
+/// Write content to a file only if it has changed
+/// Returns true if the file was written, false if it was unchanged
+fn write_if_changed(path: &Path, content: &str) -> std::io::Result<bool> {
+    // Check if file exists and has the same content
+    if path.exists() {
+        match fs::read_to_string(path) {
+            Ok(existing_content) => {
+                if existing_content == content {
+                    // Content is the same, no need to write
+                    return Ok(false);
+                }
+            }
+            Err(_) => {
+                // If we can't read the existing file, we'll write the new content
+            }
+        }
+    }
+    
+    // Write the file (either it doesn't exist or content is different)
+    fs::write(path, content)?;
+    Ok(true)
 }
 
