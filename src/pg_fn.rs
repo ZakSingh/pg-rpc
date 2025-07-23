@@ -410,6 +410,7 @@ impl ToRust for PgFn {
                 // Generate code for functions with optional parameters using string building
                 let opt_param_handling: Vec<TokenStream> = opt_args.iter().enumerate().map(|(i, arg)| {
                     let arg_name = arg.rs_name();
+                    let sql_param_name = &arg.name;
                     let param_index = req_args.len() + i + 1;
                     // We need to use as_ref() to avoid moving the value out of the Option
                     let param_ref = if arg.needs_reference(types) {
@@ -420,7 +421,7 @@ impl ToRust for PgFn {
                     quote! {
                         if let Some(val) = #arg_name.as_ref() {
                             params.push(#param_ref);
-                            optional_parts.push(format!("{} := ${}", stringify!(#arg_name), params.len()));
+                            optional_parts.push(format!("{} := ${}", #sql_param_name, params.len()));
                         }
                     }
                 }).collect();

@@ -360,8 +360,8 @@ fn generate_payload_struct(
     
     // Debug: print all fields
     for (idx, field) in task_type.fields.iter().enumerate() {
-        eprintln!("[PGRPC]   Field {}: name='{}', type_oid={}, postgres_type='{}'", 
-                  idx, field.name, field.type_oid, field.postgres_type);
+        eprintln!("[PGRPC]   Field {}: name='{}', type_oid={}, postgres_type='{}', not_null={}, comment={:?}", 
+                  idx, field.name, field.type_oid, field.postgres_type, field.not_null, field.comment);
     }
     
     let fields: Vec<TokenStream> = task_type.fields
@@ -369,17 +369,28 @@ fn generate_payload_struct(
         .map(|field| {
             let field_name = format_ident!("{}", sql_to_rs_string(&field.name, CaseType::Snake));
             
-            // Look up the PostgreSQL type in our type index to get the Rust type
+            // Generate field type with proper nullability handling
             let rust_type = if let Some(pg_type) = type_index.get(&field.type_oid) {
                 eprintln!("[PGRPC]     Field '{}' (OID {}) found in TypeIndex", field.name, field.type_oid);
                 let (type_tokens, schemas) = pg_type.to_rust_ident_with_schemas(type_index);
                 referenced_schemas.extend(schemas);
-                type_tokens
+                
+                // Apply nullability logic consistent with existing composite types
+                // Fields are nullable by default, unless they have @pgrpc_not_null comment
+                let is_nullable = !field.comment
+                    .as_ref()
+                    .is_some_and(|c| c.contains("@pgrpc_not_null"));
+                
+                if is_nullable {
+                    quote! { Option<#type_tokens> }
+                } else {
+                    type_tokens
+                }
             } else {
-                // Fallback to a basic type mapping
+                // Use fallback mapping with proper nullability handling
                 eprintln!("[PGRPC]     Field '{}' (OID {}) NOT found in TypeIndex, using fallback mapping for '{}'", 
                          field.name, field.type_oid, field.postgres_type);
-                map_postgres_type_to_rust(&field.postgres_type)
+                generate_task_field_type(field, type_index)
             };
             
             quote! { pub #field_name: #rust_type }
@@ -414,6 +425,36 @@ fn generate_task_variant(
     quote! {
         #[serde(rename = #task_name)]
         #variant_name(#payload_struct_name)
+    }
+}
+
+/// Generate Rust type for a task field, properly handling nullability and @pgrpc_not_null annotations
+fn generate_task_field_type(
+    field: &TaskField,
+    type_index: &TypeIndex,
+) -> TokenStream {
+    // Determine if field should be nullable
+    // Fields are nullable by default in PostgreSQL composite types
+    // They become NOT nullable if:
+    // 1. They have @pgrpc_not_null comment OR
+    // 2. PostgreSQL says not_null=true (but this is always false for composite type fields)
+    let is_nullable = !field.comment
+        .as_ref()
+        .is_some_and(|c| c.contains("@pgrpc_not_null"));
+
+    // Get the base Rust type
+    let base_type = if let Some(pg_type) = type_index.get(&field.type_oid) {
+        pg_type.to_rust_ident(type_index)
+    } else {
+        // Fallback to basic type mapping
+        map_postgres_type_to_rust(&field.postgres_type)
+    };
+
+    // Wrap in Option if nullable
+    if is_nullable {
+        quote! { Option<#base_type> }
+    } else {
+        base_type
     }
 }
 
