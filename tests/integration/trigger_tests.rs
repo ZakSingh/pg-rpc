@@ -275,7 +275,7 @@ fn test_trigger_exception_integration() {
             .expect("Should read trigger_api.rs");
             
         // Functions should still use unified error type
-        assert!(api_content.contains("crate::errors::PgRpcError"));
+        assert!(api_content.contains("super::errors::PgRpcError"));
         
         // Check error types include trigger exceptions
         let errors_content = std::fs::read_to_string(output_path.join("errors.rs"))

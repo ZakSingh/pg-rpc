@@ -1,21 +1,24 @@
 use crate::codegen::ToRust;
 use crate::codegen::{FunctionName, SchemaName, OID};
 use crate::config;
-use crate::exceptions::{get_exceptions_with_triggers, PgException};
+use crate::exceptions::{get_exceptions_with_triggers, get_comment_exceptions, PgException};
 use crate::fn_index::FunctionId;
-use crate::ident::{sql_to_rs_ident, CaseType};
+use crate::ident::{sql_to_rs_ident, CaseType::{self, Pascal}};
 use crate::pg_id::PgId;
 use crate::pg_type::PgType;
 use crate::rel_index::RelIndex;
 use crate::trigger_index::{TriggerIndex, TriggerEvent};
+use crate::pg_constraint::Constraint;
+use std::collections::HashSet;
+use heck::ToPascalCase;
 use config::Config;
 use itertools::{izip, Itertools};
 use jsonpath_rust::JsonPath;
 use pg_query::protobuf::node::Node;
-use pg_query::protobuf::{DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, UpdateStmt};
+use pg_query::protobuf::{CallStmt, DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, UpdateStmt};
 use pg_query::{parse_plpgsql, NodeRef, ParseResult};
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{quote, format_ident};
 use regex::Regex;
 use serde_json::Value;
 use std::cmp::PartialEq;
@@ -37,6 +40,7 @@ pub struct PgFn {
     pub out_args: Vec<PgArg>,
     pub return_type_oid: OID,
     pub returns_set: bool,
+    pub is_procedure: bool,
     pub definition: String,
     pub comment: Option<String>,
     pub exceptions: Vec<PgException>,
@@ -97,6 +101,457 @@ impl PgFn {
     pub fn return_table_struct_name(&self) -> TokenStream {
         sql_to_rs_ident(&format!("{}_row", &self.name), CaseType::Pascal)
     }
+    
+    pub fn error_enum_name(&self) -> TokenStream {
+        sql_to_rs_ident(&format!("{}_error", &self.name), CaseType::Pascal)
+    }
+    
+    /// Generate match arms for From<tokio_postgres::Error> implementation
+    fn generate_from_postgres_match_arms(
+        &self,
+        used_constraints: &HashMap<PgId, Vec<Constraint>>,
+        config: &Config,
+    ) -> TokenStream {
+        let error_enum_name = self.error_enum_name();
+        let mut unique_arms = Vec::new();
+        let mut check_arms = Vec::new();
+        let mut fk_arms = Vec::new();
+        let mut not_null_arms = Vec::new();
+        let mut custom_arms = Vec::new();
+        
+        // Process constraints by table for this function
+        for (table_id, constraints) in used_constraints {
+            let table_name_str = table_id.name();
+            let table_name_pascal = table_name_str.to_pascal_case();
+            let error_variant = format_ident!("{}Constraint", table_name_pascal);
+            let constraint_enum = format_ident!("{}Constraint", table_name_pascal);
+            
+            for constraint in constraints {
+                match constraint {
+                    Constraint::PrimaryKey(pk) => {
+                        // Constraint names are unique within schema, so simple name match works
+                        let constraint_name = pk.name.as_str();
+                        unique_arms.push(quote! {
+                            Some(#constraint_name) => #error_enum_name::#error_variant(
+                                super::errors::#constraint_enum::PrimaryKey,
+                                db_error.to_owned()
+                            )
+                        });
+                    },
+                    Constraint::Unique(u) => {
+                        let constraint_name = u.name.as_str();
+                        let variant_name_str = u.name.to_pascal_case();
+                        let variant_name = format_ident!("{}", variant_name_str);
+                        unique_arms.push(quote! {
+                            Some(#constraint_name) => #error_enum_name::#error_variant(
+                                super::errors::#constraint_enum::#variant_name,
+                                db_error.to_owned()
+                            )
+                        });
+                    },
+                    Constraint::Check(c) => {
+                        let constraint_name = c.name.as_str();
+                        let variant_name_str = c.name.to_pascal_case();
+                        let variant_name = format_ident!("{}", variant_name_str);
+                        check_arms.push(quote! {
+                            Some(#constraint_name) => #error_enum_name::#error_variant(
+                                super::errors::#constraint_enum::#variant_name,
+                                db_error.to_owned()
+                            )
+                        });
+                    },
+                    Constraint::ForeignKey(fk) => {
+                        let constraint_name = fk.name.as_str();
+                        let variant_name_str = fk.name.to_pascal_case();
+                        let variant_name = format_ident!("{}", variant_name_str);
+                        fk_arms.push(quote! {
+                            Some(#constraint_name) => #error_enum_name::#error_variant(
+                                super::errors::#constraint_enum::#variant_name,
+                                db_error.to_owned()
+                            )
+                        });
+                    },
+                    Constraint::NotNull(nn) => {
+                        // NOT NULL violations are reported by table and column, not constraint name
+                        let column_name = nn.column.as_str();
+                        let col_variant_str = nn.column.to_pascal_case();
+                        let variant_name = format_ident!("{}NotNull", col_variant_str);
+                        not_null_arms.push(quote! {
+                            (Some(#table_name_str), Some(#column_name)) => #error_enum_name::#error_variant(
+                                super::errors::#constraint_enum::#variant_name,
+                                db_error.to_owned()
+                            )
+                        });
+                    },
+                    _ => {} // Skip other constraint types
+                }
+            }
+        }
+        
+        // Process custom exceptions from this function
+        let mut has_custom_errors = false;
+        for exception in &self.exceptions {
+            match exception {
+                PgException::Explicit(sql_state) => {
+                    let code = sql_state.code();
+                    let variant_name = if let Some(description) = config.exceptions.get(code) {
+                        sql_to_rs_ident(description, Pascal)
+                    } else {
+                        exception.rs_name(config)
+                    };
+                    
+                    custom_arms.push(quote! {
+                        code if code == &tokio_postgres::error::SqlState::from_code(#code) => {
+                            #error_enum_name::#variant_name(db_error.to_owned())
+                        }
+                    });
+                }
+                PgException::CustomError(_) => {
+                    has_custom_errors = true;
+                }
+                _ => {}
+            }
+        }
+        
+        // Add handling for custom errors with JSON hint if we have any
+        if has_custom_errors {
+            // Collect all custom error names for this function
+            let custom_error_arms: Vec<TokenStream> = self.exceptions.iter()
+                .filter_map(|e| {
+                    if let PgException::CustomError(error_name) = e {
+                        let variant_name = sql_to_rs_ident(error_name, Pascal);
+                        let error_name_str = error_name.as_str();
+                        Some(quote! {
+                            Some(#error_name_str) => {
+                                if let Ok(payload) = serde_json::from_value(json.clone()) {
+                                    #error_enum_name::#variant_name(payload)
+                                } else {
+                                    #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                                }
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            
+            // Check for JSON hint instead of specific SQLSTATE
+            custom_arms.push(quote! {
+                _code if db_error.hint() == Some("application/json") => {
+                    // Parse JSON message for custom error
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(db_error.message()) {
+                        match json.get("type").and_then(|t| t.as_str()) {
+                            #(#custom_error_arms,)*
+                            _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                        }
+                    } else {
+                        #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                    }
+                }
+            });
+        }
+        
+        // Build the complete match expression
+        let mut all_arms = Vec::new();
+        
+        if !unique_arms.is_empty() {
+            all_arms.push(quote! {
+                &tokio_postgres::error::SqlState::UNIQUE_VIOLATION => {
+                    match db_error.constraint() {
+                        #(#unique_arms,)*
+                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                    }
+                },
+            });
+        }
+        
+        if !check_arms.is_empty() {
+            all_arms.push(quote! {
+                &tokio_postgres::error::SqlState::CHECK_VIOLATION => {
+                    match db_error.constraint() {
+                        #(#check_arms,)*
+                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                    }
+                },
+            });
+        }
+        
+        if !fk_arms.is_empty() {
+            all_arms.push(quote! {
+                &tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION => {
+                    match db_error.constraint() {
+                        #(#fk_arms,)*
+                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                    }
+                },
+            });
+        }
+        
+        if !not_null_arms.is_empty() {
+            all_arms.push(quote! {
+                &tokio_postgres::error::SqlState::NOT_NULL_VIOLATION => {
+                    match (db_error.table(), db_error.column()) {
+                        #(#not_null_arms,)*
+                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                    }
+                },
+            });
+        }
+        
+        all_arms.extend(custom_arms);
+        
+        // Combine all arms into a single TokenStream
+        all_arms.into_iter().collect()
+    }
+    
+    /// Generate the function-specific error enum
+    pub fn generate_error_enum(
+        &self,
+        rel_index: &crate::rel_index::RelIndex,
+        table_constraints: &HashMap<PgId, Vec<Constraint>>,
+        config: &Config,
+    ) -> TokenStream {
+        
+        let error_enum_name = self.error_enum_name();
+        let mut error_variants = Vec::new();
+        let mut used_constraints: HashMap<PgId, Vec<Constraint>> = HashMap::new();
+        
+        // Analyze both PL/pgSQL and SQL functions
+        let rel_deps = if self.definition.contains("LANGUAGE plpgsql") || self.definition.contains("language plpgsql") {
+            let parsed = parse_plpgsql(&self.definition).unwrap_or_default();
+            let queries = extract_queries(&parsed);
+            get_rel_deps(&queries, rel_index)
+        } else if self.definition.contains("LANGUAGE sql") || self.definition.contains("language sql") || self.definition.contains("LANGUAGE SQL") {
+            // For SQL functions, extract the body and parse it
+            let body = self.body();
+            match pg_query::parse(body) {
+                Ok(parsed) => {
+                    let queries = vec![parsed];
+                    get_rel_deps(&queries, rel_index)
+                }
+                Err(e) => {
+                    warn!("Failed to parse SQL function body for error analysis: {}", e);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        
+        // Collect constraints from tables this function touches
+        for dep in &rel_deps {
+            // Find the PgId for this OID
+            let pg_id = rel_index.iter()
+                .find(|(oid, _)| **oid == dep.rel_oid)
+                .map(|(_, rel)| &rel.id);
+                
+            if let Some(id) = pg_id {
+                if let Some(constraints) = table_constraints.get(id) {
+                    let relevant_constraints: Vec<Constraint> = constraints.iter()
+                        .filter(|c| {
+                            // Filter constraints based on the operation type
+                            match &dep.cmd {
+                                Cmd::Update { cols } => c.contains_columns(cols),
+                                Cmd::Insert { cols, .. } => c.contains_columns(cols) && !matches!(c, Constraint::Default(_)),
+                                Cmd::Delete => matches!(c, Constraint::ForeignKey(_)),
+                                _ => false,
+                            }
+                        })
+                        .cloned()
+                        .collect();
+                    
+                    if !relevant_constraints.is_empty() {
+                        used_constraints.insert(id.clone(), relevant_constraints);
+                    }
+                }
+            }
+        }
+        
+        // Generate constraint error variants
+        for (table_id, _) in &used_constraints {
+            let table_name_str = table_id.name();
+            let table_name_pascal = table_name_str.to_pascal_case();
+            let variant_name = format_ident!("{}Constraint", table_name_pascal);
+            let constraint_enum = format_ident!("{}Constraint", table_name_pascal);
+            
+            error_variants.push(quote! {
+                #[error("{} table constraint violation", #table_name_str)]
+                #variant_name(super::errors::#constraint_enum, #[source] tokio_postgres::error::DbError)
+            });
+        }
+        
+        // Add variants for explicit exceptions raised by this function
+        let mut handled_exceptions = HashSet::new();
+        for exception in &self.exceptions {
+            match exception {
+                PgException::Explicit(sql_state) => {
+                    let code = sql_state.code();
+                    if let Some(description) = config.exceptions.get(code) {
+                        let variant_name = sql_to_rs_ident(description, Pascal);
+                        if handled_exceptions.insert(variant_name.to_string()) {
+                            error_variants.push(quote! {
+                                #[error(#description)]
+                                #variant_name(#[source] tokio_postgres::error::DbError)
+                            });
+                        }
+                    } else {
+                        let variant_name = exception.rs_name(config);
+                        if handled_exceptions.insert(variant_name.to_string()) {
+                            error_variants.push(quote! {
+                                #[error("SQL state {}", #code)]
+                                #variant_name(#[source] tokio_postgres::error::DbError)
+                            });
+                        }
+                    }
+                }
+                PgException::CustomError(error_name) => {
+                    let variant_name = sql_to_rs_ident(error_name, Pascal);
+                    if handled_exceptions.insert(variant_name.to_string()) {
+                        let struct_name = variant_name.clone();
+                        error_variants.push(quote! {
+                            #[error("Custom error: {}", stringify!(#error_name))]
+                            #variant_name(super::errors::#struct_name)
+                        });
+                    }
+                }
+                _ => {} // Handle other exception types if needed
+            }
+        }
+        
+        // Add catch-all variant for undetected errors
+        error_variants.push(quote! {
+            #[error(transparent)]
+            Other(super::errors::PgRpcError)
+        });
+        
+        // Generate match arms for From implementations
+        let mut to_pgrpc_arms = Vec::new();
+        let mut constraint_variant_names = Vec::new();
+        
+        // Generate arms for constraint variants
+        for (table_id, _) in &used_constraints {
+            let table_name_pascal = table_id.name().to_pascal_case();
+            let variant_name = format_ident!("{}Constraint", table_name_pascal);
+            constraint_variant_names.push(variant_name.clone());
+            
+            to_pgrpc_arms.push(quote! {
+                #error_enum_name::#variant_name(constraint, db_error) => {
+                    super::errors::PgRpcError::#variant_name(constraint, db_error)
+                }
+            });
+        }
+        
+        // Generate arms for exception variants
+        for exception in &self.exceptions {
+            match exception {
+                PgException::Explicit(sql_state) => {
+                    let variant_name = if let Some(description) = config.exceptions.get(sql_state.code()) {
+                        sql_to_rs_ident(description, Pascal)
+                    } else {
+                        exception.rs_name(config)
+                    };
+                    
+                    to_pgrpc_arms.push(quote! {
+                        #error_enum_name::#variant_name(db_error) => {
+                            super::errors::PgRpcError::#variant_name(db_error)
+                        }
+                    });
+                }
+                PgException::CustomError(error_name) => {
+                    let variant_name = sql_to_rs_ident(error_name, Pascal);
+                    to_pgrpc_arms.push(quote! {
+                        #error_enum_name::#variant_name(payload) => {
+                            super::errors::PgRpcError::CustomError(super::errors::CustomError::#variant_name(payload))
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
+        
+        // Generate From<tokio_postgres::Error> match arms
+        let from_postgres_arms = self.generate_from_postgres_match_arms(&used_constraints, config);
+        
+        // Generate AsDbError implementation arms
+        let mut as_db_error_arms = Vec::new();
+        
+        // Arms for constraint variants
+        for (table_id, _) in &used_constraints {
+            let table_name_pascal = table_id.name().to_pascal_case();
+            let variant_name = format_ident!("{}Constraint", table_name_pascal);
+            as_db_error_arms.push(quote! {
+                #error_enum_name::#variant_name(_, db_error) => Some(db_error)
+            });
+        }
+        
+        // Arms for custom exception variants
+        for exception in &self.exceptions {
+            match exception {
+                PgException::Explicit(sql_state) => {
+                    let variant_name = if let Some(description) = config.exceptions.get(sql_state.code()) {
+                        sql_to_rs_ident(description, Pascal)
+                    } else {
+                        exception.rs_name(config)
+                    };
+                    as_db_error_arms.push(quote! {
+                        #error_enum_name::#variant_name(db_error) => Some(db_error)
+                    });
+                }
+                PgException::CustomError(error_name) => {
+                    let variant_name = sql_to_rs_ident(error_name, Pascal);
+                    as_db_error_arms.push(quote! {
+                        #error_enum_name::#variant_name(_) => None
+                    });
+                }
+                _ => {}
+            }
+        }
+        
+        // Build the complete error enum
+        quote! {
+            #[derive(Debug, thiserror::Error)]
+            pub enum #error_enum_name {
+                #(#error_variants),*
+            }
+            
+            impl From<tokio_postgres::Error> for #error_enum_name {
+                fn from(e: tokio_postgres::Error) -> Self {
+                    match e.as_db_error() {
+                        Some(db_error) => match db_error.code() {
+                            #from_postgres_arms
+                            _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                        },
+                        None => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                    }
+                }
+            }
+            
+            impl From<#error_enum_name> for super::errors::PgRpcError {
+                fn from(err: #error_enum_name) -> Self {
+                    match err {
+                        #error_enum_name::Other(e) => e,
+                        #(#to_pgrpc_arms),*
+                    }
+                }
+            }
+            
+            impl From<super::errors::PgRpcError> for #error_enum_name {
+                fn from(err: super::errors::PgRpcError) -> Self {
+                    #error_enum_name::Other(err)
+                }
+            }
+            
+            impl super::errors::AsDbError for #error_enum_name {
+                fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError> {
+                    match self {
+                        #(#as_db_error_arms,)*
+                        #error_enum_name::Other(e) => e.as_db_error(),
+                    }
+                }
+            }
+        }
+    }
 
     /// Get all type OIDs in the function signature (args + return type)
     pub fn ty_oids(&self) -> Vec<OID> {
@@ -128,6 +583,7 @@ impl PgFn {
         let arg_defaults: Vec<bool> = row.try_get("has_defaults")?;
         let comment: Option<String> = row.try_get("comment")?;
         let language: String = row.try_get("language")?;
+        let prokind: i8 = row.try_get("prokind")?;
         
         // Get additional fields for OUT parameters
         let arg_modes: Option<Vec<i8>> = row.try_get("arg_modes")?;
@@ -172,13 +628,87 @@ impl PgFn {
 
         let definition = row.try_get::<_, String>("function_definition")?;
         
-        // Only parse and analyze PL/pgSQL functions
-        let exceptions = if language == "plpgsql" {
-            let parsed = parse_plpgsql(&definition)?;
-            get_exceptions_with_triggers(&parsed, comment.as_ref(), rel_index, trigger_index)?
-        } else {
-            // SQL functions don't need parsing and have no exceptions
-            Vec::new()
+        // Parse and analyze both PL/pgSQL and SQL functions
+        let exceptions = match language.as_str() {
+            "plpgsql" => {
+                let parsed = parse_plpgsql(&definition)?;
+                get_exceptions_with_triggers(&parsed, comment.as_ref(), rel_index, trigger_index, None)?
+            }
+            "sql" => {
+                // Extract the function body and parse as SQL
+                let fn_obj = Self {
+                    oid: row.try_get("oid")?,
+                    name: row.try_get("function_name")?,
+                    schema: row.try_get("schema_name")?,
+                    definition: definition.clone(),
+                    returns_set: row.try_get("returns_set")?,
+                    is_procedure: prokind == b'p' as i8,
+                    comment: comment.clone(),
+                    args: args.clone(),
+                    out_args: out_args.clone(),
+                    return_type_oid: row.try_get("return_type")?,
+                    exceptions: Vec::new(),
+                };
+                
+                let body = fn_obj.body();
+                // Parse SQL body to get queries
+                match pg_query::parse(body) {
+                    Ok(parsed) => {
+                        // Convert parsed SQL to queries vector
+                        let queries = vec![parsed];
+                        let mut rel_deps = get_rel_deps(&queries, rel_index);
+                        
+                        // Populate trigger exceptions if available
+                        if let Some(trigger_idx) = trigger_index {
+                            populate_trigger_exceptions(&mut rel_deps, trigger_idx);
+                        }
+                        
+                        // Get exceptions from table dependencies
+                        let mut exceptions: Vec<PgException> = Vec::new();
+                        
+                        // Collect constraint-based exceptions
+                        for dep in &rel_deps {
+                            if let Some(rel) = rel_index.get(&dep.rel_oid) {
+                                for constraint in &rel.constraints {
+                                    // Filter constraints based on the operation type
+                                    let include = match &dep.cmd {
+                                        Cmd::Update { cols } => constraint.contains_columns(cols),
+                                        Cmd::Insert { cols, .. } => constraint.contains_columns(cols) && !matches!(constraint, Constraint::Default(_)),
+                                        Cmd::Delete => matches!(constraint, Constraint::ForeignKey(_)),
+                                        _ => false,
+                                    };
+                                    
+                                    if include {
+                                        exceptions.push(PgException::Constraint(constraint.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Add trigger-based exceptions if available
+                        if let Some(trigger_idx) = trigger_index {
+                            for dep in &rel_deps {
+                                exceptions.extend(dep.trigger_exceptions.iter().cloned());
+                            }
+                        }
+                        
+                        // Add comment exceptions
+                        if let Some(ref comment_str) = comment {
+                            exceptions.extend(get_comment_exceptions(comment_str));
+                        }
+                        
+                        exceptions
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse SQL function body: {}", e);
+                        Vec::new()
+                    }
+                }
+            }
+            _ => {
+                // Other languages not supported yet
+                Vec::new()
+            }
         };
 
         Ok(Self {
@@ -187,6 +717,7 @@ impl PgFn {
             schema: row.try_get("schema_name")?,
             definition,
             returns_set: row.try_get("returns_set")?,
+            is_procedure: prokind == b'p' as i8,  // 'p' for procedure, 'f' for function
             comment,
             args,
             out_args,
@@ -236,8 +767,10 @@ impl ToRust for PgArg {
 
 impl ToRust for PgFn {
     fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
-        // Use the unified error type from the errors module
-        let err_type: TokenStream = quote! { super::errors::PgRpcError };
+        // Use function-specific error type
+        let error_enum_name = self.error_enum_name();
+        let err_type = quote! { #error_enum_name };
+        let fn_name_str = &self.name;
 
         let return_opt = self.comment.as_ref().is_some_and(|c| c.contains("@pgrpc_return_opt"));
         if return_opt && !self.returns_set  {
@@ -270,13 +803,46 @@ impl ToRust for PgFn {
                 false
             };
             
-            let query_string = if self.returns_set || needs_expansion {
+            let query_string = if self.is_procedure {
+                format!("CALL {}.{}", self.schema, self.name)
+            } else if self.returns_set || needs_expansion {
                 format!("select * from {}.{}", self.schema, self.name)
             } else {
                 format!("select {}.{}", self.schema, self.name)
             };
 
-            let query = if return_opt {
+            let query = if self.is_procedure {
+                // Handle procedures differently
+                if self.out_args.is_empty() {
+                    // No OUT parameters - just execute
+                    quote! {
+                        client
+                            .execute(&query, &params)
+                            .await
+                            .map(|_| ())
+                            .map_err(#err_type::from)
+                    }
+                } else if self.out_args.len() == 1 {
+                    // Single OUT parameter - return it directly
+                    quote! {
+                        client
+                            .query_one(&query, &params)
+                            .await
+                            .and_then(|row| row.try_get(0))
+                            .map_err(#err_type::from)
+                    }
+                } else {
+                    // Multiple OUT parameters - return as tuple or struct
+                    // For now, return as a Row that can be converted
+                    quote! {
+                        client
+                            .query_one(&query, &params)
+                            .await
+                            .and_then(|row| row.try_into())
+                            .map_err(#err_type::from)
+                    }
+                }
+            } else if return_opt {
                 quote! {
                     client
                         .query_opt(&query, &params)
@@ -465,7 +1031,23 @@ impl ToRust for PgFn {
         // Build fn signature
         let rs_fn_name = self.rs_name();
         let args: Vec<TokenStream> = self.args.iter().map(|a| a.to_rust(types, config)).collect();
-        let return_type = if self.return_type_oid == VOID_TYPE_OID {
+        let return_type = if self.is_procedure {
+            // Procedures have different return types based on OUT parameters
+            if self.out_args.is_empty() {
+                quote! { () }
+            } else if self.out_args.len() == 1 {
+                // Single OUT parameter - return its type directly
+                let out_type = types
+                    .get(&self.out_args[0].type_oid)
+                    .unwrap()
+                    .to_rust_ident(types);
+                quote! { #out_type }
+            } else {
+                // Multiple OUT parameters - use generated struct
+                let struct_name = self.return_table_struct_name();
+                quote! { #struct_name }
+            }
+        } else if self.return_type_oid == VOID_TYPE_OID {
             quote! { () }
         } else if is_return_table {
             // For RETURN TABLE functions, use the generated struct
@@ -493,13 +1075,26 @@ impl ToRust for PgFn {
             }
         };
 
-        let comment_macro = match self.comment.as_ref() {
-            Some(comment) => quote! { #[doc=#comment] },
-            None => quote! {},
+        let doc_comment = match &self.comment {
+            Some(comment) => {
+                if self.is_procedure {
+                    format!("Calls PostgreSQL procedure: {}\n\n{}", self.name, comment)
+                } else {
+                    comment.clone()
+                }
+            }
+            None => {
+                if self.is_procedure {
+                    format!("Calls PostgreSQL procedure: {}", self.name)
+                } else {
+                    format!("Calls PostgreSQL function: {}", self.name)
+                }
+            }
         };
+        let comment_macro = quote! { #[doc=#doc_comment] };
 
-        // Generate struct for RETURN TABLE functions
-        let struct_def = if is_return_table {
+        // Generate struct for RETURN TABLE functions or procedures with multiple OUT parameters
+        let struct_def = if is_return_table || (self.is_procedure && self.out_args.len() > 1) {
             let struct_name = self.return_table_struct_name();
             let field_names: Vec<TokenStream> = self.out_args.iter()
                 .map(|arg| sql_to_rs_ident(&arg.name, CaseType::Snake))
@@ -542,19 +1137,15 @@ impl ToRust for PgFn {
             quote! {}
         };
 
-        // Add #[bon::builder] attribute if function has 3 or more parameters (excluding client)
-        let builder_attr = if self.args.len() >= 3 {
-            quote! { #[builder] }
-        } else {
-            quote! {}
-        };
-
         quote! {
             #struct_def
             
             #comment_macro
-            #builder_attr
-            pub async fn #rs_fn_name(client: &impl deadpool_postgres::GenericClient, #(#args),*) -> Result<#return_type, #err_type> {
+            #[builder(finish_fn = exec)]
+            pub async fn #rs_fn_name(
+                #[builder(finish_fn)]
+                client: &impl deadpool_postgres::GenericClient,
+                #(#args),*) -> Result<#return_type, #err_type> {
                 #fn_body
             }
         }
@@ -625,6 +1216,111 @@ pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
         .collect()
 }
 
+/// Extract custom error types from parsed queries by looking for calls to the raise_error function
+/// Returns a set of error type names and optionally their SQLSTATEs
+pub fn extract_custom_errors_from_queries(
+    queries: &[ParseResult], 
+    errors_config: &crate::config::ErrorsConfig
+) -> HashSet<String> {
+    let mut custom_errors = HashSet::new();
+    let raise_function = errors_config.get_raise_function();
+    let errors_schema = &errors_config.schema;
+    
+    for query in queries {
+        for (node, _, _, _) in query.protobuf.nodes() {
+            match node.to_enum() {
+                // Handle CALL statements
+                Node::CallStmt(stmt) => {
+                    if let Some(funccall) = &stmt.funccall {
+                        if is_raise_error_call(&funccall.funcname, raise_function) {
+                            // First argument should be the error type cast
+                            if let Some(first_arg) = funccall.args.first() {
+                                if let Some(error_type) = extract_error_type_from_node(first_arg, errors_schema) {
+                                    custom_errors.insert(error_type);
+                                    
+                                    // Check for optional second argument (SQLSTATE)
+                                    // We don't need to track the SQLSTATE here since we're using HINT-based detection
+                                    // But we could extract it for future use
+                                }
+                            }
+                        }
+                    }
+                }
+                // Handle SELECT statements (from PERFORM)
+                Node::SelectStmt(stmt) => {
+                    // Look for function calls in the target list
+                    for target in &stmt.target_list {
+                        if let Some(Node::ResTarget(res_target)) = &target.node {
+                            if let Some(Node::FuncCall(funccall)) = &res_target.val.as_ref().and_then(|v| v.node.as_ref()) {
+                                if is_raise_error_call(&funccall.funcname, raise_function) {
+                                    // First argument should be the error type cast
+                                    if let Some(first_arg) = funccall.args.first() {
+                                        if let Some(error_type) = extract_error_type_from_node(first_arg, errors_schema) {
+                                            custom_errors.insert(error_type);
+                                            
+                                            // Check for optional second argument (SQLSTATE)
+                                            // We don't need to track the SQLSTATE here since we're using HINT-based detection
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    custom_errors
+}
+
+/// Check if a function name matches the raise_error function
+fn is_raise_error_call(funcname: &[pg_query::protobuf::Node], expected: &str) -> bool {
+    let parts: Vec<String> = funcname
+        .iter()
+        .filter_map(|n| {
+            if let Some(Node::String(s)) = &n.node {
+                Some(s.sval.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    let full_name = parts.join(".");
+    full_name == expected
+}
+
+/// Extract error type name from a node if it contains a type cast to errors schema
+fn extract_error_type_from_node(node: &pg_query::protobuf::Node, errors_schema: &str) -> Option<String> {
+    // Look for TypeCast nodes
+    if let Some(Node::TypeCast(type_cast)) = &node.node {
+        if let Some(type_name) = &type_cast.type_name {
+            // Extract the type name parts
+            let type_parts: Vec<String> = type_name
+                .names
+                .iter()
+                .filter_map(|n| {
+                    if let Some(Node::String(s)) = &n.node {
+                        Some(s.sval.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            
+            // Check if it's a type from the errors schema
+            if type_parts.len() == 2 && type_parts[0] == errors_schema {
+                return Some(type_parts[1].clone());
+            }
+        }
+    }
+    
+    // Also check nested nodes (e.g., for ROW(...) expressions)
+    None
+}
+
 /// Get the relations the given queries depend upon.
 pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> Vec<RelDep> {
     queries
@@ -662,6 +1358,7 @@ fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
           Node::InsertStmt(stmt) => get_insert_deps(stmt.as_ref(), rel_index),
           Node::UpdateStmt(stmt) => get_update_deps(stmt.as_ref(), rel_index),
           Node::DeleteStmt(stmt) => get_delete_deps(stmt.as_ref(), rel_index),
+          Node::CallStmt(_stmt) => None, // We'll handle CallStmt separately for custom errors
           _ => None,
       })
       .collect()
@@ -900,6 +1597,7 @@ mod test {
             args: vec![],
             out_args: vec![],
             returns_set: true,
+            is_procedure: false,
             return_type_oid: 25, // TEXT OID
             comment: None,
             definition: "".to_string(),
@@ -918,6 +1616,7 @@ mod test {
             types: HashMap::new(),
             exceptions: HashMap::new(),
             task_queue: None,
+            errors: None,
         };
 
         // Generate the code
@@ -945,6 +1644,7 @@ mod test {
             args: vec![],
             out_args: vec![],
             returns_set: true,
+            is_procedure: false,
             return_type_oid: 1000, // Custom composite type OID
             comment: None,
             definition: "".to_string(),
@@ -985,6 +1685,7 @@ mod test {
             types: HashMap::new(),
             exceptions: HashMap::new(),
             task_queue: None,
+            errors: None,
         };
 
         // Generate the code

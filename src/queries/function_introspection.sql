@@ -15,13 +15,14 @@ select distinct on (n.nspname, p.proname) n.nspname                             
                                           '[]'::json                                                       as dependencies,
                                           p.proargmodes                                                       as arg_modes,
                                           p.proallargtypes                                                    as all_arg_types,
-                                          p.proargnames                                                       as all_arg_names
+                                          p.proargnames                                                       as all_arg_names,
+                                          p.prokind                                                           as prokind
 from pg_proc p
          join pg_namespace n on p.pronamespace = n.oid
          join pg_catalog.pg_language l on p.prolang = l.oid
          left join pg_type t on t.oid = any (p.proargtypes)
          left join pg_description d on d.objoid = p.oid
-where p.prokind = 'f'
+where p.prokind in ('f', 'p')  -- Include both functions and procedures
   and l.lanname in ('plpgsql', 'sql')
   and n.nspname  = any($1)  --not in ('pg_catalog', 'information_schema')
   and not exists ( select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e' )

@@ -10,6 +10,78 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use heck::ToPascalCase;
 
+/// Trait for types that can provide access to an underlying DbError
+pub trait AsDbError {
+    /// Returns a reference to the underlying DbError if this error contains one
+    fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError>;
+}
+
+/// Extension trait for error types that provides helper methods for PostgreSQL errors
+pub trait PgRpcErrorExt: AsDbError {
+    /// Returns the column name from the underlying PostgreSQL error, if available
+    fn column(&self) -> Option<&str> {
+        self.as_db_error().and_then(|e| e.column())
+    }
+    
+    /// Returns the constraint name from the underlying PostgreSQL error, if available
+    fn constraint(&self) -> Option<&str> {
+        self.as_db_error().and_then(|e| e.constraint())
+    }
+    
+    /// Returns the table name from the underlying PostgreSQL error, if available
+    fn table(&self) -> Option<&str> {
+        self.as_db_error().and_then(|e| e.table())
+    }
+    
+    /// Returns the error message from the underlying PostgreSQL error, if available
+    fn message(&self) -> Option<&str> {
+        self.as_db_error().map(|e| e.message())
+    }
+    
+    /// Returns the SQL state code from the underlying PostgreSQL error, if available
+    fn code(&self) -> Option<&tokio_postgres::error::SqlState> {
+        self.as_db_error().map(|e| e.code())
+    }
+    
+    /// Returns the schema name from the underlying PostgreSQL error, if available
+    fn schema(&self) -> Option<&str> {
+        self.as_db_error().and_then(|e| e.schema())
+    }
+    
+    /// Returns the data type name from the underlying PostgreSQL error, if available
+    fn datatype(&self) -> Option<&str> {
+        self.as_db_error().and_then(|e| e.datatype())
+    }
+    
+    /// Returns the detail from the underlying PostgreSQL error, if available
+    fn detail(&self) -> Option<&str> {
+        self.as_db_error().and_then(|e| e.detail())
+    }
+    
+    /// Returns the hint from the underlying PostgreSQL error, if available
+    fn hint(&self) -> Option<&str> {
+        self.as_db_error().and_then(|e| e.hint())
+    }
+    
+    /// Returns the position from the underlying PostgreSQL error, if available
+    fn position(&self) -> Option<&tokio_postgres::error::ErrorPosition> {
+        self.as_db_error().and_then(|e| e.position())
+    }
+    
+    /// Returns the where clause from the underlying PostgreSQL error, if available
+    fn where_(&self) -> Option<&str> {
+        self.as_db_error().and_then(|e| e.where_())
+    }
+    
+    /// Returns the routine from the underlying PostgreSQL error, if available
+    fn routine(&self) -> Option<&str> {
+        self.as_db_error().and_then(|e| e.routine())
+    }
+}
+
+/// Blanket implementation of PgRpcErrorExt for all types that implement AsDbError
+impl<T: AsDbError> PgRpcErrorExt for T {}
+
 /// Collects all constraints from all tables and groups them by table
 /// Only includes constraints that will generate enum variants (excludes Default constraints)
 pub fn collect_table_constraints(rel_index: &RelIndex) -> HashMap<PgId, Vec<Constraint>> {
@@ -98,7 +170,7 @@ pub fn generate_constraint_enums(table_constraints: &HashMap<PgId, Vec<Constrain
     enums
 }
 
-/// Generates the unified PgRpcError enum
+/// Generates the unified PgRpcError enum (without wrapper)
 pub fn generate_unified_error(
     table_constraints: &HashMap<PgId, Vec<Constraint>>,
     custom_exceptions: &HashSet<PgException>,
@@ -125,8 +197,8 @@ pub fn generate_unified_error(
         let variant_name = sql_to_rs_ident(description, Pascal);
         if config_variants.insert(variant_name.to_string()) {
             error_variants.push(quote! {
-                #[error("{description}: {0}", description = #description)]
-                #variant_name(String)
+                #[error(#description)]
+                #variant_name(#[source] tokio_postgres::error::DbError)
             });
         }
     }
@@ -141,22 +213,29 @@ pub fn generate_unified_error(
                 let variant_name = exception.rs_name(config);
                 if additional_custom_variants.insert(variant_name.to_string()) {
                     error_variants.push(quote! {
-                        #[error("SQL state {}: {{0}}", #sql_code)]
-                        #variant_name(String)
+                        #[error("SQL state {}", #sql_code)]
+                        #variant_name(#[source] tokio_postgres::error::DbError)
                     });
                 }
             }
         }
     }
     
-    // Add generic database error
+    // Add custom error variant if errors config is present
+    if config.errors.is_some() {
+        error_variants.push(quote! {
+            #[error("Custom error")]
+            CustomError(super::custom_errors::CustomError)
+        });
+    }
+    
+    // Add generic database error - using transparent to show underlying SQL error
     error_variants.push(quote! {
-        #[error("database error")]
+        #[error(transparent)]
         Database(tokio_postgres::Error)
     });
     
-    // Generate the From implementation match arms
-    let from_match_arms = generate_from_impl_arms(table_constraints, custom_exceptions, config);
+    // No longer need From<tokio_postgres::Error> implementation
     
     // Build the error enum variants with proper comma separation
     let all_error_variants = if error_variants.is_empty() {
@@ -176,35 +255,29 @@ pub fn generate_unified_error(
         }
     };
     
-    let from_impl = quote! {
-        impl From<tokio_postgres::Error> for PgRpcError {
-            fn from(e: tokio_postgres::Error) -> Self {
-                let Some(db_error) = e.as_db_error() else {
-                    return PgRpcError::Database(e);
-                };
-                
-                match db_error.code() {
-                    #from_match_arms
-                    _ => PgRpcError::Database(e)
-                }
-            }
-        }
-    };
+    // From implementation removed - will be handled at function level
+    
+    // No wrapper needed anymore
     
     // Generate helper methods for the error type
-    let helper_methods = generate_helper_methods(table_constraints, config);
+    let helper_methods = generate_helper_methods(table_constraints, custom_exceptions, config);
+    
+    // Generate AsDbError implementation
+    let as_db_error_impl = generate_as_db_error_impl(table_constraints, custom_exceptions, config);
 
     quote! {
         #error_enum_def
         
-        #from_impl
-        
         #helper_methods
+        
+        #as_db_error_impl
     }
 }
 
 /// Generates the match arms for the From<tokio_postgres::Error> implementation
-fn generate_from_impl_arms(
+/// This is now used by function-specific error enums
+/// Note: Constraint names are unique within a schema in PostgreSQL
+pub fn generate_from_impl_arms(
     table_constraints: &HashMap<PgId, Vec<Constraint>>,
     custom_exceptions: &HashSet<PgException>,
     config: &Config,
@@ -287,8 +360,7 @@ fn generate_from_impl_arms(
         let variant_name = sql_to_rs_ident(description, Pascal);
         custom_arms.push(quote! {
             code if code == &tokio_postgres::error::SqlState::from_code(#sql_code) => {
-                let message = db_error.message().to_string();
-                PgRpcError::#variant_name(message)
+                PgRpcError::#variant_name(db_error.to_owned())
             }
         });
     }
@@ -302,8 +374,7 @@ fn generate_from_impl_arms(
                 let variant_name = exception.rs_name(config);
                 custom_arms.push(quote! {
                     code if code == &tokio_postgres::error::SqlState::from_code(#code) => {
-                        let message = db_error.message().to_string();
-                        PgRpcError::#variant_name(message)
+                        PgRpcError::#variant_name(db_error.to_owned())
                     }
                 });
             }
@@ -370,11 +441,12 @@ fn generate_from_impl_arms(
 /// Generates helper methods for the PgRpcError enum
 fn generate_helper_methods(
     table_constraints: &HashMap<PgId, Vec<Constraint>>,
+    custom_exceptions: &HashSet<PgException>,
     config: &Config,
 ) -> TokenStream {
     let mut methods = Vec::new();
     
-    // Generate helper methods for custom exceptions from config
+    // Only generate helper methods for custom exceptions from config
     for (_sql_code, description) in &config.exceptions {
         let method_name = format_ident!("is_{}", sql_to_rs_ident(description, crate::ident::CaseType::Snake).to_string());
         let variant_name = sql_to_rs_ident(description, Pascal);
@@ -385,154 +457,68 @@ fn generate_helper_methods(
                 matches!(self, PgRpcError::#variant_name(_))
             }
         });
-        
-        let get_method_name = format_ident!("get_{}_message", sql_to_rs_ident(description, crate::ident::CaseType::Snake).to_string());
-        methods.push(quote! {
-            #[doc = concat!("Returns the error message if this is a ", #description, " error")]
-            pub fn #get_method_name(&self) -> Option<&str> {
-                match self {
-                    PgRpcError::#variant_name(msg) => Some(msg),
-                    _ => None,
-                }
-            }
-        });
     }
     
-    // Generate general helper methods
+    quote! {
+        impl PgRpcError {
+            #(#methods)*
+        }
+    }
+}
+
+/// Implementation of AsDbError for PgRpcError
+/// This allows all error types to use the helper methods via PgRpcErrorExt
+pub fn generate_as_db_error_impl(
+    table_constraints: &HashMap<PgId, Vec<Constraint>>,
+    custom_exceptions: &HashSet<PgException>,
+    config: &Config,
+) -> TokenStream {
+    // Collect all constraint variant arms
     let constraint_arms: Vec<TokenStream> = table_constraints
         .keys()
         .map(|table_id| {
             let table_name_pascal = table_id.name().to_pascal_case();
             let variant_name = format_ident!("{}Constraint", table_name_pascal);
-            quote! { PgRpcError::#variant_name(_, _) }
+            quote! { PgRpcError::#variant_name(_, db_error) => Some(db_error) }
         })
         .collect();
-
-    methods.push(quote! {
-        /// Returns true if this error is related to a database constraint violation
-        pub fn is_constraint_violation(&self) -> bool {
-            match self {
-                #(#constraint_arms)|* => true,
-                _ => false,
-            }
-        }
-    });
     
-    methods.push(quote! {
-        /// Returns true if this error is a generic database error
-        pub fn is_database_error(&self) -> bool {
-            matches!(self, PgRpcError::Database(_))
-        }
-    });
-
-    // Generate column name helper method
-    let constraint_column_arms: Vec<TokenStream> = table_constraints
-        .keys()
-        .map(|table_id| {
-            let table_name_pascal = table_id.name().to_pascal_case();
-            let variant_name = format_ident!("{}Constraint", table_name_pascal);
-            quote! { PgRpcError::#variant_name(_, db_error) => db_error.column() }
-        })
-        .collect();
-
-    methods.push(quote! {
-        /// Returns the column name from the underlying PostgreSQL error, if available
-        pub fn column(&self) -> Option<&str> {
-            match self {
-                #(#constraint_column_arms,)*
-                PgRpcError::Database(e) => e.as_db_error().and_then(|db_error| db_error.column()),
-                _ => None,
+    // Collect all custom exception variant names for arms that return None
+    let mut custom_variant_names = Vec::new();
+    
+    // Custom exceptions from config
+    for (_sql_code, description) in &config.exceptions {
+        let variant_name = sql_to_rs_ident(description, Pascal);
+        custom_variant_names.push(variant_name);
+    }
+    
+    // Additional custom exceptions not in config
+    for exception in custom_exceptions {
+        if let PgException::Explicit(sql_state) = exception {
+            let code = sql_state.code();
+            if !config.exceptions.contains_key(code) {
+                let variant_name = exception.rs_name(config);
+                custom_variant_names.push(variant_name);
             }
         }
-    });
-
-    // Generate constraint name helper method  
-    let constraint_name_arms: Vec<TokenStream> = table_constraints
-        .keys()
-        .map(|table_id| {
-            let table_name_pascal = table_id.name().to_pascal_case();
-            let variant_name = format_ident!("{}Constraint", table_name_pascal);
-            quote! { PgRpcError::#variant_name(_, db_error) => db_error.constraint() }
+    }
+    
+    let custom_arms: Vec<TokenStream> = custom_variant_names
+        .iter()
+        .map(|variant_name| {
+            quote! { PgRpcError::#variant_name(db_error) => Some(db_error) }
         })
         .collect();
-
-    methods.push(quote! {
-        /// Returns the constraint name from the underlying PostgreSQL error, if available
-        pub fn constraint(&self) -> Option<&str> {
-            match self {
-                #(#constraint_name_arms,)*
-                PgRpcError::Database(e) => e.as_db_error().and_then(|db_error| db_error.constraint()),
-                _ => None,
-            }
-        }
-    });
-
-    // Generate table name helper method
-    let constraint_table_arms: Vec<TokenStream> = table_constraints
-        .keys()
-        .map(|table_id| {
-            let table_name_pascal = table_id.name().to_pascal_case();
-            let variant_name = format_ident!("{}Constraint", table_name_pascal);
-            quote! { PgRpcError::#variant_name(_, db_error) => db_error.table() }
-        })
-        .collect();
-
-    methods.push(quote! {
-        /// Returns the table name from the underlying PostgreSQL error, if available
-        pub fn table(&self) -> Option<&str> {
-            match self {
-                #(#constraint_table_arms,)*
-                PgRpcError::Database(e) => e.as_db_error().and_then(|db_error| db_error.table()),
-                _ => None,
-            }
-        }
-    });
-
-    // Generate message helper method
-    let constraint_message_arms: Vec<TokenStream> = table_constraints
-        .keys()
-        .map(|table_id| {
-            let table_name_pascal = table_id.name().to_pascal_case();
-            let variant_name = format_ident!("{}Constraint", table_name_pascal);
-            quote! { PgRpcError::#variant_name(_, db_error) => Some(db_error.message()) }
-        })
-        .collect();
-
-    methods.push(quote! {
-        /// Returns the error message from the underlying PostgreSQL error, if available
-        pub fn message(&self) -> Option<&str> {
-            match self {
-                #(#constraint_message_arms,)*
-                PgRpcError::Database(e) => e.as_db_error().map(|db_error| db_error.message()),
-                _ => None,
-            }
-        }
-    });
-
-    // Generate code helper method
-    let constraint_code_arms: Vec<TokenStream> = table_constraints
-        .keys()
-        .map(|table_id| {
-            let table_name_pascal = table_id.name().to_pascal_case();
-            let variant_name = format_ident!("{}Constraint", table_name_pascal);
-            quote! { PgRpcError::#variant_name(_, db_error) => Some(db_error.code()) }
-        })
-        .collect();
-
-    methods.push(quote! {
-        /// Returns the SQL state code from the underlying PostgreSQL error, if available
-        pub fn code(&self) -> Option<&tokio_postgres::error::SqlState> {
-            match self {
-                #(#constraint_code_arms,)*
-                PgRpcError::Database(e) => e.as_db_error().map(|db_error| db_error.code()),
-                _ => None,
-            }
-        }
-    });
     
     quote! {
-        impl PgRpcError {
-            #(#methods)*
+        impl AsDbError for PgRpcError {
+            fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError> {
+                match self {
+                    #(#constraint_arms,)*
+                    #(#custom_arms,)*
+                    PgRpcError::Database(e) => e.as_db_error(),
+                }
+            }
         }
     }
 }
@@ -608,7 +594,8 @@ mod tests {
         assert!(code_str.contains("enum PgRpcError"));
         assert!(code_str.contains("UsersConstraint"));
         assert!(code_str.contains("Database"));
-        assert!(code_str.contains("impl From < tokio_postgres :: Error > for PgRpcError"));
+        // From<tokio_postgres::Error> is now implemented at function level, not globally
+        assert!(code_str.contains("impl AsDbError for PgRpcError"));
         
         // Check that custom exception variants are generated
         assert!(code_str.contains("CustomApplicationError"));
@@ -617,14 +604,7 @@ mod tests {
         // Check that helper methods are generated
         assert!(code_str.contains("impl PgRpcError"));
         assert!(code_str.contains("is_custom_application_error"));
-        assert!(code_str.contains("get_custom_application_error_message"));
-        assert!(code_str.contains("is_constraint_violation"));
-        assert!(code_str.contains("is_database_error"));
-        assert!(code_str.contains("fn column"));
-        assert!(code_str.contains("fn constraint"));
-        assert!(code_str.contains("fn table"));
-        assert!(code_str.contains("fn message"));
-        assert!(code_str.contains("fn code"));
+        assert!(code_str.contains("is_invalid_user_input"));
     }
 
     #[test]

@@ -135,7 +135,7 @@ fn test_function_generation() {
         
         // Should use the unified error type
         assert!(api_content.contains("Result<"));
-        assert!(api_content.contains("crate::errors::PgRpcError"));
+        assert!(api_content.contains("super::errors::PgRpcError"));
         
         // Should have proper parameter types
         assert!(api_content.contains("p_email"));

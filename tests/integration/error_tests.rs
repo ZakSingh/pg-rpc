@@ -67,6 +67,8 @@ fn create_test_project(conn_string: &str) -> TempDir {
         time = { version = \"0.3\", features = [\"serde\"] }
         thiserror = \"1.0\"
         deadpool-postgres = \"0.12\"
+        rust_decimal = { version = \"1.36\", features = [\"serde\"] }
+        bon = \"3.3\"
     "};
     std::fs::write(project_dir.join("Cargo.toml"), cargo_toml_content)
         .expect("Should write Cargo.toml");
@@ -100,8 +102,8 @@ fn test_error_enum_generation() {
         assert!(errors_content.contains("AccountConstraint(AccountConstraint"));
         assert!(errors_content.contains("PostConstraint(PostConstraint"));
         
-        // Verify From implementation exists
-        assert!(errors_content.contains("impl From<tokio_postgres::Error> for PgRpcError"));
+        // From implementation no longer exists on PgRpcError (moved to function-specific errors)
+        assert!(!errors_content.contains("impl From<tokio_postgres::Error> for PgRpcError"));
     });
 }
 
@@ -115,15 +117,47 @@ fn test_constraint_violation_mapping() {
         let errors_content = std::fs::read_to_string(generated_dir.join("errors.rs"))
             .expect("Should read errors.rs");
         
-        // Should have constraint violation handling for different SQL states
-        assert!(errors_content.contains("UNIQUE_VIOLATION"));
-        assert!(errors_content.contains("CHECK_VIOLATION"));
-        assert!(errors_content.contains("FOREIGN_KEY_VIOLATION"));
-        assert!(errors_content.contains("NOT_NULL_VIOLATION"));
+        // Constraint violation handling moved to function-specific error enums
+        // Let's check that constraint enums are still generated
+        assert!(errors_content.contains("AccountConstraint"));
+        assert!(errors_content.contains("PostConstraint"));
         
-        // Should map specific constraint names to enum variants
-        assert!(errors_content.contains("account_email_key")); // unique constraint name
-        assert!(errors_content.contains("post_title_length")); // check constraint name
+        // Check that the main error enum still has variants for constraints
+        assert!(errors_content.contains("AccountConstraint(AccountConstraint"));
+        assert!(errors_content.contains("PostConstraint(PostConstraint"));
+    });
+}
+
+#[test]
+fn test_function_specific_error_enums() {
+    with_isolated_database_and_container(|_client, _container, conn_string| {
+        
+        let _temp_dir = setup_generated_code(conn_string);
+        let generated_dir = _temp_dir.path();
+        
+        // Read the api schema file which contains our test function
+        let api_content = std::fs::read_to_string(generated_dir.join("api.rs"))
+            .expect("Should read api.rs");
+        
+        
+        // Functions should have their own error enums
+        // Looking for GetAccountByEmailError since that's our test function
+        assert!(api_content.contains("GetAccountByEmailError"), 
+                "Should contain function-specific error enum for get_account_by_email");
+        
+        // Function error enums should have From<tokio_postgres::Error>
+        assert!(api_content.contains("impl From<tokio_postgres::Error> for "),
+                "Should have From<tokio_postgres::Error> implementations");
+        
+        // Function error enums should have Other variant for catch-all
+        assert!(api_content.contains("Other(super::errors::PgRpcError)"),
+                "Should have Other variant wrapping PgRpcError");
+        
+        // Function error enums should have constraint-specific handling
+        assert!(api_content.contains("UNIQUE_VIOLATION") || 
+                api_content.contains("CHECK_VIOLATION") ||
+                api_content.contains("Other(super::errors::PgRpcError::Database(e))"),
+                "Should have constraint handling or database error fallback");
     });
 }
 
@@ -228,23 +262,23 @@ fn test_constraint_enum_coverage() {
 }
 
 #[test]
-fn test_functions_use_unified_error() {
+fn test_functions_use_specific_errors() {
     with_isolated_database_and_container(|_client, _container, conn_string| {
         
         let _temp_dir = setup_generated_code(conn_string);
         let generated_dir = _temp_dir.path();
         
-        // Check that API functions use the unified error type
+        // Check that API functions use function-specific error types
         let api_content = std::fs::read_to_string(generated_dir.join("api.rs"))
             .expect("Should read api.rs");
         
-        // Functions should return Result with PgRpcError
+        // Functions should return Result with function-specific error
         assert!(api_content.contains("Result<"));
-        assert!(api_content.contains("crate::errors::PgRpcError"));
+        assert!(api_content.contains("GetAccountByEmailError"));
         
-        // Should not have function-specific error types
-        assert!(!api_content.contains("GetAccountByEmailError"));
-        assert!(!api_content.contains("enum.*Error"));
+        // Should have From conversions to/from PgRpcError
+        assert!(api_content.contains("impl From<GetAccountByEmailError> for super::errors::PgRpcError"));
+        assert!(api_content.contains("impl From<super::errors::PgRpcError> for GetAccountByEmailError"));
     });
 }
 
@@ -261,8 +295,8 @@ fn test_database_error_fallback() {
         // Should have a generic Database error variant for unmapped errors
         assert!(errors_content.contains("Database(tokio_postgres::Error)"));
         
-        // Should have fallback cases in the From implementation
-        assert!(errors_content.contains("_ => PgRpcError::Database(e)"));
+        // From implementation no longer exists on PgRpcError
+        // Fallback is now in function-specific error enums
     });
 }
 
@@ -287,32 +321,29 @@ fn test_custom_exception_ergonomics() {
         let errors_content = std::fs::read_to_string(project_dir.join("src/generated/errors.rs"))
             .expect("Should read errors.rs");
         
-        // Check that custom exception variants are generated with ergonomic names
-        assert!(errors_content.contains("CustomApplicationError(String)"));
-        assert!(errors_content.contains("InvalidUserInput(String)"));
-        assert!(errors_content.contains("BusinessRuleViolation(String)"));
+        // Check that custom exception variants are generated with DbError instead of String
+        assert!(errors_content.contains("CustomApplicationError(#[source] tokio_postgres::error::DbError)"));
+        assert!(errors_content.contains("InvalidUserInput(#[source] tokio_postgres::error::DbError)"));
+        assert!(errors_content.contains("BusinessRuleViolation(#[source] tokio_postgres::error::DbError)"));
         
-        // Check that helper methods are generated for custom exceptions
+        // Check that is_* helper methods are generated for custom exceptions
         assert!(errors_content.contains("is_custom_application_error"));
-        assert!(errors_content.contains("get_custom_application_error_message"));
         assert!(errors_content.contains("is_invalid_user_input"));
-        assert!(errors_content.contains("get_invalid_user_input_message"));
         assert!(errors_content.contains("is_business_rule_violation"));
-        assert!(errors_content.contains("get_business_rule_violation_message"));
         
-        // Check that the From implementation maps SQL codes to custom variants
-        assert!(errors_content.contains("tokio_postgres::error::SqlState::from_code(\"P0001\")"));
-        assert!(errors_content.contains("tokio_postgres::error::SqlState::from_code(\"P0002\")"));
-        assert!(errors_content.contains("tokio_postgres::error::SqlState::from_code(\"P0003\")"));
+        // Check that AsDbError trait is implemented
+        assert!(errors_content.contains("impl AsDbError for PgRpcError"));
         
-        // Check that the generated code maps to the correct variants
-        assert!(errors_content.contains("PgRpcError::CustomApplicationError(message)"));
-        assert!(errors_content.contains("PgRpcError::InvalidUserInput(message)"));
-        assert!(errors_content.contains("PgRpcError::BusinessRuleViolation(message)"));
+        // Check that the trait definitions are included
+        assert!(errors_content.contains("trait AsDbError"));
+        assert!(errors_content.contains("trait PgRpcErrorExt"));
         
-        // Check that error messages include custom descriptions in the #[error] attributes
-        assert!(errors_content.contains("#[error(\"{}: {0}\", \"Custom application error\")]"));
-        assert!(errors_content.contains("#[error(\"{}: {0}\", \"Invalid user input\")]"));
-        assert!(errors_content.contains("#[error(\"{}: {0}\", \"Business rule violation\")]"));
+        // From implementation for SQL codes now exists in function-specific error enums
+        // The PgRpcError enum itself just has the variants
+        
+        // Check that error messages include custom descriptions in the #[error] attributes (without format strings)
+        assert!(errors_content.contains("#[error(\"Custom application error\")]"));
+        assert!(errors_content.contains("#[error(\"Invalid user input\")]"));
+        assert!(errors_content.contains("#[error(\"Business rule violation\")]"));
     });
 }

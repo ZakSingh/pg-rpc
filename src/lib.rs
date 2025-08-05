@@ -17,6 +17,7 @@ use quote::quote;
 mod types;
 mod config;
 mod db;
+mod error_type_index;
 mod exceptions;
 mod flatten;
 mod fn_index;
@@ -44,6 +45,7 @@ pub struct PgrpcBuilder {
     exceptions: HashMap<String, String>,
     output_path: Option<PathBuf>,
     task_queue: Option<TaskQueueConfig>,
+    errors: Option<config::ErrorsConfig>,
 }
 
 impl Default for PgrpcBuilder {
@@ -62,6 +64,7 @@ impl PgrpcBuilder {
             exceptions: HashMap::new(),
             output_path: None,
             task_queue: None,
+            errors: None,
         }
     }
 
@@ -146,6 +149,28 @@ impl PgrpcBuilder {
         self.task_queue = Some(config);
         self
     }
+    
+    /// Enable custom error types with default configuration
+    pub fn enable_errors(mut self, schema: impl Into<String>) -> Self {
+        self.errors = Some(config::ErrorsConfig {
+            schema: schema.into(),
+            raise_function: Some("core.raise_error".to_string()),
+        });
+        self
+    }
+    
+    /// Configure the errors schema
+    pub fn errors_schema(mut self, schema: impl Into<String>) -> Self {
+        let errors_config = self.errors.get_or_insert(config::ErrorsConfig::default());
+        errors_config.schema = schema.into();
+        self
+    }
+    
+    /// Configure the complete errors settings at once
+    pub fn errors(mut self, config: config::ErrorsConfig) -> Self {
+        self.errors = Some(config);
+        self
+    }
 
     /// Load configuration from a TOML file
     pub fn from_config_file(config_path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -159,6 +184,7 @@ impl PgrpcBuilder {
             exceptions: config.exceptions,
             output_path: config.output_path.map(PathBuf::from),
             task_queue: config.task_queue,
+            errors: config.errors,
         })
     }
 
@@ -193,6 +219,7 @@ impl PgrpcBuilder {
             types: self.types.clone(),
             exceptions: self.exceptions.clone(),
             task_queue: self.task_queue.clone(),
+            errors: self.errors.clone(),
         };
 
         let mut db = Db::new(&connection_string)?;
@@ -200,13 +227,19 @@ impl PgrpcBuilder {
         let trigger_index = trigger_index::TriggerIndex::new(&mut db.client, &rel_index, &config.schemas)?;
         let fn_index = FunctionIndex::new(&mut db.client, &rel_index, &trigger_index, &config.schemas)?;
         
-        // Collect type OIDs from both functions and task types
+        // Collect type OIDs from functions, task types, and error types
         let mut type_oids = fn_index.get_type_oids();
         
         // If task queue is configured, collect task type OIDs as well
         if let Some(task_config) = &config.task_queue {
             let task_type_oids = task_index::collect_task_type_oids(&mut db.client, task_config)?;
             type_oids.extend(task_type_oids);
+        }
+        
+        // If errors are configured, collect error type OIDs as well
+        if let Some(errors_config) = &config.errors {
+            let error_type_oids = error_type_index::collect_error_type_oids(&mut db.client, errors_config)?;
+            type_oids.extend(error_type_oids);
         }
         
         let ty_index = TypeIndex::new(&mut db.client, type_oids.as_slice())?;
@@ -249,6 +282,27 @@ impl PgrpcBuilder {
                 }
                 Err(e) => {
                     eprintln!("Warning: Failed to generate task queue types: {}", e);
+                }
+            }
+        }
+        
+        // Generate error types if errors are configured
+        if let Some(errors_config) = &config.errors {
+            match generate_error_code(&mut db.client, errors_config, &ty_index) {
+                Ok(Some(error_code)) => {
+                    let error_file_path = output_path.join("custom_errors.rs");
+                    if write_if_changed(&error_file_path, &error_code)? {
+                        files_written += 1;
+                    } else {
+                        files_unchanged += 1;
+                    }
+                    final_schema_files.insert("custom_errors".to_string(), error_code);
+                }
+                Ok(None) => {
+                    // No error types found, skip error generation
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to generate custom error types: {}", e);
                 }
             }
         }
@@ -325,6 +379,46 @@ fn generate_task_code(
     );
     
     Ok(Some(warning_ignores.to_string() + &task_code))
+}
+
+/// Generate custom error type code if error types are found
+fn generate_error_code(
+    db_client: &mut postgres::Client,
+    errors_config: &config::ErrorsConfig,
+    ty_index: &TypeIndex,
+) -> anyhow::Result<Option<String>> {
+    let error_index = error_type_index::ErrorTypeIndex::new(db_client, errors_config)?;
+    
+    if error_index.is_empty() {
+        return Ok(None);
+    }
+    
+    let config = crate::config::Config {
+        errors: Some(errors_config.clone()),
+        ..Default::default()
+    };
+    let payload_structs = error_type_index::generate_error_payload_structs(&error_index, ty_index, &config);
+    let error_enum = error_type_index::generate_error_type_enum(&error_index);
+    
+    let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
+    
+    let error_code = prettyplease::unparse(
+        &syn::parse2::<syn::File>(quote::quote! {
+            use serde::{Deserialize, Serialize};
+            use serde_json;
+            use time;
+            use uuid;
+            use rust_decimal;
+            use std::net::IpAddr;
+            
+            #payload_structs
+            
+            #error_enum
+        })
+        .expect("error type code to parse"),
+    );
+    
+    Ok(Some(warning_ignores.to_string() + &error_code))
 }
 
 fn generate_mod_file(schema_files: &HashMap<String, String>) -> String {

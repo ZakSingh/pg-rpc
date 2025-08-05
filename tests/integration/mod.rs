@@ -14,6 +14,9 @@ pub mod function_flatten_tests;
 pub mod compile_helpers;
 pub mod composite_fromsql_tests;
 pub mod task_queue_tests;
+pub mod sql_function_tests;
+pub mod custom_error_tests;
+pub mod procedure_tests;
 
 /// Global container instance that's shared across all tests
 static INIT: Once = Once::new();

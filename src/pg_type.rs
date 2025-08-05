@@ -512,13 +512,27 @@ impl ToRust for PgType {
                                 .map(|f| f.to_rust(types, config))
                                 .collect();
 
-                            let field_mappings: Vec<_> = fields
-                                .into_iter()
+                            let field_extractions: Vec<_> = fields
+                                .iter()
                                 .map(|f| {
                                     let sql_name = &f.name;
                                     let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
-
-                                    quote! { #rs_name: row.try_get(#sql_name)? }
+                                    let rs_name_str = f.name.clone();
+                                    let var_name = format_ident!("_{}", rs_name_str);
+                                    
+                                    quote! {
+                                        let #var_name = row.try_get(#sql_name)?;
+                                    }
+                                })
+                                .collect();
+                                
+                            let field_assignments: Vec<_> = fields
+                                .into_iter()
+                                .map(|f| {
+                                    let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
+                                    let rs_name_str = f.name.clone();
+                                    let var_name = format_ident!("_{}", rs_name_str);
+                                    quote! { #rs_name: #var_name }
                                 })
                                 .collect();
                                 
@@ -527,8 +541,10 @@ impl ToRust for PgType {
                                     type Error = tokio_postgres::Error;
 
                                     fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                                        #(#field_extractions)*
+                                        
                                         Ok(Self {
-                                            #(#field_mappings),*
+                                            #(#field_assignments),*
                                         })
                                     }
                                 }
@@ -544,13 +560,27 @@ impl ToRust for PgType {
                         .map(|f| f.to_rust(types, config))
                         .collect();
 
-                    let field_mappings: Vec<_> = fields
-                        .into_iter()
+                    let field_extractions: Vec<_> = fields
+                        .iter()
                         .map(|f| {
                             let sql_name = &f.name;
                             let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
-
-                            quote! { #rs_name: row.try_get(#sql_name)? }
+                            let rs_name_str = f.name.clone();
+                            let var_name = format_ident!("_{}", rs_name_str);
+                            
+                            quote! {
+                                let #var_name = row.try_get(#sql_name)?;
+                            }
+                        })
+                        .collect();
+                        
+                    let field_assignments: Vec<_> = fields
+                        .into_iter()
+                        .map(|f| {
+                            let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
+                            let rs_name_str = f.name.clone();
+                            let var_name = format_ident!("_{}", rs_name_str);
+                            quote! { #rs_name: #var_name }
                         })
                         .collect();
                     
@@ -559,8 +589,10 @@ impl ToRust for PgType {
                             type Error = tokio_postgres::Error;
 
                             fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                                #(#field_extractions)*
+                                
                                 Ok(Self {
-                                    #(#field_mappings),*
+                                    #(#field_assignments),*
                                 })
                             }
                         }
@@ -577,7 +609,7 @@ impl ToRust for PgType {
 
                 quote! {
                     #comment_macro
-                    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, postgres_types::FromSql, postgres_types::ToSql)]
+                    #[derive(Clone, Debug, bon::Builder, serde::Serialize, serde::Deserialize, postgres_types::FromSql, postgres_types::ToSql)]
                     #[postgres(name = #name)]
                     pub struct #rs_name {
                         #(#field_tokens),*
@@ -621,13 +653,27 @@ impl ToRust for PgType {
                             })
                             .collect();
 
-                        let field_mappings: Vec<_> = fields
-                            .into_iter()
+                        let field_extractions: Vec<_> = fields
+                            .iter()
                             .map(|f| {
                                 let sql_name = &f.name;
                                 let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
-
-                                quote! { #rs_name: row.try_get(#sql_name)? }
+                                let rs_name_str = f.name.clone();
+                                let var_name = format_ident!("_{}", rs_name_str);
+                                
+                                quote! {
+                                    let #var_name = row.try_get(#sql_name)?;
+                                }
+                            })
+                            .collect();
+                            
+                        let field_assignments: Vec<_> = fields
+                            .into_iter()
+                            .map(|f| {
+                                let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
+                                let rs_name_str = f.name.clone();
+                                let var_name = format_ident!("_{}", rs_name_str);
+                                quote! { #rs_name: #var_name }
                             })
                             .collect();
 
@@ -639,7 +685,7 @@ impl ToRust for PgType {
 
                         quote! {
                             #comment_macro
-                            #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+                            #[derive(Clone, Debug, bon::Builder, serde::Serialize, serde::Deserialize)]
                             pub struct #rs_name {
                                 #(#field_tokens),*
                             }
@@ -705,8 +751,10 @@ impl ToRust for PgType {
                                 type Error = tokio_postgres::Error;
 
                                 fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                                    #(#field_extractions)*
+                                    
                                     Ok(Self {
-                                        #(#field_mappings),*
+                                        #(#field_assignments),*
                                     })
                                 }
                             }
@@ -927,7 +975,10 @@ fn generate_field_extraction_code(
     if flattened_field.original_path.len() == 1 {
         // Simple field - direct access from row
         let field_name = &flattened_field.original_path[0];
-        quote! { row.try_get(#field_name)? }
+        let rs_field_name = sql_to_rs_ident(&flattened_field.name, CaseType::Snake);
+        quote! { 
+            row.try_get(#field_name)?
+        }
     } else {
         // Nested field - need to extract from composite type
         let root_field_name = &flattened_field.original_path[0];
@@ -948,6 +999,7 @@ fn generate_field_extraction_code(
                 
                 // Now that composite types have FromSql, we can extract them properly
                 // Generate nested field access through the composite type
+                let rs_field_name = sql_to_rs_ident(&flattened_field.name, CaseType::Snake);
                 quote! {
                     row.try_get::<_, Option<#composite_type_name>>(#root_field_name)?
                         .and_then(|c| c.#sub_field_rust_name.clone())
@@ -1258,6 +1310,7 @@ mod tests {
             types: HashMap::new(),
             exceptions: HashMap::new(),
             task_queue: None,
+            errors: None,
         };
         
         // Generate Rust code

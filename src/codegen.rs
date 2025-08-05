@@ -37,9 +37,12 @@ pub fn codegen_split(
     // Generate unified error types
     let (error_types_code, all_exceptions) = generate_unified_errors(fn_index, rel_index, config);
     
+    // Collect table constraints for function error generation
+    let table_constraints = unified_error::collect_table_constraints(rel_index);
+    
     // Generate types and collect referenced schemas
     let (type_def_code, type_schema_refs) = codegen_types_with_refs(&ty_index, config);
-    let (fn_code, fn_schema_refs) = codegen_fns_with_refs(&fn_index, &ty_index, config, &all_exceptions);
+    let (fn_code, fn_schema_refs) = codegen_fns_with_refs(&fn_index, &ty_index, &rel_index, &table_constraints, config, &all_exceptions);
 
     // Merge schema references
     let mut all_schema_refs: HashMap<SchemaName, HashSet<SchemaName>> = HashMap::new();
@@ -90,9 +93,13 @@ pub fn codegen_split(
     
 
     // Add the error types as a separate module
+    let error_module_code = prettyplease::unparse(
+        &syn::parse2::<syn::File>(error_types_code)
+        .expect("error module to parse"),
+    );
     schema_code.insert(
         "errors".to_string(),
-        warning_ignores.to_string() + &prettyplease::unparse(&syn::parse2(error_types_code).expect("error types to parse"))
+        warning_ignores.to_string() + &error_module_code
     );
 
     Ok(schema_code)
@@ -229,6 +236,78 @@ fn generate_unified_errors(
     let error_enum = unified_error::generate_unified_error(&table_constraints, &all_exceptions, config);
     
     let error_types_code = quote! {
+        /// Trait for types that can provide access to an underlying DbError
+        pub trait AsDbError {
+            /// Returns a reference to the underlying DbError if this error contains one
+            fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError>;
+        }
+
+        /// Extension trait for error types that provides helper methods for PostgreSQL errors
+        pub trait PgRpcErrorExt: AsDbError {
+            /// Returns the column name from the underlying PostgreSQL error, if available
+            fn column(&self) -> Option<&str> {
+                self.as_db_error().and_then(|e| e.column())
+            }
+            
+            /// Returns the constraint name from the underlying PostgreSQL error, if available
+            fn constraint(&self) -> Option<&str> {
+                self.as_db_error().and_then(|e| e.constraint())
+            }
+            
+            /// Returns the table name from the underlying PostgreSQL error, if available
+            fn table(&self) -> Option<&str> {
+                self.as_db_error().and_then(|e| e.table())
+            }
+            
+            /// Returns the error message from the underlying PostgreSQL error, if available
+            fn message(&self) -> Option<&str> {
+                self.as_db_error().map(|e| e.message())
+            }
+            
+            /// Returns the SQL state code from the underlying PostgreSQL error, if available
+            fn code(&self) -> Option<&tokio_postgres::error::SqlState> {
+                self.as_db_error().map(|e| e.code())
+            }
+            
+            /// Returns the schema name from the underlying PostgreSQL error, if available
+            fn schema(&self) -> Option<&str> {
+                self.as_db_error().and_then(|e| e.schema())
+            }
+            
+            /// Returns the data type name from the underlying PostgreSQL error, if available
+            fn datatype(&self) -> Option<&str> {
+                self.as_db_error().and_then(|e| e.datatype())
+            }
+            
+            /// Returns the detail from the underlying PostgreSQL error, if available
+            fn detail(&self) -> Option<&str> {
+                self.as_db_error().and_then(|e| e.detail())
+            }
+            
+            /// Returns the hint from the underlying PostgreSQL error, if available
+            fn hint(&self) -> Option<&str> {
+                self.as_db_error().and_then(|e| e.hint())
+            }
+            
+            /// Returns the position from the underlying PostgreSQL error, if available
+            fn position(&self) -> Option<&tokio_postgres::error::ErrorPosition> {
+                self.as_db_error().and_then(|e| e.position())
+            }
+            
+            /// Returns the where clause from the underlying PostgreSQL error, if available
+            fn where_(&self) -> Option<&str> {
+                self.as_db_error().and_then(|e| e.where_())
+            }
+            
+            /// Returns the routine from the underlying PostgreSQL error, if available
+            fn routine(&self) -> Option<&str> {
+                self.as_db_error().and_then(|e| e.routine())
+            }
+        }
+
+        /// Blanket implementation of PgRpcErrorExt for all types that implement AsDbError
+        impl<T: AsDbError> PgRpcErrorExt for T {}
+        
         #(#constraint_enums)*
         
         #error_enum
@@ -260,6 +339,8 @@ fn codegen_fns(
 fn codegen_fns_with_refs(
     fns: &FunctionIndex,
     types: &TypeIndex,
+    rel_index: &RelIndex,
+    table_constraints: &HashMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
     config: &Config,
     _all_exceptions: &HashSet<PgException>,
 ) -> (HashMap<SchemaName, TokenStream>, HashMap<SchemaName, HashSet<SchemaName>>) {
@@ -280,8 +361,16 @@ fn codegen_fns_with_refs(
             // All functions reference the errors module
             all_refs.insert("errors".to_string());
             
-            let fns_rs: Vec<TokenStream> =
-                fns.into_iter().map(|f| f.to_rust(&types, config)).collect();
+            let fns_rs: Vec<TokenStream> = fns.into_iter().map(|f| {
+                // Generate error enum for this function
+                let error_enum = f.generate_error_enum(rel_index, table_constraints, config);
+                let fn_impl = f.to_rust(&types, config);
+                quote! {
+                    #error_enum
+                    
+                    #fn_impl
+                }
+            }).collect();
             
             schema_refs.insert(schema.to_string(), all_refs);
             

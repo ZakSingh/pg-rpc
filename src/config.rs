@@ -10,6 +10,7 @@ pub struct Config {
     pub exceptions: HashMap<String, String>,
     pub schemas: Vec<String>,
     pub task_queue: Option<TaskQueueConfig>,
+    pub errors: Option<ErrorsConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -21,6 +22,12 @@ pub struct TaskQueueConfig {
     pub table_name: Option<String>,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct ErrorsConfig {
+    pub schema: String,
+    pub raise_function: Option<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -30,6 +37,7 @@ impl Default for Config {
             exceptions: HashMap::new(),
             schemas: Vec::new(),
             task_queue: None,
+            errors: None,
         }
     }
 }
@@ -59,6 +67,22 @@ impl Default for TaskQueueConfig {
             payload_column: "payload".to_string(),
             table_schema: Some("mq".to_string()),
             table_name: Some("task".to_string()),
+        }
+    }
+}
+
+impl ErrorsConfig {
+    /// Get the raise error function name, defaulting to core.raise_error
+    pub fn get_raise_function(&self) -> &str {
+        self.raise_function.as_deref().unwrap_or("core.raise_error")
+    }
+}
+
+impl Default for ErrorsConfig {
+    fn default() -> Self {
+        Self {
+            schema: "errors".to_string(),
+            raise_function: Some("core.raise_error".to_string()),
         }
     }
 }
