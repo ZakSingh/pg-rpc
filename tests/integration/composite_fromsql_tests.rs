@@ -34,13 +34,13 @@ fn test_composite_type_fromsql_generation() {
             END;
             $$ LANGUAGE plpgsql;
         "};
-        
+
         execute_sql(client, schema_sql).expect("Should create test schema");
-        
+
         // Generate code
         let temp_dir = tempfile::TempDir::new().expect("Failed to create temp directory");
         let output_path = temp_dir.path();
-        
+
         PgrpcBuilder::new()
             .connection_string(conn_string)
             .output_path(output_path)
@@ -48,28 +48,43 @@ fn test_composite_type_fromsql_generation() {
             .schema("api")
             .build()
             .expect("Code generation should succeed");
-        
+
         // Read generated code to verify it has FromSql/ToSql derives
-        let public_content = std::fs::read_to_string(output_path.join("public.rs"))
-            .expect("Should read public.rs");
-        
+        let public_content =
+            std::fs::read_to_string(output_path.join("public.rs")).expect("Should read public.rs");
+
         println!("Generated public.rs content (first 1000 chars):");
         println!("{}", &public_content.chars().take(1000).collect::<String>());
-        
+
         // Verify Contact type has FromSql and ToSql derives
-        assert!(public_content.contains("pub struct Contact"), "Should generate Contact struct");
-        assert!(public_content.contains("postgres_types::FromSql"), "Should have FromSql derive");
-        assert!(public_content.contains("postgres_types::ToSql"), "Should have ToSql derive");
-        assert!(public_content.contains("#[postgres(name = \"contact\")]"), "Should have postgres name attribute");
-        
+        assert!(
+            public_content.contains("pub struct Contact"),
+            "Should generate Contact struct"
+        );
+        assert!(
+            public_content.contains("postgres_types::FromSql"),
+            "Should have FromSql derive"
+        );
+        assert!(
+            public_content.contains("postgres_types::ToSql"),
+            "Should have ToSql derive"
+        );
+        assert!(
+            public_content.contains("#[postgres(name = \"contact\")]"),
+            "Should have postgres name attribute"
+        );
+
         // Verify Person type also has the derives
-        assert!(public_content.contains("pub struct Person"), "Should generate Person struct");
-        
+        assert!(
+            public_content.contains("pub struct Person"),
+            "Should generate Person struct"
+        );
+
         // Create a test project to verify compilation
         use crate::integration::compile_helpers::*;
-        
+
         let project_dir = create_test_cargo_project(conn_string, vec!["public", "api"]);
-        
+
         // Create a simple test that uses the generated types
         let test_code = indoc! {r#"
             use test_project::*;
@@ -114,22 +129,26 @@ fn test_composite_type_fromsql_generation() {
                 println!("✅ FromSql/ToSql works for composite types!");
             }
         "#};
-        
+
         add_test_binary(&project_dir.path(), "test_composite", &test_code);
-        
+
         // Compile and run the test
-        let output = compile_and_run_with_args(&project_dir.path(), "test_composite", &[conn_string]);
-        
+        let output =
+            compile_and_run_with_args(&project_dir.path(), "test_composite", &[conn_string]);
+
         // First check if compilation succeeded
         if !output.status.success() {
             print_output(&output);
             panic!("Test compilation failed");
         }
-        
+
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("✅ FromSql/ToSql works for composite types!"), 
-            "Test should complete successfully. Output: {}", stdout);
-        
+        assert!(
+            stdout.contains("✅ FromSql/ToSql works for composite types!"),
+            "Test should complete successfully. Output: {}",
+            stdout
+        );
+
         println!("✅ Composite types now support FromSql/ToSql!");
     });
 }
@@ -173,13 +192,13 @@ fn test_nested_composite_extraction() {
             END;
             $$ LANGUAGE plpgsql;
         "};
-        
+
         execute_sql(client, schema_sql).expect("Should create test schema");
-        
+
         // Generate code
         let temp_dir = tempfile::TempDir::new().expect("Failed to create temp directory");
         let output_path = temp_dir.path();
-        
+
         PgrpcBuilder::new()
             .connection_string(conn_string)
             .output_path(output_path)
@@ -187,12 +206,12 @@ fn test_nested_composite_extraction() {
             .schema("api")
             .build()
             .expect("Code generation should succeed");
-        
+
         // Create test project
         use crate::integration::compile_helpers::*;
-        
+
         let project_dir = create_test_cargo_project(conn_string, vec!["public", "api"]);
-        
+
         // Create test that extracts nested composite values
         let test_code = indoc! {r#"
             use test_project::*;
@@ -235,21 +254,24 @@ fn test_nested_composite_extraction() {
                 println!("✅ Nested composite extraction works!");
             }
         "#};
-        
+
         add_test_binary(&project_dir.path(), "test_nested", &test_code);
-        
+
         // Compile and run the test
         let output = compile_and_run_with_args(&project_dir.path(), "test_nested", &[conn_string]);
-        
+
         if !output.status.success() {
             print_output(&output);
             panic!("Test compilation failed");
         }
-        
+
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("✅ Nested composite extraction works!"), 
-            "Test should complete successfully. Output: {}", stdout);
-        
+        assert!(
+            stdout.contains("✅ Nested composite extraction works!"),
+            "Test should complete successfully. Output: {}",
+            stdout
+        );
+
         println!("✅ Nested composite types work properly with FromSql/ToSql!");
     });
 }

@@ -35,12 +35,13 @@ fn test_function_with_flattened_composite_parameter() {
             END;
             $$ LANGUAGE plpgsql;
         "};
-        
+
         execute_sql(client, schema_sql).expect("Should create test schema");
-        
+
         // Verify the functions were created
-        let function_rows = client.query(
-            indoc! {"
+        let function_rows = client
+            .query(
+                indoc! {"
                 SELECT p.proname, pg_get_function_result(p.oid) as result_type
                 FROM pg_proc p
                 JOIN pg_namespace n ON p.pronamespace = n.oid
@@ -48,25 +49,35 @@ fn test_function_with_flattened_composite_parameter() {
                 AND p.proname IN ('create_person', 'get_test_person')
                 ORDER BY p.proname
             "},
-            &[]
-        ).expect("Should query functions");
-        
+                &[],
+            )
+            .expect("Should query functions");
+
         assert_eq!(function_rows.len(), 2);
-        
+
         let create_person_row = &function_rows[0];
         let get_test_person_row = &function_rows[1];
-        
-        assert_eq!(create_person_row.get::<_, String>("proname"), "create_person");
+
+        assert_eq!(
+            create_person_row.get::<_, String>("proname"),
+            "create_person"
+        );
         assert_eq!(create_person_row.get::<_, String>("result_type"), "person");
-        
-        assert_eq!(get_test_person_row.get::<_, String>("proname"), "get_test_person");
-        assert_eq!(get_test_person_row.get::<_, String>("result_type"), "person");
-        
+
+        assert_eq!(
+            get_test_person_row.get::<_, String>("proname"),
+            "get_test_person"
+        );
+        assert_eq!(
+            get_test_person_row.get::<_, String>("result_type"),
+            "person"
+        );
+
         println!("✅ Successfully created functions with flattened composite types");
     });
 }
 
-#[test] 
+#[test]
 fn test_function_with_nested_flattened_composite() {
     with_isolated_database(|client| {
         // Create nested composite types with multiple flatten annotations
@@ -99,27 +110,29 @@ fn test_function_with_nested_flattened_composite() {
             END;
             $$ LANGUAGE plpgsql;
         "};
-        
+
         execute_sql(client, schema_sql).expect("Should create nested test schema");
-        
+
         // Verify the function was created
-        let function_rows = client.query(
-            indoc! {"
+        let function_rows = client
+            .query(
+                indoc! {"
                 SELECT p.proname, pg_get_function_arguments(p.oid) as args
                 FROM pg_proc p
                 JOIN pg_namespace n ON p.pronamespace = n.oid
                 WHERE n.nspname = 'api'
                 AND p.proname = 'process_person'
             "},
-            &[]
-        ).expect("Should query process_person function");
-        
+                &[],
+            )
+            .expect("Should query process_person function");
+
         assert_eq!(function_rows.len(), 1);
-        
+
         let function_row = &function_rows[0];
         assert_eq!(function_row.get::<_, String>("proname"), "process_person");
         assert_eq!(function_row.get::<_, String>("args"), "p person");
-        
+
         println!("✅ Successfully created function with nested flattened composite parameter");
     });
 }

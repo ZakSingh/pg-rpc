@@ -1,6 +1,6 @@
 use crate::codegen::OID;
-use crate::pg_type::{PgType, PgField};
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::pg_type::PgType;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct FlattenedField {
@@ -32,7 +32,7 @@ pub fn analyze_flatten_dependencies(
     let mut visited = HashSet::new();
     let mut path = Vec::new();
     let mut dependencies = HashSet::new();
-    
+
     let flattened_fields = flatten_composite_recursive(
         composite_type,
         types,
@@ -40,7 +40,7 @@ pub fn analyze_flatten_dependencies(
         &mut path,
         &mut dependencies,
     )?;
-    
+
     Ok(FlattenAnalysis {
         flattened_fields,
         dependencies,
@@ -56,47 +56,45 @@ fn flatten_composite_recursive(
 ) -> Result<Vec<FlattenedField>, FlattenError> {
     let type_name = match composite_type {
         PgType::Composite { name, .. } => name.clone(),
-        _ => return Err(FlattenError::InvalidFlattenTarget(
-            "Only composite types can be flattened".to_string()
-        )),
+        _ => {
+            return Err(FlattenError::InvalidFlattenTarget(
+                "Only composite types can be flattened".to_string(),
+            ))
+        }
     };
-    
+
     // Cycle detection
     if visited.contains(&type_name) {
         return Err(FlattenError::CyclicDependency(path.clone()));
     }
-    
+
     visited.insert(type_name.clone());
     path.push(type_name.clone());
-    
+
     let mut result = Vec::new();
-    
+
     if let PgType::Composite { fields, .. } = composite_type {
         for field in fields {
             if field.flatten {
                 // This field should be flattened
-                let field_type = types.get(&field.type_oid)
+                let field_type = types
+                    .get(&field.type_oid)
                     .ok_or(FlattenError::TypeNotFound(field.type_oid))?;
-                
+
                 dependencies.insert(field.type_oid);
-                
+
                 // Recursively flatten this field
-                let sub_fields = flatten_composite_recursive(
-                    field_type,
-                    types,
-                    visited,
-                    path,
-                    dependencies,
-                )?;
-                
+                let sub_fields =
+                    flatten_composite_recursive(field_type, types, visited, path, dependencies)?;
+
                 // Add sub-fields with updated paths and names
                 for sub_field in sub_fields {
                     let mut new_path = vec![field.name.clone()];
                     new_path.extend(sub_field.original_path);
-                    
+
                     // Generate field name with conflict resolution
                     let field_name = generate_field_name(&field.name, &sub_field.name);
-                    
+
                     result.push(FlattenedField {
                         name: field_name,
                         original_path: new_path,
@@ -117,10 +115,10 @@ fn flatten_composite_recursive(
             }
         }
     }
-    
+
     path.pop();
     visited.remove(&type_name);
-    
+
     Ok(result)
 }
 
@@ -143,11 +141,11 @@ pub fn has_field_conflict(new_name: &str, existing_fields: &[FlattenedField]) ->
 /// Resolve field name conflicts by adding prefixes
 pub fn resolve_field_conflicts(fields: &mut [FlattenedField]) {
     let mut name_counts: HashMap<String, usize> = HashMap::new();
-    
+
     for field in fields.iter_mut() {
         let count = name_counts.entry(field.name.clone()).or_insert(0);
         *count += 1;
-        
+
         if *count > 1 {
             // Add suffix for conflicts
             field.name = format!("{}_{}", field.name, count);
@@ -158,8 +156,8 @@ pub fn resolve_field_conflicts(fields: &mut [FlattenedField]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pg_type::{PgType, PgField};
-    
+    use crate::pg_type::{PgField, PgType};
+
     fn create_test_field(name: &str, type_oid: OID, flatten: bool) -> PgField {
         PgField {
             name: name.to_string(),
@@ -169,108 +167,121 @@ mod tests {
             flatten,
         }
     }
-    
+
     fn create_test_composite(name: &str, fields: Vec<PgField>) -> PgType {
         PgType::Composite {
             schema: "public".to_string(),
             name: name.to_string(),
             fields,
             comment: None,
+            relkind: None,
+            view_definition: None,
         }
     }
-    
+
     #[test]
     fn test_simple_flatten() {
         let mut types = HashMap::new();
-        
+
         // Create address type
-        let address_type = create_test_composite("address", vec![
-            create_test_field("street", 1, false),
-            create_test_field("city", 2, false),
-        ]);
+        let address_type = create_test_composite(
+            "address",
+            vec![
+                create_test_field("street", 1, false),
+                create_test_field("city", 2, false),
+            ],
+        );
         types.insert(100, address_type);
-        
+
         // Create person type with flattened address
-        let person_type = create_test_composite("person", vec![
-            create_test_field("name", 3, false),
-            create_test_field("addr", 100, true), // Flatten this
-        ]);
-        
+        let person_type = create_test_composite(
+            "person",
+            vec![
+                create_test_field("name", 3, false),
+                create_test_field("addr", 100, true), // Flatten this
+            ],
+        );
+
         let analysis = analyze_flatten_dependencies(&person_type, &types).unwrap();
-        
+
         assert_eq!(analysis.flattened_fields.len(), 3);
         assert_eq!(analysis.flattened_fields[0].name, "name");
         assert_eq!(analysis.flattened_fields[1].name, "addr_street");
         assert_eq!(analysis.flattened_fields[2].name, "addr_city");
-        
+
         assert!(analysis.dependencies.contains(&100));
     }
-    
+
     #[test]
     fn test_nested_flatten() {
         let mut types = HashMap::new();
-        
+
         // Create contact_info type
-        let contact_type = create_test_composite("contact_info", vec![
-            create_test_field("phone", 1, false),
-            create_test_field("email", 2, false),
-        ]);
+        let contact_type = create_test_composite(
+            "contact_info",
+            vec![
+                create_test_field("phone", 1, false),
+                create_test_field("email", 2, false),
+            ],
+        );
         types.insert(200, contact_type);
-        
+
         // Create address type with flattened contact
-        let address_type = create_test_composite("address", vec![
-            create_test_field("street", 3, false),
-            create_test_field("city", 4, false),
-            create_test_field("contact", 200, true), // Flatten this
-        ]);
+        let address_type = create_test_composite(
+            "address",
+            vec![
+                create_test_field("street", 3, false),
+                create_test_field("city", 4, false),
+                create_test_field("contact", 200, true), // Flatten this
+            ],
+        );
         types.insert(100, address_type);
-        
+
         // Create person type with flattened address (which contains flattened contact)
-        let person_type = create_test_composite("person", vec![
-            create_test_field("name", 5, false),
-            create_test_field("addr", 100, true), // Flatten this
-        ]);
-        
+        let person_type = create_test_composite(
+            "person",
+            vec![
+                create_test_field("name", 5, false),
+                create_test_field("addr", 100, true), // Flatten this
+            ],
+        );
+
         let analysis = analyze_flatten_dependencies(&person_type, &types).unwrap();
-        
+
         assert_eq!(analysis.flattened_fields.len(), 5);
         assert_eq!(analysis.flattened_fields[0].name, "name");
         assert_eq!(analysis.flattened_fields[1].name, "addr_street");
         assert_eq!(analysis.flattened_fields[2].name, "addr_city");
         assert_eq!(analysis.flattened_fields[3].name, "addr_contact_phone");
         assert_eq!(analysis.flattened_fields[4].name, "addr_contact_email");
-        
+
         assert!(analysis.dependencies.contains(&100));
         assert!(analysis.dependencies.contains(&200));
     }
-    
+
     #[test]
     fn test_cycle_detection() {
         let mut types = HashMap::new();
-        
+
         // Create circular dependency: A -> B -> A
-        let type_a = create_test_composite("type_a", vec![
-            create_test_field("field_b", 200, true),
-        ]);
+        let type_a = create_test_composite("type_a", vec![create_test_field("field_b", 200, true)]);
         types.insert(100, type_a);
-        
-        let type_b = create_test_composite("type_b", vec![
-            create_test_field("field_a", 100, true),
-        ]);
+
+        let type_b = create_test_composite("type_b", vec![create_test_field("field_a", 100, true)]);
         types.insert(200, type_b);
-        
+
         let result = analyze_flatten_dependencies(&types[&100], &types);
-        
+
         assert!(matches!(result, Err(FlattenError::CyclicDependency(_))));
     }
-    
+
     #[test]
     fn test_field_name_generation() {
         assert_eq!(generate_field_name("addr", "street"), "addr_street");
         assert_eq!(generate_field_name("", "name"), "name");
         assert_eq!(generate_field_name("contact", "phone"), "contact_phone");
     }
-    
+
     #[test]
     fn test_conflict_resolution() {
         let mut fields = vec![
@@ -289,9 +300,9 @@ mod tests {
                 comment: None,
             },
         ];
-        
+
         resolve_field_conflicts(&mut fields);
-        
+
         assert_eq!(fields[0].name, "name");
         assert_eq!(fields[1].name, "name_2");
     }

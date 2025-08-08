@@ -1,6 +1,6 @@
 use heck::{ToPascalCase, ToSnakeCase};
-use quote::ToTokens;
 use proc_macro2::TokenStream;
+use quote::ToTokens;
 
 pub enum CaseType {
     Snake,
@@ -33,21 +33,21 @@ pub fn sql_to_rs_ident(name: &str, case_type: CaseType) -> TokenStream {
 pub fn sql_to_rs_string(name: &str, case_type: CaseType) -> String {
     let prefix = if starts_with_number(&name) { "_" } else { "" };
     let name = prefix.to_string()
-      + &match case_type {
-        CaseType::Snake => name.to_snake_case(),
-        CaseType::Pascal => {
-            // Preserve _ prefixes (heck removes them for some reason)
-            if name.chars().next() == Some('_') {
-                "_".to_string().as_str().to_owned() + name.to_pascal_case().as_str()
-            } else {
-                name.to_pascal_case()
+        + &match case_type {
+            CaseType::Snake => name.to_snake_case(),
+            CaseType::Pascal => {
+                // Preserve _ prefixes (heck removes them for some reason)
+                if name.chars().next() == Some('_') {
+                    "_".to_string().as_str().to_owned() + name.to_pascal_case().as_str()
+                } else {
+                    name.to_pascal_case()
+                }
             }
-        }
-    };
+        };
 
     match syn::parse_str::<syn::Ident>(&name) {
         Ok(_) => name,
-        Err(_) => "r#".to_owned() + &name
+        Err(_) => "r#".to_owned() + &name,
     }
 }
 

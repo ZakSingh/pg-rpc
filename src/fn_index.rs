@@ -3,11 +3,11 @@ use crate::pg_fn::PgFn;
 use crate::rel_index::RelIndex;
 use crate::trigger_index::TriggerIndex;
 use anyhow::Context;
+use postgres::Client;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use postgres::Client;
 
 const FUNCTION_INTROSPECTION_QUERY: &'static str =
     include_str!("./queries/function_introspection.sql");
@@ -31,10 +31,10 @@ impl DerefMut for FunctionIndex {
 
 impl FunctionIndex {
     pub fn new(
-        db: &mut Client, 
-        rel_index: &RelIndex, 
+        db: &mut Client,
+        rel_index: &RelIndex,
         trigger_index: &TriggerIndex,
-        schemas: &Vec<String>
+        schemas: &Vec<String>,
     ) -> anyhow::Result<Self> {
         let fn_rows = db
             .query(FUNCTION_INTROSPECTION_QUERY, &[schemas])
@@ -54,7 +54,11 @@ impl FunctionIndex {
     }
 
     pub fn get_type_oids(&self) -> Vec<OID> {
-        self.deref().values().map(|f| f.ty_oids()).flatten().collect()
+        self.deref()
+            .values()
+            .map(|f| f.ty_oids())
+            .flatten()
+            .collect()
     }
 }
 

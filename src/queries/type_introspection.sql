@@ -53,7 +53,28 @@ with recursive type_tree as (
                                                      left join pg_description d on d.objoid = t.typrelid and d.objsubid = a.attnum
                                             where a.attrelid = t.typrelid
                                               and a.attnum > 0
-                                              and not attisdropped ) end                                          as composite_field_comments
+                                              and not attisdropped ) end                                          as composite_field_comments,
+           -- Check if this composite type is for a view
+           -- For views, we need to find the pg_class entry with the same name as the type
+           case when t.typtype = 'c' then ( 
+               select c.relkind
+               from pg_class c
+               where c.relname = t.typname 
+                 and c.relnamespace = t.typnamespace
+           ) end                                       as relkind,
+           -- Get view definition if it's a view
+           case when t.typtype = 'c' and exists (
+               select 1 
+               from pg_class c 
+               where c.relname = t.typname 
+                 and c.relnamespace = t.typnamespace 
+                 and c.relkind in ('v', 'm')
+           ) then (
+               select pg_get_viewdef(c.oid)
+               from pg_class c 
+               where c.relname = t.typname 
+                 and c.relnamespace = t.typnamespace
+           ) end                                                      as view_definition
     from pg_type t
              join pg_namespace n on t.typnamespace = n.oid
     where t.oid = any ($1)
@@ -114,7 +135,28 @@ with recursive type_tree as (
                                                      left join pg_description d on d.objoid = t.typrelid and d.objsubid = a.attnum
                                             where a.attrelid = t.typrelid
                                               and a.attnum > 0
-                                              and not attisdropped ) end                                          as composite_field_comments
+                                              and not attisdropped ) end                                          as composite_field_comments,
+           -- Check if this composite type is for a view
+           -- For views, we need to find the pg_class entry with the same name as the type
+           case when t.typtype = 'c' then ( 
+               select c.relkind
+               from pg_class c
+               where c.relname = t.typname 
+                 and c.relnamespace = t.typnamespace
+           ) end                                       as relkind,
+           -- Get view definition if it's a view
+           case when t.typtype = 'c' and exists (
+               select 1 
+               from pg_class c 
+               where c.relname = t.typname 
+                 and c.relnamespace = t.typnamespace 
+                 and c.relkind in ('v', 'm')
+           ) then (
+               select pg_get_viewdef(c.oid)
+               from pg_class c 
+               where c.relname = t.typname 
+                 and c.relnamespace = t.typnamespace
+           ) end                                                      as view_definition
     from pg_type t
              join pg_namespace n on t.typnamespace = n.oid
              join type_tree tt on (
@@ -140,5 +182,7 @@ select distinct on (oid) oid,
                          composite_field_types,
                          composite_field_nullables,
                          type_comment,
-                         composite_field_comments
+                         composite_field_comments,
+                         relkind,
+                         view_definition
 from type_tree;

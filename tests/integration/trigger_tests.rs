@@ -1,22 +1,27 @@
 use super::*;
+use indoc::indoc;
 use pgrpc::*;
 use tempfile::TempDir;
-use indoc::indoc;
 
 /// Create test triggers and trigger functions for testing
 fn setup_trigger_test_data(client: &mut Client) -> Result<(), postgres::Error> {
     // Create a test table with triggers
-    execute_sql(client, indoc! {"
+    execute_sql(
+        client,
+        indoc! {"
         CREATE TABLE test_trigger_table (
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             value INTEGER,
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
-    "})?;
-    
+    "},
+    )?;
+
     // Create trigger functions that raise different exceptions
-    execute_sql(client, indoc! {"
+    execute_sql(
+        client,
+        indoc! {"
         -- Trigger function that raises a custom exception
         CREATE OR REPLACE FUNCTION trigger_with_custom_exception()
         RETURNS TRIGGER AS $$
@@ -66,10 +71,13 @@ fn setup_trigger_test_data(client: &mut Client) -> Result<(), postgres::Error> {
             RETURN NEW;
         END;
         $$ LANGUAGE plpgsql;
-    "})?;
-    
+    "},
+    )?;
+
     // Create triggers on the test table
-    execute_sql(client, indoc! {"
+    execute_sql(
+        client,
+        indoc! {"
         -- Before insert trigger with custom exception
         CREATE TRIGGER test_trigger_before_insert
             BEFORE INSERT ON test_trigger_table
@@ -93,14 +101,17 @@ fn setup_trigger_test_data(client: &mut Client) -> Result<(), postgres::Error> {
             AFTER UPDATE ON test_trigger_table
             FOR EACH ROW
             EXECUTE FUNCTION trigger_without_exceptions();
-    "})?;
-    
+    "},
+    )?;
+
     Ok(())
 }
 
 /// Create test functions that modify trigger tables
 fn setup_trigger_test_functions(client: &mut Client) -> Result<(), postgres::Error> {
-    execute_sql(client, indoc! {"
+    execute_sql(
+        client,
+        indoc! {"
         CREATE SCHEMA IF NOT EXISTS trigger_api;
         
         -- Function that inserts into trigger table
@@ -160,8 +171,9 @@ fn setup_trigger_test_functions(client: &mut Client) -> Result<(), postgres::Err
             RETURN new_id;
         END;
         $$ LANGUAGE plpgsql;
-    "})?;
-    
+    "},
+    )?;
+
     Ok(())
 }
 
@@ -169,10 +181,11 @@ fn setup_trigger_test_functions(client: &mut Client) -> Result<(), postgres::Err
 fn test_trigger_discovery() {
     with_isolated_database(|client| {
         setup_trigger_test_data(client).expect("Should set up trigger test data");
-        
+
         // Test that we can discover triggers on tables
-        let rows = client.query(
-            indoc! {"
+        let rows = client
+            .query(
+                indoc! {"
                 SELECT t.tgname as trigger_name,
                        c.relname as table_name,
                        p.proname as function_name
@@ -183,35 +196,39 @@ fn test_trigger_discovery() {
                   AND NOT t.tgisinternal
                 ORDER BY t.tgname
             "},
-            &[]
-        ).expect("Should query triggers");
-        
-        let triggers: Vec<(String, String, String)> = rows.iter()
-            .map(|row| (
-                row.get("trigger_name"),
-                row.get("table_name"), 
-                row.get("function_name")
-            ))
+                &[],
+            )
+            .expect("Should query triggers");
+
+        let triggers: Vec<(String, String, String)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get("trigger_name"),
+                    row.get("table_name"),
+                    row.get("function_name"),
+                )
+            })
             .collect();
-        
+
         // Should find all our test triggers
-        assert!(triggers.iter().any(|(name, table, func)| 
-            name == "test_trigger_before_insert" && 
-            table == "test_trigger_table" && 
-            func == "trigger_with_custom_exception"
-        ));
-        
-        assert!(triggers.iter().any(|(name, table, func)| 
-            name == "test_trigger_before_update" && 
-            table == "test_trigger_table" && 
-            func == "trigger_with_constraint_check"
-        ));
-        
-        assert!(triggers.iter().any(|(name, table, func)| 
-            name == "test_trigger_after_insert" && 
-            table == "test_trigger_table" && 
-            func == "trigger_with_nested_calls"
-        ));
+        assert!(triggers
+            .iter()
+            .any(|(name, table, func)| name == "test_trigger_before_insert"
+                && table == "test_trigger_table"
+                && func == "trigger_with_custom_exception"));
+
+        assert!(triggers
+            .iter()
+            .any(|(name, table, func)| name == "test_trigger_before_update"
+                && table == "test_trigger_table"
+                && func == "trigger_with_constraint_check"));
+
+        assert!(triggers
+            .iter()
+            .any(|(name, table, func)| name == "test_trigger_after_insert"
+                && table == "test_trigger_table"
+                && func == "trigger_with_nested_calls"));
     });
 }
 
@@ -219,34 +236,44 @@ fn test_trigger_discovery() {
 fn test_trigger_function_exception_analysis() {
     with_isolated_database(|client| {
         setup_trigger_test_data(client).expect("Should set up trigger test data");
-        
+
         // Test that trigger functions are analyzed for exceptions
-        let rows = client.query(
-            indoc! {"
+        let rows = client
+            .query(
+                indoc! {"
                 SELECT p.proname as function_name,
                        p.prosrc as source_code
                 FROM pg_proc p
                 WHERE p.proname LIKE 'trigger_with_%'
                 ORDER BY p.proname
             "},
-            &[]
-        ).expect("Should query trigger functions");
-        
-        let functions: Vec<(String, String)> = rows.iter()
+                &[],
+            )
+            .expect("Should query trigger functions");
+
+        let functions: Vec<(String, String)> = rows
+            .iter()
             .map(|row| (row.get("function_name"), row.get("source_code")))
             .collect();
-        
+
         // Verify we have our test functions
-        assert!(functions.iter().any(|(name, _)| name == "trigger_with_custom_exception"));
-        assert!(functions.iter().any(|(name, _)| name == "trigger_with_constraint_check"));
-        assert!(functions.iter().any(|(name, _)| name == "trigger_with_nested_calls"));
-        
+        assert!(functions
+            .iter()
+            .any(|(name, _)| name == "trigger_with_custom_exception"));
+        assert!(functions
+            .iter()
+            .any(|(name, _)| name == "trigger_with_constraint_check"));
+        assert!(functions
+            .iter()
+            .any(|(name, _)| name == "trigger_with_nested_calls"));
+
         // Check that source code contains RAISE statements
-        let custom_exception_source = functions.iter()
+        let custom_exception_source = functions
+            .iter()
             .find(|(name, _)| name == "trigger_with_custom_exception")
             .map(|(_, source)| source)
             .expect("Should find custom exception function");
-            
+
         assert!(custom_exception_source.contains("RAISE EXCEPTION"));
         assert!(custom_exception_source.contains("22003"));
         assert!(custom_exception_source.contains("P0001"));
@@ -258,32 +285,32 @@ fn test_trigger_exception_integration() {
     with_isolated_database_and_container(|client, _container, conn_string| {
         setup_trigger_test_data(client).expect("Should set up trigger test data");
         setup_trigger_test_functions(client).expect("Should set up trigger test functions");
-        
+
         // Generate code including trigger API
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let output_path = temp_dir.path().join("generated");
-        
+
         let builder = PgrpcBuilder::new()
             .connection_string(conn_string)
             .schema("trigger_api")
             .output_path(&output_path);
-            
+
         builder.build().expect("Should build successfully");
-        
+
         // Check that generated functions include trigger exceptions
         let api_content = std::fs::read_to_string(output_path.join("trigger_api.rs"))
             .expect("Should read trigger_api.rs");
-            
+
         // Functions should still use unified error type
         assert!(api_content.contains("super::errors::PgRpcError"));
-        
+
         // Check error types include trigger exceptions
-        let errors_content = std::fs::read_to_string(output_path.join("errors.rs"))
-            .expect("Should read errors.rs");
-            
+        let errors_content =
+            std::fs::read_to_string(output_path.join("errors.rs")).expect("Should read errors.rs");
+
         // Should have error enum
         assert!(errors_content.contains("enum PgRpcError"));
-        
+
         // Should handle custom SQL states from triggers
         assert!(errors_content.contains("impl From<tokio_postgres::Error> for PgRpcError"));
     });
@@ -293,7 +320,9 @@ fn test_trigger_exception_integration() {
 fn test_multiple_triggers_same_table() {
     with_isolated_database_and_container(|client, _container, conn_string| {
         // Create table with multiple triggers for same operation
-        execute_sql(client, indoc! {"
+        execute_sql(
+            client,
+            indoc! {"
             CREATE TABLE multi_trigger_table (
                 id SERIAL PRIMARY KEY,
                 name TEXT,
@@ -330,11 +359,16 @@ fn test_multiple_triggers_same_table() {
                 BEFORE INSERT ON multi_trigger_table  
                 FOR EACH ROW
                 EXECUTE FUNCTION validate_status();
-        "}).expect("Should create multi-trigger setup");
-        
+        "},
+        )
+        .expect("Should create multi-trigger setup");
+
         // Create function that inserts into this table
-        execute_sql(client, "CREATE SCHEMA IF NOT EXISTS trigger_api").expect("Should create schema");
-        execute_sql(client, indoc! {"
+        execute_sql(client, "CREATE SCHEMA IF NOT EXISTS trigger_api")
+            .expect("Should create schema");
+        execute_sql(
+            client,
+            indoc! {"
             CREATE OR REPLACE FUNCTION trigger_api.insert_multi_trigger(
                 p_name TEXT,
                 p_status TEXT
@@ -349,19 +383,21 @@ fn test_multiple_triggers_same_table() {
                 RETURN new_id;
             END;
             $$ LANGUAGE plpgsql;
-        "}).expect("Should create function");
-        
+        "},
+        )
+        .expect("Should create function");
+
         // Generate code and verify trigger exceptions are captured
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let output_path = temp_dir.path().join("generated");
-        
+
         let builder = PgrpcBuilder::new()
             .connection_string(conn_string)
             .schema("trigger_api")
             .output_path(&output_path);
-            
+
         builder.build().expect("Should build successfully");
-        
+
         // The generated code should account for exceptions from both triggers
         assert!(output_path.join("trigger_api.rs").exists());
         assert!(output_path.join("errors.rs").exists());
@@ -372,7 +408,9 @@ fn test_multiple_triggers_same_table() {
 fn test_trigger_events_specificity() {
     with_isolated_database_and_container(|client, _container, conn_string| {
         // Create table with different triggers for different events
-        execute_sql(client, indoc! {"
+        execute_sql(
+            client,
+            indoc! {"
             CREATE TABLE event_specific_table (
                 id SERIAL PRIMARY KEY,
                 data TEXT
@@ -425,11 +463,16 @@ fn test_trigger_events_specificity() {
                 BEFORE DELETE ON event_specific_table
                 FOR EACH ROW
                 EXECUTE FUNCTION delete_only_validation();
-        "}).expect("Should create event-specific triggers");
-        
+        "},
+        )
+        .expect("Should create event-specific triggers");
+
         // Create functions for each operation type
-        execute_sql(client, "CREATE SCHEMA IF NOT EXISTS trigger_api").expect("Should create schema");
-        execute_sql(client, indoc! {"
+        execute_sql(client, "CREATE SCHEMA IF NOT EXISTS trigger_api")
+            .expect("Should create schema");
+        execute_sql(
+            client,
+            indoc! {"
             -- Insert-only function (should only get insert trigger exceptions)
             CREATE OR REPLACE FUNCTION trigger_api.insert_only(p_data TEXT)
             RETURNS INTEGER AS $$
@@ -462,23 +505,25 @@ fn test_trigger_events_specificity() {
                 RETURN FOUND;
             END;
             $$ LANGUAGE plpgsql;
-        "}).expect("Should create operation-specific functions");
-        
+        "},
+        )
+        .expect("Should create operation-specific functions");
+
         // Generate code and verify event-specific trigger exceptions
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let output_path = temp_dir.path().join("generated");
-        
+
         let builder = PgrpcBuilder::new()
             .connection_string(conn_string)
             .schema("trigger_api")
             .output_path(&output_path);
-            
+
         builder.build().expect("Should build successfully");
-        
+
         // Verify the files were generated
         assert!(output_path.join("trigger_api.rs").exists());
         assert!(output_path.join("errors.rs").exists());
-        
+
         // Each function should only include exceptions from relevant triggers
         // (This would require more detailed inspection of the generated exception analysis)
     });
@@ -488,7 +533,9 @@ fn test_trigger_events_specificity() {
 fn test_trigger_exception_error_codes() {
     with_isolated_database_and_container(|client, _container, conn_string| {
         // Create triggers with specific error codes that should be mapped
-        execute_sql(client, indoc! {"
+        execute_sql(
+            client,
+            indoc! {"
             CREATE TABLE error_code_table (
                 id SERIAL PRIMARY KEY,
                 test_field TEXT
@@ -518,10 +565,15 @@ fn test_trigger_exception_error_codes() {
                 BEFORE INSERT ON error_code_table
                 FOR EACH ROW
                 EXECUTE FUNCTION test_error_codes();
-        "}).expect("Should create error code test setup");
-        
-        execute_sql(client, "CREATE SCHEMA IF NOT EXISTS trigger_api").expect("Should create schema");
-        execute_sql(client, indoc! {"
+        "},
+        )
+        .expect("Should create error code test setup");
+
+        execute_sql(client, "CREATE SCHEMA IF NOT EXISTS trigger_api")
+            .expect("Should create schema");
+        execute_sql(
+            client,
+            indoc! {"
             CREATE OR REPLACE FUNCTION trigger_api.test_error_insertion(p_field TEXT)
             RETURNS INTEGER AS $$
             DECLARE
@@ -533,27 +585,29 @@ fn test_trigger_exception_error_codes() {
                 RETURN new_id;
             END;
             $$ LANGUAGE plpgsql;
-        "}).expect("Should create test function");
-        
+        "},
+        )
+        .expect("Should create test function");
+
         // Generate code
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let output_path = temp_dir.path().join("generated");
-        
+
         let builder = PgrpcBuilder::new()
             .connection_string(conn_string)
             .schema("trigger_api")
             .output_path(&output_path);
-            
+
         builder.build().expect("Should build successfully");
-        
+
         // Verify error handling includes the various SQL states
-        let errors_content = std::fs::read_to_string(output_path.join("errors.rs"))
-            .expect("Should read errors.rs");
-            
+        let errors_content =
+            std::fs::read_to_string(output_path.join("errors.rs")).expect("Should read errors.rs");
+
         // Should have error enum with proper From implementation
         assert!(errors_content.contains("enum PgRpcError"));
         assert!(errors_content.contains("impl From<tokio_postgres::Error>"));
-        
+
         // Should handle standard PostgreSQL error codes
         // (The specific mapping depends on the unified error implementation)
     });

@@ -5,16 +5,16 @@ use crate::config::{Config, TaskQueueConfig};
 use crate::db::Db;
 use crate::fn_index::FunctionIndex;
 use crate::rel_index::RelIndex;
+use crate::task_index::{generate_task_enum, TaskIndex};
 use crate::ty_index::TypeIndex;
-use crate::task_index::{TaskIndex, generate_task_enum};
+use proc_macro2::TokenStream;
+use quote::quote;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use proc_macro2::TokenStream;
-use quote::quote;
 
-mod types;
+mod codegen;
 mod config;
 mod db;
 mod error_type_index;
@@ -30,12 +30,13 @@ mod pg_rel;
 mod pg_type;
 mod rel_index;
 mod sql_state;
+pub(crate) mod task_index;
 mod tests;
 mod trigger_index;
 mod ty_index;
+mod types;
 mod unified_error;
-pub(crate) mod task_index;
-mod codegen;
+mod view_nullability;
 
 /// Builder for configuring and running pgrpc code generation
 pub struct PgrpcBuilder {
@@ -46,6 +47,7 @@ pub struct PgrpcBuilder {
     output_path: Option<PathBuf>,
     task_queue: Option<TaskQueueConfig>,
     errors: Option<config::ErrorsConfig>,
+    infer_view_nullability: bool,
 }
 
 impl Default for PgrpcBuilder {
@@ -65,6 +67,7 @@ impl PgrpcBuilder {
             output_path: None,
             task_queue: None,
             errors: None,
+            infer_view_nullability: true,
         }
     }
 
@@ -87,7 +90,11 @@ impl PgrpcBuilder {
     }
 
     /// Add a custom type mapping
-    pub fn type_mapping(mut self, pg_type: impl Into<String>, rust_type: impl Into<String>) -> Self {
+    pub fn type_mapping(
+        mut self,
+        pg_type: impl Into<String>,
+        rust_type: impl Into<String>,
+    ) -> Self {
         self.types.insert(pg_type.into(), rust_type.into());
         self
     }
@@ -149,7 +156,7 @@ impl PgrpcBuilder {
         self.task_queue = Some(config);
         self
     }
-    
+
     /// Enable custom error types with default configuration
     pub fn enable_errors(mut self, schema: impl Into<String>) -> Self {
         self.errors = Some(config::ErrorsConfig {
@@ -158,17 +165,23 @@ impl PgrpcBuilder {
         });
         self
     }
-    
+
     /// Configure the errors schema
     pub fn errors_schema(mut self, schema: impl Into<String>) -> Self {
         let errors_config = self.errors.get_or_insert(config::ErrorsConfig::default());
         errors_config.schema = schema.into();
         self
     }
-    
+
     /// Configure the complete errors settings at once
     pub fn errors(mut self, config: config::ErrorsConfig) -> Self {
         self.errors = Some(config);
+        self
+    }
+
+    /// Enable or disable automatic view nullability inference (defaults to true)
+    pub fn infer_view_nullability(mut self, infer: bool) -> Self {
+        self.infer_view_nullability = infer;
         self
     }
 
@@ -176,7 +189,7 @@ impl PgrpcBuilder {
     pub fn from_config_file(config_path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let conf_str = fs::read_to_string(config_path)?;
         let config: Config = toml::from_str(&conf_str)?;
-        
+
         Ok(Self {
             connection_string: config.connection_string,
             schemas: config.schemas,
@@ -185,21 +198,23 @@ impl PgrpcBuilder {
             output_path: config.output_path.map(PathBuf::from),
             task_queue: config.task_queue,
             errors: config.errors,
+            infer_view_nullability: config.infer_view_nullability,
         })
     }
-
 
     /// Generate and write the code to the specified output directory
     pub fn build(&self) -> anyhow::Result<()> {
         // Initialize env_logger if not already initialized
         let _ = env_logger::try_init();
-        
-        let output_path = self.output_path
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Output path is required. Specify either -o in CLI or output_path in pgrpc.toml"))?;
-        
+
+        let output_path = self.output_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Output path is required. Specify either -o in CLI or output_path in pgrpc.toml"
+            )
+        })?;
+
         let start = Instant::now();
-        
+
         let connection_string = if let Some(conn_str) = &self.connection_string {
             conn_str.clone()
         } else if let Ok(env_conn_str) = std::env::var("DATABASE_URL") {
@@ -207,7 +222,7 @@ impl PgrpcBuilder {
         } else {
             return Err(anyhow::anyhow!("Connection string is required. Provide it via config file, builder method, or DATABASE_URL environment variable"));
         };
-        
+
         if self.schemas.is_empty() {
             return Err(anyhow::anyhow!("At least one schema must be specified"));
         }
@@ -220,42 +235,54 @@ impl PgrpcBuilder {
             exceptions: self.exceptions.clone(),
             task_queue: self.task_queue.clone(),
             errors: self.errors.clone(),
+            infer_view_nullability: self.infer_view_nullability,
         };
 
         let mut db = Db::new(&connection_string)?;
         let rel_index = RelIndex::new(&mut db.client)?;
-        let trigger_index = trigger_index::TriggerIndex::new(&mut db.client, &rel_index, &config.schemas)?;
-        let fn_index = FunctionIndex::new(&mut db.client, &rel_index, &trigger_index, &config.schemas)?;
-        
+        let trigger_index =
+            trigger_index::TriggerIndex::new(&mut db.client, &rel_index, &config.schemas)?;
+        let fn_index =
+            FunctionIndex::new(&mut db.client, &rel_index, &trigger_index, &config.schemas)?;
+
         // Collect type OIDs from functions, task types, and error types
         let mut type_oids = fn_index.get_type_oids();
-        
+
+        // Collect view type OIDs
+        let view_type_oids = rel_index.get_view_type_oids(&mut db.client)?;
+        type_oids.extend(view_type_oids);
+
         // If task queue is configured, collect task type OIDs as well
         if let Some(task_config) = &config.task_queue {
             let task_type_oids = task_index::collect_task_type_oids(&mut db.client, task_config)?;
             type_oids.extend(task_type_oids);
         }
-        
+
         // If errors are configured, collect error type OIDs as well
         if let Some(errors_config) = &config.errors {
-            let error_type_oids = error_type_index::collect_error_type_oids(&mut db.client, errors_config)?;
+            let error_type_oids =
+                error_type_index::collect_error_type_oids(&mut db.client, errors_config)?;
             type_oids.extend(error_type_oids);
         }
-        
-        let ty_index = TypeIndex::new(&mut db.client, type_oids.as_slice())?;
-        
+
+        let mut ty_index = TypeIndex::new(&mut db.client, type_oids.as_slice())?;
+
+        // Apply view nullability inference if enabled
+        ty_index.apply_view_nullability(&rel_index, config.infer_view_nullability)?;
+
         let schema_files = codegen_split(&fn_index, &ty_index, &rel_index, &config)?;
-        
+
         // Create output directory if it doesn't exist
         fs::create_dir_all(output_path)?;
-        
+
         // Track how many files were written vs unchanged
         let mut files_written = 0;
         let mut files_unchanged = 0;
-        
+
         // Write each schema file
         for (schema, code) in &schema_files {
-            let schema_name = crate::ident::sql_to_rs_ident(schema, crate::ident::CaseType::Snake).to_string();
+            let schema_name =
+                crate::ident::sql_to_rs_ident(schema, crate::ident::CaseType::Snake).to_string();
             let file_path = output_path.join(format!("{}.rs", schema_name));
             if write_if_changed(&file_path, code)? {
                 files_written += 1;
@@ -263,7 +290,7 @@ impl PgrpcBuilder {
                 files_unchanged += 1;
             }
         }
-        
+
         // Generate task enum if task queue is configured
         let mut final_schema_files = schema_files.clone();
         if let Some(task_config) = &config.task_queue {
@@ -285,7 +312,7 @@ impl PgrpcBuilder {
                 }
             }
         }
-        
+
         // Generate error types if errors are configured
         if let Some(errors_config) = &config.errors {
             match generate_error_code(&mut db.client, errors_config, &ty_index) {
@@ -306,7 +333,7 @@ impl PgrpcBuilder {
                 }
             }
         }
-        
+
         // Generate and write mod.rs
         let mod_content = generate_mod_file(&final_schema_files);
         if write_if_changed(&output_path.join("mod.rs"), &mod_content)? {
@@ -314,24 +341,25 @@ impl PgrpcBuilder {
         } else {
             files_unchanged += 1;
         }
-        
+
         let duration = start.elapsed().as_secs_f64();
         let total_files = files_written + files_unchanged;
-        
+
         // Create a detailed message based on what was updated
         let update_message = if files_unchanged == 0 {
             format!("{} files written", files_written)
         } else if files_written == 0 {
             format!("{} files unchanged", files_unchanged)
         } else {
-            format!("{} files updated, {} unchanged", files_written, files_unchanged)
+            format!(
+                "{} files updated, {} unchanged",
+                files_written, files_unchanged
+            )
         };
-        
+
         println!(
             "✅  PgRPC: {} ({} total) in {:.2}s",
-            update_message,
-            total_files,
-            duration
+            update_message, total_files, duration
         );
 
         Ok(())
@@ -346,14 +374,14 @@ fn generate_task_code(
     config: &Config,
 ) -> anyhow::Result<Option<String>> {
     let task_index = TaskIndex::new(db_client, task_config)?;
-    
+
     if task_index.is_empty() {
         return Ok(None);
     }
-    
+
     let (task_enum_code, referenced_schemas) = generate_task_enum(&task_index, ty_index, config);
     let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
-    
+
     // Generate use statements for referenced schemas
     let schema_imports: Vec<TokenStream> = referenced_schemas
         .into_iter()
@@ -362,7 +390,7 @@ fn generate_task_code(
             quote! { use super::#schema_ident; }
         })
         .collect();
-    
+
     let task_code = prettyplease::unparse(
         &syn::parse2::<syn::File>(quote::quote! {
             #(#schema_imports)*
@@ -372,12 +400,12 @@ fn generate_task_code(
             use uuid;
             use rust_decimal;
             use std::net::IpAddr;
-            
+
             #task_enum_code
         })
         .expect("task enum code to parse"),
     );
-    
+
     Ok(Some(warning_ignores.to_string() + &task_code))
 }
 
@@ -388,20 +416,21 @@ fn generate_error_code(
     ty_index: &TypeIndex,
 ) -> anyhow::Result<Option<String>> {
     let error_index = error_type_index::ErrorTypeIndex::new(db_client, errors_config)?;
-    
+
     if error_index.is_empty() {
         return Ok(None);
     }
-    
+
     let config = crate::config::Config {
         errors: Some(errors_config.clone()),
         ..Default::default()
     };
-    let payload_structs = error_type_index::generate_error_payload_structs(&error_index, ty_index, &config);
+    let payload_structs =
+        error_type_index::generate_error_payload_structs(&error_index, ty_index, &config);
     let error_enum = error_type_index::generate_error_type_enum(&error_index);
-    
+
     let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
-    
+
     let error_code = prettyplease::unparse(
         &syn::parse2::<syn::File>(quote::quote! {
             use serde::{Deserialize, Serialize};
@@ -410,29 +439,30 @@ fn generate_error_code(
             use uuid;
             use rust_decimal;
             use std::net::IpAddr;
-            
+
             #payload_structs
-            
+
             #error_enum
         })
         .expect("error type code to parse"),
     );
-    
+
     Ok(Some(warning_ignores.to_string() + &error_code))
 }
 
 fn generate_mod_file(schema_files: &HashMap<String, String>) -> String {
     let mut sorted_schemas: Vec<_> = schema_files.keys().collect();
     sorted_schemas.sort();
-    
+
     let mod_declarations: Vec<String> = sorted_schemas
         .iter()
         .map(|schema| {
-            let schema_name = crate::ident::sql_to_rs_ident(schema, crate::ident::CaseType::Snake).to_string();
+            let schema_name =
+                crate::ident::sql_to_rs_ident(schema, crate::ident::CaseType::Snake).to_string();
             format!("pub mod {};", schema_name)
         })
         .collect();
-    
+
     mod_declarations.join("\n") + "\n"
 }
 
@@ -453,9 +483,8 @@ fn write_if_changed(path: &Path, content: &str) -> std::io::Result<bool> {
             }
         }
     }
-    
+
     // Write the file (either it doesn't exist or content is different)
     fs::write(path, content)?;
     Ok(true)
 }
-

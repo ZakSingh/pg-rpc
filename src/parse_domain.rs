@@ -62,11 +62,13 @@ fn collect_from_node(node: &Node, columns: &mut HashSet<String>) {
                 // For OR, we can only infer not-null constraints in specific cases
 
                 // Check if any branch is testing if value is null
-                let null_branches: Vec<_> = bool_expr.args.iter()
-                                                     .enumerate()
-                                                     .filter(|(_, arg)| is_value_null_test(arg))
-                                                     .map(|(idx, _)| idx)
-                                                     .collect();
+                let null_branches: Vec<_> = bool_expr
+                    .args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, arg)| is_value_null_test(arg))
+                    .map(|(idx, _)| idx)
+                    .collect();
 
                 // If exactly one branch tests value is null, we can analyze other branches
                 if null_branches.len() == 1 {
@@ -85,23 +87,28 @@ fn collect_from_node(node: &Node, columns: &mut HashSet<String>) {
 
                     // Only add these fields if every non-null branch has a direct not-null test
                     // If there are other conditions, we can't make the inference
-                    if direct_not_nulls.len() > 0 &&
-                      bool_expr.args.len() - 1 == bool_expr.args.iter().enumerate()
-                                                           .filter(|(idx, _)| *idx != null_branch_idx)
-                                                           .filter(|(_, arg)| is_direct_not_null_test(arg))
-                                                           .count() {
+                    if direct_not_nulls.len() > 0
+                        && bool_expr.args.len() - 1
+                            == bool_expr
+                                .args
+                                .iter()
+                                .enumerate()
+                                .filter(|(idx, _)| *idx != null_branch_idx)
+                                .filter(|(_, arg)| is_direct_not_null_test(arg))
+                                .count()
+                    {
                         columns.extend(direct_not_nulls);
                     }
                 }
             }
-        },
+        }
         Some(NodeEnum::NullTest(null_test)) => {
             if null_test.nulltesttype() == NullTestType::IsNotNull {
                 if let Some(arg) = &null_test.arg {
                     collect_from_node(arg, columns);
                 }
             }
-        },
+        }
         Some(NodeEnum::AIndirection(a_ind)) => {
             // e.g. extract `field` from (value).field
             if let Some(arg) = &a_ind.arg {
@@ -115,7 +122,7 @@ fn collect_from_node(node: &Node, columns: &mut HashSet<String>) {
                     }
                 }
             }
-        },
+        }
         _ => {}
     }
 }
@@ -172,7 +179,9 @@ fn collect_direct_not_nulls(node: &Node, columns: &mut HashSet<String>) {
                                 if col_ref.fields.len() == 1 {
                                     if let Some(NodeEnum::String(value)) = &col_ref.fields[0].node {
                                         if value.sval.to_lowercase() == "value" {
-                                            if let Some(NodeEnum::String(field)) = &a_ind.indirection[0].node {
+                                            if let Some(NodeEnum::String(field)) =
+                                                &a_ind.indirection[0].node
+                                            {
                                                 columns.insert(field.sval.clone());
                                             }
                                         }
@@ -183,7 +192,7 @@ fn collect_direct_not_nulls(node: &Node, columns: &mut HashSet<String>) {
                     }
                 }
             }
-        },
+        }
         Some(NodeEnum::BoolExpr(bool_expr)) => {
             if bool_expr.boolop() == BoolExprType::AndExpr {
                 // For AND expressions within an OR, we can still collect direct not-nulls
@@ -192,8 +201,8 @@ fn collect_direct_not_nulls(node: &Node, columns: &mut HashSet<String>) {
                 }
             }
             // Ignore nested OR expressions
-        },
-        _ => {},
+        }
+        _ => {}
     }
 }
 

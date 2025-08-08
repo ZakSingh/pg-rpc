@@ -1,12 +1,12 @@
 use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
+use postgres::error::SqlState;
 use postgres::types::{FromSql, Type};
-use quote::ToTokens;
 use proc_macro2::TokenStream;
+use quote::ToTokens;
 use serde::Deserialize;
 use smallvec::SmallVec;
 use std::error::Error;
-use postgres::error::SqlState;
 use ustr::Ustr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
@@ -63,7 +63,7 @@ pub struct DefaultConstraint {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 pub struct DomainConstraint {
     pub(crate) name: Ustr,
-    pub column: Ustr
+    pub column: Ustr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
@@ -82,7 +82,7 @@ pub enum Constraint {
     #[serde(rename = "d")]
     Default(DefaultConstraint),
     #[serde(rename = "domain")]
-    Domain(DomainConstraint)
+    Domain(DomainConstraint),
 }
 
 impl FromSql<'_> for Constraint {

@@ -4,11 +4,11 @@ use crate::ident::{sql_to_rs_ident, CaseType::Pascal};
 use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
 use crate::rel_index::RelIndex;
-use quote::{quote, format_ident};
+use heck::ToPascalCase;
 use proc_macro2::TokenStream;
+use quote::{format_ident, quote};
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
-use heck::ToPascalCase;
 
 /// Trait for types that can provide access to an underlying DbError
 pub trait AsDbError {
@@ -22,57 +22,57 @@ pub trait PgRpcErrorExt: AsDbError {
     fn column(&self) -> Option<&str> {
         self.as_db_error().and_then(|e| e.column())
     }
-    
+
     /// Returns the constraint name from the underlying PostgreSQL error, if available
     fn constraint(&self) -> Option<&str> {
         self.as_db_error().and_then(|e| e.constraint())
     }
-    
+
     /// Returns the table name from the underlying PostgreSQL error, if available
     fn table(&self) -> Option<&str> {
         self.as_db_error().and_then(|e| e.table())
     }
-    
+
     /// Returns the error message from the underlying PostgreSQL error, if available
     fn message(&self) -> Option<&str> {
         self.as_db_error().map(|e| e.message())
     }
-    
+
     /// Returns the SQL state code from the underlying PostgreSQL error, if available
     fn code(&self) -> Option<&tokio_postgres::error::SqlState> {
         self.as_db_error().map(|e| e.code())
     }
-    
+
     /// Returns the schema name from the underlying PostgreSQL error, if available
     fn schema(&self) -> Option<&str> {
         self.as_db_error().and_then(|e| e.schema())
     }
-    
+
     /// Returns the data type name from the underlying PostgreSQL error, if available
     fn datatype(&self) -> Option<&str> {
         self.as_db_error().and_then(|e| e.datatype())
     }
-    
+
     /// Returns the detail from the underlying PostgreSQL error, if available
     fn detail(&self) -> Option<&str> {
         self.as_db_error().and_then(|e| e.detail())
     }
-    
+
     /// Returns the hint from the underlying PostgreSQL error, if available
     fn hint(&self) -> Option<&str> {
         self.as_db_error().and_then(|e| e.hint())
     }
-    
+
     /// Returns the position from the underlying PostgreSQL error, if available
     fn position(&self) -> Option<&tokio_postgres::error::ErrorPosition> {
         self.as_db_error().and_then(|e| e.position())
     }
-    
+
     /// Returns the where clause from the underlying PostgreSQL error, if available
     fn where_(&self) -> Option<&str> {
         self.as_db_error().and_then(|e| e.where_())
     }
-    
+
     /// Returns the routine from the underlying PostgreSQL error, if available
     fn routine(&self) -> Option<&str> {
         self.as_db_error().and_then(|e| e.routine())
@@ -86,74 +86,77 @@ impl<T: AsDbError> PgRpcErrorExt for T {}
 /// Only includes constraints that will generate enum variants (excludes Default constraints)
 pub fn collect_table_constraints(rel_index: &RelIndex) -> HashMap<PgId, Vec<Constraint>> {
     let mut table_constraints: HashMap<PgId, Vec<Constraint>> = HashMap::new();
-    
+
     for rel in rel_index.deref().values() {
         // Filter out constraints that won't generate enum variants
-        let non_default_constraints: Vec<Constraint> = rel.constraints
+        let non_default_constraints: Vec<Constraint> = rel
+            .constraints
             .iter()
             .filter(|constraint| !matches!(constraint, Constraint::Default(_)))
             .cloned()
             .collect();
-        
+
         if !non_default_constraints.is_empty() {
             table_constraints.insert(rel.id.clone(), non_default_constraints);
         }
     }
-    
+
     table_constraints
 }
 
 /// Generates constraint enums for each table
-pub fn generate_constraint_enums(table_constraints: &HashMap<PgId, Vec<Constraint>>) -> Vec<TokenStream> {
+pub fn generate_constraint_enums(
+    table_constraints: &HashMap<PgId, Vec<Constraint>>,
+) -> Vec<TokenStream> {
     let mut enums = Vec::new();
-    
+
     for (table_id, constraints) in table_constraints {
         let table_name_str = table_id.name();
         let table_name_pascal = table_name_str.to_pascal_case();
         let enum_name = quote::format_ident!("{}Constraint", table_name_pascal);
-        
+
         let mut variants = Vec::new();
         let mut seen_names = HashSet::new();
-        
+
         for constraint in constraints {
             let variant_name = match constraint {
                 Constraint::PrimaryKey(_) => quote::format_ident!("PrimaryKey"),
                 Constraint::Unique(u) => {
                     let name = u.name.to_pascal_case();
                     quote::format_ident!("{}", name)
-                },
+                }
                 Constraint::Check(c) => {
                     let name = c.name.to_pascal_case();
                     quote::format_ident!("{}", name)
-                },
+                }
                 Constraint::ForeignKey(fk) => {
                     let name = fk.name.to_pascal_case();
                     quote::format_ident!("{}", name)
-                },
+                }
                 Constraint::NotNull(nn) => {
                     let col_name = nn.column.to_pascal_case();
                     quote::format_ident!("{}NotNull", col_name)
-                },
+                }
                 Constraint::Domain(d) => {
                     let name = d.name.to_pascal_case();
                     quote::format_ident!("{}", name)
-                },
+                }
                 Constraint::Default(_) => continue, // Skip default constraints
             };
-            
+
             // Avoid duplicate variant names
             if seen_names.insert(variant_name.to_string()) {
                 variants.push(variant_name);
             }
         }
-        
+
         if !variants.is_empty() {
             let enum_def = quote! {
                 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
                 pub enum #enum_name {
                     #(#variants),*
                 }
-                
+
                 impl std::fmt::Display for #enum_name {
                     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                         match self {
@@ -162,11 +165,11 @@ pub fn generate_constraint_enums(table_constraints: &HashMap<PgId, Vec<Constrain
                     }
                 }
             };
-            
+
             enums.push(enum_def);
         }
     }
-    
+
     enums
 }
 
@@ -177,20 +180,20 @@ pub fn generate_unified_error(
     config: &Config,
 ) -> TokenStream {
     let mut error_variants: Vec<TokenStream> = Vec::new();
-    
+
     // Generate variants for each table's constraints
     for (table_id, _) in table_constraints {
         let table_name_str = table_id.name();
         let table_name_pascal = table_name_str.to_pascal_case();
         let variant_name = quote::format_ident!("{}Constraint", table_name_pascal);
         let constraint_enum = quote::format_ident!("{}Constraint", table_name_pascal);
-        
+
         error_variants.push(quote! {
             #[error("{} table constraint violation", #table_name_str)]
             #variant_name(#constraint_enum, #[source] tokio_postgres::error::DbError)
         });
     }
-    
+
     // Add custom SQL state exceptions from config
     let mut config_variants = HashSet::new();
     for (_sql_code, description) in &config.exceptions {
@@ -202,7 +205,7 @@ pub fn generate_unified_error(
             });
         }
     }
-    
+
     // Add any custom SQL state exceptions not already covered by config
     let mut additional_custom_variants = HashSet::new();
     for exception in custom_exceptions {
@@ -220,7 +223,7 @@ pub fn generate_unified_error(
             }
         }
     }
-    
+
     // Add custom error variant if errors config is present
     if config.errors.is_some() {
         error_variants.push(quote! {
@@ -228,15 +231,15 @@ pub fn generate_unified_error(
             CustomError(super::custom_errors::CustomError)
         });
     }
-    
+
     // Add generic database error - using transparent to show underlying SQL error
     error_variants.push(quote! {
         #[error(transparent)]
         Database(tokio_postgres::Error)
     });
-    
+
     // No longer need From<tokio_postgres::Error> implementation
-    
+
     // Build the error enum variants with proper comma separation
     let all_error_variants = if error_variants.is_empty() {
         quote! {}
@@ -247,29 +250,29 @@ pub fn generate_unified_error(
             .collect::<TokenStream>();
         variants_with_commas
     };
-    
+
     let error_enum_def = quote! {
         #[derive(Debug, thiserror::Error)]
         pub enum PgRpcError {
             #all_error_variants
         }
     };
-    
+
     // From implementation removed - will be handled at function level
-    
+
     // No wrapper needed anymore
-    
+
     // Generate helper methods for the error type
     let helper_methods = generate_helper_methods(table_constraints, custom_exceptions, config);
-    
+
     // Generate AsDbError implementation
     let as_db_error_impl = generate_as_db_error_impl(table_constraints, custom_exceptions, config);
 
     quote! {
         #error_enum_def
-        
+
         #helper_methods
-        
+
         #as_db_error_impl
     }
 }
@@ -287,14 +290,14 @@ pub fn generate_from_impl_arms(
     let mut fk_arms: Vec<TokenStream> = Vec::new();
     let mut not_null_arms: Vec<TokenStream> = Vec::new();
     let mut custom_arms: Vec<TokenStream> = Vec::new();
-    
+
     // Process constraints by table
     for (table_id, constraints) in table_constraints {
         let table_name_str = table_id.name();
         let table_name_pascal = table_name_str.to_pascal_case();
         let error_variant = quote::format_ident!("{}Constraint", table_name_pascal);
         let constraint_enum = quote::format_ident!("{}Constraint", table_name_pascal);
-        
+
         for constraint in constraints {
             match constraint {
                 Constraint::PrimaryKey(pk) => {
@@ -305,7 +308,7 @@ pub fn generate_from_impl_arms(
                             db_error.to_owned()
                         )
                     });
-                },
+                }
                 Constraint::Unique(u) => {
                     let constraint_name = u.name.as_str();
                     let variant_name_str = u.name.to_pascal_case();
@@ -316,7 +319,7 @@ pub fn generate_from_impl_arms(
                             db_error.to_owned()
                         )
                     });
-                },
+                }
                 Constraint::Check(c) => {
                     let constraint_name = c.name.as_str();
                     let variant_name_str = c.name.to_pascal_case();
@@ -327,7 +330,7 @@ pub fn generate_from_impl_arms(
                             db_error.to_owned()
                         )
                     });
-                },
+                }
                 Constraint::ForeignKey(fk) => {
                     let constraint_name = fk.name.as_str();
                     let variant_name_str = fk.name.to_pascal_case();
@@ -338,7 +341,7 @@ pub fn generate_from_impl_arms(
                             db_error.to_owned()
                         )
                     });
-                },
+                }
                 Constraint::NotNull(nn) => {
                     let column_name = nn.column.as_str();
                     let col_variant_str = nn.column.to_pascal_case();
@@ -349,12 +352,12 @@ pub fn generate_from_impl_arms(
                             db_error.to_owned()
                         )
                     });
-                },
+                }
                 _ => {} // Skip other constraint types
             }
         }
     }
-    
+
     // Process custom exceptions from config first
     for (sql_code, description) in &config.exceptions {
         let variant_name = sql_to_rs_ident(description, Pascal);
@@ -364,7 +367,7 @@ pub fn generate_from_impl_arms(
             }
         });
     }
-    
+
     // Process any additional custom exceptions not covered by config
     for exception in custom_exceptions {
         if let PgException::Explicit(sql_state) = exception {
@@ -380,10 +383,10 @@ pub fn generate_from_impl_arms(
             }
         }
     }
-    
+
     // Build the complete match expression
     let mut all_arms = Vec::new();
-    
+
     if !unique_arms.is_empty() {
         all_arms.push(quote! {
             &tokio_postgres::error::SqlState::UNIQUE_VIOLATION => {
@@ -394,7 +397,7 @@ pub fn generate_from_impl_arms(
             },
         });
     }
-    
+
     if !check_arms.is_empty() {
         all_arms.push(quote! {
             &tokio_postgres::error::SqlState::CHECK_VIOLATION => {
@@ -405,7 +408,7 @@ pub fn generate_from_impl_arms(
             },
         });
     }
-    
+
     if !fk_arms.is_empty() {
         all_arms.push(quote! {
             &tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION => {
@@ -416,7 +419,7 @@ pub fn generate_from_impl_arms(
             },
         });
     }
-    
+
     if !not_null_arms.is_empty() {
         all_arms.push(quote! {
             &tokio_postgres::error::SqlState::NOT_NULL_VIOLATION => {
@@ -427,14 +430,14 @@ pub fn generate_from_impl_arms(
             },
         });
     }
-    
+
     if !custom_arms.is_empty() {
         all_arms.extend(custom_arms);
     }
-    
+
     // Combine all arms into a single TokenStream
     let combined_arms = all_arms.into_iter().collect::<TokenStream>();
-    
+
     combined_arms
 }
 
@@ -445,12 +448,15 @@ fn generate_helper_methods(
     config: &Config,
 ) -> TokenStream {
     let mut methods = Vec::new();
-    
+
     // Only generate helper methods for custom exceptions from config
     for (_sql_code, description) in &config.exceptions {
-        let method_name = format_ident!("is_{}", sql_to_rs_ident(description, crate::ident::CaseType::Snake).to_string());
+        let method_name = format_ident!(
+            "is_{}",
+            sql_to_rs_ident(description, crate::ident::CaseType::Snake).to_string()
+        );
         let variant_name = sql_to_rs_ident(description, Pascal);
-        
+
         methods.push(quote! {
             #[doc = concat!("Returns true if this error is a ", #description, " error")]
             pub fn #method_name(&self) -> bool {
@@ -458,7 +464,7 @@ fn generate_helper_methods(
             }
         });
     }
-    
+
     quote! {
         impl PgRpcError {
             #(#methods)*
@@ -482,16 +488,16 @@ pub fn generate_as_db_error_impl(
             quote! { PgRpcError::#variant_name(_, db_error) => Some(db_error) }
         })
         .collect();
-    
+
     // Collect all custom exception variant names for arms that return None
     let mut custom_variant_names = Vec::new();
-    
+
     // Custom exceptions from config
     for (_sql_code, description) in &config.exceptions {
         let variant_name = sql_to_rs_ident(description, Pascal);
         custom_variant_names.push(variant_name);
     }
-    
+
     // Additional custom exceptions not in config
     for exception in custom_exceptions {
         if let PgException::Explicit(sql_state) = exception {
@@ -502,14 +508,14 @@ pub fn generate_as_db_error_impl(
             }
         }
     }
-    
+
     let custom_arms: Vec<TokenStream> = custom_variant_names
         .iter()
         .map(|variant_name| {
             quote! { PgRpcError::#variant_name(db_error) => Some(db_error) }
         })
         .collect();
-    
+
     quote! {
         impl AsDbError for PgRpcError {
             fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError> {
@@ -526,18 +532,18 @@ pub fn generate_as_db_error_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pg_constraint::{Constraint, UniqueConstraint, CheckConstraint};
+    use crate::pg_constraint::{CheckConstraint, Constraint, UniqueConstraint};
     use crate::pg_id::PgId;
     use crate::pg_rel::{PgRel, PgRelKind};
+    use smallvec::SmallVec;
     use std::collections::{HashMap, HashSet};
     use ustr::ustr;
-    use smallvec::SmallVec;
 
     #[test]
     fn test_constraint_enum_generation() {
         // Create test constraints
         let mut table_constraints = HashMap::new();
-        
+
         let users_constraints = vec![
             Constraint::Unique(UniqueConstraint {
                 name: ustr("users_email_key"),
@@ -548,16 +554,16 @@ mod tests {
                 columns: SmallVec::from_slice(&[ustr("age")]),
             }),
         ];
-        
+
         let users_id = PgId::new(Some(ustr("public")), ustr("users"));
         table_constraints.insert(users_id, users_constraints);
-        
+
         // Generate constraint enums
         let enums = generate_constraint_enums(&table_constraints);
-        
+
         // Should generate one enum
         assert_eq!(enums.len(), 1);
-        
+
         // Check that the generated code contains the expected enum
         let code_str = enums[0].to_string();
         assert!(code_str.contains("enum UsersConstraint"));
@@ -569,26 +575,28 @@ mod tests {
     fn test_unified_error_generation() {
         // Create test data
         let mut table_constraints = HashMap::new();
-        
-        let users_constraints = vec![
-            Constraint::Unique(UniqueConstraint {
-                name: ustr("users_email_key"),
-                columns: SmallVec::from_slice(&[ustr("email")]),
-            }),
-        ];
-        
+
+        let users_constraints = vec![Constraint::Unique(UniqueConstraint {
+            name: ustr("users_email_key"),
+            columns: SmallVec::from_slice(&[ustr("email")]),
+        })];
+
         let users_id = PgId::new(Some(ustr("public")), ustr("users"));
         table_constraints.insert(users_id, users_constraints);
-        
+
         let custom_exceptions = HashSet::new();
-        
+
         let mut config = Config::default();
-        config.exceptions.insert("P0001".to_string(), "Custom application error".to_string());
-        config.exceptions.insert("P0002".to_string(), "Invalid user input".to_string());
-        
+        config
+            .exceptions
+            .insert("P0001".to_string(), "Custom application error".to_string());
+        config
+            .exceptions
+            .insert("P0002".to_string(), "Invalid user input".to_string());
+
         // Generate unified error
         let error_code = generate_unified_error(&table_constraints, &custom_exceptions, &config);
-        
+
         // Check that the generated code contains the expected error enum
         let code_str = error_code.to_string();
         assert!(code_str.contains("enum PgRpcError"));
@@ -596,11 +604,11 @@ mod tests {
         assert!(code_str.contains("Database"));
         // From<tokio_postgres::Error> is now implemented at function level, not globally
         assert!(code_str.contains("impl AsDbError for PgRpcError"));
-        
+
         // Check that custom exception variants are generated
         assert!(code_str.contains("CustomApplicationError"));
         assert!(code_str.contains("InvalidUserInput"));
-        
+
         // Check that helper methods are generated
         assert!(code_str.contains("impl PgRpcError"));
         assert!(code_str.contains("is_custom_application_error"));
@@ -610,26 +618,24 @@ mod tests {
     #[test]
     fn test_collect_table_constraints() {
         let mut rel_index = RelIndex::default();
-        
+
         // Create a test relation with constraints
         let users_rel = PgRel {
             oid: 1,
             id: PgId::new(Some(ustr("public")), ustr("users")),
             kind: PgRelKind::Table,
-            constraints: vec![
-                Constraint::Unique(UniqueConstraint {
-                    name: ustr("users_email_key"),
-                    columns: SmallVec::from_slice(&[ustr("email")]),
-                }),
-            ],
+            constraints: vec![Constraint::Unique(UniqueConstraint {
+                name: ustr("users_email_key"),
+                columns: SmallVec::from_slice(&[ustr("email")]),
+            })],
             columns: vec![ustr("id"), ustr("email"), ustr("name")],
         };
-        
+
         rel_index.insert(1, users_rel);
-        
+
         // Collect constraints
         let table_constraints = collect_table_constraints(&rel_index);
-        
+
         assert_eq!(table_constraints.len(), 1);
         let users_id = PgId::new(Some(ustr("public")), ustr("users"));
         assert!(table_constraints.contains_key(&users_id));

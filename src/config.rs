@@ -11,6 +11,7 @@ pub struct Config {
     pub schemas: Vec<String>,
     pub task_queue: Option<TaskQueueConfig>,
     pub errors: Option<ErrorsConfig>,
+    pub infer_view_nullability: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -38,6 +39,7 @@ impl Default for Config {
             schemas: Vec::new(),
             task_queue: None,
             errors: None,
+            infer_view_nullability: true,
         }
     }
 }
@@ -47,12 +49,12 @@ impl TaskQueueConfig {
     pub fn get_table_schema(&self) -> &str {
         self.table_schema.as_deref().unwrap_or("mq")
     }
-    
+
     /// Get the table name, using default if not specified
     pub fn get_table_name(&self) -> &str {
         self.table_name.as_deref().unwrap_or("task")
     }
-    
+
     /// Get the full table name (schema.table)
     pub fn get_full_table_name(&self) -> String {
         format!("{}.{}", self.get_table_schema(), self.get_table_name())

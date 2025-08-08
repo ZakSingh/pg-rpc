@@ -1,8 +1,8 @@
 use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
 use phf::phf_map;
-use quote::ToTokens;
 use proc_macro2::TokenStream;
+use quote::ToTokens;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 

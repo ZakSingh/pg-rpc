@@ -1,32 +1,37 @@
 use crate::codegen::ToRust;
 use crate::codegen::{FunctionName, SchemaName, OID};
 use crate::config;
-use crate::exceptions::{get_exceptions_with_triggers, get_comment_exceptions, PgException};
+use crate::exceptions::{get_comment_exceptions, get_exceptions_with_triggers, PgException};
 use crate::fn_index::FunctionId;
-use crate::ident::{sql_to_rs_ident, CaseType::{self, Pascal}};
+use crate::ident::{
+    sql_to_rs_ident,
+    CaseType::{self, Pascal},
+};
+use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
 use crate::pg_type::PgType;
 use crate::rel_index::RelIndex;
-use crate::trigger_index::{TriggerIndex, TriggerEvent};
-use crate::pg_constraint::Constraint;
-use std::collections::HashSet;
-use heck::ToPascalCase;
+use crate::trigger_index::{TriggerEvent, TriggerIndex};
 use config::Config;
+use heck::ToPascalCase;
 use itertools::{izip, Itertools};
 use jsonpath_rust::JsonPath;
+use log::warn;
 use pg_query::protobuf::node::Node;
-use pg_query::protobuf::{CallStmt, DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, UpdateStmt};
+use pg_query::protobuf::{
+    CallStmt, DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, UpdateStmt,
+};
 use pg_query::{parse_plpgsql, NodeRef, ParseResult};
+use postgres::Row;
 use proc_macro2::TokenStream;
-use quote::{quote, format_ident};
+use quote::{format_ident, quote};
 use regex::Regex;
 use serde_json::Value;
 use std::cmp::PartialEq;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::Deref;
-use postgres::Row;
-use ustr::{Ustr};
-use log::warn;
+use ustr::Ustr;
 
 const VOID_TYPE_OID: u32 = 2278;
 const RECORD_TYPE_OID: u32 = 2249;
@@ -41,6 +46,7 @@ pub struct PgFn {
     pub return_type_oid: OID,
     pub returns_set: bool,
     pub is_procedure: bool,
+    pub has_table_params: bool,
     pub definition: String,
     pub comment: Option<String>,
     pub exceptions: Vec<PgException>,
@@ -51,6 +57,20 @@ pub struct PgArg {
     pub name: String,
     pub type_oid: OID,
     pub has_default: bool,
+    pub nullable: bool,
+}
+
+/// Parse @pgrpc_not_null(param_name) annotations from function comments
+fn parse_out_param_not_null_annotations(comment: &Option<String>) -> HashSet<String> {
+    let mut not_null_params = HashSet::new();
+    if let Some(comment) = comment {
+        // Match @pgrpc_not_null(param_name) pattern
+        let re = Regex::new(r"@pgrpc_not_null\((\w+)\)").unwrap();
+        for cap in re.captures_iter(comment) {
+            not_null_params.insert(cap[1].to_string());
+        }
+    }
+    not_null_params
 }
 
 impl PgArg {
@@ -63,18 +83,19 @@ impl PgArg {
         };
         sql_to_rs_ident(clean_name, CaseType::Snake)
     }
-    
+
     /// Returns whether this argument needs an additional `&` when passed to the params vector
     pub fn needs_reference(&self, types: &HashMap<OID, PgType>) -> bool {
         match types.get(&self.type_oid) {
-            Some(PgType::Int16) | Some(PgType::Int32) | Some(PgType::Int64) | Some(PgType::Bool) => true, // Primitive types need refs
+            Some(PgType::Int16) | Some(PgType::Int32) | Some(PgType::Int64)
+            | Some(PgType::Bool) => true, // Primitive types need refs
             Some(PgType::Text) => true, // Function param is &str, need &&str for ToSql vector
             Some(PgType::Enum { .. }) => true, // Enums are passed by value, need reference
-            Some(_) => true, // Domain types, composite types need references for ToSql
-            None => true, // Unknown types (like std::net::IpAddr) need references
+            Some(_) => true,            // Domain types, composite types need references for ToSql
+            None => true,               // Unknown types (like std::net::IpAddr) need references
         }
     }
-    
+
     /// Returns the appropriate reference for this argument in the params vector
     pub fn param_reference(&self, types: &HashMap<OID, PgType>) -> TokenStream {
         let name = self.rs_name();
@@ -97,15 +118,19 @@ impl PgFn {
     pub fn rs_name(&self) -> TokenStream {
         sql_to_rs_ident(&self.name, CaseType::Snake)
     }
-    
+
     pub fn return_table_struct_name(&self) -> TokenStream {
         sql_to_rs_ident(&format!("{}_row", &self.name), CaseType::Pascal)
     }
     
+    pub fn out_params_struct_name(&self) -> TokenStream {
+        sql_to_rs_ident(&format!("{}_out", &self.name), CaseType::Pascal)
+    }
+
     pub fn error_enum_name(&self) -> TokenStream {
         sql_to_rs_ident(&format!("{}_error", &self.name), CaseType::Pascal)
     }
-    
+
     /// Generate match arms for From<tokio_postgres::Error> implementation
     fn generate_from_postgres_match_arms(
         &self,
@@ -118,14 +143,14 @@ impl PgFn {
         let mut fk_arms = Vec::new();
         let mut not_null_arms = Vec::new();
         let mut custom_arms = Vec::new();
-        
+
         // Process constraints by table for this function
         for (table_id, constraints) in used_constraints {
             let table_name_str = table_id.name();
             let table_name_pascal = table_name_str.to_pascal_case();
             let error_variant = format_ident!("{}Constraint", table_name_pascal);
             let constraint_enum = format_ident!("{}Constraint", table_name_pascal);
-            
+
             for constraint in constraints {
                 match constraint {
                     Constraint::PrimaryKey(pk) => {
@@ -137,7 +162,7 @@ impl PgFn {
                                 db_error.to_owned()
                             )
                         });
-                    },
+                    }
                     Constraint::Unique(u) => {
                         let constraint_name = u.name.as_str();
                         let variant_name_str = u.name.to_pascal_case();
@@ -148,7 +173,7 @@ impl PgFn {
                                 db_error.to_owned()
                             )
                         });
-                    },
+                    }
                     Constraint::Check(c) => {
                         let constraint_name = c.name.as_str();
                         let variant_name_str = c.name.to_pascal_case();
@@ -159,7 +184,7 @@ impl PgFn {
                                 db_error.to_owned()
                             )
                         });
-                    },
+                    }
                     Constraint::ForeignKey(fk) => {
                         let constraint_name = fk.name.as_str();
                         let variant_name_str = fk.name.to_pascal_case();
@@ -170,7 +195,7 @@ impl PgFn {
                                 db_error.to_owned()
                             )
                         });
-                    },
+                    }
                     Constraint::NotNull(nn) => {
                         // NOT NULL violations are reported by table and column, not constraint name
                         let column_name = nn.column.as_str();
@@ -182,12 +207,12 @@ impl PgFn {
                                 db_error.to_owned()
                             )
                         });
-                    },
+                    }
                     _ => {} // Skip other constraint types
                 }
             }
         }
-        
+
         // Process custom exceptions from this function
         let mut has_custom_errors = false;
         for exception in &self.exceptions {
@@ -199,7 +224,7 @@ impl PgFn {
                     } else {
                         exception.rs_name(config)
                     };
-                    
+
                     custom_arms.push(quote! {
                         code if code == &tokio_postgres::error::SqlState::from_code(#code) => {
                             #error_enum_name::#variant_name(db_error.to_owned())
@@ -212,11 +237,13 @@ impl PgFn {
                 _ => {}
             }
         }
-        
+
         // Add handling for custom errors with JSON hint if we have any
         if has_custom_errors {
             // Collect all custom error names for this function
-            let custom_error_arms: Vec<TokenStream> = self.exceptions.iter()
+            let custom_error_arms: Vec<TokenStream> = self
+                .exceptions
+                .iter()
                 .filter_map(|e| {
                     if let PgException::CustomError(error_name) = e {
                         let variant_name = sql_to_rs_ident(error_name, Pascal);
@@ -235,7 +262,7 @@ impl PgFn {
                     }
                 })
                 .collect();
-            
+
             // Check for JSON hint instead of specific SQLSTATE
             custom_arms.push(quote! {
                 _code if db_error.hint() == Some("application/json") => {
@@ -251,10 +278,10 @@ impl PgFn {
                 }
             });
         }
-        
+
         // Build the complete match expression
         let mut all_arms = Vec::new();
-        
+
         if !unique_arms.is_empty() {
             all_arms.push(quote! {
                 &tokio_postgres::error::SqlState::UNIQUE_VIOLATION => {
@@ -265,7 +292,7 @@ impl PgFn {
                 },
             });
         }
-        
+
         if !check_arms.is_empty() {
             all_arms.push(quote! {
                 &tokio_postgres::error::SqlState::CHECK_VIOLATION => {
@@ -276,7 +303,7 @@ impl PgFn {
                 },
             });
         }
-        
+
         if !fk_arms.is_empty() {
             all_arms.push(quote! {
                 &tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION => {
@@ -287,7 +314,7 @@ impl PgFn {
                 },
             });
         }
-        
+
         if !not_null_arms.is_empty() {
             all_arms.push(quote! {
                 &tokio_postgres::error::SqlState::NOT_NULL_VIOLATION => {
@@ -298,13 +325,13 @@ impl PgFn {
                 },
             });
         }
-        
+
         all_arms.extend(custom_arms);
-        
+
         // Combine all arms into a single TokenStream
         all_arms.into_iter().collect()
     }
-    
+
     /// Generate the function-specific error enum
     pub fn generate_error_enum(
         &self,
@@ -312,17 +339,21 @@ impl PgFn {
         table_constraints: &HashMap<PgId, Vec<Constraint>>,
         config: &Config,
     ) -> TokenStream {
-        
         let error_enum_name = self.error_enum_name();
         let mut error_variants = Vec::new();
         let mut used_constraints: HashMap<PgId, Vec<Constraint>> = HashMap::new();
-        
+
         // Analyze both PL/pgSQL and SQL functions
-        let rel_deps = if self.definition.contains("LANGUAGE plpgsql") || self.definition.contains("language plpgsql") {
+        let rel_deps = if self.definition.contains("LANGUAGE plpgsql")
+            || self.definition.contains("language plpgsql")
+        {
             let parsed = parse_plpgsql(&self.definition).unwrap_or_default();
             let queries = extract_queries(&parsed);
             get_rel_deps(&queries, rel_index)
-        } else if self.definition.contains("LANGUAGE sql") || self.definition.contains("language sql") || self.definition.contains("LANGUAGE SQL") {
+        } else if self.definition.contains("LANGUAGE sql")
+            || self.definition.contains("language sql")
+            || self.definition.contains("LANGUAGE SQL")
+        {
             // For SQL functions, extract the body and parse it
             let body = self.body();
             match pg_query::parse(body) {
@@ -331,56 +362,63 @@ impl PgFn {
                     get_rel_deps(&queries, rel_index)
                 }
                 Err(e) => {
-                    warn!("Failed to parse SQL function body for error analysis: {}", e);
+                    warn!(
+                        "Failed to parse SQL function body for error analysis: {}",
+                        e
+                    );
                     Vec::new()
                 }
             }
         } else {
             Vec::new()
         };
-        
+
         // Collect constraints from tables this function touches
         for dep in &rel_deps {
             // Find the PgId for this OID
-            let pg_id = rel_index.iter()
+            let pg_id = rel_index
+                .iter()
                 .find(|(oid, _)| **oid == dep.rel_oid)
                 .map(|(_, rel)| &rel.id);
-                
+
             if let Some(id) = pg_id {
                 if let Some(constraints) = table_constraints.get(id) {
-                    let relevant_constraints: Vec<Constraint> = constraints.iter()
+                    let relevant_constraints: Vec<Constraint> = constraints
+                        .iter()
                         .filter(|c| {
                             // Filter constraints based on the operation type
                             match &dep.cmd {
                                 Cmd::Update { cols } => c.contains_columns(cols),
-                                Cmd::Insert { cols, .. } => c.contains_columns(cols) && !matches!(c, Constraint::Default(_)),
+                                Cmd::Insert { cols, .. } => {
+                                    c.contains_columns(cols) && !matches!(c, Constraint::Default(_))
+                                }
                                 Cmd::Delete => matches!(c, Constraint::ForeignKey(_)),
                                 _ => false,
                             }
                         })
                         .cloned()
                         .collect();
-                    
+
                     if !relevant_constraints.is_empty() {
                         used_constraints.insert(id.clone(), relevant_constraints);
                     }
                 }
             }
         }
-        
+
         // Generate constraint error variants
         for (table_id, _) in &used_constraints {
             let table_name_str = table_id.name();
             let table_name_pascal = table_name_str.to_pascal_case();
             let variant_name = format_ident!("{}Constraint", table_name_pascal);
             let constraint_enum = format_ident!("{}Constraint", table_name_pascal);
-            
+
             error_variants.push(quote! {
                 #[error("{} table constraint violation", #table_name_str)]
                 #variant_name(super::errors::#constraint_enum, #[source] tokio_postgres::error::DbError)
             });
         }
-        
+
         // Add variants for explicit exceptions raised by this function
         let mut handled_exceptions = HashSet::new();
         for exception in &self.exceptions {
@@ -418,40 +456,41 @@ impl PgFn {
                 _ => {} // Handle other exception types if needed
             }
         }
-        
+
         // Add catch-all variant for undetected errors
         error_variants.push(quote! {
             #[error(transparent)]
             Other(super::errors::PgRpcError)
         });
-        
+
         // Generate match arms for From implementations
         let mut to_pgrpc_arms = Vec::new();
         let mut constraint_variant_names = Vec::new();
-        
+
         // Generate arms for constraint variants
         for (table_id, _) in &used_constraints {
             let table_name_pascal = table_id.name().to_pascal_case();
             let variant_name = format_ident!("{}Constraint", table_name_pascal);
             constraint_variant_names.push(variant_name.clone());
-            
+
             to_pgrpc_arms.push(quote! {
                 #error_enum_name::#variant_name(constraint, db_error) => {
                     super::errors::PgRpcError::#variant_name(constraint, db_error)
                 }
             });
         }
-        
+
         // Generate arms for exception variants
         for exception in &self.exceptions {
             match exception {
                 PgException::Explicit(sql_state) => {
-                    let variant_name = if let Some(description) = config.exceptions.get(sql_state.code()) {
-                        sql_to_rs_ident(description, Pascal)
-                    } else {
-                        exception.rs_name(config)
-                    };
-                    
+                    let variant_name =
+                        if let Some(description) = config.exceptions.get(sql_state.code()) {
+                            sql_to_rs_ident(description, Pascal)
+                        } else {
+                            exception.rs_name(config)
+                        };
+
                     to_pgrpc_arms.push(quote! {
                         #error_enum_name::#variant_name(db_error) => {
                             super::errors::PgRpcError::#variant_name(db_error)
@@ -469,13 +508,13 @@ impl PgFn {
                 _ => {}
             }
         }
-        
+
         // Generate From<tokio_postgres::Error> match arms
         let from_postgres_arms = self.generate_from_postgres_match_arms(&used_constraints, config);
-        
+
         // Generate AsDbError implementation arms
         let mut as_db_error_arms = Vec::new();
-        
+
         // Arms for constraint variants
         for (table_id, _) in &used_constraints {
             let table_name_pascal = table_id.name().to_pascal_case();
@@ -484,16 +523,17 @@ impl PgFn {
                 #error_enum_name::#variant_name(_, db_error) => Some(db_error)
             });
         }
-        
+
         // Arms for custom exception variants
         for exception in &self.exceptions {
             match exception {
                 PgException::Explicit(sql_state) => {
-                    let variant_name = if let Some(description) = config.exceptions.get(sql_state.code()) {
-                        sql_to_rs_ident(description, Pascal)
-                    } else {
-                        exception.rs_name(config)
-                    };
+                    let variant_name =
+                        if let Some(description) = config.exceptions.get(sql_state.code()) {
+                            sql_to_rs_ident(description, Pascal)
+                        } else {
+                            exception.rs_name(config)
+                        };
                     as_db_error_arms.push(quote! {
                         #error_enum_name::#variant_name(db_error) => Some(db_error)
                     });
@@ -507,14 +547,14 @@ impl PgFn {
                 _ => {}
             }
         }
-        
+
         // Build the complete error enum
         quote! {
             #[derive(Debug, thiserror::Error)]
             pub enum #error_enum_name {
                 #(#error_variants),*
             }
-            
+
             impl From<tokio_postgres::Error> for #error_enum_name {
                 fn from(e: tokio_postgres::Error) -> Self {
                     match e.as_db_error() {
@@ -526,7 +566,7 @@ impl PgFn {
                     }
                 }
             }
-            
+
             impl From<#error_enum_name> for super::errors::PgRpcError {
                 fn from(err: #error_enum_name) -> Self {
                     match err {
@@ -535,13 +575,13 @@ impl PgFn {
                     }
                 }
             }
-            
+
             impl From<super::errors::PgRpcError> for #error_enum_name {
                 fn from(err: super::errors::PgRpcError) -> Self {
                     #error_enum_name::Other(err)
                 }
             }
-            
+
             impl super::errors::AsDbError for #error_enum_name {
                 fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError> {
                     match self {
@@ -568,15 +608,13 @@ impl PgFn {
 
         &self.definition[start_ind..end_ind]
     }
-
-
 }
 
 impl PgFn {
     pub fn from_row(
-        row: Row, 
+        row: Row,
         rel_index: &RelIndex,
-        trigger_index: Option<&TriggerIndex>
+        trigger_index: Option<&TriggerIndex>,
     ) -> Result<Self, anyhow::Error> {
         let arg_type_oids: Vec<OID> = row.try_get("arg_oids")?;
         let arg_names: Vec<String> = row.try_get("arg_names")?;
@@ -584,7 +622,7 @@ impl PgFn {
         let comment: Option<String> = row.try_get("comment")?;
         let language: String = row.try_get("language")?;
         let prokind: i8 = row.try_get("prokind")?;
-        
+
         // Get additional fields for OUT parameters
         let arg_modes: Option<Vec<i8>> = row.try_get("arg_modes")?;
         let all_arg_types: Option<Vec<OID>> = row.try_get("all_arg_types")?;
@@ -592,26 +630,39 @@ impl PgFn {
 
         let mut args: Vec<PgArg> = Vec::new();
         let mut out_args: Vec<PgArg> = Vec::new();
+        let mut has_table_params = false;
         
+        // Parse @pgrpc_not_null annotations for OUT parameters
+        let not_null_params = parse_out_param_not_null_annotations(&comment);
+
         // If we have arg_modes, parse IN/OUT parameters separately
         if let (Some(modes), Some(types), Some(names)) = (arg_modes, all_arg_types, all_arg_names) {
-            for (i, ((mode, &type_oid), name)) in modes.iter().zip(types.iter()).zip(names.iter()).enumerate() {
+            for (i, ((mode, &type_oid), name)) in
+                modes.iter().zip(types.iter()).zip(names.iter()).enumerate()
+            {
                 match *mode {
-                    105 | 98 => { // 'i' (IN) or 'b' (INOUT) parameters
+                    105 | 98 => {
+                        // 'i' (IN) or 'b' (INOUT) parameters
                         args.push(PgArg {
                             name: name.clone(),
                             type_oid,
                             has_default: arg_defaults.get(args.len()).copied().unwrap_or(false),
+                            nullable: false, // IN parameters are never nullable in function signatures
                         });
                     }
                     _ => {} // Skip for now
                 }
-                
-                if *mode == 111 || *mode == 98 || *mode == 116 { // 'o' (OUT), 'b' (INOUT), or 't' (TABLE) parameters
+
+                if *mode == 111 || *mode == 98 || *mode == 116 {
+                    // 'o' (OUT), 'b' (INOUT), or 't' (TABLE) parameters
+                    if *mode == 116 {
+                        has_table_params = true;
+                    }
                     out_args.push(PgArg {
                         name: name.clone(),
                         type_oid,
                         has_default: false,
+                        nullable: !not_null_params.contains(name),
                     });
                 }
             }
@@ -622,17 +673,24 @@ impl PgFn {
                     name: name.clone(),
                     type_oid: oid,
                     has_default,
+                    nullable: false, // IN parameters are never nullable
                 })
                 .collect();
         }
 
         let definition = row.try_get::<_, String>("function_definition")?;
-        
+
         // Parse and analyze both PL/pgSQL and SQL functions
         let exceptions = match language.as_str() {
             "plpgsql" => {
                 let parsed = parse_plpgsql(&definition)?;
-                get_exceptions_with_triggers(&parsed, comment.as_ref(), rel_index, trigger_index, None)?
+                get_exceptions_with_triggers(
+                    &parsed,
+                    comment.as_ref(),
+                    rel_index,
+                    trigger_index,
+                    None,
+                )?
             }
             "sql" => {
                 // Extract the function body and parse as SQL
@@ -643,13 +701,14 @@ impl PgFn {
                     definition: definition.clone(),
                     returns_set: row.try_get("returns_set")?,
                     is_procedure: prokind == b'p' as i8,
+                    has_table_params,
                     comment: comment.clone(),
                     args: args.clone(),
                     out_args: out_args.clone(),
                     return_type_oid: row.try_get("return_type")?,
                     exceptions: Vec::new(),
                 };
-                
+
                 let body = fn_obj.body();
                 // Parse SQL body to get queries
                 match pg_query::parse(body) {
@@ -657,15 +716,15 @@ impl PgFn {
                         // Convert parsed SQL to queries vector
                         let queries = vec![parsed];
                         let mut rel_deps = get_rel_deps(&queries, rel_index);
-                        
+
                         // Populate trigger exceptions if available
                         if let Some(trigger_idx) = trigger_index {
                             populate_trigger_exceptions(&mut rel_deps, trigger_idx);
                         }
-                        
+
                         // Get exceptions from table dependencies
                         let mut exceptions: Vec<PgException> = Vec::new();
-                        
+
                         // Collect constraint-based exceptions
                         for dep in &rel_deps {
                             if let Some(rel) = rel_index.get(&dep.rel_oid) {
@@ -673,30 +732,36 @@ impl PgFn {
                                     // Filter constraints based on the operation type
                                     let include = match &dep.cmd {
                                         Cmd::Update { cols } => constraint.contains_columns(cols),
-                                        Cmd::Insert { cols, .. } => constraint.contains_columns(cols) && !matches!(constraint, Constraint::Default(_)),
-                                        Cmd::Delete => matches!(constraint, Constraint::ForeignKey(_)),
+                                        Cmd::Insert { cols, .. } => {
+                                            constraint.contains_columns(cols)
+                                                && !matches!(constraint, Constraint::Default(_))
+                                        }
+                                        Cmd::Delete => {
+                                            matches!(constraint, Constraint::ForeignKey(_))
+                                        }
                                         _ => false,
                                     };
-                                    
+
                                     if include {
-                                        exceptions.push(PgException::Constraint(constraint.clone()));
+                                        exceptions
+                                            .push(PgException::Constraint(constraint.clone()));
                                     }
                                 }
                             }
                         }
-                        
+
                         // Add trigger-based exceptions if available
                         if let Some(trigger_idx) = trigger_index {
                             for dep in &rel_deps {
                                 exceptions.extend(dep.trigger_exceptions.iter().cloned());
                             }
                         }
-                        
+
                         // Add comment exceptions
                         if let Some(ref comment_str) = comment {
                             exceptions.extend(get_comment_exceptions(comment_str));
                         }
-                        
+
                         exceptions
                     }
                     Err(e) => {
@@ -717,7 +782,8 @@ impl PgFn {
             schema: row.try_get("schema_name")?,
             definition,
             returns_set: row.try_get("returns_set")?,
-            is_procedure: prokind == b'p' as i8,  // 'p' for procedure, 'f' for function
+            is_procedure: prokind == b'p' as i8, // 'p' for procedure, 'f' for function
+            has_table_params,
             comment,
             args,
             out_args,
@@ -772,14 +838,19 @@ impl ToRust for PgFn {
         let err_type = quote! { #error_enum_name };
         let fn_name_str = &self.name;
 
-        let return_opt = self.comment.as_ref().is_some_and(|c| c.contains("@pgrpc_return_opt"));
-        if return_opt && !self.returns_set  {
-            panic!("{}: Only set-returning functions can have @pgrpc_return_opt.", self.name)
+        let return_opt = self
+            .comment
+            .as_ref()
+            .is_some_and(|c| c.contains("@pgrpc_return_opt"));
+        if return_opt && !self.returns_set {
+            panic!(
+                "{}: Only set-returning functions can have @pgrpc_return_opt.",
+                self.name
+            )
         }
-        
-        // Check if this is a RETURN TABLE function
-        let is_return_table = self.return_type_oid == RECORD_TYPE_OID && !self.out_args.is_empty();
 
+        // Check if this is a RETURN TABLE function
+        let is_return_table = self.has_table_params;
 
         let fn_body = {
             let (opt_args, req_args): (Vec<PgArg>, Vec<PgArg>) =
@@ -792,7 +863,8 @@ impl ToRust for PgFn {
                 .join(", ");
 
             let req_arg_names: Vec<TokenStream> = req_args.iter().map(|a| a.rs_name()).collect();
-            let req_arg_refs: Vec<TokenStream> = req_args.iter().map(|a| a.param_reference(types)).collect();
+            let req_arg_refs: Vec<TokenStream> =
+                req_args.iter().map(|a| a.param_reference(types)).collect();
             let opt_arg_names: Vec<TokenStream> = opt_args.iter().map(|a| a.rs_name()).collect();
 
             // Check if return type needs special handling
@@ -802,10 +874,10 @@ impl ToRust for PgFn {
             } else {
                 false
             };
-            
+
             let query_string = if self.is_procedure {
                 format!("CALL {}.{}", self.schema, self.name)
-            } else if self.returns_set || needs_expansion {
+            } else if self.returns_set || needs_expansion || (!self.is_procedure && self.out_args.len() > 1) {
                 format!("select * from {}.{}", self.schema, self.name)
             } else {
                 format!("select {}.{}", self.schema, self.name)
@@ -901,6 +973,15 @@ impl ToRust for PgFn {
                         }
                     }
                 }
+            } else if !self.is_procedure && self.out_args.len() > 1 {
+                // Functions with multiple OUT parameters return a struct via TryFrom<Row>
+                quote! {
+                    client
+                        .query_one(&query, &params)
+                        .await
+                        .and_then(|r| r.try_into())
+                        .map_err(#err_type::from)
+                }
             } else if self.return_type_oid == VOID_TYPE_OID {
                 // Void returning function
                 quote! {
@@ -930,7 +1011,10 @@ impl ToRust for PgFn {
                         if has_flatten {
                             // For composite types with flatten, we use SELECT * FROM function()
                             // which expands the composite type into columns that our TryFrom can handle
-                            let return_not_null = self.comment.as_ref().is_some_and(|c| c.contains("@pgrpc_not_null"));
+                            let return_not_null = self
+                                .comment
+                                .as_ref()
+                                .is_some_and(|c| c.contains("@pgrpc_not_null"));
                             if return_not_null {
                                 quote! {
                                     client
@@ -995,9 +1079,9 @@ impl ToRust for PgFn {
                 quote! {
                     let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#req_arg_refs),*];
                     let mut optional_parts = Vec::new();
-                    
+
                     #(#opt_param_handling)*
-                    
+
                     let query = if optional_parts.is_empty() {
                         if params.is_empty() {
                             format!("{}()", #query_string)
@@ -1041,10 +1125,14 @@ impl ToRust for PgFn {
                     .get(&self.out_args[0].type_oid)
                     .unwrap()
                     .to_rust_ident(types);
-                quote! { #out_type }
+                if self.out_args[0].nullable {
+                    quote! { Option<#out_type> }
+                } else {
+                    quote! { #out_type }
+                }
             } else {
                 // Multiple OUT parameters - use generated struct
-                let struct_name = self.return_table_struct_name();
+                let struct_name = self.out_params_struct_name();
                 quote! { #struct_name }
             }
         } else if self.return_type_oid == VOID_TYPE_OID {
@@ -1057,6 +1145,10 @@ impl ToRust for PgFn {
             } else {
                 quote! { #struct_name }
             }
+        } else if !self.is_procedure && self.out_args.len() > 1 {
+            // Functions with multiple OUT parameters use generated struct
+            let struct_name = self.out_params_struct_name();
+            quote! { #struct_name }
         } else {
             let inner_ty = types
                 .get(&self.return_type_oid)
@@ -1066,7 +1158,10 @@ impl ToRust for PgFn {
             if self.returns_set {
                 quote! { Vec<#inner_ty> }
             } else {
-                let return_not_null = self.comment.as_ref().is_some_and(|c| c.contains("@pgrpc_not_null"));
+                let return_not_null = self
+                    .comment
+                    .as_ref()
+                    .is_some_and(|c| c.contains("@pgrpc_not_null"));
                 if return_not_null {
                     inner_ty
                 } else {
@@ -1093,37 +1188,52 @@ impl ToRust for PgFn {
         };
         let comment_macro = quote! { #[doc=#doc_comment] };
 
-        // Generate struct for RETURN TABLE functions or procedures with multiple OUT parameters
-        let struct_def = if is_return_table || (self.is_procedure && self.out_args.len() > 1) {
-            let struct_name = self.return_table_struct_name();
-            let field_names: Vec<TokenStream> = self.out_args.iter()
+        // Generate struct for RETURN TABLE functions or procedures/functions with multiple OUT parameters
+        let struct_def = if is_return_table || self.out_args.len() > 1 {
+            let struct_name = if is_return_table {
+                self.return_table_struct_name()
+            } else {
+                self.out_params_struct_name()
+            };
+            let field_names: Vec<TokenStream> = self
+                .out_args
+                .iter()
                 .map(|arg| sql_to_rs_ident(&arg.name, CaseType::Snake))
                 .collect();
-            let field_types: Vec<TokenStream> = self.out_args.iter().map(|arg| {
-                match types.get(&arg.type_oid).unwrap() {
-                    PgType::Int16 => quote! { i16 },
-                    PgType::Int32 => quote! { i32 },
-                    PgType::Int64 => quote! { i64 },
-                    PgType::Bool => quote! { bool },
-                    PgType::Text => quote! { String },
-                    t => {
-                        let id = t.to_rust_ident(types);
-                        quote! { #id }
+            let field_types: Vec<TokenStream> = self
+                .out_args
+                .iter()
+                .map(|arg| {
+                    let base_type = match types.get(&arg.type_oid).unwrap() {
+                        PgType::Int16 => quote! { i16 },
+                        PgType::Int32 => quote! { i32 },
+                        PgType::Int64 => quote! { i64 },
+                        PgType::Bool => quote! { bool },
+                        PgType::Text => quote! { String },
+                        t => {
+                            let id = t.to_rust_ident(types);
+                            quote! { #id }
+                        }
+                    };
+                    if arg.nullable {
+                        quote! { Option<#base_type> }
+                    } else {
+                        base_type
                     }
-                }
-            }).collect();
-            
+                })
+                .collect();
+
             let field_indices: Vec<usize> = (0..self.out_args.len()).collect();
-            
+
             quote! {
                 #[derive(Debug, Clone)]
                 pub struct #struct_name {
                     #(pub #field_names: #field_types),*
                 }
-                
+
                 impl TryFrom<tokio_postgres::Row> for #struct_name {
                     type Error = tokio_postgres::Error;
-                    
+
                     fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
                         Ok(Self {
                             #(
@@ -1139,7 +1249,7 @@ impl ToRust for PgFn {
 
         quote! {
             #struct_def
-            
+
             #comment_macro
             #[builder(finish_fn = exec)]
             pub async fn #rs_fn_name(
@@ -1154,9 +1264,9 @@ impl ToRust for PgFn {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictTarget {
-    Columns(Vec<Ustr>),             // ON CONFLICT (col1, col2)
-    Constraint(Ustr),             // ON CONFLICT ON CONSTRAINT constraint_name
-    Any,                            // ON CONFLICT without target
+    Columns(Vec<Ustr>), // ON CONFLICT (col1, col2)
+    Constraint(Ustr),   // ON CONFLICT ON CONSTRAINT constraint_name
+    Any,                // ON CONFLICT without target
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1164,7 +1274,6 @@ pub enum ConflictAction {
     DoNothing,
     DoUpdate,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictClause {
@@ -1175,14 +1284,22 @@ pub struct ConflictClause {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinType {
     Inner,
-    Outer
+    Outer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
-    Select { cols: Vec<Ustr>, join_type: JoinType },
-    Update { cols: Vec<Ustr> },
-    Insert { cols: Vec<Ustr>, on_conflict: Option<ConflictClause> },
+    Select {
+        cols: Vec<Ustr>,
+        join_type: JoinType,
+    },
+    Update {
+        cols: Vec<Ustr>,
+    },
+    Insert {
+        cols: Vec<Ustr>,
+        on_conflict: Option<ConflictClause>,
+    },
     Delete,
 }
 
@@ -1219,13 +1336,13 @@ pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
 /// Extract custom error types from parsed queries by looking for calls to the raise_error function
 /// Returns a set of error type names and optionally their SQLSTATEs
 pub fn extract_custom_errors_from_queries(
-    queries: &[ParseResult], 
-    errors_config: &crate::config::ErrorsConfig
+    queries: &[ParseResult],
+    errors_config: &crate::config::ErrorsConfig,
 ) -> HashSet<String> {
     let mut custom_errors = HashSet::new();
     let raise_function = errors_config.get_raise_function();
     let errors_schema = &errors_config.schema;
-    
+
     for query in queries {
         for (node, _, _, _) in query.protobuf.nodes() {
             match node.to_enum() {
@@ -1235,9 +1352,11 @@ pub fn extract_custom_errors_from_queries(
                         if is_raise_error_call(&funccall.funcname, raise_function) {
                             // First argument should be the error type cast
                             if let Some(first_arg) = funccall.args.first() {
-                                if let Some(error_type) = extract_error_type_from_node(first_arg, errors_schema) {
+                                if let Some(error_type) =
+                                    extract_error_type_from_node(first_arg, errors_schema)
+                                {
                                     custom_errors.insert(error_type);
-                                    
+
                                     // Check for optional second argument (SQLSTATE)
                                     // We don't need to track the SQLSTATE here since we're using HINT-based detection
                                     // But we could extract it for future use
@@ -1251,13 +1370,17 @@ pub fn extract_custom_errors_from_queries(
                     // Look for function calls in the target list
                     for target in &stmt.target_list {
                         if let Some(Node::ResTarget(res_target)) = &target.node {
-                            if let Some(Node::FuncCall(funccall)) = &res_target.val.as_ref().and_then(|v| v.node.as_ref()) {
+                            if let Some(Node::FuncCall(funccall)) =
+                                &res_target.val.as_ref().and_then(|v| v.node.as_ref())
+                            {
                                 if is_raise_error_call(&funccall.funcname, raise_function) {
                                     // First argument should be the error type cast
                                     if let Some(first_arg) = funccall.args.first() {
-                                        if let Some(error_type) = extract_error_type_from_node(first_arg, errors_schema) {
+                                        if let Some(error_type) =
+                                            extract_error_type_from_node(first_arg, errors_schema)
+                                        {
                                             custom_errors.insert(error_type);
-                                            
+
                                             // Check for optional second argument (SQLSTATE)
                                             // We don't need to track the SQLSTATE here since we're using HINT-based detection
                                         }
@@ -1271,7 +1394,7 @@ pub fn extract_custom_errors_from_queries(
             }
         }
     }
-    
+
     custom_errors
 }
 
@@ -1287,13 +1410,16 @@ fn is_raise_error_call(funcname: &[pg_query::protobuf::Node], expected: &str) ->
             }
         })
         .collect();
-    
+
     let full_name = parts.join(".");
     full_name == expected
 }
 
 /// Extract error type name from a node if it contains a type cast to errors schema
-fn extract_error_type_from_node(node: &pg_query::protobuf::Node, errors_schema: &str) -> Option<String> {
+fn extract_error_type_from_node(
+    node: &pg_query::protobuf::Node,
+    errors_schema: &str,
+) -> Option<String> {
     // Look for TypeCast nodes
     if let Some(Node::TypeCast(type_cast)) = &node.node {
         if let Some(type_name) = &type_cast.type_name {
@@ -1309,14 +1435,14 @@ fn extract_error_type_from_node(node: &pg_query::protobuf::Node, errors_schema: 
                     }
                 })
                 .collect();
-            
+
             // Check if it's a type from the errors schema
             if type_parts.len() == 2 && type_parts[0] == errors_schema {
                 return Some(type_parts[1].clone());
             }
         }
     }
-    
+
     // Also check nested nodes (e.g., for ROW(...) expressions)
     None
 }
@@ -1324,16 +1450,13 @@ fn extract_error_type_from_node(node: &pg_query::protobuf::Node, errors_schema: 
 /// Get the relations the given queries depend upon.
 pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> Vec<RelDep> {
     queries
-      .iter()
-      .flat_map(|q| get_query_deps(q, rel_index))
-      .collect()
+        .iter()
+        .flat_map(|q| get_query_deps(q, rel_index))
+        .collect()
 }
 
 /// Populate trigger exceptions for relation dependencies
-pub fn populate_trigger_exceptions(
-    rel_deps: &mut [RelDep],
-    trigger_index: &TriggerIndex,
-) {
+pub fn populate_trigger_exceptions(rel_deps: &mut [RelDep], trigger_index: &TriggerIndex) {
     for rel_dep in rel_deps {
         let trigger_event = match &rel_dep.cmd {
             Cmd::Insert { .. } => Some(TriggerEvent::Insert),
@@ -1341,34 +1464,34 @@ pub fn populate_trigger_exceptions(
             Cmd::Delete => Some(TriggerEvent::Delete),
             _ => None,
         };
-        
+
         if let Some(event) = trigger_event {
-            rel_dep.trigger_exceptions = trigger_index.get_exceptions_for_event(rel_dep.rel_oid, &event);
+            rel_dep.trigger_exceptions =
+                trigger_index.get_exceptions_for_event(rel_dep.rel_oid, &event);
         }
     }
 }
 
 fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
     query
-      .protobuf
-      .nodes()
-      .iter()
-      .filter_map(|(node, _, _, _)| match node.to_enum() {
-          Node::SelectStmt(stmt) => get_select_deps(stmt.as_ref(), rel_index),
-          Node::InsertStmt(stmt) => get_insert_deps(stmt.as_ref(), rel_index),
-          Node::UpdateStmt(stmt) => get_update_deps(stmt.as_ref(), rel_index),
-          Node::DeleteStmt(stmt) => get_delete_deps(stmt.as_ref(), rel_index),
-          Node::CallStmt(_stmt) => None, // We'll handle CallStmt separately for custom errors
-          _ => None,
-      })
-      .collect()
+        .protobuf
+        .nodes()
+        .iter()
+        .filter_map(|(node, _, _, _)| match node.to_enum() {
+            Node::SelectStmt(stmt) => get_select_deps(stmt.as_ref(), rel_index),
+            Node::InsertStmt(stmt) => get_insert_deps(stmt.as_ref(), rel_index),
+            Node::UpdateStmt(stmt) => get_update_deps(stmt.as_ref(), rel_index),
+            Node::DeleteStmt(stmt) => get_delete_deps(stmt.as_ref(), rel_index),
+            Node::CallStmt(_stmt) => None, // We'll handle CallStmt separately for custom errors
+            _ => None,
+        })
+        .collect()
 }
 
 fn get_select_deps(_stmt: &SelectStmt, _rel_index: &RelIndex) -> Option<RelDep> {
     // TODO
     None
 }
-
 
 /// Collect all dependencies from an `insert`.
 fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
@@ -1422,28 +1545,28 @@ fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
         let target = if let Some(infer) = &conflict.infer {
             // ON CONFLICT (col1, col2)
             let cols = infer
-              .index_elems
-              .iter()
-              .filter_map(|col| {
-                  col.node.as_ref().map(|n| match n {
-                      Node::InferenceElem(elem) => elem.expr.as_ref().and_then(|e| {
-                          if let Some(Node::ColumnRef(col_ref)) = &e.node {
-                              col_ref.fields.last().and_then(|f| {
-                                  if let Some(Node::String(s)) = &f.node {
-                                      Some(s.sval.as_str().into())
-                                  } else {
-                                      None
-                                  }
-                              })
-                          } else {
-                              None
-                          }
-                      }),
-                      _ => None,
-                  })
-              })
-              .flatten()
-              .collect::<Vec<_>>();
+                .index_elems
+                .iter()
+                .filter_map(|col| {
+                    col.node.as_ref().map(|n| match n {
+                        Node::InferenceElem(elem) => elem.expr.as_ref().and_then(|e| {
+                            if let Some(Node::ColumnRef(col_ref)) = &e.node {
+                                col_ref.fields.last().and_then(|f| {
+                                    if let Some(Node::String(s)) = &f.node {
+                                        Some(s.sval.as_str().into())
+                                    } else {
+                                        None
+                                    }
+                                })
+                            } else {
+                                None
+                            }
+                        }),
+                        _ => None,
+                    })
+                })
+                .flatten()
+                .collect::<Vec<_>>();
 
             if !cols.is_empty() {
                 ConflictTarget::Columns(cols)
@@ -1513,8 +1636,6 @@ fn get_update_deps(stmt: &UpdateStmt, rel_index: &RelIndex) -> Option<RelDep> {
     })
 }
 
-
-
 /// Get the position of the first `$...$` tag
 fn quote_ind(src: &str) -> Option<(&str, usize)> {
     let re = Regex::new(r"\$.*?\$").unwrap();
@@ -1527,7 +1648,6 @@ fn quote_ind(src: &str) -> Option<(&str, usize)> {
         None
     }
 }
-
 
 #[cfg(test)]
 mod test {
@@ -1584,9 +1704,9 @@ mod test {
 
     #[test]
     fn test_setof_primitive_codegen() {
-        use crate::pg_type::PgType;
-        use crate::pg_fn::PgFn;
         use crate::codegen::ToRust;
+        use crate::pg_fn::PgFn;
+        use crate::pg_type::PgType;
         use std::collections::HashMap;
 
         // Create a function that returns SETOF text
@@ -1598,6 +1718,7 @@ mod test {
             out_args: vec![],
             returns_set: true,
             is_procedure: false,
+            has_table_params: false,
             return_type_oid: 25, // TEXT OID
             comment: None,
             definition: "".to_string(),
@@ -1607,7 +1728,7 @@ mod test {
         // Create type index with Text type
         let mut types = HashMap::new();
         types.insert(25, PgType::Text);
-        
+
         // Create a simple config
         let config = crate::config::Config {
             connection_string: None,
@@ -1617,6 +1738,7 @@ mod test {
             exceptions: HashMap::new(),
             task_queue: None,
             errors: None,
+            infer_view_nullability: true,
         };
 
         // Generate the code
@@ -1624,16 +1746,17 @@ mod test {
         let generated_str = generated.to_string();
 
         // Verify that for primitive SETOF return types, we use row.try_get(0)
-        assert!(generated_str.contains("rows . into_iter () . map (| row | row . try_get (0)) . collect ()"));
+        assert!(generated_str
+            .contains("rows . into_iter () . map (| row | row . try_get (0)) . collect ()"));
         // Should NOT contain TryInto::try_into for primitive types
         assert!(!generated_str.contains("TryInto :: try_into"));
     }
 
     #[test]
     fn test_setof_composite_codegen() {
-        use crate::pg_type::{PgType, PgField};
-        use crate::pg_fn::PgFn;
         use crate::codegen::ToRust;
+        use crate::pg_fn::PgFn;
+        use crate::pg_type::{PgField, PgType};
         use std::collections::HashMap;
 
         // Create a function that returns SETOF composite_type
@@ -1645,6 +1768,7 @@ mod test {
             out_args: vec![],
             returns_set: true,
             is_procedure: false,
+            has_table_params: false,
             return_type_oid: 1000, // Custom composite type OID
             comment: None,
             definition: "".to_string(),
@@ -1653,30 +1777,35 @@ mod test {
 
         // Create type index with a composite type
         let mut types = HashMap::new();
-        types.insert(1000, PgType::Composite {
-            schema: "public".to_string(),
-            name: "user_type".to_string(),
-            fields: vec![
-                PgField {
-                    name: "id".to_string(),
-                    type_oid: 23, // INT4
-                    nullable: false,
-                    comment: None,
-                    flatten: false,
-                },
-                PgField {
-                    name: "name".to_string(),
-                    type_oid: 25, // TEXT
-                    nullable: true,
-                    comment: None,
-                    flatten: false,
-                },
-            ],
-            comment: None,
-        });
+        types.insert(
+            1000,
+            PgType::Composite {
+                schema: "public".to_string(),
+                name: "user_type".to_string(),
+                fields: vec![
+                    PgField {
+                        name: "id".to_string(),
+                        type_oid: 23, // INT4
+                        nullable: false,
+                        comment: None,
+                        flatten: false,
+                    },
+                    PgField {
+                        name: "name".to_string(),
+                        type_oid: 25, // TEXT
+                        nullable: true,
+                        comment: None,
+                        flatten: false,
+                    },
+                ],
+                comment: None,
+                relkind: None,
+                view_definition: None,
+            },
+        );
         types.insert(23, PgType::Int32);
         types.insert(25, PgType::Text);
-        
+
         // Create a simple config
         let config = crate::config::Config {
             connection_string: None,
@@ -1686,6 +1815,7 @@ mod test {
             exceptions: HashMap::new(),
             task_queue: None,
             errors: None,
+            infer_view_nullability: true,
         };
 
         // Generate the code
@@ -1693,7 +1823,9 @@ mod test {
         let generated_str = generated.to_string();
 
         // Verify that for composite SETOF return types, we use TryInto::try_into
-        assert!(generated_str.contains("rows . into_iter () . map (TryInto :: try_into) . collect ()"));
+        assert!(
+            generated_str.contains("rows . into_iter () . map (TryInto :: try_into) . collect ()")
+        );
         // Should NOT contain try_get(0) for composite types
         assert!(!generated_str.contains("row . try_get (0)"));
     }

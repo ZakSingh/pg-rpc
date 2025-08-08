@@ -2,7 +2,7 @@ use super::*;
 use pgrpc::*;
 
 // NOTE: Current Limitation with @pgrpc_flatten
-// 
+//
 // The @pgrpc_flatten annotation is partially implemented. It correctly:
 // - Parses the annotation from PostgreSQL column comments
 // - Generates flattened struct fields (e.g., addr_street, addr_city)
@@ -40,12 +40,13 @@ fn test_flatten_annotation_parsing() {
             -- Add the comment with the flatten annotation
             COMMENT ON COLUMN person.addr IS '@pgrpc_flatten';
         "};
-        
+
         execute_sql(client, schema_sql).expect("Should create test schema");
-        
+
         // Verify the composite types were created
-        let rows = client.query(
-            indoc! {"
+        let rows = client
+            .query(
+                indoc! {"
                 SELECT t.typname, n.nspname as schema_name
                 FROM pg_type t
                 JOIN pg_namespace n ON t.typnamespace = n.oid
@@ -54,14 +55,16 @@ fn test_flatten_annotation_parsing() {
                 AND t.typname IN ('address', 'person')
                 ORDER BY t.typname
             "},
-            &[]
-        ).expect("Should query composite types");
-        
+                &[],
+            )
+            .expect("Should query composite types");
+
         assert_eq!(rows.len(), 2);
-        
+
         // Verify the field comments with annotations
-        let comment_rows = client.query(
-            indoc! {"
+        let comment_rows = client
+            .query(
+                indoc! {"
                 SELECT 
                     t.typname as type_name,
                     a.attname as field_name,
@@ -76,18 +79,20 @@ fn test_flatten_annotation_parsing() {
                 AND NOT a.attisdropped
                 ORDER BY a.attnum
             "},
-            &[]
-        ).expect("Should query field comments");
-        
+                &[],
+            )
+            .expect("Should query field comments");
+
         // Find the addr field comment
-        let addr_comment = comment_rows.iter()
+        let addr_comment = comment_rows
+            .iter()
             .find(|row| {
                 let field_name: String = row.get("field_name");
                 field_name == "addr"
             })
             .map(|row| row.get::<_, Option<String>>("field_comment"))
             .flatten();
-            
+
         assert_eq!(addr_comment, Some("@pgrpc_flatten".to_string()));
     });
 }
@@ -118,12 +123,13 @@ fn test_nested_flatten_annotation_parsing() {
             COMMENT ON COLUMN address.contact IS '@pgrpc_flatten';
             COMMENT ON COLUMN person.addr IS '@pgrpc_flatten';
         "};
-        
+
         execute_sql(client, schema_sql).expect("Should create nested test schema");
-        
+
         // Verify both flatten annotations exist
-        let comment_rows = client.query(
-            indoc! {"
+        let comment_rows = client
+            .query(
+                indoc! {"
                 SELECT 
                     t.typname as type_name,
                     a.attname as field_name,
@@ -139,23 +145,27 @@ fn test_nested_flatten_annotation_parsing() {
                 AND d.description IS NOT NULL
                 ORDER BY t.typname, a.attnum
             "},
-            &[]
-        ).expect("Should query field comments");
-        
-        let flatten_comments: Vec<(String, String, String)> = comment_rows.iter()
-            .map(|row| (
-                row.get("type_name"),
-                row.get("field_name"), 
-                row.get("field_comment")
-            ))
+                &[],
+            )
+            .expect("Should query field comments");
+
+        let flatten_comments: Vec<(String, String, String)> = comment_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get("type_name"),
+                    row.get("field_name"),
+                    row.get("field_comment"),
+                )
+            })
             .collect();
-            
+
         assert!(flatten_comments.contains(&(
             "address".to_string(),
-            "contact".to_string(), 
+            "contact".to_string(),
             "@pgrpc_flatten".to_string()
         )));
-        
+
         assert!(flatten_comments.contains(&(
             "person".to_string(),
             "addr".to_string(),
@@ -164,7 +174,7 @@ fn test_nested_flatten_annotation_parsing() {
     });
 }
 
-#[test] 
+#[test]
 fn test_flatten_annotation_mixed_with_other_annotations() {
     with_isolated_database(|client| {
         // Test that flatten works alongside other annotations
@@ -185,12 +195,13 @@ fn test_flatten_annotation_mixed_with_other_annotations() {
             COMMENT ON COLUMN person.contact IS '@pgrpc_flatten';
             COMMENT ON COLUMN person.required_contact IS '@pgrpc_not_null @pgrpc_flatten';
         "};
-        
+
         execute_sql(client, schema_sql).expect("Should create mixed annotation test schema");
-        
+
         // Verify both annotations are present
-        let comment_rows = client.query(
-            indoc! {"
+        let comment_rows = client
+            .query(
+                indoc! {"
                 SELECT 
                     a.attname as field_name,
                     d.description as field_comment
@@ -205,30 +216,36 @@ fn test_flatten_annotation_mixed_with_other_annotations() {
                 AND d.description IS NOT NULL
                 ORDER BY a.attnum
             "},
-            &[]
-        ).expect("Should query field comments");
-        
-        let comments: Vec<(String, String)> = comment_rows.iter()
-            .map(|row| (
-                row.get("field_name"),
-                row.get("field_comment")
-            ))
+                &[],
+            )
+            .expect("Should query field comments");
+
+        let comments: Vec<(String, String)> = comment_rows
+            .iter()
+            .map(|row| (row.get("field_name"), row.get("field_comment")))
             .collect();
-            
+
         // Check that both fields have flatten annotation
-        let contact_comment = comments.iter()
+        let contact_comment = comments
+            .iter()
             .find(|(field, _)| field == "contact")
             .map(|(_, comment)| comment);
         assert_eq!(contact_comment, Some(&"@pgrpc_flatten".to_string()));
-        
-        let required_contact_comment = comments.iter()
+
+        let required_contact_comment = comments
+            .iter()
             .find(|(field, _)| field == "required_contact")
             .map(|(_, comment)| comment);
-        assert_eq!(required_contact_comment, Some(&"@pgrpc_not_null @pgrpc_flatten".to_string()));
-        
+        assert_eq!(
+            required_contact_comment,
+            Some(&"@pgrpc_not_null @pgrpc_flatten".to_string())
+        );
+
         // Verify both contain the flatten annotation
         assert!(required_contact_comment.unwrap().contains("@pgrpc_flatten"));
-        assert!(required_contact_comment.unwrap().contains("@pgrpc_not_null"));
+        assert!(required_contact_comment
+            .unwrap()
+            .contains("@pgrpc_not_null"));
     });
 }
 
@@ -259,12 +276,13 @@ fn test_basic_code_generation_with_flatten() {
             END;
             $$ LANGUAGE plpgsql;
         "};
-        
+
         execute_sql(client, schema_sql).expect("Should create test schema");
-        
+
         // Verify the types and comments were created correctly
-        let type_rows = client.query(
-            indoc! {"
+        let type_rows = client
+            .query(
+                indoc! {"
                 SELECT t.typname
                 FROM pg_type t
                 JOIN pg_namespace n ON t.typnamespace = n.oid
@@ -273,13 +291,15 @@ fn test_basic_code_generation_with_flatten() {
                 AND t.typname IN ('contact_info', 'person')
                 ORDER BY t.typname
             "},
-            &[]
-        ).expect("Should query composite types");
-        
+                &[],
+            )
+            .expect("Should query composite types");
+
         assert_eq!(type_rows.len(), 2);
-        
-        let comment_rows = client.query(
-            indoc! {"
+
+        let comment_rows = client
+            .query(
+                indoc! {"
                 SELECT 
                     t.typname as type_name,
                     a.attname as field_name,
@@ -294,13 +314,14 @@ fn test_basic_code_generation_with_flatten() {
                 AND a.attnum > 0
                 AND NOT a.attisdropped
             "},
-            &[]
-        ).expect("Should query field comments");
-        
+                &[],
+            )
+            .expect("Should query field comments");
+
         assert_eq!(comment_rows.len(), 1);
         let comment: String = comment_rows[0].get("field_comment");
         assert_eq!(comment, "@pgrpc_flatten");
-        
+
         println!("✅ Successfully created and verified flatten annotation in test schema");
     });
 }
@@ -309,7 +330,7 @@ fn test_basic_code_generation_with_flatten() {
 fn test_flattened_type_compilation() {
     with_isolated_database_and_container(|client, _container, conn_string| {
         use crate::integration::compile_helpers::*;
-        
+
         // Create test schema with flattened types
         // NOTE: This test demonstrates a current limitation - composite types
         // used in flattened fields need manual FromSql implementation
@@ -329,16 +350,16 @@ fn test_flattened_type_compilation() {
             END;
             $$ LANGUAGE plpgsql;
         "};
-        
+
         execute_sql(client, schema_sql).expect("Should create test schema");
-        
+
         // Generate code and create test project
         let project_dir = create_test_cargo_project(conn_string, vec!["public", "api"]);
-        
+
         // Compile the generated code
         let output = compile_project(project_dir.path());
         assert_compilation_success(output);
-        
+
         println!("✅ Generated code compiles successfully");
         println!("Note: Flattening of nested composite types requires FromSql implementations");
     });
@@ -376,14 +397,14 @@ fn test_flattened_type_runtime() {
             END;
             $$ LANGUAGE plpgsql;
         "};
-        
+
         execute_sql(client, schema_sql).expect("Should create test schema");
-        
+
         // Generate code and test runtime behavior
         use crate::integration::compile_helpers::*;
-        
+
         let project_dir = create_test_cargo_project(conn_string, vec!["public", "api"]);
-        
+
         let test_code = indoc! {r#"
             use test_project::generated::public::*;
             use test_project::generated::api::*;
@@ -424,20 +445,24 @@ fn test_flattened_type_runtime() {
                 println!("✅ Flattened type runtime extraction works!");
             }
         "#};
-        
+
         add_test_binary(&project_dir.path(), "test_flatten_runtime", &test_code);
-        
-        let output = compile_and_run_with_args(&project_dir.path(), "test_flatten_runtime", &[conn_string]);
-        
+
+        let output =
+            compile_and_run_with_args(&project_dir.path(), "test_flatten_runtime", &[conn_string]);
+
         if !output.status.success() {
             print_output(&output);
             panic!("Test execution failed");
         }
-        
+
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("✅ Flattened type runtime extraction works!"), 
-            "Test should complete successfully. Output: {}", stdout);
-        
+        assert!(
+            stdout.contains("✅ Flattened type runtime extraction works!"),
+            "Test should complete successfully. Output: {}",
+            stdout
+        );
+
         println!("✅ Flattened composite types work at runtime!");
     });
 }
@@ -448,10 +473,10 @@ fn test_nested_flattened_type_runtime() {
     // This test is currently disabled because pgrpc doesn't generate FromSql
     // implementations for composite types, which prevents extracting nested
     // composite values from database rows.
-    // 
+    //
     // TODO: Enable this test once composite types support FromSql or an
     // alternative extraction method is implemented.
-    
+
     println!("Test skipped: Nested flattened composite type runtime tests require FromSql implementation");
 }
 
@@ -461,9 +486,9 @@ fn test_nullable_flattened_type_runtime() {
     // This test is currently disabled because pgrpc doesn't generate FromSql
     // implementations for composite types, which prevents extracting nested
     // composite values from database rows.
-    // 
+    //
     // TODO: Enable this test once composite types support FromSql or an
     // alternative extraction method is implemented.
-    
+
     println!("Test skipped: Nullable flattened composite type runtime tests require FromSql implementation");
 }

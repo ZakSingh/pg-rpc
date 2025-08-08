@@ -16,18 +16,16 @@ use tokio_postgres::NoTls;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to the database
-    let (_client, connection) = tokio_postgres::connect(
-        "postgres://postgres:postgres@localhost:5432/mydb",
-        NoTls
-    ).await?;
-    
+    let (_client, connection) =
+        tokio_postgres::connect("postgres://postgres:postgres@localhost:5432/mydb", NoTls).await?;
+
     // Spawn the connection handler
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("Connection error: {}", e);
         }
     });
-    
+
     // Use the generated functions
     // After generating code with pgrpc CLI, you would use it like:
     // let user = api::get_user(&client, 123).await?;
@@ -36,9 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     Err(PgRpcError::UserNotFound(_)) => println!("User not found"),
     //     Err(e) => return Err(e.into()),
     // }
-    
+
     println!("This is just an example of how to structure your code.");
     println!("Run 'pgrpc generate' first to generate the actual modules.");
-    
+
     Ok(())
 }

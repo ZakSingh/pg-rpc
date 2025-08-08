@@ -1,31 +1,31 @@
-use tempfile::TempDir;
+use indoc::indoc;
 use std::path::Path;
 use std::process::{Command, Output};
-use indoc::indoc;
+use tempfile::TempDir;
 
 /// Create a minimal Cargo project for testing generated code
 pub fn create_test_cargo_project(conn_string: &str, schemas: Vec<&str>) -> TempDir {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let project_dir = temp_dir.path();
-    
+
     // Create src directory
     let src_dir = project_dir.join("src");
     std::fs::create_dir(&src_dir).expect("Should create src directory");
-    
+
     // Generate pgrpc code in a subdirectory
     let pgrpc_dir = src_dir.join("generated");
     std::fs::create_dir(&pgrpc_dir).expect("Should create generated directory");
-    
+
     let mut builder = pgrpc::PgrpcBuilder::new()
         .connection_string(conn_string)
         .output_path(&pgrpc_dir);
-    
+
     for schema in schemas {
         builder = builder.schema(schema);
     }
-    
+
     builder.build().expect("Code generation should succeed");
-    
+
     // Create a simple lib.rs that uses the generated code
     let lib_rs_content = indoc! {"
         pub mod generated;
@@ -39,9 +39,8 @@ pub fn create_test_cargo_project(conn_string: &str, schemas: Vec<&str>) -> TempD
         #[allow(unused_imports)]
         pub use generated::api::*;
     "};
-    std::fs::write(src_dir.join("lib.rs"), lib_rs_content)
-        .expect("Should write lib.rs");
-    
+    std::fs::write(src_dir.join("lib.rs"), lib_rs_content).expect("Should write lib.rs");
+
     // Create Cargo.toml with all required dependencies
     let cargo_toml_content = indoc! {r#"
         [package]
@@ -62,7 +61,7 @@ pub fn create_test_cargo_project(conn_string: &str, schemas: Vec<&str>) -> TempD
     "#};
     std::fs::write(project_dir.join("Cargo.toml"), cargo_toml_content)
         .expect("Should write Cargo.toml");
-    
+
     temp_dir
 }
 
@@ -70,22 +69,23 @@ pub fn create_test_cargo_project(conn_string: &str, schemas: Vec<&str>) -> TempD
 pub fn add_test_binary(project_dir: &Path, test_name: &str, test_code: &str) {
     let src_dir = project_dir.join("src");
     let test_file = src_dir.join(format!("{}.rs", test_name));
-    std::fs::write(&test_file, test_code)
-        .expect(&format!("Should write {}.rs", test_name));
-    
+    std::fs::write(&test_file, test_code).expect(&format!("Should write {}.rs", test_name));
+
     // Update Cargo.toml to include the new binary
     let cargo_toml_path = project_dir.join("Cargo.toml");
-    let mut cargo_content = std::fs::read_to_string(&cargo_toml_path)
-        .expect("Should read Cargo.toml");
-    
-    cargo_content.push_str(&format!(r#"
+    let mut cargo_content =
+        std::fs::read_to_string(&cargo_toml_path).expect("Should read Cargo.toml");
+
+    cargo_content.push_str(&format!(
+        r#"
 [[bin]]
 name = "{}"
 path = "src/{}.rs"
-"#, test_name, test_name));
-    
-    std::fs::write(cargo_toml_path, cargo_content)
-        .expect("Should update Cargo.toml");
+"#,
+        test_name, test_name
+    ));
+
+    std::fs::write(cargo_toml_path, cargo_content).expect("Should update Cargo.toml");
 }
 
 /// Compile the test project
@@ -107,11 +107,11 @@ pub fn compile_and_run(project_dir: &Path, binary_name: &str) -> Output {
         .current_dir(project_dir)
         .output()
         .expect("Should run cargo build");
-    
+
     if !compile_output.status.success() {
         return compile_output;
     }
-    
+
     // Then run
     Command::new("cargo")
         .arg("run")
@@ -132,22 +132,19 @@ pub fn compile_and_run_with_args(project_dir: &Path, binary_name: &str, args: &[
         .current_dir(project_dir)
         .output()
         .expect("Should run cargo build");
-    
+
     if !compile_output.status.success() {
         return compile_output;
     }
-    
+
     // Then run with arguments
     let mut cmd = Command::new("cargo");
-    cmd.arg("run")
-        .arg("--bin")
-        .arg(binary_name)
-        .arg("--");
-    
+    cmd.arg("run").arg("--bin").arg(binary_name).arg("--");
+
     for arg in args {
         cmd.arg(arg);
     }
-    
+
     cmd.current_dir(project_dir)
         .output()
         .expect("Should run binary")
@@ -176,10 +173,14 @@ pub fn assert_execution_success(output: Output, expected_output: Option<&str>) {
         print_output(&output);
         panic!("Execution failed");
     }
-    
+
     if let Some(expected) = expected_output {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains(expected), 
-            "Expected output '{}' not found in:\n{}", expected, stdout);
+        assert!(
+            stdout.contains(expected),
+            "Expected output '{}' not found in:\n{}",
+            expected,
+            stdout
+        );
     }
 }

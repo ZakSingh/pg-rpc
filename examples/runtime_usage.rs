@@ -11,6 +11,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .exception("P0001", "Custom application error")
         .output_path("src/generated")
         .build()?;
-    
+
     Ok(())
 }
