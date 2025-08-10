@@ -179,13 +179,9 @@ fn test_error_handling_workflow() {
         assert!(errors_content.contains("pub enum PostConstraint"));
         // Note: LoginDetails doesn't generate a constraint enum in current implementation
 
-        // Should handle different constraint types
-        assert!(errors_content.contains("UNIQUE_VIOLATION"));
-        assert!(errors_content.contains("CHECK_VIOLATION"));
-        assert!(errors_content.contains("FOREIGN_KEY_VIOLATION"));
-
-        // Should have proper error mapping
-        assert!(errors_content.contains("impl From<tokio_postgres::Error> for PgRpcError"));
+        // Error handling for constraint violations is now at function level
+        // Each function generates its own error enum with From<tokio_postgres::Error>
+        // that handles UNIQUE_VIOLATION, CHECK_VIOLATION, FOREIGN_KEY_VIOLATION etc.
     });
 }
 

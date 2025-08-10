@@ -20,6 +20,7 @@ pub mod schema_tests;
 pub mod sql_function_tests;
 pub mod task_queue_tests;
 pub mod trigger_tests;
+pub mod view_constraint_test;
 pub mod view_nullability_tests;
 pub mod workflow_tests;
 

@@ -3,6 +3,7 @@ use crate::exceptions::PgException;
 use crate::ident::{sql_to_rs_ident, CaseType::Pascal};
 use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
+use crate::pg_rel::PgRelKind;
 use crate::rel_index::RelIndex;
 use heck::ToPascalCase;
 use proc_macro2::TokenStream;
@@ -88,6 +89,11 @@ pub fn collect_table_constraints(rel_index: &RelIndex) -> HashMap<PgId, Vec<Cons
     let mut table_constraints: HashMap<PgId, Vec<Constraint>> = HashMap::new();
 
     for rel in rel_index.deref().values() {
+        // Only process actual tables, not views
+        if !matches!(rel.kind, PgRelKind::Table) {
+            continue;
+        }
+        
         // Filter out constraints that won't generate enum variants
         let non_default_constraints: Vec<Constraint> = rel
             .constraints

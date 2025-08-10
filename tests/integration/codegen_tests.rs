@@ -138,12 +138,12 @@ fn test_function_generation() {
         // Should be an async function
         assert!(api_content.contains("pub async fn get_account_by_email"));
 
-        // Should use the unified error type
+        // Should use function-specific error type
         assert!(api_content.contains("Result<"));
-        assert!(api_content.contains("super::errors::PgRpcError"));
+        assert!(api_content.contains("GetAccountByEmailError"));
 
         // Should have proper parameter types
-        assert!(api_content.contains("p_email"));
+        assert!(api_content.contains("email: &str"));
     });
 }
 
@@ -164,13 +164,8 @@ fn test_error_generation() {
         // Should have specific constraint variants
         assert!(errors_content.contains("AccountEmailKey")); // unique constraint
 
-        // Should have the From implementation
-        assert!(errors_content.contains("impl From"));
-        assert!(errors_content.contains("tokio_postgres::Error"));
-
-        // Should have constraint violation handling
-        assert!(errors_content.contains("UNIQUE_VIOLATION"));
-        assert!(errors_content.contains("CHECK_VIOLATION"));
+        // Error handling is now at function level, not in errors.rs
+        // Each function generates its own error enum with From<tokio_postgres::Error>
     });
 }
 

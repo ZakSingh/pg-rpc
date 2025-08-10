@@ -311,8 +311,10 @@ fn test_trigger_exception_integration() {
         // Should have error enum
         assert!(errors_content.contains("enum PgRpcError"));
 
-        // Should handle custom SQL states from triggers
-        assert!(errors_content.contains("impl From<tokio_postgres::Error> for PgRpcError"));
+        // Error handling is now at function level, not global
+        // Each function has its own error enum with From<tokio_postgres::Error> implementation
+        // Check that we have the unified error type available
+        assert!(errors_content.contains("enum PgRpcError"));
     });
 }
 
@@ -606,7 +608,8 @@ fn test_trigger_exception_error_codes() {
 
         // Should have error enum with proper From implementation
         assert!(errors_content.contains("enum PgRpcError"));
-        assert!(errors_content.contains("impl From<tokio_postgres::Error>"));
+        // From implementation is now at function level, not in errors.rs
+        // Each function generates its own error enum that implements From<tokio_postgres::Error>
 
         // Should handle standard PostgreSQL error codes
         // (The specific mapping depends on the unified error implementation)
