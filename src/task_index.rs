@@ -1,10 +1,10 @@
 use crate::codegen::OID;
 use crate::config::{Config, TaskQueueConfig};
 use crate::ident::{sql_to_rs_string, CaseType};
+use crate::pg_type::PgType;
 use crate::ty_index::TypeIndex;
 use anyhow::Context;
 use itertools::Itertools;
-use log::warn;
 use postgres::Client;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -19,6 +19,7 @@ pub struct TaskType {
     pub task_name: String,
     pub type_oid: OID,
     pub fields: Vec<TaskField>,
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +80,7 @@ impl TaskIndex {
 
                 let task_name: String = row.try_get("task_name")?;
                 let type_oid: u32 = row.try_get("type_oid")?;
+                let type_comment: Option<String> = row.try_get("type_comment")?;
                 let fields_json: Value = row.try_get("fields")?;
 
                 eprintln!("[PGRPC] Row {}: Processing task type '{}' (OID: {})", row_idx, task_name, type_oid);
@@ -145,6 +147,7 @@ impl TaskIndex {
                         task_name,
                         type_oid,
                         fields,
+                        comment: type_comment,
                     }
                 ))
             })
@@ -388,6 +391,11 @@ fn generate_payload_struct(
         task_type.fields.len()
     );
 
+    // Parse bulk not null annotations from type-level comment
+    let bulk_not_null_columns = crate::pg_type::parse_bulk_not_null_columns(&task_type.comment);
+    eprintln!("[PGRPC] Task type comment: {:?}", task_type.comment);
+    eprintln!("[PGRPC] Bulk not null columns: {:?}", bulk_not_null_columns);
+
     // Debug: print all fields
     for (idx, field) in task_type.fields.iter().enumerate() {
         eprintln!("[PGRPC]   Field {}: name='{}', type_oid={}, postgres_type='{}', not_null={}, comment={:?}",
@@ -406,10 +414,13 @@ fn generate_payload_struct(
                 referenced_schemas.extend(schemas);
 
                 // Apply nullability logic consistent with existing composite types
-                // Fields are nullable by default, unless they have @pgrpc_not_null comment
+                // Fields are nullable by default, unless they have:
+                // 1. @pgrpc_not_null in their field-level comment OR
+                // 2. Their name is in the bulk_not_null_columns set from type-level comment
                 let is_nullable = !field.comment
                     .as_ref()
-                    .is_some_and(|c| c.contains("@pgrpc_not_null"));
+                    .is_some_and(|c| c.contains("@pgrpc_not_null"))
+                    && !bulk_not_null_columns.contains(&field.name);
 
                 if is_nullable {
                     quote! { Option<#type_tokens> }
@@ -420,7 +431,7 @@ fn generate_payload_struct(
                 // Use fallback mapping with proper nullability handling
                 eprintln!("[PGRPC]     Field '{}' (OID {}) NOT found in TypeIndex, using fallback mapping for '{}'",
                          field.name, field.type_oid, field.postgres_type);
-                generate_task_field_type(field, type_index)
+                generate_task_field_type(field, type_index, &bulk_not_null_columns)
             };
 
             quote! { pub #field_name: #rust_type }
@@ -465,16 +476,17 @@ fn generate_task_variant(
 }
 
 /// Generate Rust type for a task field, properly handling nullability and @pgrpc_not_null annotations
-fn generate_task_field_type(field: &TaskField, type_index: &TypeIndex) -> TokenStream {
+fn generate_task_field_type(field: &TaskField, type_index: &HashMap<OID, PgType>, bulk_not_null_columns: &HashSet<String>) -> TokenStream {
     // Determine if field should be nullable
     // Fields are nullable by default in PostgreSQL composite types
     // They become NOT nullable if:
     // 1. They have @pgrpc_not_null comment OR
-    // 2. PostgreSQL says not_null=true (but this is always false for composite type fields)
+    // 2. Their name is in the bulk_not_null_columns set from type-level comment
     let is_nullable = !field
         .comment
         .as_ref()
-        .is_some_and(|c| c.contains("@pgrpc_not_null"));
+        .is_some_and(|c| c.contains("@pgrpc_not_null"))
+        && !bulk_not_null_columns.contains(&field.name);
 
     // Get the base Rust type
     let base_type = if let Some(pg_type) = type_index.get(&field.type_oid) {
@@ -522,7 +534,6 @@ mod tests {
     use super::*;
     use crate::config::{Config, TaskQueueConfig};
     use crate::pg_type::PgType;
-    use crate::ty_index::TypeIndex;
     use serde_json::json;
 
     fn create_test_task_index() -> TaskIndex {
@@ -550,6 +561,7 @@ mod tests {
                     comment: None,
                 },
             ],
+            comment: None,
         };
 
         // Create a task type without fields (current problematic case)
@@ -557,6 +569,7 @@ mod tests {
             task_name: "shipment_created".to_string(),
             type_oid: 123457,
             fields: vec![], // This is what's currently happening
+            comment: None,
         };
 
         task_index.insert("send_verification_code".to_string(), task_with_fields);
@@ -566,12 +579,12 @@ mod tests {
     }
 
     fn create_test_type_index() -> HashMap<OID, PgType> {
-        let mut type_index = HashMap::new();
+        let mut type_map = HashMap::new();
 
         // Just add basic types - we don't need domain types for our test
-        type_index.insert(25, PgType::Text);
+        type_map.insert(25, PgType::Text);
 
-        type_index
+        type_map
     }
 
     fn create_test_config() -> Config {
@@ -748,6 +761,7 @@ mod tests {
                     comment: None,
                 },
             ],
+            comment: None,
         };
 
         // Test with minimal type_index - fields will use fallback mapping
@@ -798,6 +812,7 @@ mod tests {
             task_name: "send_verification_code".to_string(),
             type_oid: 123456,
             fields: vec![], // Fields don't matter for variant generation anymore
+            comment: None,
         };
 
         // Directly test the variant generation
@@ -913,5 +928,61 @@ mod tests {
             null_fields_json.is_null(),
             "Null JSON should be detected as null"
         );
+    }
+
+    #[test]
+    fn test_bulk_not_null_annotation_for_tasks() {
+        let task_type = TaskType {
+            task_name: "create_authorization".to_string(),
+            type_oid: 123458,
+            fields: vec![
+                TaskField {
+                    name: "payment_method_id".to_string(),
+                    type_oid: 25, // text
+                    postgres_type: "text".to_string(),
+                    position: 1,
+                    not_null: false,
+                    comment: None,
+                },
+                TaskField {
+                    name: "stripe_customer_id".to_string(),
+                    type_oid: 25, // text
+                    postgres_type: "text".to_string(),
+                    position: 2,
+                    not_null: false,
+                    comment: None,
+                },
+                TaskField {
+                    name: "optional_field".to_string(),
+                    type_oid: 25, // text
+                    postgres_type: "text".to_string(),
+                    position: 3,
+                    not_null: false,
+                    comment: None,
+                },
+            ],
+            comment: Some("Task payload for creating payment authorization when setup intent succeeds... @pgrpc_not_null(payment_method_id, stripe_customer_id)".to_string()),
+        };
+
+        // Parse bulk not null columns
+        let bulk_not_null_columns = crate::pg_type::parse_bulk_not_null_columns(&task_type.comment);
+        assert!(bulk_not_null_columns.contains("payment_method_id"));
+        assert!(bulk_not_null_columns.contains("stripe_customer_id"));
+        assert!(!bulk_not_null_columns.contains("optional_field"));
+
+        // Test field nullability logic
+        let type_index = create_test_type_index();
+        for field in &task_type.fields {
+            let rust_type = generate_task_field_type(field, &type_index, &bulk_not_null_columns);
+            let type_str = rust_type.to_string();
+            
+            if field.name == "payment_method_id" || field.name == "stripe_customer_id" {
+                assert!(!type_str.contains("Option"), 
+                    "Field {} should not be Option because it's in bulk_not_null_columns", field.name);
+            } else {
+                assert!(type_str.contains("Option"), 
+                    "Field {} should be Option because it's not in bulk_not_null_columns", field.name);
+            }
+        }
     }
 }

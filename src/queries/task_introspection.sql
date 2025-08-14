@@ -4,7 +4,8 @@ WITH task_types AS (
     SELECT 
         t.typname as task_name,
         t.oid as type_oid,
-        t.typrelid
+        t.typrelid,
+        obj_description(t.oid, 'pg_type') as type_comment
     FROM pg_type t
     WHERE t.typnamespace = (
         SELECT oid FROM pg_namespace WHERE nspname = $1  -- task schema name
@@ -14,6 +15,7 @@ WITH task_types AS (
 SELECT 
     tt.task_name,
     tt.type_oid,
+    tt.type_comment,
     COALESCE(
         json_agg(
             CASE 
@@ -37,5 +39,5 @@ LEFT JOIN pg_attribute a ON a.attrelid = tt.typrelid
     AND a.attnum > 0
     AND NOT a.attisdropped
 LEFT JOIN pg_description d ON d.objoid = tt.typrelid AND d.objsubid = a.attnum
-GROUP BY tt.task_name, tt.type_oid
+GROUP BY tt.task_name, tt.type_oid, tt.type_comment
 ORDER BY tt.task_name;

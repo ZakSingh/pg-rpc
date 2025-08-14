@@ -168,13 +168,34 @@ impl TypeIndex {
 
                             // Update the type's field nullability
                             if let Some(pg_type) = self.0.get_mut(oid) {
-                                if let PgType::Composite { fields, .. } = pg_type {
+                                if let PgType::Composite { fields, comment, .. } = pg_type {
+                                    // Parse type-level bulk not null annotations
+                                    let bulk_not_null_columns = crate::pg_type::parse_bulk_not_null_columns(comment);
+                                    
                                     for field in fields.iter_mut() {
-                                        if let Some(&is_not_null) = nullability_map.get(&field.name)
-                                        {
+                                        // Check for column-level @pgrpc_not_null annotation (highest priority)
+                                        let has_column_annotation = field.comment
+                                            .as_ref()
+                                            .is_some_and(|c| c.contains("@pgrpc_not_null"));
+                                        
+                                        // Check for type-level bulk annotation
+                                        let has_bulk_annotation = bulk_not_null_columns.contains(&field.name);
+                                        
+                                        // Apply annotations or inferred nullability
+                                        if has_column_annotation || has_bulk_annotation {
+                                            // Annotations take precedence over inference
+                                            if field.nullable {
+                                                log::info!(
+                                                    "Updating field {} to NOT NULL due to annotation",
+                                                    field.name
+                                                );
+                                                field.nullable = false;
+                                            }
+                                        } else if let Some(&is_not_null) = nullability_map.get(&field.name) {
+                                            // Use inferred nullability if no annotations
                                             if is_not_null && field.nullable {
                                                 log::info!(
-                                                    "Updating field {} to NOT NULL",
+                                                    "Updating field {} to NOT NULL based on inference",
                                                     field.name
                                                 );
                                                 field.nullable = false;

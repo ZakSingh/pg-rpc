@@ -10,8 +10,29 @@ use postgres::Row;
 use postgres_types::FromSql;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+
+/// Parse @pgrpc_not_null(col1, col2, ...) annotations from a comment
+pub fn parse_bulk_not_null_columns(comment: &Option<String>) -> HashSet<String> {
+    let mut columns = HashSet::new();
+    if let Some(comment_text) = comment {
+        // Match @pgrpc_not_null(col1, col2, col3) pattern
+        let re = Regex::new(r"@pgrpc_not_null\(([^)]+)\)").unwrap();
+        for cap in re.captures_iter(comment_text) {
+            // Split the column list by comma and trim whitespace
+            let cols_str = &cap[1];
+            for col in cols_str.split(',') {
+                let col = col.trim();
+                if !col.is_empty() {
+                    columns.insert(col.to_string());
+                }
+            }
+        }
+    }
+    columns
+}
 
 // Temporarily inline flatten types until module import is resolved
 #[derive(Debug, Clone)]
@@ -432,6 +453,9 @@ impl TryFrom<Row> for PgType {
                         view_definition,
                     }
                 } else {
+                    // Parse type-level bulk not null annotations
+                    let bulk_not_null_columns = parse_bulk_not_null_columns(&comment);
+                    
                     PgType::Composite {
                         schema,
                         name,
@@ -442,17 +466,22 @@ impl TryFrom<Row> for PgType {
                             t.get::<&str, Vec<bool>>("composite_field_nullables"),
                             t.get::<&str, Vec<Option<String>>>("composite_field_comments")
                         )
-                        .map(|(name, ty, nullable, comment)| PgField {
-                            name: name.to_string(),
-                            type_oid: ty,
-                            nullable: nullable
-                                && !comment
-                                    .as_ref()
-                                    .is_some_and(|c| c.contains("@pgrpc_not_null")),
-                            comment: comment.clone(),
-                            flatten: comment
+                        .map(|(name, ty, nullable, comment)| {
+                            let field_name = name.to_string();
+                            let is_bulk_not_null = bulk_not_null_columns.contains(&field_name);
+                            let is_column_not_null = comment
                                 .as_ref()
-                                .is_some_and(|c| c.contains("@pgrpc_flatten")),
+                                .is_some_and(|c| c.contains("@pgrpc_not_null"));
+                            
+                            PgField {
+                                name: field_name,
+                                type_oid: ty,
+                                nullable: nullable && !is_column_not_null && !is_bulk_not_null,
+                                comment: comment.clone(),
+                                flatten: comment
+                                    .as_ref()
+                                    .is_some_and(|c| c.contains("@pgrpc_flatten")),
+                            }
                         })
                         .collect(),
                         relkind: relkind.map(|c| c.to_string()),
@@ -805,7 +834,7 @@ impl ToRust for PgType {
                                 }
 
                                 fn accepts(ty: &postgres_types::Type) -> bool {
-                                    ty.name() == #name
+                                    ty.name() == #name || ty.name() == #pg_inner_name
                                 }
                             }
 
@@ -821,7 +850,7 @@ impl ToRust for PgType {
                                 }
 
                                 fn accepts(ty: &postgres_types::Type) -> bool {
-                                    ty.name() == #name
+                                    ty.name() == #name || ty.name() == #pg_inner_name
                                 }
 
                                 postgres_types::to_sql_checked!();
@@ -867,8 +896,8 @@ impl ToRust for PgType {
                                 }
 
                                 fn accepts(ty: &postgres_types::Type) -> bool {
-                                    // Match domain by name
-                                    ty.name() == #name
+                                    // Match domain by name or underlying composite type name
+                                    ty.name() == #name || ty.name() == #pg_inner_name
                                 }
                                 postgres_types::to_sql_checked!();
                             }
