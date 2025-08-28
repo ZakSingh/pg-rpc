@@ -2,7 +2,6 @@ use crate::codegen::OID;
 use crate::pg_id::PgId;
 use crate::pg_rel::PgRel;
 use anyhow::Context;
-use itertools::Itertools;
 use postgres::Client;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
@@ -37,7 +36,7 @@ impl RelIndex {
             .map(|row| {
                 Ok::<_, postgres::Error>((row.try_get::<_, u32>("oid")?, PgRel::try_from(row)?))
             })
-            .try_collect()?;
+            .collect::<Result<HashMap<_, _>, _>>()?;
 
         Ok(Self(relations))
     }

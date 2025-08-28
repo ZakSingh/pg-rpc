@@ -1,5 +1,3 @@
-#![feature(iterator_try_collect)]
-
 use crate::codegen::codegen_split;
 use crate::config::{Config, TaskQueueConfig};
 use crate::db::Db;

@@ -4,7 +4,6 @@ use crate::ident::{sql_to_rs_ident, CaseType};
 use crate::ty_index::TypeIndex;
 use anyhow::Context;
 use heck::ToPascalCase;
-use itertools::Itertools;
 use postgres::Client;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -103,7 +102,7 @@ impl ErrorTypeIndex {
                     },
                 ))
             })
-            .try_collect()?;
+            .collect::<Result<HashMap<_, _>, _>>()?;
 
         Ok(Self(error_types))
     }

@@ -4,7 +4,6 @@ use crate::ident::{sql_to_rs_string, CaseType};
 use crate::pg_type::PgType;
 use crate::ty_index::TypeIndex;
 use anyhow::Context;
-use itertools::Itertools;
 use postgres::Client;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -151,7 +150,7 @@ impl TaskIndex {
                     }
                 ))
             })
-            .try_collect()?;
+            .collect::<Result<HashMap<_, _>, _>>()?;
 
         eprintln!(
             "[PGRPC] Found {} task types in schema '{}'",

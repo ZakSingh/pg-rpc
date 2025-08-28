@@ -216,7 +216,7 @@ fn get_raised_sql_states_and_custom_errors(
                 })
                 .ok_or_else(|| anyhow!("Failed to parse sql state"))
         })
-        .try_collect()?;
+        .collect::<Result<HashSet<_>, _>>()?;
 
     // add P0001 code if errors exist w/o code
     if err_count > sql_states.len() {
