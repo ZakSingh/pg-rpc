@@ -12,6 +12,7 @@ pub struct Config {
     pub task_queue: Option<TaskQueueConfig>,
     pub errors: Option<ErrorsConfig>,
     pub infer_view_nullability: bool,
+    pub disable_deserialize: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -40,7 +41,16 @@ impl Default for Config {
             task_queue: None,
             errors: None,
             infer_view_nullability: true,
+            disable_deserialize: Vec::new(),
         }
+    }
+}
+
+impl Config {
+    /// Check if a type should have Deserialize disabled
+    pub fn should_disable_deserialize(&self, schema: &str, type_name: &str) -> bool {
+        let full_name = format!("{}.{}", schema, type_name);
+        self.disable_deserialize.contains(&full_name)
     }
 }
 

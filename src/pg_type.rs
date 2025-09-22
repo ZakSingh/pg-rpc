@@ -590,6 +590,7 @@ impl ToRust for PgType {
         match self {
             PgType::Composite {
                 name,
+                schema,
                 comment,
                 fields,
                 ..
@@ -718,9 +719,15 @@ impl ToRust for PgType {
                     quote! {}
                 };
 
+                let deserialize_derive = if config.should_disable_deserialize(schema, name) {
+                    quote! {}
+                } else {
+                    quote! { serde::Deserialize, }
+                };
+
                 quote! {
                     #comment_macro
-                    #[derive(Clone, Debug, bon::Builder, serde::Serialize, serde::Deserialize, postgres_types::FromSql, postgres_types::ToSql)]
+                    #[derive(Clone, Debug, bon::Builder, serde::Serialize, #deserialize_derive postgres_types::FromSql, postgres_types::ToSql)]
                     #[postgres(name = #name)]
                     pub struct #rs_name {
                         #(#field_tokens),*
@@ -731,6 +738,7 @@ impl ToRust for PgType {
             }
             PgType::Domain {
                 name,
+                schema,
                 comment,
                 type_oid,
                 constraints,
@@ -742,6 +750,7 @@ impl ToRust for PgType {
                     PgType::Composite {
                         fields,
                         name: pg_inner_name,
+                        schema: _inner_schema,
                         ..
                     } => {
                         let rs_dom_name =
@@ -803,9 +812,15 @@ impl ToRust for PgType {
                             quote! {}
                         };
 
+                        let deserialize_derive = if config.should_disable_deserialize(schema, name) {
+                            quote! {}
+                        } else {
+                            quote! { serde::Deserialize, }
+                        };
+
                         quote! {
                             #comment_macro
-                            #[derive(Clone, Debug, bon::Builder, serde::Serialize, serde::Deserialize)]
+                            #[derive(Clone, Debug, bon::Builder, serde::Serialize, #deserialize_derive)]
                             pub struct #rs_name {
                                 #(#field_tokens),*
                             }
@@ -909,7 +924,13 @@ impl ToRust for PgType {
                         let (additional_derives, custom_impls) =
                             determine_domain_traits(pg_type, &rs_name);
 
-                        let base_derives = quote! { Debug, Clone, derive_more::Deref, serde::Serialize, serde::Deserialize, postgres_types::ToSql, postgres_types::FromSql };
+                        let deserialize_derive = if config.should_disable_deserialize(schema, name) {
+                            quote! {}
+                        } else {
+                            quote! { serde::Deserialize, }
+                        };
+
+                        let base_derives = quote! { Debug, Clone, derive_more::Deref, serde::Serialize, #deserialize_derive postgres_types::ToSql, postgres_types::FromSql };
                         let all_derives = if additional_derives.is_empty() {
                             base_derives
                         } else {
@@ -928,6 +949,7 @@ impl ToRust for PgType {
             }
             PgType::Enum {
                 name,
+                schema,
                 comment,
                 variants,
                 ..
@@ -952,9 +974,15 @@ impl ToRust for PgType {
                     quote! {}
                 };
 
+                let deserialize_derive = if config.should_disable_deserialize(schema, name) {
+                    quote! {}
+                } else {
+                    quote! { serde::Deserialize, }
+                };
+
                 quote! {
                     #comment_macro
-                    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, postgres_types::FromSql, postgres_types::ToSql, serde::Deserialize, serde::Serialize)]
+                    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, postgres_types::FromSql, postgres_types::ToSql, #deserialize_derive serde::Serialize)]
                     #[postgres(name = #name)]
                     pub enum #rs_enum_name {
                         #(#rs_variants),*

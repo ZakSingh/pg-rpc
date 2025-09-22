@@ -375,7 +375,7 @@ pub fn generate_task_enum(
 fn generate_payload_struct(
     task_type: &TaskType,
     type_index: &TypeIndex,
-    _config: &Config,
+    config: &Config,
 ) -> (TokenStream, std::collections::HashSet<String>) {
     let mut referenced_schemas = std::collections::HashSet::new();
     let struct_name = format_ident!(
@@ -439,8 +439,24 @@ fn generate_payload_struct(
 
     eprintln!("[PGRPC]   Generated {} field tokens", fields.len());
 
+    // Get the task queue schema from config
+    let task_schema = config
+        .task_queue
+        .as_ref()
+        .map(|tc| tc.schema.as_str())
+        .unwrap_or("tasks");
+
+    // Generate struct name in format that matches the pattern
+    let full_type_name = format!("{}.{}", task_schema, struct_name.to_string());
+    
+    let deserialize_derive = if config.should_disable_deserialize(task_schema, &struct_name.to_string()) {
+        quote! {}
+    } else {
+        quote! { serde::Deserialize, }
+    };
+
     let payload_struct = quote! {
-        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        #[derive(Debug, Clone, serde::Serialize, #deserialize_derive)]
         pub struct #struct_name {
             #(#fields),*
         }

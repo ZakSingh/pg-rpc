@@ -181,8 +181,21 @@ pub fn generate_error_payload_structs(
             })
             .collect();
 
+        // Get the error schema from config
+        let error_schema = config
+            .errors
+            .as_ref()
+            .map(|ec| ec.schema.as_str())
+            .unwrap_or("errors");
+        
+        let deserialize_derive = if config.should_disable_deserialize(error_schema, &struct_name.to_string()) {
+            quote! {}
+        } else {
+            quote! { serde::Deserialize, }
+        };
+
         structs.push(quote! {
-            #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+            #[derive(Debug, Clone, #deserialize_derive serde::Serialize)]
             pub struct #struct_name {
                 #(#fields),*
             }

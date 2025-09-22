@@ -46,6 +46,7 @@ pub struct PgrpcBuilder {
     task_queue: Option<TaskQueueConfig>,
     errors: Option<config::ErrorsConfig>,
     infer_view_nullability: bool,
+    disable_deserialize: Vec<String>,
 }
 
 impl Default for PgrpcBuilder {
@@ -66,6 +67,7 @@ impl PgrpcBuilder {
             task_queue: None,
             errors: None,
             infer_view_nullability: true,
+            disable_deserialize: Vec::new(),
         }
     }
 
@@ -183,6 +185,18 @@ impl PgrpcBuilder {
         self
     }
 
+    /// Add a type that should not have Deserialize derived
+    pub fn disable_deserialize(mut self, type_name: impl Into<String>) -> Self {
+        self.disable_deserialize.push(type_name.into());
+        self
+    }
+
+    /// Add multiple types that should not have Deserialize derived
+    pub fn disable_deserialize_types(mut self, types: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.disable_deserialize.extend(types.into_iter().map(Into::into));
+        self
+    }
+
     /// Load configuration from a TOML file
     pub fn from_config_file(config_path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let conf_str = fs::read_to_string(config_path)?;
@@ -197,6 +211,7 @@ impl PgrpcBuilder {
             task_queue: config.task_queue,
             errors: config.errors,
             infer_view_nullability: config.infer_view_nullability,
+            disable_deserialize: config.disable_deserialize,
         })
     }
 
@@ -234,6 +249,7 @@ impl PgrpcBuilder {
             task_queue: self.task_queue.clone(),
             errors: self.errors.clone(),
             infer_view_nullability: self.infer_view_nullability,
+            disable_deserialize: self.disable_deserialize.clone(),
         };
 
         let mut db = Db::new(&connection_string)?;
