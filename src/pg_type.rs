@@ -409,6 +409,8 @@ impl TryFrom<Row> for PgType {
                 "json" | "jsonb" => PgType::Json,
                 "geography" => PgType::Geography,
                 "geometry" => PgType::Geometry,
+                "tsvector" => PgType::Text,
+                "tsquery" => PgType::Text,
                 x => unimplemented!("base type not implemented {}", x),
             },
             'c' => {
