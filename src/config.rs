@@ -13,6 +13,7 @@ pub struct Config {
     pub errors: Option<ErrorsConfig>,
     pub infer_view_nullability: bool,
     pub disable_deserialize: Vec<String>,
+    pub queries: Option<QueriesConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -30,6 +31,12 @@ pub struct ErrorsConfig {
     pub raise_function: Option<String>,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct QueriesConfig {
+    /// Glob patterns for SQL query files
+    pub paths: Vec<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -42,6 +49,7 @@ impl Default for Config {
             errors: None,
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
+            queries: None,
         }
     }
 }

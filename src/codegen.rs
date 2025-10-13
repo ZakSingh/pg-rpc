@@ -431,3 +431,261 @@ fn collect_fn_refs(pg_fn: &PgFn, types: &TypeIndex) -> HashSet<String> {
 
     refs
 }
+
+/// Generate code for SQL query files
+pub fn codegen_queries(
+    query_index: &crate::query_index::QueryIndex,
+    type_index: &TypeIndex,
+    config: &Config,
+) -> TokenStream {
+    use crate::query_introspector::IntrospectedQuery;
+    use crate::sql_parser::QueryType;
+
+    let queries: Vec<&IntrospectedQuery> = query_index.values().collect();
+
+    let query_code: Vec<TokenStream> = queries
+        .iter()
+        .map(|query| generate_query_code(query, type_index, config))
+        .collect();
+
+    quote! {
+        #(#query_code)*
+    }
+}
+
+/// Generate code for a single query
+fn generate_query_code(
+    query: &crate::query_introspector::IntrospectedQuery,
+    type_index: &TypeIndex,
+    _config: &Config,
+) -> TokenStream {
+    use crate::ident::{sql_to_rs_ident, CaseType};
+
+    let fn_name = sql_to_rs_ident(&query.name, CaseType::Snake);
+    let sql = &query.sql;
+
+    // Generate parameter list
+    let params: Vec<TokenStream> = query
+        .params
+        .iter()
+        .map(|param| {
+            let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
+            let param_type = get_param_type(param.type_oid, type_index);
+            quote! { #param_name: #param_type }
+        })
+        .collect();
+
+    // Generate return type and query execution code
+    let (return_type, query_execution, row_struct) = match &query.query_type {
+        crate::sql_parser::QueryType::One => {
+            if let Some(columns) = &query.return_columns {
+                let struct_name_str = format!("{}Row", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
+                let struct_name = quote::format_ident!("{}", struct_name_str);
+                let row_struct = generate_row_struct(&struct_name, columns, type_index);
+
+                let return_type = quote! { Result<Option<#struct_name>, tokio_postgres::Error> };
+                let execution = quote! {
+                    let row = client.query_opt(query, &params).await?;
+                    match row {
+                        Some(row) => Ok(Some(row.try_into()?)),
+                        None => Ok(None),
+                    }
+                };
+
+                (return_type, execution, row_struct)
+            } else {
+                // Should not happen for :one queries
+                let return_type = quote! { Result<(), tokio_postgres::Error> };
+                let execution = quote! {
+                    client.execute(query, &params).await?;
+                    Ok(())
+                };
+                (return_type, execution, quote! {})
+            }
+        }
+        crate::sql_parser::QueryType::Many => {
+            if let Some(columns) = &query.return_columns {
+                let struct_name_str = format!("{}Row", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
+                let struct_name = quote::format_ident!("{}", struct_name_str);
+                let row_struct = generate_row_struct(&struct_name, columns, type_index);
+
+                let return_type = quote! { Result<Vec<#struct_name>, tokio_postgres::Error> };
+                let execution = quote! {
+                    let rows = client.query(query, &params).await?;
+                    rows.into_iter().map(|row| row.try_into()).collect()
+                };
+
+                (return_type, execution, row_struct)
+            } else {
+                // Should not happen for :many queries
+                let return_type = quote! { Result<Vec<()>, tokio_postgres::Error> };
+                let execution = quote! {
+                    let rows = client.query(query, &params).await?;
+                    Ok(vec![(); rows.len()])
+                };
+                (return_type, execution, quote! {})
+            }
+        }
+        crate::sql_parser::QueryType::Exec => {
+            let return_type = quote! { Result<(), tokio_postgres::Error> };
+            let execution = quote! {
+                client.execute(query, &params).await?;
+                Ok(())
+            };
+            (return_type, execution, quote! {})
+        }
+        crate::sql_parser::QueryType::ExecRows => {
+            let return_type = quote! { Result<u64, tokio_postgres::Error> };
+            let execution = quote! {
+                let rows_affected = client.execute(query, &params).await?;
+                Ok(rows_affected)
+            };
+            (return_type, execution, quote! {})
+        }
+    };
+
+    // Build parameter references for query call
+    let param_refs: Vec<TokenStream> = query
+        .params
+        .iter()
+        .map(|param| {
+            let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
+            // Check if we need to add a reference
+            if needs_reference(param.type_oid, type_index) {
+                quote! { &#param_name }
+            } else {
+                quote! { #param_name }
+            }
+        })
+        .collect();
+
+    // Generate doc comment with SQL
+    let doc_comment = format!("Query: {}\n\nSQL:\n```sql\n{}\n```", query.name, sql);
+
+    quote! {
+        #row_struct
+
+        #[doc = #doc_comment]
+        pub async fn #fn_name(
+            client: &impl deadpool_postgres::GenericClient,
+            #(#params),*
+        ) -> #return_type {
+            let query = #sql;
+            let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#param_refs),*];
+
+            #query_execution
+        }
+    }
+}
+
+/// Generate a row struct for query results
+fn generate_row_struct(
+    struct_name: &proc_macro2::Ident,
+    columns: &[crate::query_introspector::QueryColumn],
+    type_index: &TypeIndex,
+) -> TokenStream {
+    use crate::ident::{sql_to_rs_ident, CaseType};
+
+    let fields: Vec<TokenStream> = columns
+        .iter()
+        .map(|col| {
+            let field_name = quote::format_ident!("{}", sql_to_rs_ident(&col.name, CaseType::Snake).to_string());
+            let field_type = get_column_type(col, type_index);
+            quote! { pub #field_name: #field_type }
+        })
+        .collect();
+
+    let field_indices: Vec<usize> = (0..columns.len()).collect();
+    let field_names: Vec<proc_macro2::Ident> = columns
+        .iter()
+        .map(|col| quote::format_ident!("{}", sql_to_rs_ident(&col.name, CaseType::Snake).to_string()))
+        .collect();
+
+    quote! {
+        #[derive(Debug, Clone)]
+        pub struct #struct_name {
+            #(#fields),*
+        }
+
+        impl TryFrom<tokio_postgres::Row> for #struct_name {
+            type Error = tokio_postgres::Error;
+
+            fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                Ok(Self {
+                    #(
+                        #field_names: row.try_get(#field_indices)?,
+                    )*
+                })
+            }
+        }
+    }
+}
+
+/// Get Rust type for a parameter
+fn get_param_type(type_oid: OID, type_index: &TypeIndex) -> TokenStream {
+    if let Some(pg_type) = type_index.get(&type_oid) {
+        match pg_type {
+            PgType::Int16 => quote! { i16 },
+            PgType::Int32 => quote! { i32 },
+            PgType::Int64 => quote! { i64 },
+            PgType::Bool => quote! { bool },
+            PgType::Text => quote! { &str },
+            PgType::Enum { .. } => {
+                let type_ident = pg_type.to_rust_ident(type_index);
+                quote! { #type_ident }
+            }
+            _ => {
+                let type_ident = pg_type.to_rust_ident(type_index);
+                quote! { &#type_ident }
+            }
+        }
+    } else {
+        // Fallback for unknown types
+        quote! { &dyn postgres_types::ToSql }
+    }
+}
+
+/// Get Rust type for a column
+fn get_column_type(
+    column: &crate::query_introspector::QueryColumn,
+    type_index: &TypeIndex,
+) -> TokenStream {
+    if let Some(pg_type) = type_index.get(&column.type_oid) {
+        let base_type = match pg_type {
+            PgType::Int16 => quote! { i16 },
+            PgType::Int32 => quote! { i32 },
+            PgType::Int64 => quote! { i64 },
+            PgType::Bool => quote! { bool },
+            PgType::Text => quote! { String },
+            _ => {
+                let type_ident = pg_type.to_rust_ident(type_index);
+                quote! { #type_ident }
+            }
+        };
+
+        if column.nullable {
+            quote! { Option<#base_type> }
+        } else {
+            base_type
+        }
+    } else {
+        // Fallback for unknown types
+        if column.nullable {
+            quote! { Option<serde_json::Value> }
+        } else {
+            quote! { serde_json::Value }
+        }
+    }
+}
+
+/// Check if a parameter type needs a reference when passed to ToSql
+fn needs_reference(type_oid: OID, type_index: &TypeIndex) -> bool {
+    if let Some(pg_type) = type_index.get(&type_oid) {
+        !matches!(
+            pg_type,
+            PgType::Text | PgType::Enum { .. }
+        )
+    } else {
+        true
+    }
+}

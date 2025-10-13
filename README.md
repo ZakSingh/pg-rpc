@@ -312,6 +312,201 @@ TaskPayload::payload_column()      // Returns "data"
 - **Tagged Unions**: Serde's tagged union format for efficient JSON representation
 - **Flexible Configuration**: Customize table and column names to match existing systems
 
+## SQL Query Files
+
+PgRPC can generate type-safe Rust functions directly from SQL query files, similar to [sqlc](https://sqlc.dev/) for Go. This allows you to write SQL queries in `.sql` files and automatically generate Rust code with proper nullability analysis.
+
+### Setup
+
+1. **Create SQL query files with annotations:**
+
+```sql
+-- queries/authors.sql
+
+-- name: GetAuthor :one
+SELECT * FROM authors WHERE id = @author_id LIMIT 1;
+
+-- name: ListAuthors :many
+SELECT * FROM authors ORDER BY name;
+
+-- name: CreateAuthor :one
+INSERT INTO authors (name, bio)
+VALUES (@name, @bio)
+RETURNING *;
+
+-- name: UpdateAuthor :exec
+UPDATE authors
+SET name = @name, bio = @bio
+WHERE id = @author_id;
+
+-- name: DeleteAuthor :execrows
+DELETE FROM authors WHERE id = @author_id;
+```
+
+2. **Configure in `pgrpc.toml`:**
+
+```toml
+[queries]
+paths = ["queries/**/*.sql"]  # Glob patterns for SQL files
+```
+
+### Query Annotations
+
+**Format:** `-- name: FunctionName :type`
+
+**Query Types:**
+- `:one` - Returns `Result<Option<T>, Error>` for single row queries (uses `query_opt`)
+- `:many` - Returns `Result<Vec<T>, Error>` for multiple row queries (uses `query`)
+- `:exec` - Returns `Result<(), Error>` for commands with no return value
+- `:execrows` - Returns `Result<u64, Error>` for commands returning affected row count
+
+### Parameter Syntax
+
+**Named Parameters (Recommended):** Use `@param_name` for explicit parameter names:
+
+```sql
+-- name: GetUserByEmail :one
+SELECT id, name, email FROM users WHERE email = @user_email;
+```
+
+Generates:
+```rust
+pub async fn get_user_by_email(
+    client: &impl deadpool_postgres::GenericClient,
+    user_email: &str,
+) -> Result<Option<GetUserByEmailRow>, tokio_postgres::Error>
+```
+
+**Positional Parameters:** Use `$1, $2, ...` for PostgreSQL standard syntax:
+
+```sql
+-- name: UpdateUser :exec
+UPDATE users SET name = $1 WHERE id = $2;
+```
+
+Parameter names will be inferred from context or use `param_1`, `param_2` as fallbacks.
+
+### Nullability Analysis
+
+**Key Feature:** PgRPC applies its powerful nullability analysis to query results, including:
+
+- **Base Table Constraints:** NOT NULL constraints from table definitions
+- **JOIN Analysis:** LEFT/RIGHT/FULL JOINs make columns nullable
+- **View Analysis:** Queries referencing views inherit their nullability
+- **Expression Analysis:** COALESCE, CASE, aggregate functions, etc.
+
+**Example:**
+
+Given this view:
+```sql
+CREATE VIEW user_posts AS
+SELECT
+    u.id,
+    u.name,      -- NOT NULL in users table
+    p.title,     -- Can be NULL (LEFT JOIN + no constraint)
+    p.created_at
+FROM users u
+LEFT JOIN posts p ON u.id = p.user_id;
+```
+
+Query:
+```sql
+-- name: GetUserPosts :many
+SELECT id, name, title, created_at FROM user_posts;
+```
+
+Generated code with **accurate nullability**:
+```rust
+#[derive(Debug, Clone)]
+pub struct GetUserPostsRow {
+    pub id: i32,
+    pub name: String,              // NOT NULL (analyzed from base table)
+    pub title: Option<String>,     // Nullable (LEFT JOIN + no constraint)
+    pub created_at: Option<time::OffsetDateTime>, // Nullable
+}
+
+pub async fn get_user_posts(
+    client: &impl deadpool_postgres::GenericClient,
+) -> Result<Vec<GetUserPostsRow>, tokio_postgres::Error> {
+    // Generated implementation
+}
+```
+
+### Generated Code
+
+For each query, PgRPC generates:
+
+1. **Row Struct** (for `:one` and `:many` queries):
+   - Named after the query (e.g., `GetAuthorRow`)
+   - Fields with proper nullability from analysis
+   - `TryFrom<tokio_postgres::Row>` implementation
+
+2. **Async Function**:
+   - Named after the query in snake_case
+   - Accepts `&impl deadpool_postgres::GenericClient`
+   - Type-safe parameters
+   - Appropriate return type based on query type
+   - SQL included in doc comments
+
+**Example Generated Code:**
+
+```rust
+/// Query: GetAuthor
+///
+/// SQL:
+/// ```sql
+/// SELECT * FROM authors WHERE id = $1 LIMIT 1
+/// ```
+pub async fn get_author(
+    client: &impl deadpool_postgres::GenericClient,
+    author_id: i32,
+) -> Result<Option<GetAuthorRow>, tokio_postgres::Error> {
+    let query = "SELECT id, name, bio FROM authors WHERE id = $1 LIMIT 1";
+    let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![&author_id];
+
+    let row = client.query_opt(query, &params).await?;
+    match row {
+        Some(row) => Ok(Some(row.try_into()?)),
+        None => Ok(None),
+    }
+}
+```
+
+### Usage
+
+```rust
+use crate::generated::queries;
+
+// Query single row
+let author = queries::get_author(&client, 123).await?;
+if let Some(author) = author {
+    println!("Author: {}", author.name);
+}
+
+// Query multiple rows
+let authors = queries::list_authors(&client).await?;
+for author in authors {
+    println!("{}: {}", author.id, author.name);
+}
+
+// Execute command
+queries::delete_author(&client, 123).await?;
+
+// Execute with row count
+let deleted = queries::delete_author(&client, 123).await?;
+println!("Deleted {} rows", deleted);
+```
+
+### Benefits
+
+- **Type Safety:** Compile-time verification of query parameters and results
+- **Nullability Analysis:** Superior to most SQL generators - analyzes JOINs, views, expressions
+- **Named Parameters:** Clear, self-documenting parameter names with `@param`
+- **View Composition:** Queries on views get correct nullability transitively
+- **SQL First:** Write idiomatic SQL, not ORM abstractions
+- **Documentation:** SQL queries included in generated doc comments
+- **Incremental:** Works alongside function-based approach
+
 ## Justification
 
 Currently it is common to write a 'repository layer' for applications that handles persistence with the database.

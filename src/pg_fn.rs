@@ -1739,6 +1739,8 @@ mod test {
             task_queue: None,
             errors: None,
             infer_view_nullability: true,
+            disable_deserialize: Vec::new(),
+            queries: None,
         };
 
         // Generate the code
@@ -1816,6 +1818,8 @@ mod test {
             task_queue: None,
             errors: None,
             infer_view_nullability: true,
+            disable_deserialize: Vec::new(),
+            queries: None,
         };
 
         // Generate the code

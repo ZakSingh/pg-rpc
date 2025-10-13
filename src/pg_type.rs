@@ -1529,6 +1529,8 @@ mod tests {
             task_queue: None,
             errors: None,
             infer_view_nullability: true,
+            disable_deserialize: Vec::new(),
+            queries: None,
         };
 
         // Generate Rust code

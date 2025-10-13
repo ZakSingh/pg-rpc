@@ -1,5 +1,5 @@
 use crate::codegen::codegen_split;
-use crate::config::{Config, TaskQueueConfig};
+use crate::config::Config;
 use crate::db::Db;
 use crate::fn_index::FunctionIndex;
 use crate::rel_index::RelIndex;
@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+// Re-export public types for use in tests and external code
+pub use crate::config::{ErrorsConfig, QueriesConfig, TaskQueueConfig};
 
 mod codegen;
 mod config;
@@ -26,15 +29,18 @@ mod pg_fn;
 mod pg_id;
 mod pg_rel;
 mod pg_type;
-mod rel_index;
+pub mod query_index;
+pub mod query_introspector;
+pub mod rel_index;
+pub mod sql_parser;
 mod sql_state;
 pub(crate) mod task_index;
 mod tests;
 mod trigger_index;
-mod ty_index;
+pub mod ty_index;
 mod types;
 mod unified_error;
-mod view_nullability;
+pub mod view_nullability;
 
 /// Builder for configuring and running pgrpc code generation
 pub struct PgrpcBuilder {
@@ -47,6 +53,7 @@ pub struct PgrpcBuilder {
     errors: Option<config::ErrorsConfig>,
     infer_view_nullability: bool,
     disable_deserialize: Vec<String>,
+    queries: Option<config::QueriesConfig>,
 }
 
 impl Default for PgrpcBuilder {
@@ -68,6 +75,7 @@ impl PgrpcBuilder {
             errors: None,
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
+            queries: None,
         }
     }
 
@@ -197,6 +205,37 @@ impl PgrpcBuilder {
         self
     }
 
+    /// Configure SQL query files for code generation
+    pub fn queries_config(mut self, config: config::QueriesConfig) -> Self {
+        self.queries = Some(config);
+        self
+    }
+
+    /// Add a SQL query file path or glob pattern for code generation
+    ///
+    /// Can be called multiple times to add multiple paths.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use pgrpc::PgrpcBuilder;
+    ///
+    /// PgrpcBuilder::new()
+    ///     .connection_string("postgres://localhost/mydb")
+    ///     .schema("public")
+    ///     .query_path("queries/**/*.sql")
+    ///     .query_path("sql/queries/*.sql")
+    ///     .output_path("src/generated")
+    ///     .build()
+    ///     .expect("Failed to generate code");
+    /// ```
+    pub fn query_path(mut self, path: impl Into<String>) -> Self {
+        let queries_config = self.queries.get_or_insert_with(|| config::QueriesConfig {
+            paths: Vec::new(),
+        });
+        queries_config.paths.push(path.into());
+        self
+    }
+
     /// Load configuration from a TOML file
     pub fn from_config_file(config_path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let conf_str = fs::read_to_string(config_path)?;
@@ -212,6 +251,7 @@ impl PgrpcBuilder {
             errors: config.errors,
             infer_view_nullability: config.infer_view_nullability,
             disable_deserialize: config.disable_deserialize,
+            queries: config.queries,
         })
     }
 
@@ -250,6 +290,7 @@ impl PgrpcBuilder {
             errors: self.errors.clone(),
             infer_view_nullability: self.infer_view_nullability,
             disable_deserialize: self.disable_deserialize.clone(),
+            queries: self.queries.clone(),
         };
 
         let mut db = Db::new(&connection_string)?;
@@ -279,10 +320,44 @@ impl PgrpcBuilder {
             type_oids.extend(error_type_oids);
         }
 
+        // Build view nullability cache if enabled
+        // This will be shared between TypeIndex (for view types) and QueryIndex (for query analysis)
+        let view_nullability_cache = if config.infer_view_nullability {
+            build_view_nullability_cache(&mut db.client, &rel_index)?
+        } else {
+            view_nullability::ViewNullabilityCache::new()
+        };
+
+        // If queries are configured, parse and introspect to collect type OIDs
+        // We need a temporary TypeIndex for introspection, then rebuild with all OIDs
+        let query_index_opt = if let Some(queries_config) = &config.queries {
+            // Build a temporary type index with what we have so far
+            let temp_ty_index = TypeIndex::new(&mut db.client, type_oids.as_slice())?;
+
+            // Build query index using the shared view nullability cache
+            let query_index = query_index::QueryIndex::new(
+                &mut db.client,
+                &rel_index,
+                &temp_ty_index,
+                &view_nullability_cache,
+                queries_config,
+            )?;
+
+            // Collect query type OIDs
+            let query_type_oids = query_index.get_type_oids();
+            type_oids.extend(query_type_oids);
+
+            Some(query_index)
+        } else {
+            None
+        };
+
         let mut ty_index = TypeIndex::new(&mut db.client, type_oids.as_slice())?;
 
-        // Apply view nullability inference if enabled
-        ty_index.apply_view_nullability(&rel_index, config.infer_view_nullability)?;
+        // Apply view nullability inference using the pre-built cache
+        if config.infer_view_nullability {
+            ty_index.apply_view_nullability_from_cache(&view_nullability_cache)?;
+        }
 
         let schema_files = codegen_split(&fn_index, &ty_index, &rel_index, &config)?;
 
@@ -344,6 +419,26 @@ impl PgrpcBuilder {
                 }
                 Err(e) => {
                     eprintln!("Warning: Failed to generate custom error types: {}", e);
+                }
+            }
+        }
+
+        // Generate queries if configured
+        if let Some(query_index) = &query_index_opt {
+            if !query_index.is_empty() {
+                match generate_query_code(query_index, &ty_index, &config) {
+                    Ok(query_code) => {
+                        let query_file_path = output_path.join("queries.rs");
+                        if write_if_changed(&query_file_path, &query_code)? {
+                            files_written += 1;
+                        } else {
+                            files_unchanged += 1;
+                        }
+                        final_schema_files.insert("queries".to_string(), query_code);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to generate query code: {}", e);
+                    }
                 }
             }
         }
@@ -478,6 +573,171 @@ fn generate_mod_file(schema_files: &HashMap<String, String>) -> String {
         .collect();
 
     mod_declarations.join("\n") + "\n"
+}
+
+/// Build view nullability cache by analyzing all views in the database
+fn build_view_nullability_cache(
+    db: &mut postgres::Client,
+    rel_index: &RelIndex,
+) -> anyhow::Result<view_nullability::ViewNullabilityCache> {
+    use petgraph::algo::toposort;
+    use petgraph::graph::{DiGraph, NodeIndex};
+    use std::collections::{HashMap, HashSet};
+
+    log::info!("Building view nullability cache");
+
+    // Query all views from the database
+    let view_query = r#"
+        SELECT
+            n.nspname as schema,
+            c.relname as view_name,
+            pg_get_viewdef(c.oid) as view_definition,
+            array_agg(a.attname ORDER BY a.attnum) as column_names
+        FROM pg_class c
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        WHERE c.relkind IN ('v', 'm')
+        GROUP BY n.nspname, c.relname, c.oid
+    "#;
+
+    let rows = db.query(view_query, &[])?;
+
+    // Collect all views
+    let mut views: HashMap<(Option<String>, String), (String, Vec<String>)> = HashMap::new();
+
+    for row in rows {
+        let schema: String = row.get(0);
+        let view_name: String = row.get(1);
+        let view_def: String = row.get(2);
+        let column_names: Vec<String> = row.get(3);
+
+        let schema_opt = if schema == "public" {
+            None
+        } else {
+            Some(schema)
+        };
+
+        views.insert((schema_opt, view_name), (view_def, column_names));
+    }
+
+    log::info!("Found {} views to analyze", views.len());
+
+    if views.is_empty() {
+        return Ok(view_nullability::ViewNullabilityCache::new());
+    }
+
+    // Build dependency graph
+    let mut graph = DiGraph::new();
+    let mut node_map: HashMap<(Option<String>, String), NodeIndex> = HashMap::new();
+    let mut node_to_view: HashMap<NodeIndex, (Option<String>, String)> = HashMap::new();
+
+    // Add nodes
+    for view_key in views.keys() {
+        let node = graph.add_node(view_key.clone());
+        node_map.insert(view_key.clone(), node);
+        node_to_view.insert(node, view_key.clone());
+    }
+
+    // Create a temporary cache for dependency extraction
+    let temp_cache = view_nullability::ViewNullabilityCache::new();
+
+    // Add edges based on dependencies
+    for (view_key, (view_def, _columns)) in &views {
+        let analyzer = view_nullability::ViewNullabilityAnalyzer::new(rel_index, &temp_cache);
+
+        // Extract dependencies, but only consider views we're actually analyzing
+        if let Ok(raw_deps) = analyzer.extract_view_dependencies(view_def) {
+            // Filter to only include views that exist in our set
+            let deps: HashSet<_> = raw_deps
+                .into_iter()
+                .filter(|dep| views.contains_key(dep))
+                .collect();
+
+            log::debug!("View {:?} depends on: {:?}", view_key, deps);
+
+            let from_node = node_map[view_key];
+            for dep in deps {
+                if let Some(&to_node) = node_map.get(&dep) {
+                    // Add edge from dependency TO dependent (reversed for topological sort)
+                    graph.add_edge(to_node, from_node, ());
+                }
+            }
+        }
+    }
+
+    // Perform topological sort
+    let sorted_nodes = match toposort(&graph, None) {
+        Ok(nodes) => nodes,
+        Err(_) => {
+            log::warn!("Circular dependency detected in views, falling back to unordered analysis");
+            node_to_view.keys().cloned().collect()
+        }
+    };
+
+    // Analyze views in topological order
+    let mut nullability_cache = view_nullability::ViewNullabilityCache::new();
+
+    for node in sorted_nodes {
+        if let Some(view_key) = node_to_view.get(&node) {
+            if let Some((view_def, column_names)) = views.get(view_key) {
+                log::info!("Analyzing view {:?} in topological order", view_key);
+
+                let mut analyzer =
+                    view_nullability::ViewNullabilityAnalyzer::new(rel_index, &nullability_cache);
+
+                match analyzer.analyze_view(view_def, column_names) {
+                    Ok(nullability_map) => {
+                        log::info!(
+                            "View nullability analysis results for {:?}: {:?}",
+                            view_key,
+                            nullability_map
+                        );
+
+                        // Store in cache for dependent views
+                        nullability_cache.insert(view_key.clone(), nullability_map);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to analyze view nullability for {:?}: {}",
+                            view_key,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    log::info!(
+        "Built view nullability cache with {} entries",
+        nullability_cache.len()
+    );
+
+    Ok(nullability_cache)
+}
+
+/// Generate query code from parsed SQL files
+fn generate_query_code(
+    query_index: &query_index::QueryIndex,
+    ty_index: &TypeIndex,
+    config: &Config,
+) -> anyhow::Result<String> {
+    let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
+
+    let query_code_tokens = codegen::codegen_queries(query_index, ty_index, config);
+
+    let query_code = prettyplease::unparse(
+        &syn::parse2::<syn::File>(quote! {
+            use postgres_types::private::BytesMut;
+            use postgres_types::{IsNull, ToSql, Type};
+            use rust_decimal::Decimal;
+
+            #query_code_tokens
+        })
+        .expect("query code to parse"),
+    );
+
+    Ok(warning_ignores.to_string() + &query_code)
 }
 
 /// Write content to a file only if it has changed

@@ -1,0 +1,36 @@
+# Example pgrpc configuration with SQL query files
+# This demonstrates the sqlc-like query generation feature
+
+connection_string = "postgres://postgres:postgres@localhost:5432/mydb"
+output_path = "src/generated"
+schemas = ["public", "api"]
+
+# Enable view nullability inference for accurate Option<T> wrapping
+infer_view_nullability = true
+
+# Custom type mappings
+[types]
+ltree = "String"
+
+# Exception mappings
+[exceptions]
+P0001 = "Custom application error"
+
+# SQL Query Files Configuration
+# Queries are analyzed with the same powerful nullability analysis as views
+[queries]
+paths = [
+    "queries/**/*.sql",
+    "sql/queries/*.sql",
+]
+
+# Optional: Task queue configuration
+# [task_queue]
+# schema = "tasks"
+# task_name_column = "task_name"
+# payload_column = "payload"
+
+# Optional: Custom error types
+# [errors]
+# schema = "errors"
+# raise_function = "errors.raise_error"

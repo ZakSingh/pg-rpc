@@ -218,4 +218,90 @@ impl TypeIndex {
 
         Ok(())
     }
+
+    /// Apply view nullability from a pre-built cache
+    /// This is used when the cache has already been built separately (e.g., for sharing with queries)
+    pub fn apply_view_nullability_from_cache(
+        &mut self,
+        nullability_cache: &ViewNullabilityCache,
+    ) -> anyhow::Result<()> {
+        log::info!("Applying view nullability from pre-built cache");
+
+        // Find all view types
+        for (oid, pg_type) in self.0.iter_mut() {
+            if let PgType::Composite {
+                fields,
+                relkind,
+                name,
+                schema,
+                comment,
+                ..
+            } = pg_type
+            {
+                if let Some(ref kind) = relkind {
+                    if kind == "v" || kind == "m" {
+                        // This is a view or materialized view
+                        let schema_opt = if schema == "public" {
+                            None
+                        } else {
+                            Some(schema.clone())
+                        };
+
+                        let view_key = (schema_opt, name.clone());
+
+                        // Look up in cache
+                        if let Some(nullability_map) = nullability_cache.get(&view_key) {
+                            log::info!(
+                                "Applying cached nullability for view {:?}: {:?}",
+                                view_key,
+                                nullability_map
+                            );
+
+                            // Parse type-level bulk not null annotations
+                            let bulk_not_null_columns = crate::pg_type::parse_bulk_not_null_columns(comment);
+
+                            // Update field nullability
+                            for field in fields.iter_mut() {
+                                // Check for column-level @pgrpc_not_null annotation (highest priority)
+                                let has_column_annotation = field
+                                    .comment
+                                    .as_ref()
+                                    .is_some_and(|c| c.contains("@pgrpc_not_null"));
+
+                                // Check for type-level bulk annotation
+                                let has_bulk_annotation = bulk_not_null_columns.contains(&field.name);
+
+                                // Apply annotations or inferred nullability
+                                if has_column_annotation || has_bulk_annotation {
+                                    // Annotations take precedence over inference
+                                    if field.nullable {
+                                        log::info!(
+                                            "Updating field {}.{} to NOT NULL due to annotation",
+                                            name,
+                                            field.name
+                                        );
+                                        field.nullable = false;
+                                    }
+                                } else if let Some(&is_not_null) = nullability_map.get(&field.name) {
+                                    // Use inferred nullability if no annotations
+                                    if is_not_null && field.nullable {
+                                        log::info!(
+                                            "Updating field {}.{} to NOT NULL based on cached inference",
+                                            name,
+                                            field.name
+                                        );
+                                        field.nullable = false;
+                                    }
+                                }
+                            }
+                        } else {
+                            log::debug!("No cached nullability found for view {:?}", view_key);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }

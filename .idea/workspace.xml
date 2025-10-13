@@ -11,7 +11,7 @@
     </cargoProject>
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="945f98b6-7558-4dca-911e-a71f09b8ebf1" name="Changes" comment="">
+    <list default="true" id="945f98b6-7558-4dca-911e-a71f09b8ebf1" name="Changes" comment="basic support for tsvector/tsquery">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -249,11 +249,24 @@
       <workItem from="1753249736679" duration="27805000" />
       <workItem from="1754313671359" duration="2384000" />
       <workItem from="1758575835091" duration="3091000" />
-      <workItem from="1759027698959" duration="311000" />
+      <workItem from="1759027698959" duration="1172000" />
     </task>
+    <task id="LOCAL-00001" summary="basic support for tsvector/tsquery">
+      <option name="closed" value="true" />
+      <created>1759028278986</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1759028278986</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="basic support for tsvector/tsquery" />
+    <option name="LAST_COMMIT_MESSAGE" value="basic support for tsvector/tsquery" />
   </component>
 </project>
