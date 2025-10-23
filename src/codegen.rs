@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::exceptions::PgException;
 use crate::fn_index::FunctionIndex;
-use crate::pg_fn::PgFn;
+use crate::pg_fn::{param_needs_reference, PgFn};
 use crate::pg_type::PgType;
 use crate::rel_index::RelIndex;
 use crate::ty_index::TypeIndex;
@@ -551,7 +551,7 @@ fn generate_query_code(
         .map(|param| {
             let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
             // Check if we need to add a reference
-            if needs_reference(param.type_oid, type_index) {
+            if param_needs_reference(param.type_oid, type_index) {
                 quote! { &#param_name }
             } else {
                 quote! { #param_name }
@@ -675,17 +675,5 @@ fn get_column_type(
         } else {
             quote! { serde_json::Value }
         }
-    }
-}
-
-/// Check if a parameter type needs a reference when passed to ToSql
-fn needs_reference(type_oid: OID, type_index: &TypeIndex) -> bool {
-    if let Some(pg_type) = type_index.get(&type_oid) {
-        !matches!(
-            pg_type,
-            PgType::Text | PgType::Enum { .. }
-        )
-    } else {
-        true
     }
 }

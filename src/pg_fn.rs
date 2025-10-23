@@ -73,6 +73,22 @@ fn parse_out_param_not_null_annotations(comment: &Option<String>) -> HashSet<Str
     not_null_params
 }
 
+/// Returns whether a parameter with this type needs an additional `&` when passed to the params vector.
+///
+/// For parameters declared as reference types (like `&str`), we need to add another `&` to create
+/// the correct type for the ToSql trait. For example, a `&str` parameter becomes `&&str` in the
+/// params vector because `ToSql` is implemented for `&str`, not `str`.
+pub fn param_needs_reference(type_oid: OID, types: &HashMap<OID, PgType>) -> bool {
+    match types.get(&type_oid) {
+        Some(PgType::Int16) | Some(PgType::Int32) | Some(PgType::Int64)
+        | Some(PgType::Bool) => true, // Primitive types need refs
+        Some(PgType::Text) => true, // Function param is &str, need &&str for ToSql vector
+        Some(PgType::Enum { .. }) => true, // Enums are passed by value, need reference
+        Some(_) => true,            // Domain types, composite types need references for ToSql
+        None => true,               // Unknown types (like std::net::IpAddr) need references
+    }
+}
+
 impl PgArg {
     pub fn rs_name(&self) -> TokenStream {
         // Strip 'p_' prefix if present for cleaner Rust parameter names
@@ -86,14 +102,7 @@ impl PgArg {
 
     /// Returns whether this argument needs an additional `&` when passed to the params vector
     pub fn needs_reference(&self, types: &HashMap<OID, PgType>) -> bool {
-        match types.get(&self.type_oid) {
-            Some(PgType::Int16) | Some(PgType::Int32) | Some(PgType::Int64)
-            | Some(PgType::Bool) => true, // Primitive types need refs
-            Some(PgType::Text) => true, // Function param is &str, need &&str for ToSql vector
-            Some(PgType::Enum { .. }) => true, // Enums are passed by value, need reference
-            Some(_) => true,            // Domain types, composite types need references for ToSql
-            None => true,               // Unknown types (like std::net::IpAddr) need references
-        }
+        param_needs_reference(self.type_oid, types)
     }
 
     /// Returns the appropriate reference for this argument in the params vector
