@@ -166,6 +166,9 @@ impl<'a> QueryIntrospector<'a> {
             .as_nanos();
         let view_name = format!("_pgrpc_introspect_{}", timestamp);
 
+        log::debug!("[INTROSPECT] View name: {}", view_name);
+        log::debug!("[INTROSPECT] Original SQL: {}", sql);
+
         // Begin a transaction for temp view
         self.client.execute("BEGIN", &[])?;
 
@@ -175,11 +178,15 @@ impl<'a> QueryIntrospector<'a> {
             .unwrap()
             .replace_all(sql, "NULL::unknown");
 
+        log::debug!("[INTROSPECT] SQL with params replaced: {}", sql_without_params);
+
         // Create temporary view
         let create_view_sql = format!("CREATE TEMP VIEW {} AS {}", view_name, sql_without_params);
         self.client
             .execute(&create_view_sql, &[])
             .with_context(|| format!("Failed to create temp view for introspection: {}", create_view_sql))?;
+
+        log::debug!("[INTROSPECT] Temporary view created successfully");
 
         // Query column information from PostgreSQL catalogs
         // Using pg_attribute instead of information_schema to properly handle temporary views
@@ -198,11 +205,15 @@ impl<'a> QueryIntrospector<'a> {
 
         let rows = self.client.query(columns_query, &[&view_name])?;
 
+        log::debug!("[INTROSPECT] pg_attribute query returned {} rows", rows.len());
+
         let mut columns = Vec::new();
         for row in rows {
             let column_name: String = row.get(0);
             let type_oid: OID = row.get(1);
             let is_nullable: bool = row.get(2);
+
+            log::debug!("[INTROSPECT] Found column: {} (OID: {}, nullable: {})", column_name, type_oid, is_nullable);
 
             columns.push(QueryColumn {
                 name: column_name,
@@ -211,14 +222,18 @@ impl<'a> QueryIntrospector<'a> {
             });
         }
 
+        log::debug!("[INTROSPECT] Total columns collected: {}", columns.len());
+
         // Drop the temporary view and rollback
         self.client.execute(&format!("DROP VIEW {}", view_name), &[])?;
         self.client.execute("ROLLBACK", &[])?;
 
         // Apply nullability analysis if we have a SELECT query
         if let Some(refined_columns) = self.refine_nullability(sql, &columns)? {
+            log::debug!("[INTROSPECT] After refine_nullability: {} columns", refined_columns.len());
             Ok(refined_columns)
         } else {
+            log::debug!("[INTROSPECT] No refinement applied, returning {} columns", columns.len());
             Ok(columns)
         }
     }

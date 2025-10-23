@@ -498,3 +498,89 @@ fn test_multiple_query_files() {
         assert!(generated_code.contains("pub async fn get_post"));
     });
 }
+
+#[test]
+fn test_query_with_joins_and_type_casts() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create test tables similar to the shipping query structure
+        client.execute(
+            "CREATE TABLE users (
+                id SERIAL PRIMARY KEY,
+                username TEXT NOT NULL,
+                email TEXT NOT NULL
+            )",
+            &[],
+        ).unwrap();
+
+        client.execute(
+            "CREATE TABLE posts (
+                id SERIAL PRIMARY KEY,
+                user_id INT NOT NULL REFERENCES users(id),
+                title TEXT NOT NULL,
+                content TEXT
+            )",
+            &[],
+        ).unwrap();
+
+        client.execute(
+            "CREATE TABLE comments (
+                id SERIAL PRIMARY KEY,
+                post_id INT NOT NULL REFERENCES posts(id),
+                user_id INT NOT NULL REFERENCES users(id),
+                comment_text TEXT NOT NULL
+            )",
+            &[],
+        ).unwrap();
+
+        // Create temporary SQL file with a query similar to the shipping query
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // Query with JOINs, type casts, and aliases - mimics the shipping query structure
+        let sql = r#"
+-- name: GetPostDetails :one
+SELECT
+    p.title::text AS post_title,
+    u.username::text AS author_name,
+    u.email::text AS author_email,
+    c.comment_text::text AS latest_comment
+FROM posts p
+INNER JOIN users u ON u.id = p.user_id
+LEFT JOIN comments c ON c.post_id = p.id
+WHERE p.id = $1;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        // Generate code
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        // Read generated queries.rs file
+        let queries_file = output_dir.join("queries.rs");
+        assert!(queries_file.exists(), "queries.rs should be generated");
+
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE ===\n{}\n======================", generated_code);
+
+        // Verify the struct is NOT empty
+        assert!(generated_code.contains("struct GetPostDetailsRow"), "Should generate GetPostDetailsRow struct");
+
+        // Check for struct fields - this is where the bug would manifest
+        assert!(generated_code.contains("pub post_title:"), "Struct should have post_title field");
+        assert!(generated_code.contains("pub author_name:"), "Struct should have author_name field");
+        assert!(generated_code.contains("pub author_email:"), "Struct should have author_email field");
+        assert!(generated_code.contains("pub latest_comment:"), "Struct should have latest_comment field");
+    });
+}
