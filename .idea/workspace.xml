@@ -11,7 +11,9 @@
     </cargoProject>
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="945f98b6-7558-4dca-911e-a71f09b8ebf1" name="Changes" comment="basic support for tsvector/tsquery" />
+    <list default="true" id="945f98b6-7558-4dca-911e-a71f09b8ebf1" name="Changes" comment="basic support for tsvector/tsquery">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -248,7 +250,7 @@
       <workItem from="1754313671359" duration="2384000" />
       <workItem from="1758575835091" duration="3091000" />
       <workItem from="1759027698959" duration="1172000" />
-      <workItem from="1761194963848" duration="3756000" />
+      <workItem from="1761194963848" duration="4943000" />
     </task>
     <task id="LOCAL-00001" summary="basic support for tsvector/tsquery">
       <option name="closed" value="true" />

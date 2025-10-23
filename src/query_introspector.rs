@@ -12,6 +12,7 @@ pub struct QueryParam {
     pub name: String,
     pub type_oid: OID,
     pub position: usize,
+    pub nullable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -84,17 +85,21 @@ impl<'a> QueryIntrospector<'a> {
         // Get parameter types from pg_prepared_statements
         let param_types = self.get_parameter_types(&stmt_name)?;
 
-        // Determine parameter names
-        let param_names = self.determine_parameter_names(&parsed.parameters, &parsed.postgres_sql, param_types.len())?;
+        // Determine parameter names and nullable flags
+        let param_info = self.determine_parameter_info(&parsed.parameters, &parsed.postgres_sql, param_types.len())?;
 
         // Build parameter list
         let params: Vec<QueryParam> = param_types
             .into_iter()
             .enumerate()
-            .map(|(i, type_oid)| QueryParam {
-                name: param_names.get(i).cloned().unwrap_or_else(|| format!("param_{}", i + 1)),
-                type_oid,
-                position: i + 1,
+            .map(|(i, type_oid)| {
+                let (name, nullable) = param_info.get(i).cloned().unwrap_or_else(|| (format!("param_{}", i + 1), false));
+                QueryParam {
+                    name,
+                    type_oid,
+                    position: i + 1,
+                    nullable,
+                }
             })
             .collect();
 
@@ -386,39 +391,47 @@ impl<'a> QueryIntrospector<'a> {
         Ok(row.get(0))
     }
 
-    /// Determine parameter names from specs, inference, or fallback
-    fn determine_parameter_names(
+    /// Determine parameter names and nullable flags from specs, inference, or fallback
+    fn determine_parameter_info(
         &self,
         param_specs: &[ParameterSpec],
         sql: &str,
         param_count: usize,
-    ) -> Result<Vec<String>> {
-        let mut names = Vec::new();
+    ) -> Result<Vec<(String, bool)>> {
+        let mut param_info = Vec::new();
 
         for i in 0..param_count {
             let position = i + 1;
 
-            // Priority 1: Check for explicit @name
-            if let Some(ParameterSpec::Named { name, position: p }) =
-                param_specs.iter().find(|s| {
-                    matches!(s, ParameterSpec::Named { position: pos, .. } if *pos == position)
-                })
-            {
-                names.push(name.clone());
+            // Priority 1: Check for explicit @name or @name?
+            if let Some(param_spec) = param_specs.iter().find(|s| match s {
+                ParameterSpec::Named { position: pos, .. } => *pos == position,
+                ParameterSpec::Positional { position: pos, .. } => *pos == position,
+            }) {
+                let (name, nullable) = match param_spec {
+                    ParameterSpec::Named { name, nullable, .. } => (name.clone(), *nullable),
+                    ParameterSpec::Positional { nullable, .. } => {
+                        // For positional, try to infer name, otherwise use fallback
+                        let inferred_name = self.infer_param_name_from_ast(sql, position)
+                            .unwrap_or_else(|| format!("param_{}", position));
+                        (inferred_name, *nullable)
+                    }
+                };
+                param_info.push((name, nullable));
                 continue;
             }
 
-            // Priority 2: Try AST inference
+            // Priority 2: Try AST inference (no spec found)
             if let Some(inferred_name) = self.infer_param_name_from_ast(sql, position) {
-                names.push(inferred_name);
+                param_info.push((inferred_name, false));
                 continue;
             }
 
             // Priority 3: Fallback
-            names.push(format!("param_{}", position));
+            param_info.push((format!("param_{}", position), false));
         }
 
-        Ok(names)
+        Ok(param_info)
     }
 
     /// Infer parameter name from SQL AST by finding column_name = $N patterns

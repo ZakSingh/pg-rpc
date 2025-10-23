@@ -470,7 +470,7 @@ fn generate_query_code(
         .iter()
         .map(|param| {
             let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
-            let param_type = get_param_type(param.type_oid, type_index);
+            let param_type = get_param_type(param.type_oid, type_index, param.nullable);
             quote! { #param_name: #param_type }
         })
         .collect();
@@ -550,11 +550,18 @@ fn generate_query_code(
         .iter()
         .map(|param| {
             let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
-            // Check if we need to add a reference
-            if param_needs_reference(param.type_oid, type_index) {
+
+            if param.nullable {
+                // For nullable parameters, Option<T> implements ToSql, so always use reference
+                // This handles both Option<&T> and Option<T>
                 quote! { &#param_name }
             } else {
-                quote! { #param_name }
+                // For non-nullable, check if we need to add a reference
+                if param_needs_reference(param.type_oid, type_index) {
+                    quote! { &#param_name }
+                } else {
+                    quote! { #param_name }
+                }
             }
         })
         .collect();
@@ -622,8 +629,8 @@ fn generate_row_struct(
 }
 
 /// Get Rust type for a parameter
-fn get_param_type(type_oid: OID, type_index: &TypeIndex) -> TokenStream {
-    if let Some(pg_type) = type_index.get(&type_oid) {
+fn get_param_type(type_oid: OID, type_index: &TypeIndex, nullable: bool) -> TokenStream {
+    let base_type = if let Some(pg_type) = type_index.get(&type_oid) {
         match pg_type {
             PgType::Int16 => quote! { i16 },
             PgType::Int32 => quote! { i32 },
@@ -642,6 +649,12 @@ fn get_param_type(type_oid: OID, type_index: &TypeIndex) -> TokenStream {
     } else {
         // Fallback for unknown types
         quote! { &dyn postgres_types::ToSql }
+    };
+
+    if nullable {
+        quote! { Option<#base_type> }
+    } else {
+        base_type
     }
 }
 

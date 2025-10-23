@@ -25,9 +25,10 @@ UPDATE users SET name = @name, email = @email WHERE id = @user_id;
     assert_eq!(get_user.query_type, pgrpc::sql_parser::QueryType::One);
     assert_eq!(get_user.parameters.len(), 1);
 
-    if let pgrpc::sql_parser::ParameterSpec::Named { name, position } = &get_user.parameters[0] {
+    if let pgrpc::sql_parser::ParameterSpec::Named { name, position, nullable } = &get_user.parameters[0] {
         assert_eq!(name, "user_id");
         assert_eq!(*position, 1);
+        assert_eq!(*nullable, false);
     } else {
         panic!("Expected named parameter");
     }
@@ -45,7 +46,10 @@ UPDATE users SET name = @name, email = @email WHERE id = @user_id;
     // Parameters should be in order: name, email, user_id
     let param_names: Vec<String> = update_user.parameters.iter().map(|p| {
         match p {
-            pgrpc::sql_parser::ParameterSpec::Named { name, .. } => name.clone(),
+            pgrpc::sql_parser::ParameterSpec::Named { name, nullable, .. } => {
+                assert_eq!(*nullable, false);
+                name.clone()
+            },
             _ => panic!("Expected named parameter"),
         }
     }).collect();
@@ -582,5 +586,80 @@ WHERE p.id = $1;
         assert!(generated_code.contains("pub author_name:"), "Struct should have author_name field");
         assert!(generated_code.contains("pub author_email:"), "Struct should have author_email field");
         assert!(generated_code.contains("pub latest_comment:"), "Struct should have latest_comment field");
+    });
+}
+
+/// Test nullable parameter syntax and code generation
+#[test]
+fn test_nullable_parameters() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create test table
+        client.execute(
+            "CREATE TABLE users (
+                id SERIAL PRIMARY KEY,
+                username TEXT NOT NULL,
+                email TEXT,
+                age INT
+            )",
+            &[],
+        ).unwrap();
+
+        // Insert test data
+        client.execute(
+            "INSERT INTO users (username, email, age) VALUES
+             ('alice', 'alice@example.com', 30),
+             ('bob', NULL, 25),
+             ('charlie', 'charlie@example.com', NULL)",
+            &[],
+        ).unwrap();
+
+        // Create temporary SQL file with nullable parameters
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        let sql = r#"
+-- name: FindUsers :many
+SELECT id, username, email, age
+FROM users
+WHERE (email = @email? OR @email? IS NULL)
+  AND (age = @age? OR @age? IS NULL);
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        // Generate code
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        // Read generated queries.rs file
+        let queries_file = output_dir.join("queries.rs");
+        assert!(queries_file.exists(), "queries.rs should be generated");
+
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE ===\n{}\n======================", generated_code);
+
+        // Verify nullable parameters are Option types
+        assert!(generated_code.contains("email: Option<&str>"), "email parameter should be Option<&str>");
+        assert!(generated_code.contains("age: Option<i32>"), "age parameter should be Option<i32>");
+
+        // Verify function signature
+        assert!(generated_code.contains("pub async fn find_users"), "Should generate find_users function");
+        assert!(generated_code.contains("Result<Vec<FindUsersRow>"), "Should return Vec<FindUsersRow>");
+
+        // Verify row struct
+        assert!(generated_code.contains("struct FindUsersRow"), "Should generate FindUsersRow struct");
+        assert!(generated_code.contains("pub id: i32"), "Should have id field");
+        assert!(generated_code.contains("pub username: String"), "Should have username field");
     });
 }

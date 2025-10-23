@@ -29,10 +29,10 @@ impl QueryType {
 
 #[derive(Debug, Clone)]
 pub enum ParameterSpec {
-    /// Named parameter: @param_name
-    Named { name: String, position: usize },
-    /// Positional parameter: $N (will need name inference)
-    Positional { position: usize },
+    /// Named parameter: @param_name or @param_name? (nullable)
+    Named { name: String, position: usize, nullable: bool },
+    /// Positional parameter: $N or $N? (nullable)
+    Positional { position: usize, nullable: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ impl SqlParser {
         Self {
             annotation_regex: Regex::new(r"^--\s*name:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:([a-z]+)\s*$")
                 .unwrap(),
-            named_param_regex: Regex::new(r"@([a-zA-Z_][a-zA-Z0-9_]*)").unwrap(),
+            named_param_regex: Regex::new(r"@([a-zA-Z_][a-zA-Z0-9_]*)(\?)?").unwrap(),
         }
     }
 
@@ -166,35 +166,55 @@ impl SqlParser {
     fn transform_parameters(&self, sql: &str) -> Result<(String, Vec<ParameterSpec>)> {
         let mut position = 1;
         let mut parameters = Vec::new();
-        let mut seen_names = std::collections::HashSet::new();
+        let mut seen_params: std::collections::HashMap<String, (usize, bool)> = std::collections::HashMap::new();
 
         // Find all named parameters and their positions
         let transformed_sql = self.named_param_regex.replace_all(sql, |caps: &regex::Captures| {
             let param_name = caps[1].to_string();
+            let nullable = caps.get(2).is_some(); // Check if ? suffix is present
 
-            // Check for duplicate parameter names
-            if seen_names.contains(&param_name) {
-                // We can't return an error here due to closure constraints
-                // We'll handle this by allowing it but it will be caught during introspection
-                log::warn!("Duplicate parameter name: @{}", param_name);
+            // Check if we've seen this parameter name before
+            if let Some(&(existing_pos, existing_nullable)) = seen_params.get(&param_name) {
+                // Reuse the same position for duplicate parameter names
+                // Check if nullable flags match
+                if existing_nullable != nullable {
+                    log::warn!(
+                        "Parameter @{} has inconsistent nullable annotations (both ? and non-?)",
+                        param_name
+                    );
+                }
+                format!("${}", existing_pos)
+            } else {
+                // New parameter, assign a position
+                seen_params.insert(param_name.clone(), (position, nullable));
+                parameters.push(ParameterSpec::Named {
+                    name: param_name,
+                    position,
+                    nullable,
+                });
+
+                let replacement = format!("${}", position);
+                position += 1;
+                replacement
             }
-            seen_names.insert(param_name.clone());
-
-            parameters.push(ParameterSpec::Named {
-                name: param_name,
-                position,
-            });
-
-            let replacement = format!("${}", position);
-            position += 1;
-            replacement
         }).to_string();
 
-        // Now check for any existing $N parameters in the transformed SQL
-        let positional_regex = Regex::new(r"\$(\d+)").unwrap();
-        for cap in positional_regex.captures_iter(&transformed_sql) {
-            let num: usize = cap[1].parse().unwrap();
+        // Now check for any existing $N or $N? parameters in the ORIGINAL SQL
+        // We need to check original SQL to detect the ? suffix before it's transformed
+        let positional_regex = Regex::new(r"\$(\d+)(\?)?").unwrap();
+        let mut positional_params: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
 
+        for cap in positional_regex.captures_iter(sql) {
+            let num: usize = cap[1].parse().unwrap();
+            let nullable = cap.get(2).is_some();
+            positional_params.insert(num, nullable);
+        }
+
+        // Now transform $N? to $N in the SQL
+        let final_sql = Regex::new(r"\$(\d+)\?").unwrap().replace_all(&transformed_sql, "$$1").to_string();
+
+        // Add positional parameters that weren't already handled as named parameters
+        for (&num, &nullable) in &positional_params {
             // Check if this position is already covered by a named parameter
             if !parameters.iter().any(|p| matches!(p, ParameterSpec::Named { position: pos, .. } if *pos == num)) {
                 // This is a bare positional parameter, add it
@@ -202,15 +222,20 @@ impl SqlParser {
                     let pos = parameters.len() + 1;
                     if !parameters.iter().any(|p| match p {
                         ParameterSpec::Named { position, .. } => *position == pos,
-                        ParameterSpec::Positional { position } => *position == pos,
+                        ParameterSpec::Positional { position, .. } => *position == pos,
                     }) {
-                        parameters.push(ParameterSpec::Positional { position: pos });
+                        // Use the nullable flag if we have it, otherwise default to false
+                        let is_nullable = positional_params.get(&pos).copied().unwrap_or(false);
+                        parameters.push(ParameterSpec::Positional {
+                            position: pos,
+                            nullable: is_nullable,
+                        });
                     }
                 }
             }
         }
 
-        Ok((transformed_sql, parameters))
+        Ok((final_sql, parameters))
     }
 }
 
@@ -261,17 +286,19 @@ DELETE FROM authors WHERE id = @author_id;
         assert_eq!(params.len(), 2);
 
         match &params[0] {
-            ParameterSpec::Named { name, position } => {
+            ParameterSpec::Named { name, position, nullable } => {
                 assert_eq!(name, "user_id");
                 assert_eq!(*position, 1);
+                assert_eq!(*nullable, false);
             }
             _ => panic!("Expected named parameter"),
         }
 
         match &params[1] {
-            ParameterSpec::Named { name, position } => {
+            ParameterSpec::Named { name, position, nullable } => {
                 assert_eq!(name, "status");
                 assert_eq!(*position, 2);
+                assert_eq!(*nullable, false);
             }
             _ => panic!("Expected named parameter"),
         }
@@ -315,8 +342,9 @@ RETURNING *;
 
         for (i, param) in params.iter().enumerate() {
             match param {
-                ParameterSpec::Positional { position } => {
+                ParameterSpec::Positional { position, nullable } => {
                     assert_eq!(*position, i + 1);
+                    assert_eq!(*nullable, false);
                 }
                 _ => panic!("Expected positional parameter"),
             }
@@ -335,11 +363,96 @@ RETURNING *;
         assert_eq!(params.len(), 2);
 
         match &params[0] {
-            ParameterSpec::Named { name, position } => {
+            ParameterSpec::Named { name, position, nullable } => {
                 assert_eq!(name, "user_id");
                 assert_eq!(*position, 1);
+                assert_eq!(*nullable, false);
             }
             _ => panic!("Expected named parameter"),
+        }
+    }
+
+    #[test]
+    fn test_nullable_named_parameters() {
+        let parser = SqlParser::new();
+
+        let sql = "SELECT * FROM users WHERE id = @user_id AND email = @email?";
+        let (transformed, params) = parser.transform_parameters(sql).unwrap();
+
+        assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND email = $2");
+        assert_eq!(params.len(), 2);
+
+        match &params[0] {
+            ParameterSpec::Named { name, position, nullable } => {
+                assert_eq!(name, "user_id");
+                assert_eq!(*position, 1);
+                assert_eq!(*nullable, false);
+            }
+            _ => panic!("Expected named parameter"),
+        }
+
+        match &params[1] {
+            ParameterSpec::Named { name, position, nullable } => {
+                assert_eq!(name, "email");
+                assert_eq!(*position, 2);
+                assert_eq!(*nullable, true);
+            }
+            _ => panic!("Expected named parameter"),
+        }
+    }
+
+    #[test]
+    fn test_nullable_positional_parameters() {
+        let parser = SqlParser::new();
+
+        let sql = "SELECT * FROM users WHERE id = $1? AND status = $2";
+        let (transformed, params) = parser.transform_parameters(sql).unwrap();
+
+        assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND status = $2");
+        assert_eq!(params.len(), 2);
+
+        match &params[0] {
+            ParameterSpec::Positional { position, nullable } => {
+                assert_eq!(*position, 1);
+                assert_eq!(*nullable, true);
+            }
+            _ => panic!("Expected positional parameter"),
+        }
+
+        match &params[1] {
+            ParameterSpec::Positional { position, nullable } => {
+                assert_eq!(*position, 2);
+                assert_eq!(*nullable, false);
+            }
+            _ => panic!("Expected positional parameter"),
+        }
+    }
+
+    #[test]
+    fn test_mixed_nullable_parameters() {
+        let parser = SqlParser::new();
+
+        let sql = "SELECT * FROM users WHERE id = @user_id? AND created > $2";
+        let (transformed, params) = parser.transform_parameters(sql).unwrap();
+
+        assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND created > $2");
+        assert_eq!(params.len(), 2);
+
+        match &params[0] {
+            ParameterSpec::Named { name, position, nullable } => {
+                assert_eq!(name, "user_id");
+                assert_eq!(*position, 1);
+                assert_eq!(*nullable, true);
+            }
+            _ => panic!("Expected named parameter"),
+        }
+
+        match &params[1] {
+            ParameterSpec::Positional { position, nullable } => {
+                assert_eq!(*position, 2);
+                assert_eq!(*nullable, false);
+            }
+            _ => panic!("Expected positional parameter"),
         }
     }
 }
