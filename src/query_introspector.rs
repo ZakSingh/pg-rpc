@@ -181,15 +181,19 @@ impl<'a> QueryIntrospector<'a> {
             .execute(&create_view_sql, &[])
             .with_context(|| format!("Failed to create temp view for introspection: {}", create_view_sql))?;
 
-        // Query column information from information_schema
+        // Query column information from PostgreSQL catalogs
+        // Using pg_attribute instead of information_schema to properly handle temporary views
         let columns_query = r#"
             SELECT
-                column_name,
-                udt_name,
-                is_nullable
-            FROM information_schema.columns
-            WHERE table_name = $1
-            ORDER BY ordinal_position
+                a.attname AS column_name,
+                a.atttypid AS type_oid,
+                NOT a.attnotnull AS is_nullable
+            FROM pg_class c
+            JOIN pg_attribute a ON a.attrelid = c.oid
+            WHERE c.relname = $1
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            ORDER BY a.attnum
         "#;
 
         let rows = self.client.query(columns_query, &[&view_name])?;
@@ -197,14 +201,8 @@ impl<'a> QueryIntrospector<'a> {
         let mut columns = Vec::new();
         for row in rows {
             let column_name: String = row.get(0);
-            let udt_name: String = row.get(1);
-            let is_nullable_str: String = row.get(2);
-
-            // Map UDT name to OID
-            let type_oid = self.resolve_type_name(&udt_name)?;
-
-            // information_schema gives us basic nullability, but we'll refine it
-            let is_nullable = is_nullable_str == "YES";
+            let type_oid: OID = row.get(1);
+            let is_nullable: bool = row.get(2);
 
             columns.push(QueryColumn {
                 name: column_name,
