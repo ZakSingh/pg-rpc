@@ -1022,6 +1022,20 @@ impl ToRust for PgField {
     }
 }
 
+/// Generate serde annotation for datetime types that need special serialization
+fn generate_datetime_serde_attr(pg_type: &PgType, nullable: bool) -> Option<TokenStream> {
+    match pg_type {
+        PgType::Timestamptz => {
+            if nullable {
+                Some(quote! { #[serde(with = "time::serde::rfc3339::option")] })
+            } else {
+                Some(quote! { #[serde(with = "time::serde::rfc3339")] })
+            }
+        }
+        _ => None,
+    }
+}
+
 impl PgField {
     pub fn to_rust_inner(
         &self,
@@ -1048,10 +1062,23 @@ impl PgField {
             quote! {#ident}
         };
 
+        // Generate datetime serde annotation if needed
+        let pg_type = types.get(&self.type_oid).unwrap();
+        let datetime_serde_attr = generate_datetime_serde_attr(pg_type, self.nullable);
+        let serde_attr = match datetime_serde_attr {
+            Some(attr) => quote! {
+                #[serde(rename = #pg_name)]
+                #attr
+            },
+            None => quote! {
+                #[serde(rename = #pg_name)]
+            },
+        };
+
         quote! {
             #comment_macro
             #pg_macro
-            #[serde(rename = #pg_name)]
+            #serde_attr
             pub #field_name: #option_macro
         }
     }
@@ -1082,9 +1109,22 @@ fn generate_flattened_field_token(
         quote! { #type_ident }
     };
 
+    // Generate datetime serde annotation if needed
+    let pg_type = types.get(&flattened_field.type_oid).unwrap();
+    let datetime_serde_attr = generate_datetime_serde_attr(pg_type, flattened_field.nullable);
+    let serde_attr = match datetime_serde_attr {
+        Some(attr) => quote! {
+            #[serde(rename = #pg_name)]
+            #attr
+        },
+        None => quote! {
+            #[serde(rename = #pg_name)]
+        },
+    };
+
     quote! {
         #comment_macro
-        #[serde(rename = #pg_name)]
+        #serde_attr
         pub #field_name: #option_macro
     }
 }

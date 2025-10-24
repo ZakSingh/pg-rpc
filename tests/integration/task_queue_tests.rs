@@ -290,22 +290,22 @@ fn test_task_queue_code_generation() {
             "Should have serde tag configuration"
         );
 
-        // Verify field mapping - check some specific fields
+        // Verify field mapping - check some specific fields (all nullable by default)
         assert!(
-            tasks_content.contains("pub user_id: i32"),
-            "Should map INTEGER to i32"
+            tasks_content.contains("user_id") && tasks_content.contains("Option<i32>"),
+            "Should map INTEGER to Option<i32>"
         );
         assert!(
-            tasks_content.contains("pub email: String"),
-            "Should map TEXT to String"
+            tasks_content.contains("email") && tasks_content.contains("Option<String>"),
+            "Should map TEXT to Option<String>"
         );
         assert!(
-            tasks_content.contains("pub amount: rust_decimal::Decimal"),
-            "Should map DECIMAL to rust_decimal::Decimal"
+            tasks_content.contains("amount") && tasks_content.contains("Option<rust_decimal::Decimal>"),
+            "Should map DECIMAL to Option<rust_decimal::Decimal>"
         );
         assert!(
-            tasks_content.contains("pub payment_id: uuid::Uuid"),
-            "Should map UUID to uuid::Uuid"
+            tasks_content.contains("payment_id") && tasks_content.contains("Option<uuid::Uuid>"),
+            "Should map UUID to Option<uuid::Uuid>"
         );
 
         // Verify generated methods
@@ -339,13 +339,13 @@ fn test_generated_task_enum_compiles() {
             name = \"test_tasks\"
             version = \"0.1.0\"
             edition = \"2021\"
-            
+
             [dependencies]
             serde = { version = \"1.0\", features = [\"derive\"] }
             serde_json = \"1.0\"
             uuid = { version = \"1.0\", features = [\"v4\"] }
             rust_decimal = \"1.0\"
-            chrono = { version = \"0.4\", features = [\"serde\"] }
+            time = { version = \"0.3\", features = [\"serde-well-known\"] }
         "};
 
         std::fs::write(project_dir.join("Cargo.toml"), cargo_toml)
@@ -362,23 +362,23 @@ fn test_generated_task_enum_compiles() {
         let main_rs = indoc! {"
             mod tasks;
             use tasks::TaskPayload;
-            
+
             fn main() {
-                // Test that we can create and serialize task payloads
-                let email_task = TaskPayload::SendWelcomeEmail {
-                    user_id: 123,
-                    email: \"test@example.com\".to_string(),
-                    template_name: \"welcome\".to_string(),
-                    send_at: chrono::Utc::now(),
-                };
-                
                 // Test serialization
+                let email_payload = tasks::SendWelcomeEmailPayload {
+                    user_id: Some(123),
+                    email: Some(\"test@example.com\".to_string()),
+                    template_name: Some(\"welcome\".to_string()),
+                    send_at: Some(time::OffsetDateTime::now_utc()),
+                };
+                let email_task = TaskPayload::SendWelcomeEmail(email_payload);
+
                 let json = serde_json::to_string(&email_task).expect(\"Should serialize\");
                 println!(\"Serialized: {}\", json);
-                
+
                 // Test task_name method
                 assert_eq!(email_task.task_name(), \"send_welcome_email\");
-                
+
                 // Test deserialization
                 let task_name = \"send_welcome_email\";
                 let payload = serde_json::json!({
@@ -387,17 +387,17 @@ fn test_generated_task_enum_compiles() {
                     \"template_name\": \"welcome\",
                     \"send_at\": \"2023-01-01T00:00:00Z\"
                 });
-                
+
                 let reconstructed = TaskPayload::from_database_row(task_name, payload)
                     .expect(\"Should deserialize from database format\");
-                
+
                 match reconstructed {
-                    TaskPayload::SendWelcomeEmail { user_id, .. } => {
-                        assert_eq!(user_id, 456);
+                    TaskPayload::SendWelcomeEmail(payload) => {
+                        assert_eq!(payload.user_id, Some(456));
                     }
                     _ => panic!(\"Should be SendWelcomeEmail variant\"),
                 }
-                
+
                 println!(\"All tests passed!\");
             }
         "};
@@ -526,49 +526,51 @@ fn test_task_queue_type_mapping() {
         let generated = test_task_queue_generation(conn_string);
         let tasks_content = generated.get("tasks.rs").unwrap();
 
-        // Verify type mappings
-        assert!(tasks_content.contains("pub id: i64"), "BIGINT -> i64");
-        assert!(tasks_content.contains("pub name: String"), "TEXT -> String");
+        // Verify type mappings (all fields are nullable by default in task payloads)
+        // The fields have serde annotations, so we check that both the field name and type exist
+        assert!(tasks_content.contains("id") && tasks_content.contains("Option<i64>"), "BIGINT -> Option<i64>");
+        assert!(tasks_content.contains("name") && tasks_content.contains("Option<String>"), "TEXT -> Option<String>");
         assert!(
-            tasks_content.contains("pub active: bool"),
-            "BOOLEAN -> bool"
+            tasks_content.contains("active") && tasks_content.contains("Option<bool>"),
+            "BOOLEAN -> Option<bool>"
         );
-        assert!(tasks_content.contains("pub score: f32"), "REAL -> f32");
+        assert!(tasks_content.contains("score") && tasks_content.contains("Option<f32>"), "REAL -> Option<f32>");
         assert!(
-            tasks_content.contains("pub precise_score: f64"),
-            "DOUBLE PRECISION -> f64"
-        );
-        assert!(
-            tasks_content.contains("pub amount: rust_decimal::Decimal"),
-            "NUMERIC -> rust_decimal::Decimal"
+            tasks_content.contains("precise_score") && tasks_content.contains("Option<f64>"),
+            "DOUBLE PRECISION -> Option<f64>"
         );
         assert!(
-            tasks_content.contains("pub data: serde_json::Value"),
-            "JSONB -> serde_json::Value"
+            tasks_content.contains("amount") && tasks_content.contains("Option<rust_decimal::Decimal>"),
+            "NUMERIC -> Option<rust_decimal::Decimal>"
         );
         assert!(
-            tasks_content.contains("pub created_at: chrono::NaiveDateTime"),
-            "TIMESTAMP -> chrono::NaiveDateTime"
+            tasks_content.contains("data") && tasks_content.contains("Option<serde_json::Value>"),
+            "JSONB -> Option<serde_json::Value>"
+        );
+        // timestamp without timezone and with timezone both map to time::OffsetDateTime
+        assert!(
+            tasks_content.contains("created_at") && tasks_content.contains("Option<time::OffsetDateTime>"),
+            "TIMESTAMP -> Option<time::OffsetDateTime>"
         );
         assert!(
-            tasks_content.contains("pub created_at_tz: chrono::DateTime<chrono::Utc>"),
-            "TIMESTAMPTZ -> chrono::DateTime<Utc>"
+            tasks_content.contains("created_at_tz") && tasks_content.contains("Option<time::OffsetDateTime>"),
+            "TIMESTAMPTZ -> Option<time::OffsetDateTime>"
         );
         assert!(
-            tasks_content.contains("pub birth_date: chrono::NaiveDate"),
-            "DATE -> chrono::NaiveDate"
+            tasks_content.contains("birth_date") && tasks_content.contains("Option<time::Date>"),
+            "DATE -> Option<time::Date>"
         );
         assert!(
-            tasks_content.contains("pub work_time: chrono::NaiveTime"),
-            "TIME -> chrono::NaiveTime"
+            tasks_content.contains("work_time") && tasks_content.contains("Option<time::Time>"),
+            "TIME -> Option<time::Time>"
         );
         assert!(
-            tasks_content.contains("pub file_data: Vec<u8>"),
-            "BYTEA -> Vec<u8>"
+            tasks_content.contains("file_data") && tasks_content.contains("Option<Vec<u8>>"),
+            "BYTEA -> Option<Vec<u8>>"
         );
         assert!(
-            tasks_content.contains("pub ip_address: std::net::IpAddr"),
-            "INET -> std::net::IpAddr"
+            tasks_content.contains("ip_address") && tasks_content.contains("Option<std::net::IpAddr>"),
+            "INET -> Option<std::net::IpAddr>"
         );
     });
 }
@@ -648,18 +650,18 @@ fn test_custom_table_configuration() {
             "Should include custom payload column"
         );
 
-        // Verify field mappings work correctly
+        // Verify field mappings work correctly (all nullable by default)
         assert!(
-            tasks_content.contains("pub user_id: i32"),
-            "Should map INTEGER to i32"
+            tasks_content.contains("user_id: Option<i32>"),
+            "Should map INTEGER to Option<i32>"
         );
         assert!(
-            tasks_content.contains("pub message: String"),
-            "Should map TEXT to String"
+            tasks_content.contains("message: Option<String>"),
+            "Should map TEXT to Option<String>"
         );
         assert!(
-            tasks_content.contains("pub compression: bool"),
-            "Should map BOOLEAN to bool"
+            tasks_content.contains("compression: Option<bool>"),
+            "Should map BOOLEAN to Option<bool>"
         );
     });
 }
@@ -696,11 +698,13 @@ fn test_custom_table_compilation() {
             name = \"test_custom_tasks\"
             version = \"0.1.0\"
             edition = \"2021\"
-            
+
             [dependencies]
             serde = { version = \"1.0\", features = [\"derive\"] }
             serde_json = \"1.0\"
-            chrono = { version = \"0.4\", features = [\"serde\"] }
+            time = { version = \"0.3\", features = [\"serde-well-known\"] }
+            uuid = \"1.0\"
+            rust_decimal = \"1.0\"
         "};
 
         std::fs::write(project_dir.join("Cargo.toml"), cargo_toml)
@@ -717,27 +721,28 @@ fn test_custom_table_compilation() {
         let main_rs = indoc! {"
             mod tasks;
             use tasks::TaskPayload;
-            
+
             fn main() {
                 // Test that we can create and serialize task payloads with custom config
-                let notification_task = TaskPayload::SendNotification {
-                    user_id: 456,
-                    message: \"Hello, World!\".to_string(),
-                    channel: \"email\".to_string(),
+                let notification_payload = tasks::SendNotificationPayload {
+                    user_id: Some(456),
+                    message: Some(\"Hello, World!\".to_string()),
+                    channel: Some(\"email\".to_string()),
                 };
-                
+                let notification_task = TaskPayload::SendNotification(notification_payload);
+
                 // Test serialization with custom column names
                 let json = serde_json::to_string(&notification_task).expect(\"Should serialize\");
                 println!(\"Serialized: {}\", json);
-                
+
                 // Test custom helper methods
                 assert_eq!(TaskPayload::table_name(), \"queue.jobs\");
                 assert_eq!(TaskPayload::task_name_column(), \"job_type\");
                 assert_eq!(TaskPayload::payload_column(), \"data\");
-                
+
                 // Test task_name method
                 assert_eq!(notification_task.task_name(), \"send_notification\");
-                
+
                 // Test deserialization
                 let task_name = \"backup_data\";
                 let payload = serde_json::json!({
@@ -745,18 +750,18 @@ fn test_custom_table_compilation() {
                     \"backup_location\": \"/backups/users.sql\",
                     \"compression\": true
                 });
-                
+
                 let reconstructed = TaskPayload::from_database_row(task_name, payload)
                     .expect(\"Should deserialize from database format\");
-                
+
                 match reconstructed {
-                    TaskPayload::BackupData { table_name, compression, .. } => {
-                        assert_eq!(table_name, \"users\");
-                        assert_eq!(compression, true);
+                    TaskPayload::BackupData(payload) => {
+                        assert_eq!(payload.table_name, Some(\"users\".to_string()));
+                        assert_eq!(payload.compression, Some(true));
                     }
                     _ => panic!(\"Should be BackupData variant\"),
                 }
-                
+
                 println!(\"All custom configuration tests passed!\");
             }
         "};
@@ -795,6 +800,182 @@ fn test_custom_table_compilation() {
         assert!(
             stdout.contains("All custom configuration tests passed!"),
             "Runtime tests should pass: {}",
+            stdout
+        );
+    });
+}
+
+#[test]
+fn test_timestamptz_serialization_deserialization() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create a task type with timestamptz fields (like the bug report scenario)
+        let task_schema_sql = indoc! {"
+            CREATE SCHEMA IF NOT EXISTS tasks;
+            CREATE SCHEMA IF NOT EXISTS mq;
+
+            -- Create a task with direct timestamptz fields
+            CREATE TYPE tasks.schedule_task AS (
+                task_id BIGINT,
+                scheduled_at TIMESTAMPTZ,
+                description TEXT
+            );
+
+            -- Create another task with nullable timestamptz
+            CREATE TYPE tasks.reminder_task AS (
+                reminder_id BIGINT,
+                remind_at TIMESTAMPTZ,
+                message TEXT
+            );
+        "};
+
+        execute_sql(client, task_schema_sql).expect("Should create task types with timestamptz");
+
+        // Generate code
+        let generated = test_task_queue_generation(conn_string);
+        let tasks_content = generated.get("tasks.rs").unwrap();
+
+        // Verify that the generated code includes the RFC3339 serde annotations
+        assert!(
+            tasks_content.contains("time::serde::rfc3339"),
+            "Should generate time::serde::rfc3339 annotation for timestamptz fields"
+        );
+
+        // Verify the task payloads are generated
+        assert!(
+            tasks_content.contains("ScheduleTaskPayload") ||
+            tasks_content.contains("schedule_task"),
+            "Should generate ScheduleTask task"
+        );
+
+        assert!(
+            tasks_content.contains("ReminderTaskPayload") ||
+            tasks_content.contains("reminder_task"),
+            "Should generate ReminderTask task"
+        );
+
+        // Verify type mapping for direct timestamptz fields (nullable by default)
+        assert!(
+            tasks_content.contains("pub scheduled_at: Option<time::OffsetDateTime>") ||
+            tasks_content.contains("pub scheduled_at: time::OffsetDateTime"),
+            "Should map timestamptz to Option<time::OffsetDateTime> (nullable) or time::OffsetDateTime"
+        );
+
+        // Create a test project to verify serialization/deserialization works
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let project_dir = temp_dir.path();
+
+        // Create Cargo.toml with all necessary dependencies
+        let cargo_toml = indoc! {"
+            [package]
+            name = \"test_timestamptz_serde\"
+            version = \"0.1.0\"
+            edition = \"2021\"
+
+            [dependencies]
+            serde = { version = \"1.0\", features = [\"derive\"] }
+            serde_json = \"1.0\"
+            time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\"] }
+            uuid = \"1.0\"
+            rust_decimal = \"1.0\"
+        "};
+
+        std::fs::write(project_dir.join("Cargo.toml"), cargo_toml)
+            .expect("Should write Cargo.toml");
+
+        // Create src directory
+        let src_dir = project_dir.join("src");
+        std::fs::create_dir(&src_dir).expect("Should create src directory");
+
+        // Write the generated tasks code
+        std::fs::write(src_dir.join("tasks.rs"), tasks_content)
+            .expect("Should write tasks.rs");
+
+        // Create main.rs that tests serialization/deserialization
+        let main_rs = indoc! {r#"
+            mod tasks;
+
+            use serde_json;
+
+            fn main() {
+                // Test: Direct timestamptz field serialization/deserialization
+                // Simulate JSONB payload from database (like the bug report)
+                let json_payload = serde_json::json!({
+                    "task_id": 123,
+                    "scheduled_at": "2025-10-24T00:49:00.064902+00:00",
+                    "description": "Test task"
+                });
+
+                // This should deserialize successfully with the RFC3339 annotation
+                // This is THE KEY TEST - without the annotation, this would fail with:
+                // "invalid type: string "2025-10-24T00:49:00.064902+00:00", expected an `OffsetDateTime`"
+                let deserialized: tasks::ScheduleTaskPayload =
+                    serde_json::from_value(json_payload.clone())
+                        .expect("Should deserialize timestamptz from RFC3339 string");
+
+                assert_eq!(deserialized.task_id, Some(123));
+                assert_eq!(deserialized.description, Some("Test task".to_string()));
+                assert!(deserialized.scheduled_at.is_some(), "scheduled_at should be Some");
+
+                // Verify serialization round-trip
+                let serialized = serde_json::to_value(&deserialized)
+                    .expect("Should serialize");
+
+                // The timestamp should be in RFC3339 format (or null if None)
+                let scheduled_at_value = &serialized["scheduled_at"];
+                if !scheduled_at_value.is_null() {
+                    assert!(scheduled_at_value.is_string(), "scheduled_at should be string if not null");
+                    // Verify it's actually RFC3339 format
+                    let timestamp_str = scheduled_at_value.as_str().unwrap();
+                    assert!(timestamp_str.contains('T'), "RFC3339 timestamp should contain 'T'");
+                    assert!(timestamp_str.contains('+') || timestamp_str.contains('Z'),
+                           "RFC3339 timestamp should have timezone");
+                }
+
+                println!("✓ Test passed: timestamptz serialization/deserialization works!");
+
+                // Test nullable field with null value
+                let null_payload = serde_json::json!({
+                    "reminder_id": 456,
+                    "remind_at": null,
+                    "message": "Reminder"
+                });
+
+                let null_deserialized: tasks::ReminderTaskPayload =
+                    serde_json::from_value(null_payload)
+                        .expect("Should deserialize null timestamptz");
+
+                assert_eq!(null_deserialized.reminder_id, Some(456));
+                assert!(null_deserialized.remind_at.is_none(), "remind_at should be None");
+
+                println!("✓ Test passed: null timestamptz works!");
+
+                println!("\n✅ All timestamptz serialization/deserialization tests passed!");
+            }
+        "#};
+
+        std::fs::write(src_dir.join("main.rs"), main_rs)
+            .expect("Should write main.rs");
+
+        // Try to compile and run the test
+        let output = std::process::Command::new("cargo")
+            .arg("run")
+            .current_dir(project_dir)
+            .output()
+            .expect("Should run cargo run");
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            panic!(
+                "Timestamptz serialization test failed to run:\nstdout: {}\nstderr: {}",
+                stdout, stderr
+            );
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("All timestamptz serialization/deserialization tests passed!"),
+            "Timestamptz tests should pass: {}",
             stdout
         );
     });

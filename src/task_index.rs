@@ -371,6 +371,34 @@ pub fn generate_task_enum(
     (enum_code, referenced_schemas)
 }
 
+/// Generate serde annotation for datetime types in task payloads
+fn generate_task_datetime_serde_attr(pg_type: &PgType, nullable: bool) -> Option<TokenStream> {
+    match pg_type {
+        PgType::Timestamptz => {
+            if nullable {
+                Some(quote! { #[serde(with = "time::serde::rfc3339::option")] })
+            } else {
+                Some(quote! { #[serde(with = "time::serde::rfc3339")] })
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Generate serde annotation for datetime types from postgres type string
+fn generate_task_datetime_serde_attr_from_string(postgres_type: &str, nullable: bool) -> Option<TokenStream> {
+    match postgres_type {
+        "timestamptz" | "timestamp with time zone" => {
+            if nullable {
+                Some(quote! { #[serde(with = "time::serde::rfc3339::option")] })
+            } else {
+                Some(quote! { #[serde(with = "time::serde::rfc3339")] })
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Generate a payload struct for a task type
 fn generate_payload_struct(
     task_type: &TaskType,
@@ -405,9 +433,10 @@ fn generate_payload_struct(
         .iter()
         .map(|field| {
             let field_name = format_ident!("{}", sql_to_rs_string(&field.name, CaseType::Snake));
+            let pg_field_name = &field.name;
 
             // Generate field type with proper nullability handling
-            let rust_type = if let Some(pg_type) = type_index.get(&field.type_oid) {
+            let (rust_type, is_nullable, pg_type_opt) = if let Some(pg_type) = type_index.get(&field.type_oid) {
                 eprintln!("[PGRPC]     Field '{}' (OID {}) found in TypeIndex", field.name, field.type_oid);
                 let (type_tokens, schemas) = pg_type.to_rust_ident_with_schemas(type_index);
                 referenced_schemas.extend(schemas);
@@ -421,19 +450,47 @@ fn generate_payload_struct(
                     .is_some_and(|c| c.contains("@pgrpc_not_null"))
                     && !bulk_not_null_columns.contains(&field.name);
 
-                if is_nullable {
+                let rust_type = if is_nullable {
                     quote! { Option<#type_tokens> }
                 } else {
                     type_tokens
-                }
+                };
+
+                (rust_type, is_nullable, Some(pg_type))
             } else {
                 // Use fallback mapping with proper nullability handling
                 eprintln!("[PGRPC]     Field '{}' (OID {}) NOT found in TypeIndex, using fallback mapping for '{}'",
                          field.name, field.type_oid, field.postgres_type);
-                generate_task_field_type(field, type_index, &bulk_not_null_columns)
+                let is_nullable = !field.comment
+                    .as_ref()
+                    .is_some_and(|c| c.contains("@pgrpc_not_null"))
+                    && !bulk_not_null_columns.contains(&field.name);
+                let rust_type = generate_task_field_type(field, type_index, &bulk_not_null_columns);
+                (rust_type, is_nullable, None)
             };
 
-            quote! { pub #field_name: #rust_type }
+            // Generate serde annotations
+            let datetime_serde_attr = if let Some(pg_type) = pg_type_opt {
+                generate_task_datetime_serde_attr(pg_type, is_nullable)
+            } else {
+                // Fallback for when type is not in TypeIndex - check postgres_type string
+                generate_task_datetime_serde_attr_from_string(&field.postgres_type, is_nullable)
+            };
+
+            let serde_attr = match datetime_serde_attr {
+                Some(attr) => quote! {
+                    #[serde(rename = #pg_field_name)]
+                    #attr
+                },
+                None => quote! {
+                    #[serde(rename = #pg_field_name)]
+                },
+            };
+
+            quote! {
+                #serde_attr
+                pub #field_name: #rust_type
+            }
         })
         .collect();
 
