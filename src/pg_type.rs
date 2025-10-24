@@ -1032,6 +1032,13 @@ fn generate_datetime_serde_attr(pg_type: &PgType, nullable: bool) -> Option<Toke
                 Some(quote! { #[serde(with = "time::serde::rfc3339")] })
             }
         }
+        PgType::Date => {
+            if nullable {
+                Some(quote! { #[serde(with = "date_serde::option")] })
+            } else {
+                Some(quote! { #[serde(with = "date_serde")] })
+            }
+        }
         _ => None,
     }
 }

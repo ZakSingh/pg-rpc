@@ -381,6 +381,13 @@ fn generate_task_datetime_serde_attr(pg_type: &PgType, nullable: bool) -> Option
                 Some(quote! { #[serde(with = "time::serde::rfc3339")] })
             }
         }
+        PgType::Date => {
+            if nullable {
+                Some(quote! { #[serde(with = "date_serde::option")] })
+            } else {
+                Some(quote! { #[serde(with = "date_serde")] })
+            }
+        }
         _ => None,
     }
 }
@@ -393,6 +400,13 @@ fn generate_task_datetime_serde_attr_from_string(postgres_type: &str, nullable: 
                 Some(quote! { #[serde(with = "time::serde::rfc3339::option")] })
             } else {
                 Some(quote! { #[serde(with = "time::serde::rfc3339")] })
+            }
+        }
+        "date" => {
+            if nullable {
+                Some(quote! { #[serde(with = "date_serde::option")] })
+            } else {
+                Some(quote! { #[serde(with = "date_serde")] })
             }
         }
         _ => None,

@@ -980,3 +980,151 @@ fn test_timestamptz_serialization_deserialization() {
         );
     });
 }
+
+#[test]
+fn test_date_serialization_deserialization() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create a task type with date fields
+        let task_schema_sql = indoc! {"
+            CREATE SCHEMA IF NOT EXISTS tasks;
+            CREATE SCHEMA IF NOT EXISTS mq;
+
+            -- Create a task with date fields
+            CREATE TYPE tasks.birthday_reminder AS (
+                person_id BIGINT,
+                birth_date DATE,
+                reminder_date DATE
+            );
+        "};
+
+        execute_sql(client, task_schema_sql).expect("Should create task types with date");
+
+        // Generate code
+        let generated = test_task_queue_generation(conn_string);
+        let tasks_content = generated.get("tasks.rs").unwrap();
+
+        // Verify that Date fields are generated
+        assert!(
+            tasks_content.contains("time::Date"),
+            "Should map DATE to time::Date"
+        );
+
+        // Create a test project to verify serialization/deserialization works
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let project_dir = temp_dir.path();
+
+        // Create Cargo.toml with all necessary dependencies
+        let cargo_toml = indoc! {"
+            [package]
+            name = \"test_date_serde\"
+            version = \"0.1.0\"
+            edition = \"2021\"
+
+            [dependencies]
+            serde = { version = \"1.0\", features = [\"derive\"] }
+            serde_json = \"1.0\"
+            time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\"] }
+            uuid = \"1.0\"
+            rust_decimal = \"1.0\"
+        "};
+
+        std::fs::write(project_dir.join("Cargo.toml"), cargo_toml)
+            .expect("Should write Cargo.toml");
+
+        // Create src directory
+        let src_dir = project_dir.join("src");
+        std::fs::create_dir(&src_dir).expect("Should create src directory");
+
+        // Write the generated tasks code
+        std::fs::write(src_dir.join("tasks.rs"), tasks_content)
+            .expect("Should write tasks.rs");
+
+        // Create main.rs that tests serialization/deserialization
+        let main_rs = indoc! {r#"
+            mod tasks;
+
+            use serde_json;
+
+            fn main() {
+                // Test: Date field serialization/deserialization
+                // Simulate JSONB payload from database with DATE values
+                let json_payload = serde_json::json!({
+                    "person_id": 123,
+                    "birth_date": "2022-11-05",
+                    "reminder_date": "2025-11-05"
+                });
+
+                // This should deserialize successfully with serde-human-readable
+                // This is THE KEY TEST - without proper serde support, this would fail with:
+                // "invalid type: string \"2022-11-05\", expected a `Date`"
+                let deserialized: tasks::BirthdayReminderPayload =
+                    serde_json::from_value(json_payload.clone())
+                        .expect("Should deserialize Date from YYYY-MM-DD string");
+
+                assert_eq!(deserialized.person_id, Some(123));
+                assert!(deserialized.birth_date.is_some(), "birth_date should be Some");
+                assert!(deserialized.reminder_date.is_some(), "reminder_date should be Some");
+
+                // Verify serialization round-trip
+                let serialized = serde_json::to_value(&deserialized)
+                    .expect("Should serialize");
+
+                // The date should be in YYYY-MM-DD format
+                let birth_date_value = &serialized["birth_date"];
+                if !birth_date_value.is_null() {
+                    assert!(birth_date_value.is_string(), "birth_date should be string if not null");
+                    let date_str = birth_date_value.as_str().unwrap();
+                    assert_eq!(date_str.len(), 10, "Date should be YYYY-MM-DD format (10 chars)");
+                    assert_eq!(date_str, "2022-11-05", "Date should match input");
+                }
+
+                println!("✓ Test passed: Date serialization/deserialization works!");
+
+                // Test nullable field with null value
+                let null_payload = serde_json::json!({
+                    "person_id": 456,
+                    "birth_date": null,
+                    "reminder_date": "2025-12-25"
+                });
+
+                let null_deserialized: tasks::BirthdayReminderPayload =
+                    serde_json::from_value(null_payload)
+                        .expect("Should deserialize null Date");
+
+                assert_eq!(null_deserialized.person_id, Some(456));
+                assert!(null_deserialized.birth_date.is_none(), "birth_date should be None");
+                assert!(null_deserialized.reminder_date.is_some(), "reminder_date should be Some");
+
+                println!("✓ Test passed: null Date works!");
+
+                println!("\n✅ All Date serialization/deserialization tests passed!");
+            }
+        "#};
+
+        std::fs::write(src_dir.join("main.rs"), main_rs)
+            .expect("Should write main.rs");
+
+        // Try to compile and run the test
+        let output = std::process::Command::new("cargo")
+            .arg("run")
+            .current_dir(project_dir)
+            .output()
+            .expect("Should run cargo run");
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            panic!(
+                "Date serialization test failed to run:\nstdout: {}\nstderr: {}",
+                stdout, stderr
+            );
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("All Date serialization/deserialization tests passed!"),
+            "Date tests should pass: {}",
+            stdout
+        );
+    });
+}
