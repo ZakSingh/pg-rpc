@@ -29,7 +29,7 @@ impl QueryType {
 
 #[derive(Debug, Clone)]
 pub enum ParameterSpec {
-    /// Named parameter: @param_name or @param_name? (nullable)
+    /// Named parameter: :param_name or pgrpc.narg('param_name') (nullable)
     Named { name: String, position: usize, nullable: bool },
     /// Positional parameter: $N or $N? (nullable)
     Positional { position: usize, nullable: bool },
@@ -54,8 +54,10 @@ pub struct ParsedQuery {
 pub struct SqlParser {
     /// Regex for matching -- name: FunctionName :type
     annotation_regex: Regex,
-    /// Regex for matching named parameters @param_name
+    /// Regex for matching named parameters :param_name
     named_param_regex: Regex,
+    /// Regex for matching nullable parameters pgrpc.narg('param_name')
+    nullable_param_regex: Regex,
 }
 
 impl SqlParser {
@@ -63,7 +65,8 @@ impl SqlParser {
         Self {
             annotation_regex: Regex::new(r"^--\s*name:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:([a-z]+)\s*$")
                 .unwrap(),
-            named_param_regex: Regex::new(r"@([a-zA-Z_][a-zA-Z0-9_]*)(\?)?").unwrap(),
+            named_param_regex: Regex::new(r":([a-zA-Z_][a-zA-Z0-9_]*)").unwrap(),
+            nullable_param_regex: Regex::new(r"pgrpc\.narg\('([a-zA-Z_][a-zA-Z0-9_]*)'\)").unwrap(),
         }
     }
 
@@ -162,35 +165,38 @@ impl SqlParser {
         Ok(queries)
     }
 
-    /// Transform named parameters (@param) to positional ($N) and extract parameter specs
+    /// Transform named parameters (:param) and nullable parameters (pgrpc.narg('param'))
+    /// to positional ($N) and extract parameter specs
     fn transform_parameters(&self, sql: &str) -> Result<(String, Vec<ParameterSpec>)> {
         let mut position = 1;
         let mut parameters = Vec::new();
         let mut seen_params: std::collections::HashMap<String, (usize, bool)> = std::collections::HashMap::new();
 
-        // Find all named parameters and their positions
-        let transformed_sql = self.named_param_regex.replace_all(sql, |caps: &regex::Captures| {
+        // Temporarily replace :: (type cast operator) with a placeholder to avoid matching it
+        const TYPECAST_PLACEHOLDER: &str = "___PGRPC_TYPECAST___";
+        let sql_with_placeholder = sql.replace("::", TYPECAST_PLACEHOLDER);
+
+        // Step 1: Process nullable parameters first (pgrpc.narg('param_name'))
+        let sql_after_nullable = self.nullable_param_regex.replace_all(&sql_with_placeholder, |caps: &regex::Captures| {
             let param_name = caps[1].to_string();
-            let nullable = caps.get(2).is_some(); // Check if ? suffix is present
 
             // Check if we've seen this parameter name before
             if let Some(&(existing_pos, existing_nullable)) = seen_params.get(&param_name) {
                 // Reuse the same position for duplicate parameter names
-                // Check if nullable flags match
-                if existing_nullable != nullable {
+                if !existing_nullable {
                     log::warn!(
-                        "Parameter @{} has inconsistent nullable annotations (both ? and non-?)",
+                        "Parameter '{}' has inconsistent nullable annotations (both pgrpc.narg and non-nullable)",
                         param_name
                     );
                 }
                 format!("${}", existing_pos)
             } else {
                 // New parameter, assign a position
-                seen_params.insert(param_name.clone(), (position, nullable));
+                seen_params.insert(param_name.clone(), (position, true));
                 parameters.push(ParameterSpec::Named {
                     name: param_name,
                     position,
-                    nullable,
+                    nullable: true,
                 });
 
                 let replacement = format!("${}", position);
@@ -199,8 +205,36 @@ impl SqlParser {
             }
         }).to_string();
 
-        // Now check for any existing $N or $N? parameters in the ORIGINAL SQL
-        // We need to check original SQL to detect the ? suffix before it's transformed
+        // Step 2: Process regular named parameters (:param_name)
+        let sql_after_named = self.named_param_regex.replace_all(&sql_after_nullable, |caps: &regex::Captures| {
+            let param_name = caps[1].to_string();
+
+            // Check if we've seen this parameter name before
+            if let Some(&(existing_pos, existing_nullable)) = seen_params.get(&param_name) {
+                // Reuse the same position for duplicate parameter names
+                if existing_nullable {
+                    log::warn!(
+                        "Parameter '{}' has inconsistent nullable annotations (both pgrpc.narg and non-nullable)",
+                        param_name
+                    );
+                }
+                format!("${}", existing_pos)
+            } else {
+                // New parameter, assign a position
+                seen_params.insert(param_name.clone(), (position, false));
+                parameters.push(ParameterSpec::Named {
+                    name: param_name,
+                    position,
+                    nullable: false,
+                });
+
+                let replacement = format!("${}", position);
+                position += 1;
+                replacement
+            }
+        }).to_string();
+
+        // Step 3: Check for any existing $N or $N? parameters in the ORIGINAL SQL
         let positional_regex = Regex::new(r"\$(\d+)(\?)?").unwrap();
         let mut positional_params: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
 
@@ -210,8 +244,11 @@ impl SqlParser {
             positional_params.insert(num, nullable);
         }
 
-        // Now transform $N? to $N in the SQL
-        let final_sql = Regex::new(r"\$(\d+)\?").unwrap().replace_all(&transformed_sql, "$$1").to_string();
+        // Transform $N? to $N in the SQL
+        let sql_after_positional = Regex::new(r"\$(\d+)\?").unwrap().replace_all(&sql_after_named, "$$1").to_string();
+
+        // Restore :: type cast operator
+        let final_sql = sql_after_positional.replace(TYPECAST_PLACEHOLDER, "::");
 
         // Add positional parameters that weren't already handled as named parameters
         for (&num, &nullable) in &positional_params {
@@ -255,13 +292,13 @@ mod tests {
 
         let content = r#"
 -- name: GetAuthor :one
-SELECT * FROM authors WHERE id = @author_id;
+SELECT * FROM authors WHERE id = :author_id;
 
 -- name: ListAuthors :many
 SELECT * FROM authors ORDER BY name;
 
 -- name: DeleteAuthor :exec
-DELETE FROM authors WHERE id = @author_id;
+DELETE FROM authors WHERE id = :author_id;
         "#;
 
         let queries = parser.parse_content(content, PathBuf::from("test.sql")).unwrap();
@@ -279,7 +316,7 @@ DELETE FROM authors WHERE id = @author_id;
     fn test_named_parameters() {
         let parser = SqlParser::new();
 
-        let sql = "SELECT * FROM users WHERE id = @user_id AND status = @status";
+        let sql = "SELECT * FROM users WHERE id = :user_id AND status = :status";
         let (transformed, params) = parser.transform_parameters(sql).unwrap();
 
         assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND status = $2");
@@ -313,11 +350,11 @@ DELETE FROM authors WHERE id = @author_id;
 SELECT u.id, u.name, p.title
 FROM users u
 LEFT JOIN posts p ON u.id = p.user_id
-WHERE u.id = @user_id;
+WHERE u.id = :user_id;
 
 -- name: CreateUser :one
 INSERT INTO users (name, email)
-VALUES (@name, @email)
+VALUES (:name, :email)
 RETURNING *;
         "#;
 
@@ -356,7 +393,7 @@ RETURNING *;
         let parser = SqlParser::new();
 
         // Named parameter gets transformed first
-        let sql = "SELECT * FROM users WHERE id = @user_id AND created > $2";
+        let sql = "SELECT * FROM users WHERE id = :user_id AND created > $2";
         let (transformed, params) = parser.transform_parameters(sql).unwrap();
 
         assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND created > $2");
@@ -376,26 +413,26 @@ RETURNING *;
     fn test_nullable_named_parameters() {
         let parser = SqlParser::new();
 
-        let sql = "SELECT * FROM users WHERE id = @user_id AND email = @email?";
+        let sql = "SELECT * FROM users WHERE id = :user_id AND email = pgrpc.narg('email')";
         let (transformed, params) = parser.transform_parameters(sql).unwrap();
 
-        assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND email = $2");
+        assert_eq!(transformed, "SELECT * FROM users WHERE id = $2 AND email = $1");
         assert_eq!(params.len(), 2);
 
         match &params[0] {
             ParameterSpec::Named { name, position, nullable } => {
-                assert_eq!(name, "user_id");
+                assert_eq!(name, "email");
                 assert_eq!(*position, 1);
-                assert_eq!(*nullable, false);
+                assert_eq!(*nullable, true);
             }
             _ => panic!("Expected named parameter"),
         }
 
         match &params[1] {
             ParameterSpec::Named { name, position, nullable } => {
-                assert_eq!(name, "email");
+                assert_eq!(name, "user_id");
                 assert_eq!(*position, 2);
-                assert_eq!(*nullable, true);
+                assert_eq!(*nullable, false);
             }
             _ => panic!("Expected named parameter"),
         }
@@ -432,7 +469,7 @@ RETURNING *;
     fn test_mixed_nullable_parameters() {
         let parser = SqlParser::new();
 
-        let sql = "SELECT * FROM users WHERE id = @user_id? AND created > $2";
+        let sql = "SELECT * FROM users WHERE id = pgrpc.narg('user_id') AND created > $2";
         let (transformed, params) = parser.transform_parameters(sql).unwrap();
 
         assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND created > $2");

@@ -5,14 +5,14 @@
 -- Fetch a single author by ID
 SELECT id, name, bio, created_at
 FROM authors
-WHERE id = @author_id
+WHERE id = :author_id
 LIMIT 1;
 
 -- name: GetAuthorByEmail :one
 -- Fetch author by email address
 SELECT id, name, bio, email, created_at
 FROM authors
-WHERE email = @email;
+WHERE email = :email;
 
 -- name: ListAuthors :many
 -- List all authors ordered by name
@@ -24,39 +24,39 @@ ORDER BY name;
 -- List authors created after a specific date
 SELECT id, name, bio, created_at
 FROM authors
-WHERE created_at > @since
+WHERE created_at > :since
 ORDER BY created_at DESC;
 
 -- name: CreateAuthor :one
 -- Create a new author and return the created record
 INSERT INTO authors (name, bio, email)
-VALUES (@name, @bio, @email)
+VALUES (:name, :bio, :email)
 RETURNING id, name, bio, email, created_at;
 
 -- name: UpdateAuthor :exec
 -- Update an existing author
 UPDATE authors
 SET
-    name = @name,
-    bio = @bio,
+    name = :name,
+    bio = :bio,
     updated_at = NOW()
-WHERE id = @author_id;
+WHERE id = :author_id;
 
 -- name: UpdateAuthorEmail :exec
 -- Update only the email address
 UPDATE authors
-SET email = @email, updated_at = NOW()
-WHERE id = @author_id;
+SET email = :email, updated_at = NOW()
+WHERE id = :author_id;
 
 -- name: DeleteAuthor :execrows
 -- Delete an author and return the number of rows affected
 DELETE FROM authors
-WHERE id = @author_id;
+WHERE id = :author_id;
 
 -- name: DeleteInactiveAuthors :execrows
 -- Delete authors who haven't been active
 DELETE FROM authors
-WHERE last_active_at < @cutoff_date;
+WHERE last_active_at < :cutoff_date;
 
 -- name: CountAuthors :one
 -- Count total number of authors
@@ -67,6 +67,6 @@ FROM authors;
 -- Search authors by name pattern
 SELECT id, name, bio
 FROM authors
-WHERE name ILIKE @search_pattern
+WHERE name ILIKE :search_pattern
 ORDER BY name
-LIMIT @limit_count;
+LIMIT :limit_count;

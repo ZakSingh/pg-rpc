@@ -3,15 +3,15 @@ use pgrpc::*;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-/// Test parsing SQL files with @param syntax
+/// Test parsing SQL files with :param syntax
 #[test]
 fn test_sql_parser_named_params() {
     let sql = r#"
 -- name: GetUser :one
-SELECT * FROM users WHERE id = @user_id LIMIT 1;
+SELECT * FROM users WHERE id = :user_id LIMIT 1;
 
 -- name: UpdateUser :exec
-UPDATE users SET name = @name, email = @email WHERE id = @user_id;
+UPDATE users SET name = :name, email = :email WHERE id = :user_id;
 "#;
 
     let parser = pgrpc::sql_parser::SqlParser::new();
@@ -33,9 +33,9 @@ UPDATE users SET name = @name, email = @email WHERE id = @user_id;
         panic!("Expected named parameter");
     }
 
-    // SQL should be transformed to use $1 instead of @user_id
+    // SQL should be transformed to use $1 instead of :user_id
     assert!(get_user.postgres_sql.contains("$1"));
-    assert!(!get_user.postgres_sql.contains("@user_id"));
+    assert!(!get_user.postgres_sql.contains(":user_id"));
 
     // Second query - UpdateUser
     let update_user = &queries[1];
@@ -85,7 +85,7 @@ UPDATE users SET name = $1, email = $2 WHERE id = $3;
 fn test_sql_parser_query_types() {
     let sql = r#"
 -- name: GetOne :one
-SELECT * FROM users WHERE id = @id;
+SELECT * FROM users WHERE id = :id;
 
 -- name: GetMany :many
 SELECT * FROM users;
@@ -125,7 +125,7 @@ fn test_query_introspection() {
         ).unwrap();
 
         // Create a simple query
-        let sql = "-- name: GetUser :one\nSELECT id, username, email FROM users WHERE id = @user_id;";
+        let sql = "-- name: GetUser :one\nSELECT id, username, email FROM users WHERE id = :user_id;";
 
         let parser = pgrpc::sql_parser::SqlParser::new();
         let queries = parser.parse_content(sql, PathBuf::from("test.sql")).unwrap();
@@ -206,7 +206,7 @@ SELECT
     p.content
 FROM users u
 LEFT JOIN posts p ON u.id = p.user_id
-WHERE u.id = @user_id;
+WHERE u.id = :user_id;
 "#;
 
         let parser = pgrpc::sql_parser::SqlParser::new();
@@ -268,19 +268,19 @@ fn test_query_code_generation() {
 
         let sql = r#"
 -- name: GetUser :one
-SELECT id, username, email FROM users WHERE id = @user_id;
+SELECT id, username, email FROM users WHERE id = :user_id;
 
 -- name: ListUsers :many
 SELECT id, username, email FROM users ORDER BY username;
 
 -- name: CreateUser :one
-INSERT INTO users (username, email) VALUES (@username, @email) RETURNING id, username, email, created_at;
+INSERT INTO users (username, email) VALUES (:username, :email) RETURNING id, username, email, created_at;
 
 -- name: UpdateUser :exec
-UPDATE users SET username = @username WHERE id = @user_id;
+UPDATE users SET username = :username WHERE id = :user_id;
 
 -- name: DeleteUser :execrows
-DELETE FROM users WHERE id = @user_id;
+DELETE FROM users WHERE id = :user_id;
 "#;
 
         std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
@@ -373,7 +373,7 @@ fn test_query_view_nullability_inheritance() {
 
         let sql = r#"
 -- name: GetUserPosts :many
-SELECT user_id, username, post_id, title FROM user_posts WHERE user_id = @user_id;
+SELECT user_id, username, post_id, title FROM user_posts WHERE user_id = :user_id;
 "#;
 
         std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
@@ -427,7 +427,7 @@ fn test_query_coalesce_nullability() {
         // COALESCE should make bio NOT NULL
         let sql = r#"
 -- name: GetUserWithBio :one
-SELECT id, username, COALESCE(bio, 'No bio') as bio FROM users WHERE id = @user_id;
+SELECT id, username, COALESCE(bio, 'No bio') as bio FROM users WHERE id = :user_id;
 "#;
 
         std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
@@ -473,10 +473,10 @@ fn test_multiple_query_files() {
 
         // Create two SQL files
         let users_sql = temp_dir.path().join("users.sql");
-        std::fs::write(&users_sql, "-- name: GetUser :one\nSELECT * FROM users WHERE id = @id;").unwrap();
+        std::fs::write(&users_sql, "-- name: GetUser :one\nSELECT * FROM users WHERE id = :id;").unwrap();
 
         let posts_sql = temp_dir.path().join("posts.sql");
-        std::fs::write(&posts_sql, "-- name: GetPost :one\nSELECT * FROM posts WHERE id = @id;").unwrap();
+        std::fs::write(&posts_sql, "-- name: GetPost :one\nSELECT * FROM posts WHERE id = :id;").unwrap();
 
         let output_dir = temp_dir.path().join("generated");
 
@@ -621,8 +621,8 @@ fn test_nullable_parameters() {
 -- name: FindUsers :many
 SELECT id, username, email, age
 FROM users
-WHERE (email = @email? OR @email? IS NULL)
-  AND (age = @age? OR @age? IS NULL);
+WHERE (email = pgrpc.narg('email') OR pgrpc.narg('email') IS NULL)
+  AND (age = pgrpc.narg('age') OR pgrpc.narg('age') IS NULL);
 "#;
 
         std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
