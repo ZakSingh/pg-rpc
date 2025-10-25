@@ -218,7 +218,7 @@ impl<'a> QueryIntrospector<'a> {
             let type_oid: OID = row.get(1);
             let is_nullable: bool = row.get(2);
 
-            log::debug!("[INTROSPECT] Found column: {} (OID: {}, nullable: {})", column_name, type_oid, is_nullable);
+            log::info!("[INTROSPECT] pg_attribute reports - column: {} (OID: {}, nullable: {})", column_name, type_oid, is_nullable);
 
             columns.push(QueryColumn {
                 name: column_name,
@@ -227,7 +227,7 @@ impl<'a> QueryIntrospector<'a> {
             });
         }
 
-        log::debug!("[INTROSPECT] Total columns collected: {}", columns.len());
+        log::info!("[INTROSPECT] Total columns from pg_attribute: {}", columns.len());
 
         // Drop the temporary view and rollback
         self.client.execute(&format!("DROP VIEW {}", view_name), &[])?;
@@ -350,6 +350,12 @@ impl<'a> QueryIntrospector<'a> {
 
     /// Refine column nullability using ViewNullabilityAnalyzer
     fn refine_nullability(&self, sql: &str, columns: &[QueryColumn]) -> Result<Option<Vec<QueryColumn>>> {
+        log::info!("[REFINE] Starting nullability refinement for query: {}", sql);
+        log::info!("[REFINE] Input columns from pg_attribute:");
+        for col in columns {
+            log::info!("[REFINE]   {} -> nullable={}", col.name, col.nullable);
+        }
+
         // Try to apply view nullability analysis
         let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
@@ -357,22 +363,31 @@ impl<'a> QueryIntrospector<'a> {
 
         match analyzer.analyze_view(sql, &column_names) {
             Ok(nullability_map) => {
+                log::info!("[REFINE] ViewNullabilityAnalyzer results:");
+                for (name, is_not_null) in &nullability_map {
+                    log::info!("[REFINE]   {} -> is_not_null={} (nullable={})", name, is_not_null, !is_not_null);
+                }
+
                 let refined_columns = columns
                     .iter()
                     .map(|col| {
                         let is_not_null = nullability_map.get(&col.name).copied().unwrap_or(false);
+                        let new_nullable = !is_not_null;
+                        log::info!("[REFINE] Column '{}': pg_attribute says nullable={}, analyzer says is_not_null={}, final nullable={}",
+                            col.name, col.nullable, is_not_null, new_nullable);
                         QueryColumn {
                             name: col.name.clone(),
                             type_oid: col.type_oid,
-                            nullable: !is_not_null,
+                            nullable: new_nullable,
                         }
                     })
                     .collect();
 
+                log::info!("[REFINE] Refinement succeeded, returning refined columns");
                 Ok(Some(refined_columns))
             }
             Err(e) => {
-                log::warn!("Could not apply nullability analysis: {}", e);
+                log::warn!("[REFINE] Could not apply nullability analysis: {}", e);
                 Ok(None)
             }
         }

@@ -13,10 +13,9 @@
   <component name="ChangeListManager">
     <list default="true" id="945f98b6-7558-4dca-911e-a71f09b8ebf1" name="Changes" comment="basic support for tsvector/tsquery">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/examples/queries/authors.sql" beforeDir="false" afterPath="$PROJECT_DIR$/examples/queries/authors.sql" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/sql_parser.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/sql_parser.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/integration/query_tests.rs" beforeDir="false" afterPath="$PROJECT_DIR$/tests/integration/query_tests.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/test_queries.sql" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_queries.sql" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/query_introspector.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/query_introspector.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/view_nullability.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/view_nullability.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/integration/mod.rs" beforeDir="false" afterPath="$PROJECT_DIR$/tests/integration/mod.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -255,7 +254,7 @@
       <workItem from="1758575835091" duration="3091000" />
       <workItem from="1759027698959" duration="1172000" />
       <workItem from="1761194963848" duration="10662000" />
-      <workItem from="1761267636528" duration="9500000" />
+      <workItem from="1761267636528" duration="13566000" />
     </task>
     <task id="LOCAL-00001" summary="basic support for tsvector/tsquery">
       <option name="closed" value="true" />

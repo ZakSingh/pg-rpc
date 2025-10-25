@@ -24,6 +24,7 @@ pub mod trigger_tests;
 pub mod bulk_nullability_minimal_tests;
 pub mod view_constraint_test;
 pub mod view_nullability_tests;
+pub mod view_query_nullability_test;
 pub mod workflow_tests;
 
 /// Global container instance that's shared across all tests

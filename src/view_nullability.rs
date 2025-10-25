@@ -2,12 +2,13 @@ use crate::codegen::OID;
 use crate::pg_constraint::Constraint;
 use crate::pg_rel::PgRel;
 use crate::rel_index::RelIndex;
+use indexmap::IndexMap;
 use pg_query::protobuf;
 use std::collections::{HashMap, HashSet};
 
 /// Cache for storing view nullability analysis results
-/// Key: (schema, view_name), Value: map of column_name -> is_not_null
-pub type ViewNullabilityCache = HashMap<(Option<String>, String), HashMap<String, bool>>;
+/// Key: (schema, view_name), Value: map of column_name -> is_not_null (order-preserving)
+pub type ViewNullabilityCache = HashMap<(Option<String>, String), IndexMap<String, bool>>;
 
 /// Analyzes view definitions to infer column nullability
 pub struct ViewNullabilityAnalyzer<'a> {
@@ -35,8 +36,8 @@ enum TableInfo {
     View {
         schema: Option<String>,
         name: String,
-        /// Column name -> is_not_null mapping
-        nullability: HashMap<String, bool>,
+        /// Column name -> is_not_null mapping (order-preserving)
+        nullability: IndexMap<String, bool>,
         /// True if this view reference can produce NULL values due to outer joins
         is_nullable: bool,
     },
@@ -135,11 +136,12 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
 
     /// Analyze a view definition and return a map of column names to their nullability
     /// The map value is true if the column is NOT NULL, false if nullable
+    /// Returns an IndexMap to preserve column order
     pub fn analyze_view(
         &mut self,
         view_definition: &str,
         view_columns: &[String],
-    ) -> anyhow::Result<HashMap<String, bool>> {
+    ) -> anyhow::Result<IndexMap<String, bool>> {
         log::info!("Analyzing view with {} columns", view_columns.len());
         log::info!("View definition: {}", view_definition);
 
@@ -186,7 +188,8 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
         }
 
         // Map view columns to their nullability
-        let mut result = HashMap::new();
+        // Use IndexMap to preserve column order
+        let mut result = IndexMap::new();
         for (i, column_name) in view_columns.iter().enumerate() {
             if let Some(&not_null) = column_nullability.get(i) {
                 result.insert(column_name.clone(), not_null);
@@ -390,9 +393,12 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
             match col_ref.fields.len() {
                 1 => {
                     // SELECT * - expand all tables
+                    log::info!("[STAR_EXPAND] Expanding SELECT * for {} tables", self.alias_map.len());
                     for (alias, table_info) in &self.alias_map {
+                        log::info!("[STAR_EXPAND] Processing table alias '{}'", alias);
                         let columns = self.get_table_columns(table_info)?;
                         for (col_name, is_not_null) in columns {
+                            log::info!("[STAR_EXPAND]   Adding column '{}.{}' with is_not_null={}", alias, col_name, is_not_null);
                             result.push((format!("{}.{}", alias, col_name), is_not_null));
                         }
                     }
@@ -401,8 +407,10 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                     // SELECT table.* - expand specific table
                     if let Some(protobuf::node::Node::String(table_ref)) = &col_ref.fields[0].node {
                         if let Some(table_info) = self.alias_map.get(&table_ref.sval) {
+                            log::info!("[STAR_EXPAND] Expanding SELECT {}.* ", table_ref.sval);
                             let columns = self.get_table_columns(table_info)?;
                             for (col_name, is_not_null) in columns {
+                                log::info!("[STAR_EXPAND]   Adding column '{}' with is_not_null={}", col_name, is_not_null);
                                 result.push((col_name, is_not_null));
                             }
                         } else {
@@ -419,6 +427,7 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
             }
         }
 
+        log::info!("[STAR_EXPAND] Expansion complete, {} columns", result.len());
         Ok(result)
     }
 
@@ -433,27 +442,35 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                 is_nullable,
                 ..
             } => {
+                log::info!("[GET_COLUMNS] Getting columns for table {:?}.{} (is_nullable={})", schema, name, is_nullable);
                 if let Some(rel) = self.find_relation(schema, name) {
                     for column in &rel.columns {
                         // Column is NOT NULL if table is not nullable (from join) AND column has NOT NULL constraint
                         let is_not_null = !is_nullable && self.is_column_not_null(rel, &column);
+                        log::info!("[GET_COLUMNS]   Column '{}': is_not_null={}", column, is_not_null);
                         result.push((column.to_string(), is_not_null));
                     }
                 }
             }
             TableInfo::View {
+                schema,
+                name,
                 nullability,
                 is_nullable,
                 ..
             } => {
+                log::info!("[GET_COLUMNS] Getting columns for view {:?}.{} (is_nullable={})", schema, name, is_nullable);
+                log::info!("[GET_COLUMNS] View has {} columns in cache", nullability.len());
                 for (col_name, &is_not_null) in nullability {
                     // View column nullability is affected by join context
                     let final_not_null = is_not_null && !is_nullable;
+                    log::info!("[GET_COLUMNS]   Column '{}': cached is_not_null={}, final is_not_null={}", col_name, is_not_null, final_not_null);
                     result.push((col_name.clone(), final_not_null));
                 }
             }
         }
 
+        log::info!("[GET_COLUMNS] Returning {} columns", result.len());
         Ok(result)
     }
 
