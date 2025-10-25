@@ -784,6 +784,58 @@ fn generate_query_code(
             use postgres_types::{IsNull, ToSql, Type};
             use rust_decimal::Decimal;
 
+            /// Custom serde module for time::Date using YYYY-MM-DD format
+            pub mod date_serde {
+                use serde::{self, Deserialize, Deserializer, Serializer};
+                use time::Date;
+
+                const FORMAT: &[time::format_description::FormatItem] = time::macros::format_description!("[year]-[month]-[day]");
+
+                pub fn serialize<S>(date: &Date, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: Serializer,
+                {
+                    let s = date.format(&FORMAT).map_err(serde::ser::Error::custom)?;
+                    serializer.serialize_str(&s)
+                }
+
+                pub fn deserialize<'de, D>(deserializer: D) -> Result<Date, D::Error>
+                where
+                    D: Deserializer<'de>,
+                {
+                    let s = String::deserialize(deserializer)?;
+                    Date::parse(&s, &FORMAT).map_err(serde::de::Error::custom)
+                }
+
+                pub mod option {
+                    use serde::{Deserialize, Deserializer, Serializer};
+                    use time::Date;
+
+                    const FORMAT: &[time::format_description::FormatItem] = time::macros::format_description!("[year]-[month]-[day]");
+
+                    pub fn serialize<S>(date: &Option<Date>, serializer: S) -> Result<S::Ok, S::Error>
+                    where
+                        S: Serializer,
+                    {
+                        match date {
+                            Some(d) => {
+                                let s = d.format(&FORMAT).map_err(serde::ser::Error::custom)?;
+                                serializer.serialize_some(&s)
+                            }
+                            None => serializer.serialize_none(),
+                        }
+                    }
+
+                    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Date>, D::Error>
+                    where
+                        D: Deserializer<'de>,
+                    {
+                        let opt = Option::<String>::deserialize(deserializer)?;
+                        opt.map(|s| Date::parse(&s, &FORMAT).map_err(serde::de::Error::custom)).transpose()
+                    }
+                }
+            }
+
             #query_code_tokens
         })
         .expect("query code to parse"),

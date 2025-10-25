@@ -637,6 +637,27 @@ fn generate_query_code(
     }
 }
 
+/// Generate serde annotation for datetime types that need special serialization
+fn generate_datetime_serde_attr(pg_type: &PgType, nullable: bool) -> Option<TokenStream> {
+    match pg_type {
+        PgType::Timestamptz => {
+            if nullable {
+                Some(quote! { #[serde(with = "time::serde::rfc3339::option")] })
+            } else {
+                Some(quote! { #[serde(with = "time::serde::rfc3339")] })
+            }
+        }
+        PgType::Date => {
+            if nullable {
+                Some(quote! { #[serde(with = "date_serde::option")] })
+            } else {
+                Some(quote! { #[serde(with = "date_serde")] })
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Generate a row struct for query results
 fn generate_row_struct(
     struct_name: &proc_macro2::Ident,
@@ -650,7 +671,30 @@ fn generate_row_struct(
         .map(|col| {
             let field_name = quote::format_ident!("{}", sql_to_rs_ident(&col.name, CaseType::Snake).to_string());
             let field_type = get_column_type(col, type_index);
-            quote! { pub #field_name: #field_type }
+            let column_name = &col.name;
+
+            // Generate datetime serde attribute if needed
+            let datetime_serde_attr = if let Some(pg_type) = type_index.get(&col.type_oid) {
+                generate_datetime_serde_attr(pg_type, col.nullable)
+            } else {
+                None
+            };
+
+            // Generate serde attributes
+            let serde_attr = match datetime_serde_attr {
+                Some(attr) => quote! {
+                    #[serde(rename = #column_name)]
+                    #attr
+                },
+                None => quote! {
+                    #[serde(rename = #column_name)]
+                },
+            };
+
+            quote! {
+                #serde_attr
+                pub #field_name: #field_type
+            }
         })
         .collect();
 
@@ -661,7 +705,7 @@ fn generate_row_struct(
         .collect();
 
     quote! {
-        #[derive(Debug, Clone)]
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
         pub struct #struct_name {
             #(#fields),*
         }
