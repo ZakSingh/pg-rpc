@@ -617,6 +617,99 @@ impl PgFn {
 
         &self.definition[start_ind..end_ind]
     }
+
+    /// Infer nullability of OUT parameters for SQL language functions
+    /// using the ViewNullabilityAnalyzer on the function body
+    pub fn infer_out_param_nullability(
+        &mut self,
+        rel_index: &RelIndex,
+        view_nullability_cache: &crate::view_nullability::ViewNullabilityCache,
+    ) -> anyhow::Result<()> {
+        // Only apply to SQL language functions with OUT parameters
+        if !self.definition.contains("LANGUAGE sql")
+            && !self.definition.contains("language sql")
+            && !self.definition.contains("LANGUAGE SQL") {
+            return Ok(());
+        }
+
+        if self.out_args.is_empty() {
+            return Ok(());
+        }
+
+        // Parse @pgrpc_not_null annotations - these take precedence over inference
+        let not_null_annotations = parse_out_param_not_null_annotations(&self.comment);
+
+        // Extract the function body
+        let body = self.body();
+
+        // Parse the body as SQL
+        let parsed = match pg_query::parse(body) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!(
+                    "Failed to parse SQL function body for nullability analysis (function: {}): {}",
+                    self.name,
+                    e
+                );
+                return Ok(()); // Gracefully fall back to default nullable
+            }
+        };
+
+        // Create analyzer
+        let mut analyzer = crate::view_nullability::ViewNullabilityAnalyzer::new(
+            rel_index,
+            view_nullability_cache,
+        );
+
+        // Collect column names from OUT parameters
+        let column_names: Vec<String> = self.out_args.iter().map(|arg| arg.name.clone()).collect();
+
+        // Analyze the query
+        match analyzer.analyze_view(body, &column_names) {
+            Ok(nullability_map) => {
+                log::info!(
+                    "Inferred nullability for SQL function {}: {:?}",
+                    self.name,
+                    nullability_map
+                );
+
+                // Update OUT parameter nullability
+                for out_arg in &mut self.out_args {
+                    // Skip if annotation exists (annotations take precedence)
+                    if not_null_annotations.contains(&out_arg.name) {
+                        log::debug!(
+                            "Function {}: OUT param {} has @pgrpc_not_null annotation, skipping inference",
+                            self.name,
+                            out_arg.name
+                        );
+                        out_arg.nullable = false;
+                        continue;
+                    }
+
+                    // Apply inferred nullability
+                    if let Some(&is_not_null) = nullability_map.get(&out_arg.name) {
+                        out_arg.nullable = !is_not_null;
+                        log::debug!(
+                            "Function {}: OUT param {} inferred as {}",
+                            self.name,
+                            out_arg.name,
+                            if is_not_null { "NOT NULL" } else { "NULLABLE" }
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to analyze SQL function nullability (function: {}): {}",
+                    self.name,
+                    e
+                );
+                // Gracefully fall back to default nullable behavior
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl PgFn {

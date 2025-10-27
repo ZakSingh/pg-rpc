@@ -370,3 +370,205 @@ fn test_sql_function_constraint_exceptions() {
         println!("SQL function constraint exception test completed successfully!");
     });
 }
+
+#[test]
+fn test_sql_function_nullability_inference() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create test schema with tables
+        execute_sql(client, "CREATE SCHEMA nullability_test").expect("Should create schema");
+
+        // Create tables with NOT NULL constraints
+        execute_sql(
+            client,
+            r#"
+            CREATE TABLE nullability_test.users (
+                id SERIAL PRIMARY KEY,
+                email TEXT NOT NULL,
+                name TEXT,
+                age INTEGER NOT NULL
+            )
+        "#,
+        )
+        .expect("Should create users table");
+
+        execute_sql(
+            client,
+            r#"
+            CREATE TABLE nullability_test.posts (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT
+            )
+        "#,
+        )
+        .expect("Should create posts table");
+
+        // SQL function returning columns with NOT NULL constraints
+        execute_sql(
+            client,
+            r#"
+            CREATE OR REPLACE FUNCTION nullability_test.get_user_info(p_user_id INTEGER)
+            RETURNS TABLE(user_id INTEGER, email TEXT, age INTEGER)
+            LANGUAGE SQL AS $$
+                SELECT id, email, age FROM nullability_test.users WHERE id = p_user_id;
+            $$;
+        "#,
+        )
+        .expect("Should create get_user_info function");
+
+        // SQL function with LEFT JOIN (should make joined columns nullable)
+        execute_sql(
+            client,
+            r#"
+            CREATE OR REPLACE FUNCTION nullability_test.get_user_with_posts(p_user_id INTEGER)
+            RETURNS TABLE(user_email TEXT, post_title TEXT)
+            LANGUAGE SQL AS $$
+                SELECT u.email, p.title
+                FROM nullability_test.users u
+                LEFT JOIN nullability_test.posts p ON u.id = p.user_id
+                WHERE u.id = p_user_id;
+            $$;
+        "#,
+        )
+        .expect("Should create get_user_with_posts function");
+
+        // SQL function with INNER JOIN (columns retain NOT NULL status)
+        execute_sql(
+            client,
+            r#"
+            CREATE OR REPLACE FUNCTION nullability_test.get_user_posts_inner(p_user_id INTEGER)
+            RETURNS TABLE(user_email TEXT, post_title TEXT)
+            LANGUAGE SQL AS $$
+                SELECT u.email, p.title
+                FROM nullability_test.users u
+                INNER JOIN nullability_test.posts p ON u.id = p.user_id
+                WHERE u.id = p_user_id;
+            $$;
+        "#,
+        )
+        .expect("Should create get_user_posts_inner function");
+
+        // SQL function with nullable column
+        execute_sql(
+            client,
+            r#"
+            CREATE OR REPLACE FUNCTION nullability_test.get_user_name(p_user_id INTEGER)
+            RETURNS TABLE(user_name TEXT)
+            LANGUAGE SQL AS $$
+                SELECT name FROM nullability_test.users WHERE id = p_user_id;
+            $$;
+        "#,
+        )
+        .expect("Should create get_user_name function");
+
+        // Generate code
+        let temp_dir = TempDir::new().expect("Should create temp directory");
+        let output_path = temp_dir.path();
+
+        pgrpc::PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("nullability_test")
+            .output_path(output_path)
+            .build()
+            .expect("Should generate code");
+
+        let content = std::fs::read_to_string(output_path.join("nullability_test.rs"))
+            .expect("Should read generated file");
+
+        println!("Generated code for nullability inference:\n{}", content);
+
+        // Verify get_user_info struct has correct nullability
+        // user_id and email should be NOT NULL (i32/String), age should be NOT NULL (i32)
+        assert!(
+            content.contains("pub struct GetUserInfoRow"),
+            "Should generate GetUserInfoRow struct"
+        );
+
+        // Check that the struct fields have correct types
+        // user_id should be i32 (not Option<i32>)
+        // email should be String (not Option<String>)
+        // age should be i32 (not Option<i32>)
+
+        // Find the struct definition
+        if let Some(struct_start) = content.find("pub struct GetUserInfoRow") {
+            let struct_end = content[struct_start..].find('}').unwrap() + struct_start;
+            let struct_def = &content[struct_start..struct_end];
+
+            println!("GetUserInfoRow struct:\n{}", struct_def);
+
+            // user_id comes from id column which is PRIMARY KEY (NOT NULL)
+            assert!(
+                struct_def.contains("pub user_id: i32") || struct_def.contains("pub user_id : i32"),
+                "user_id should be i32 (NOT NULL)"
+            );
+
+            // email has NOT NULL constraint
+            assert!(
+                struct_def.contains("pub email: String") || struct_def.contains("pub email : String"),
+                "email should be String (NOT NULL)"
+            );
+
+            // age has NOT NULL constraint
+            assert!(
+                struct_def.contains("pub age: i32") || struct_def.contains("pub age : i32"),
+                "age should be i32 (NOT NULL)"
+            );
+        }
+
+        // Verify get_user_with_posts struct (LEFT JOIN should make post_title nullable)
+        if let Some(struct_start) = content.find("pub struct GetUserWithPostsRow") {
+            let struct_end = content[struct_start..].find('}').unwrap() + struct_start;
+            let struct_def = &content[struct_start..struct_end];
+
+            println!("GetUserWithPostsRow struct:\n{}", struct_def);
+
+            // user_email should be NOT NULL (from users table with NOT NULL constraint)
+            assert!(
+                struct_def.contains("pub user_email: String") || struct_def.contains("pub user_email : String"),
+                "user_email should be String (NOT NULL)"
+            );
+
+            // post_title should be nullable due to LEFT JOIN
+            assert!(
+                struct_def.contains("pub post_title: Option<String>") || struct_def.contains("pub post_title : Option < String >"),
+                "post_title should be Option<String> (nullable due to LEFT JOIN)"
+            );
+        }
+
+        // Verify get_user_posts_inner struct (INNER JOIN preserves NOT NULL)
+        if let Some(struct_start) = content.find("pub struct GetUserPostsInnerRow") {
+            let struct_end = content[struct_start..].find('}').unwrap() + struct_start;
+            let struct_def = &content[struct_start..struct_end];
+
+            println!("GetUserPostsInnerRow struct:\n{}", struct_def);
+
+            // Both columns should be NOT NULL (INNER JOIN + NOT NULL constraints)
+            assert!(
+                struct_def.contains("pub user_email: String") || struct_def.contains("pub user_email : String"),
+                "user_email should be String (NOT NULL)"
+            );
+
+            assert!(
+                struct_def.contains("pub post_title: String") || struct_def.contains("pub post_title : String"),
+                "post_title should be String (NOT NULL from INNER JOIN)"
+            );
+        }
+
+        // Verify get_user_name struct (nullable column)
+        if let Some(struct_start) = content.find("pub struct GetUserNameRow") {
+            let struct_end = content[struct_start..].find('}').unwrap() + struct_start;
+            let struct_def = &content[struct_start..struct_end];
+
+            println!("GetUserNameRow struct:\n{}", struct_def);
+
+            // name column is nullable in the table
+            assert!(
+                struct_def.contains("pub user_name: Option<String>") || struct_def.contains("pub user_name : Option < String >"),
+                "user_name should be Option<String> (nullable column)"
+            );
+        }
+
+        println!("SQL function nullability inference test completed successfully!");
+    });
+}

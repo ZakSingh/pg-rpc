@@ -297,7 +297,7 @@ impl PgrpcBuilder {
         let rel_index = RelIndex::new(&mut db.client)?;
         let trigger_index =
             trigger_index::TriggerIndex::new(&mut db.client, &rel_index, &config.schemas)?;
-        let fn_index =
+        let mut fn_index =
             FunctionIndex::new(&mut db.client, &rel_index, &trigger_index, &config.schemas)?;
 
         // Collect type OIDs from functions, task types, and error types
@@ -357,6 +357,11 @@ impl PgrpcBuilder {
         // Apply view nullability inference using the pre-built cache
         if config.infer_view_nullability {
             ty_index.apply_view_nullability_from_cache(&view_nullability_cache)?;
+        }
+
+        // Apply nullability inference to SQL language functions with OUT parameters
+        if config.infer_view_nullability {
+            fn_index.apply_sql_function_nullability(&rel_index, &view_nullability_cache)?;
         }
 
         let schema_files = codegen_split(&fn_index, &ty_index, &rel_index, &config)?;

@@ -60,6 +60,58 @@ impl FunctionIndex {
             .flatten()
             .collect()
     }
+
+    /// Apply nullability inference to SQL language functions with OUT parameters
+    /// This should be called after the view nullability cache has been built
+    pub fn apply_sql_function_nullability(
+        &mut self,
+        rel_index: &RelIndex,
+        view_nullability_cache: &crate::view_nullability::ViewNullabilityCache,
+    ) -> anyhow::Result<()> {
+        log::info!("Applying nullability inference to SQL functions...");
+
+        let mut analyzed_count = 0;
+        let mut error_count = 0;
+
+        for (_oid, pg_fn) in self.deref_mut().iter_mut() {
+            // Only analyze SQL language functions with OUT parameters
+            if pg_fn.out_args.is_empty() {
+                continue;
+            }
+
+            let is_sql_function = pg_fn.definition.contains("LANGUAGE sql")
+                || pg_fn.definition.contains("language sql")
+                || pg_fn.definition.contains("LANGUAGE SQL");
+
+            if !is_sql_function {
+                continue;
+            }
+
+            analyzed_count += 1;
+
+            match pg_fn.infer_out_param_nullability(rel_index, view_nullability_cache) {
+                Ok(()) => {
+                    log::debug!("Successfully analyzed SQL function: {}", pg_fn.name);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Error analyzing SQL function {} for nullability: {}",
+                        pg_fn.name,
+                        e
+                    );
+                    error_count += 1;
+                }
+            }
+        }
+
+        log::info!(
+            "SQL function nullability analysis complete: {} analyzed, {} errors",
+            analyzed_count,
+            error_count
+        );
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
