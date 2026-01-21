@@ -589,6 +589,168 @@ WHERE p.id = $1;
     });
 }
 
+/// Test INSERT with SELECT and RETURNING clause generates correct struct
+#[test]
+fn test_insert_select_with_returning() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create test tables similar to the chat/message scenario in the bug report
+        client.execute(
+            "CREATE TABLE chat (
+                chat_id SERIAL PRIMARY KEY,
+                chat_nanoid TEXT NOT NULL UNIQUE
+            )",
+            &[],
+        ).unwrap();
+
+        client.execute(
+            "CREATE TABLE chat_account (
+                chat_id INT NOT NULL REFERENCES chat(chat_id),
+                account_id INT NOT NULL,
+                PRIMARY KEY (chat_id, account_id)
+            )",
+            &[],
+        ).unwrap();
+
+        client.execute(
+            "CREATE TABLE message (
+                message_id SERIAL PRIMARY KEY,
+                chat_id INT NOT NULL REFERENCES chat(chat_id),
+                account_id INT NOT NULL,
+                item_id INT,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            &[],
+        ).unwrap();
+
+        // Create temporary SQL file with INSERT...SELECT...RETURNING
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // This is the query pattern that was generating empty structs
+        let sql = r#"
+-- name: InsertMessage :one
+INSERT INTO message (chat_id, account_id, content)
+SELECT c.chat_id, :account_id, :content
+FROM chat c
+     JOIN chat_account ca USING (chat_id)
+WHERE c.chat_nanoid = :chat_nanoid
+  AND ca.account_id = :account_id
+RETURNING message_id, account_id, item_id, content, created_at, updated_at;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        // Generate code
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        // Read generated queries.rs file
+        let queries_file = output_dir.join("queries.rs");
+        assert!(queries_file.exists(), "queries.rs should be generated");
+
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE ===\n{}\n======================", generated_code);
+
+        // Verify the struct is NOT empty - this was the main bug
+        assert!(generated_code.contains("struct InsertMessageRow"), "Should generate InsertMessageRow struct");
+
+        // Verify all RETURNING columns are present with correct types
+        assert!(generated_code.contains("pub message_id: i32"), "Should have message_id field");
+        assert!(generated_code.contains("pub account_id: i32"), "Should have account_id field");
+        assert!(generated_code.contains("pub item_id: Option<i32>"), "item_id should be Option<i32> (nullable)");
+        assert!(generated_code.contains("pub content: String"), "Should have content field");
+
+        // created_at and updated_at should be OffsetDateTime (not Option) because they're NOT NULL
+        assert!(
+            generated_code.contains("pub created_at: time::OffsetDateTime") ||
+            generated_code.contains("pub created_at: chrono::DateTime"),
+            "Should have created_at field with proper type"
+        );
+        assert!(
+            generated_code.contains("pub updated_at: time::OffsetDateTime") ||
+            generated_code.contains("pub updated_at: chrono::DateTime"),
+            "Should have updated_at field with proper type"
+        );
+    });
+}
+
+/// Test UPDATE and DELETE with RETURNING clause generates correct struct
+#[test]
+fn test_update_delete_with_returning() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create test table
+        client.execute(
+            "CREATE TABLE items (
+                item_id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                price NUMERIC(10,2) NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        let sql = r#"
+-- name: UpdateItem :one
+UPDATE items
+SET name = :name, price = :price, updated_at = NOW()
+WHERE item_id = :item_id
+RETURNING item_id, name, description, price, updated_at;
+
+-- name: DeleteItem :one
+DELETE FROM items
+WHERE item_id = :item_id
+RETURNING item_id, name, description, price;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE ===\n{}\n======================", generated_code);
+
+        // Verify UPDATE RETURNING struct
+        assert!(generated_code.contains("struct UpdateItemRow"), "Should generate UpdateItemRow struct");
+        assert!(generated_code.contains("pub item_id: i32"), "UpdateItemRow should have item_id");
+        assert!(generated_code.contains("pub name: String"), "UpdateItemRow should have name");
+        assert!(generated_code.contains("pub description: Option<String>"), "description should be Option<String>");
+        assert!(generated_code.contains("pub price: rust_decimal::Decimal"), "UpdateItemRow should have price");
+
+        // Verify DELETE RETURNING struct
+        assert!(generated_code.contains("struct DeleteItemRow"), "Should generate DeleteItemRow struct");
+    });
+}
+
 /// Test nullable parameter syntax and code generation
 #[test]
 fn test_nullable_parameters() {

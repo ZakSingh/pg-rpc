@@ -6,12 +6,21 @@
   <component name="CargoProjects">
     <cargoProject FILE="$PROJECT_DIR$/Cargo.toml">
       <package file="$PROJECT_DIR$">
-        <enabledFeature name="default" />
+        <feature name="default" enabled="true" />
       </package>
     </cargoProject>
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="945f98b6-7558-4dca-911e-a71f09b8ebf1" name="Changes" comment="basic support for tsvector/tsquery" />
+    <list default="true" id="945f98b6-7558-4dca-911e-a71f09b8ebf1" name="Changes" comment="basic support for tsvector/tsquery">
+      <change beforePath="$PROJECT_DIR$/.idea/dataSources.local.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/dataSources.local.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/dataSources/8d49257a-d66c-43b6-b773-3e79914fb76c.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/dataSources/8d49257a-d66c-43b6-b773-3e79914fb76c.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/query_introspector.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/query_introspector.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/integration/compile_helpers.rs" beforeDir="false" afterPath="$PROJECT_DIR$/tests/integration/compile_helpers.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/integration/error_tests.rs" beforeDir="false" afterPath="$PROJECT_DIR$/tests/integration/error_tests.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/integration/query_tests.rs" beforeDir="false" afterPath="$PROJECT_DIR$/tests/integration/query_tests.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/integration/task_queue_tests.rs" beforeDir="false" afterPath="$PROJECT_DIR$/tests/integration/task_queue_tests.rs" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -63,8 +72,10 @@
     &quot;Cargo.Test parse_domain::tests::nullable_value_works_2.executor&quot;: &quot;Run&quot;,
     &quot;Cargo.Test pg_fn::test::test_get_rels.executor&quot;: &quot;Run&quot;,
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.rust.reset.selective.auto.import&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.typescript.service.memoryLimit.init&quot;: &quot;true&quot;,
     &quot;git-widget-placeholder&quot;: &quot;main&quot;,
     &quot;last_opened_file_path&quot;: &quot;/Users/zaksingh/code/pgrpc&quot;,
     &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
@@ -250,6 +261,7 @@
       <workItem from="1759027698959" duration="1172000" />
       <workItem from="1761194963848" duration="10662000" />
       <workItem from="1761267636528" duration="15795000" />
+      <workItem from="1769023388081" duration="2277000" />
     </task>
     <task id="LOCAL-00001" summary="basic support for tsvector/tsquery">
       <option name="closed" value="true" />

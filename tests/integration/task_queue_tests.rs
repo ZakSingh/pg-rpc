@@ -345,7 +345,7 @@ fn test_generated_task_enum_compiles() {
             serde_json = \"1.0\"
             uuid = { version = \"1.0\", features = [\"v4\"] }
             rust_decimal = \"1.0\"
-            time = { version = \"0.3\", features = [\"serde-well-known\"] }
+            time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
         "};
 
         std::fs::write(project_dir.join("Cargo.toml"), cargo_toml)
@@ -702,7 +702,7 @@ fn test_custom_table_compilation() {
             [dependencies]
             serde = { version = \"1.0\", features = [\"derive\"] }
             serde_json = \"1.0\"
-            time = { version = \"0.3\", features = [\"serde-well-known\"] }
+            time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
             uuid = \"1.0\"
             rust_decimal = \"1.0\"
         "};
@@ -874,7 +874,7 @@ fn test_timestamptz_serialization_deserialization() {
             [dependencies]
             serde = { version = \"1.0\", features = [\"derive\"] }
             serde_json = \"1.0\"
-            time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\"] }
+            time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
             uuid = \"1.0\"
             rust_decimal = \"1.0\"
         "};
@@ -1023,7 +1023,7 @@ fn test_date_serialization_deserialization() {
             [dependencies]
             serde = { version = \"1.0\", features = [\"derive\"] }
             serde_json = \"1.0\"
-            time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\"] }
+            time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
             uuid = \"1.0\"
             rust_decimal = \"1.0\"
         "};

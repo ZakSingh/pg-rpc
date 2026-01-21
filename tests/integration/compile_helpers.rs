@@ -53,10 +53,11 @@ pub fn create_test_cargo_project(conn_string: &str, schemas: Vec<&str>) -> TempD
         postgres-types = { version = "0.2", features = ["derive"] }
         serde = { version = "1.0", features = ["derive"] }
         serde_json = "1.0"
-        time = { version = "0.3", features = ["serde"] }
+        time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }
         thiserror = "1.0"
         deadpool-postgres = "0.12"
         tokio = { version = "1.0", features = ["full"] }
+        postgis-butmaintained = "0.12"
         
     "#};
     std::fs::write(project_dir.join("Cargo.toml"), cargo_toml_content)
