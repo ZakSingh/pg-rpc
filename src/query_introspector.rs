@@ -33,6 +33,55 @@ pub struct IntrospectedQuery {
     pub line_number: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum QueryAstType {
+    Select,              // SELECT or CTE with final SELECT
+    DmlWithReturning,    // INSERT/UPDATE/DELETE with RETURNING
+    DmlWithoutReturning, // INSERT/UPDATE/DELETE without RETURNING
+    Unknown,             // Parsing failed
+}
+
+fn determine_query_type_from_ast(sql: &str) -> QueryAstType {
+    match pg_query::parse(sql) {
+        Ok(result) => {
+            if let Some(stmt) = result.protobuf.stmts.first() {
+                if let Some(node) = &stmt.stmt {
+                    match &node.node {
+                        Some(pg_query::protobuf::node::Node::SelectStmt(_)) => QueryAstType::Select,
+                        Some(pg_query::protobuf::node::Node::InsertStmt(s)) => {
+                            if s.returning_list.is_empty() {
+                                QueryAstType::DmlWithoutReturning
+                            } else {
+                                QueryAstType::DmlWithReturning
+                            }
+                        }
+                        Some(pg_query::protobuf::node::Node::UpdateStmt(s)) => {
+                            if s.returning_list.is_empty() {
+                                QueryAstType::DmlWithoutReturning
+                            } else {
+                                QueryAstType::DmlWithReturning
+                            }
+                        }
+                        Some(pg_query::protobuf::node::Node::DeleteStmt(s)) => {
+                            if s.returning_list.is_empty() {
+                                QueryAstType::DmlWithoutReturning
+                            } else {
+                                QueryAstType::DmlWithReturning
+                            }
+                        }
+                        _ => QueryAstType::Unknown,
+                    }
+                } else {
+                    QueryAstType::Unknown
+                }
+            } else {
+                QueryAstType::Unknown
+            }
+        }
+        Err(_) => QueryAstType::Unknown,
+    }
+}
+
 pub struct QueryIntrospector<'a> {
     client: &'a mut Client,
     rel_index: &'a RelIndex,
@@ -147,18 +196,22 @@ impl<'a> QueryIntrospector<'a> {
 
     /// Introspect return columns using the prepared statement
     fn introspect_return_columns(&mut self, stmt_name: &str, sql: &str) -> Result<Vec<QueryColumn>> {
-        // Check if this is a SELECT query or an INSERT/UPDATE/DELETE with RETURNING
-        let is_select = sql.trim_start().to_uppercase().starts_with("SELECT");
-        let has_returning = sql.to_uppercase().contains("RETURNING");
-
-        if is_select {
-            // For SELECT queries, create a temporary view
-            self.introspect_select_columns(sql)
-        } else if has_returning {
-            // For INSERT/UPDATE/DELETE with RETURNING, execute the prepared statement in a transaction
-            self.introspect_returning_columns(stmt_name, sql)
-        } else {
-            Ok(Vec::new())
+        match determine_query_type_from_ast(sql) {
+            QueryAstType::Select => self.introspect_select_columns(sql),
+            QueryAstType::DmlWithReturning => self.introspect_returning_columns(stmt_name, sql),
+            QueryAstType::DmlWithoutReturning => Ok(Vec::new()),
+            QueryAstType::Unknown => {
+                // Fallback to string-based detection
+                log::warn!("Could not parse SQL for query type detection, falling back to string matching");
+                let trimmed = sql.trim_start().to_uppercase();
+                if trimmed.starts_with("SELECT") || trimmed.starts_with("WITH") {
+                    self.introspect_select_columns(sql)
+                } else if sql.to_uppercase().contains("RETURNING") {
+                    self.introspect_returning_columns(stmt_name, sql)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
         }
     }
 

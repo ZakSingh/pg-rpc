@@ -825,3 +825,203 @@ WHERE (email = pgrpc.narg('email') OR pgrpc.narg('email') IS NULL)
         assert!(generated_code.contains("pub username: String"), "Should have username field");
     });
 }
+
+/// Test CTE (WITH clause) queries are correctly detected and introspected
+#[test]
+fn test_cte_select_query() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create test tables
+        client.execute(
+            "CREATE TABLE users (
+                id SERIAL PRIMARY KEY,
+                username TEXT NOT NULL,
+                email TEXT NOT NULL
+            )",
+            &[],
+        ).unwrap();
+
+        client.execute(
+            "CREATE TABLE posts (
+                id SERIAL PRIMARY KEY,
+                user_id INT NOT NULL REFERENCES users(id),
+                title TEXT NOT NULL,
+                published BOOLEAN NOT NULL DEFAULT false
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // CTE with final SELECT - this was previously generating empty structs
+        let sql = r#"
+-- name: GetActiveUserPosts :many
+WITH active_users AS (
+    SELECT id, username FROM users WHERE id = :user_id
+)
+SELECT au.id as user_id, au.username, p.id as post_id, p.title
+FROM active_users au
+JOIN posts p ON p.user_id = au.id
+WHERE p.published = true;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE (CTE SELECT) ===\n{}\n======================", generated_code);
+
+        // Verify the struct is NOT empty - this was the main bug
+        assert!(generated_code.contains("struct GetActiveUserPostsRow"), "Should generate GetActiveUserPostsRow struct");
+
+        // Verify all columns are present
+        assert!(generated_code.contains("pub user_id:"), "Should have user_id field");
+        assert!(generated_code.contains("pub username:"), "Should have username field");
+        assert!(generated_code.contains("pub post_id:"), "Should have post_id field");
+        assert!(generated_code.contains("pub title:"), "Should have title field");
+    });
+}
+
+/// Test CTE with INSERT and RETURNING clause
+#[test]
+fn test_cte_insert_with_returning() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create test tables similar to the original bug report
+        client.execute(
+            "CREATE TABLE accounts (
+                account_id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL
+            )",
+            &[],
+        ).unwrap();
+
+        client.execute(
+            "CREATE TABLE account_connections (
+                connection_id SERIAL PRIMARY KEY,
+                account_id INT NOT NULL REFERENCES accounts(account_id),
+                provider TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                connected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // CTE with INSERT...RETURNING - the connect_shopify pattern from bug report
+        let sql = r#"
+-- name: ConnectProvider :one
+WITH target_account AS (
+    SELECT account_id FROM accounts WHERE account_id = :account_id
+)
+INSERT INTO account_connections (account_id, provider, external_id)
+SELECT account_id, :provider, :external_id
+FROM target_account
+RETURNING account_id;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE (CTE INSERT) ===\n{}\n======================", generated_code);
+
+        // Verify the struct has the account_id field from RETURNING
+        assert!(generated_code.contains("struct ConnectProviderRow"), "Should generate ConnectProviderRow struct");
+        assert!(generated_code.contains("pub account_id: i32"), "Should have account_id field");
+    });
+}
+
+/// Test recursive CTE
+#[test]
+fn test_recursive_cte() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create a hierarchical table for recursive CTE
+        client.execute(
+            "CREATE TABLE categories (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                parent_id INT REFERENCES categories(id)
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // Recursive CTE to get category hierarchy
+        let sql = r#"
+-- name: GetCategoryHierarchy :many
+WITH RECURSIVE category_tree AS (
+    SELECT id, name, parent_id, 1 as depth
+    FROM categories
+    WHERE id = :root_id
+
+    UNION ALL
+
+    SELECT c.id, c.name, c.parent_id, ct.depth + 1
+    FROM categories c
+    JOIN category_tree ct ON c.parent_id = ct.id
+)
+SELECT id, name, parent_id, depth FROM category_tree;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE (RECURSIVE CTE) ===\n{}\n======================", generated_code);
+
+        // Verify the struct is NOT empty
+        assert!(generated_code.contains("struct GetCategoryHierarchyRow"), "Should generate GetCategoryHierarchyRow struct");
+
+        // Verify all columns are present
+        assert!(generated_code.contains("pub id:"), "Should have id field");
+        assert!(generated_code.contains("pub name:"), "Should have name field");
+        assert!(generated_code.contains("pub parent_id:"), "Should have parent_id field");
+        assert!(generated_code.contains("pub depth:"), "Should have depth field");
+    });
+}
