@@ -3,9 +3,8 @@ use crate::rel_index::RelIndex;
 use crate::sql_parser::{ParameterSpec, ParsedQuery, QueryType};
 use crate::ty_index::TypeIndex;
 use crate::view_nullability::ViewNullabilityAnalyzer;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use postgres::Client;
-use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct QueryParam {
@@ -33,58 +32,10 @@ pub struct IntrospectedQuery {
     pub line_number: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum QueryAstType {
-    Select,              // SELECT or CTE with final SELECT
-    DmlWithReturning,    // INSERT/UPDATE/DELETE with RETURNING
-    DmlWithoutReturning, // INSERT/UPDATE/DELETE without RETURNING
-    Unknown,             // Parsing failed
-}
-
-fn determine_query_type_from_ast(sql: &str) -> QueryAstType {
-    match pg_query::parse(sql) {
-        Ok(result) => {
-            if let Some(stmt) = result.protobuf.stmts.first() {
-                if let Some(node) = &stmt.stmt {
-                    match &node.node {
-                        Some(pg_query::protobuf::node::Node::SelectStmt(_)) => QueryAstType::Select,
-                        Some(pg_query::protobuf::node::Node::InsertStmt(s)) => {
-                            if s.returning_list.is_empty() {
-                                QueryAstType::DmlWithoutReturning
-                            } else {
-                                QueryAstType::DmlWithReturning
-                            }
-                        }
-                        Some(pg_query::protobuf::node::Node::UpdateStmt(s)) => {
-                            if s.returning_list.is_empty() {
-                                QueryAstType::DmlWithoutReturning
-                            } else {
-                                QueryAstType::DmlWithReturning
-                            }
-                        }
-                        Some(pg_query::protobuf::node::Node::DeleteStmt(s)) => {
-                            if s.returning_list.is_empty() {
-                                QueryAstType::DmlWithoutReturning
-                            } else {
-                                QueryAstType::DmlWithReturning
-                            }
-                        }
-                        _ => QueryAstType::Unknown,
-                    }
-                } else {
-                    QueryAstType::Unknown
-                }
-            } else {
-                QueryAstType::Unknown
-            }
-        }
-        Err(_) => QueryAstType::Unknown,
-    }
-}
-
 pub struct QueryIntrospector<'a> {
     client: &'a mut Client,
     rel_index: &'a RelIndex,
+    #[allow(dead_code)]
     type_index: &'a TypeIndex,
     view_nullability_cache: &'a crate::view_nullability::ViewNullabilityCache,
 }
@@ -113,14 +64,11 @@ impl<'a> QueryIntrospector<'a> {
             parsed.line_number
         );
 
-        // Use a unique prepared statement name for this query
-        let stmt_name = format!("_pgrpc_{}", parsed.name.to_lowercase());
-
-        // Prepare the statement to analyze parameters
-        let prepare_sql = format!("PREPARE {} AS {}", stmt_name, parsed.postgres_sql);
-
-        self.client
-            .execute(&prepare_sql, &[])
+        // Use rust-postgres prepare() to get statement metadata
+        // This works for ALL query types including CTEs with data-modifying statements
+        let stmt = self
+            .client
+            .prepare(&parsed.postgres_sql)
             .with_context(|| {
                 format!(
                     "Failed to prepare query '{}' from {}:{}\nSQL: {}",
@@ -131,18 +79,22 @@ impl<'a> QueryIntrospector<'a> {
                 )
             })?;
 
-        // Get parameter types from pg_prepared_statements
-        let param_types = self.get_parameter_types(&stmt_name)?;
+        // Get parameter types directly from the statement
+        let param_types: Vec<OID> = stmt.params().iter().map(|t| t.oid()).collect();
 
         // Determine parameter names and nullable flags
-        let param_info = self.determine_parameter_info(&parsed.parameters, &parsed.postgres_sql, param_types.len())?;
+        let param_info =
+            self.determine_parameter_info(&parsed.parameters, &parsed.postgres_sql, param_types.len())?;
 
         // Build parameter list
         let params: Vec<QueryParam> = param_types
             .into_iter()
             .enumerate()
             .map(|(i, type_oid)| {
-                let (name, nullable) = param_info.get(i).cloned().unwrap_or_else(|| (format!("param_{}", i + 1), false));
+                let (name, nullable) = param_info
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| (format!("param_{}", i + 1), false));
                 QueryParam {
                     name,
                     type_oid,
@@ -152,20 +104,15 @@ impl<'a> QueryIntrospector<'a> {
             })
             .collect();
 
-        // Get return columns for queries that return data
+        // Get return columns using statement metadata
         let return_columns = match parsed.query_type {
             QueryType::One | QueryType::Many => {
-                // Check if this is a SELECT or has RETURNING clause
-                // Pass the prepared statement name so we can use it for introspection
-                Some(self.introspect_return_columns(&stmt_name, &parsed.postgres_sql)?)
+                Some(self.introspect_return_columns_from_stmt(&stmt, &parsed.postgres_sql)?)
             }
             QueryType::Exec | QueryType::ExecRows => None,
         };
 
-        // Deallocate prepared statement
-        self.client
-            .execute(&format!("DEALLOCATE {}", stmt_name), &[])
-            .ok(); // Ignore errors on cleanup
+        // No need to DEALLOCATE - Statement is dropped automatically
 
         Ok(IntrospectedQuery {
             name: parsed.name.clone(),
@@ -178,312 +125,70 @@ impl<'a> QueryIntrospector<'a> {
         })
     }
 
-    /// Get parameter types from a prepared statement
-    fn get_parameter_types(&mut self, stmt_name: &str) -> Result<Vec<OID>> {
-        // Query parameter_types, which is an array of regtype (OID)
-        // We need to unnest the array to get individual OIDs
-        let rows = self
-            .client
-            .query(
-                "SELECT unnest(parameter_types)::oid as param_type FROM pg_prepared_statements WHERE name = $1",
-                &[&stmt_name],
-            )
-            .context("Failed to query pg_prepared_statements")?;
+    /// Introspect return columns using the prepared statement metadata
+    fn introspect_return_columns_from_stmt(
+        &mut self,
+        stmt: &postgres::Statement,
+        sql: &str,
+    ) -> Result<Vec<QueryColumn>> {
+        // Get column info directly from the prepared statement
+        let columns: Vec<QueryColumn> = stmt
+            .columns()
+            .iter()
+            .map(|col| QueryColumn {
+                name: col.name().to_string(),
+                type_oid: col.type_().oid(),
+                nullable: true, // Default to nullable, will be refined by analysis
+            })
+            .collect();
 
-        let param_type_oids: Vec<OID> = rows.iter().map(|row| row.get(0)).collect();
-        Ok(param_type_oids)
-    }
-
-    /// Introspect return columns using the prepared statement
-    fn introspect_return_columns(&mut self, stmt_name: &str, sql: &str) -> Result<Vec<QueryColumn>> {
-        match determine_query_type_from_ast(sql) {
-            QueryAstType::Select => self.introspect_select_columns(sql),
-            QueryAstType::DmlWithReturning => self.introspect_returning_columns(stmt_name, sql),
-            QueryAstType::DmlWithoutReturning => Ok(Vec::new()),
-            QueryAstType::Unknown => {
-                // Fallback to string-based detection
-                log::warn!("Could not parse SQL for query type detection, falling back to string matching");
-                let trimmed = sql.trim_start().to_uppercase();
-                if trimmed.starts_with("SELECT") || trimmed.starts_with("WITH") {
-                    self.introspect_select_columns(sql)
-                } else if sql.to_uppercase().contains("RETURNING") {
-                    self.introspect_returning_columns(stmt_name, sql)
-                } else {
-                    Ok(Vec::new())
-                }
-            }
-        }
-    }
-
-    /// Introspect columns from a SELECT query by creating a temporary view
-    fn introspect_select_columns(&mut self, sql: &str) -> Result<Vec<QueryColumn>> {
-        // Create a unique temporary view name using timestamp
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let view_name = format!("_pgrpc_introspect_{}", timestamp);
-
-        log::debug!("[INTROSPECT] View name: {}", view_name);
-        log::debug!("[INTROSPECT] Original SQL: {}", sql);
-
-        // Begin a transaction for temp view
-        self.client.execute("BEGIN", &[])?;
-
-        // Replace parameter markers with NULL::unknown to create a valid view
-        // This allows us to introspect column names and types
-        let sql_without_params = regex::Regex::new(r"\$\d+")
-            .unwrap()
-            .replace_all(sql, "NULL::unknown");
-
-        log::debug!("[INTROSPECT] SQL with params replaced: {}", sql_without_params);
-
-        // Create temporary view
-        let create_view_sql = format!("CREATE TEMP VIEW {} AS {}", view_name, sql_without_params);
-        self.client
-            .execute(&create_view_sql, &[])
-            .with_context(|| format!("Failed to create temp view for introspection: {}", create_view_sql))?;
-
-        log::debug!("[INTROSPECT] Temporary view created successfully");
-
-        // Query column information from PostgreSQL catalogs
-        // Using pg_attribute instead of information_schema to properly handle temporary views
-        let columns_query = r#"
-            SELECT
-                a.attname AS column_name,
-                a.atttypid AS type_oid,
-                NOT a.attnotnull AS is_nullable
-            FROM pg_class c
-            JOIN pg_attribute a ON a.attrelid = c.oid
-            WHERE c.relname = $1
-              AND a.attnum > 0
-              AND NOT a.attisdropped
-            ORDER BY a.attnum
-        "#;
-
-        let rows = self.client.query(columns_query, &[&view_name])?;
-
-        log::debug!("[INTROSPECT] pg_attribute query returned {} rows", rows.len());
-
-        let mut columns = Vec::new();
-        for row in rows {
-            let column_name: String = row.get(0);
-            let type_oid: OID = row.get(1);
-            let is_nullable: bool = row.get(2);
-
-            log::info!("[INTROSPECT] pg_attribute reports - column: {} (OID: {}, nullable: {})", column_name, type_oid, is_nullable);
-
-            columns.push(QueryColumn {
-                name: column_name,
-                type_oid,
-                nullable: is_nullable,
-            });
+        if columns.is_empty() {
+            return Ok(Vec::new());
         }
 
-        log::info!("[INTROSPECT] Total columns from pg_attribute: {}", columns.len());
+        log::debug!(
+            "[INTROSPECT] Statement returned {} columns",
+            columns.len()
+        );
+        for col in &columns {
+            log::debug!(
+                "[INTROSPECT] Column from statement: {} (OID: {})",
+                col.name,
+                col.type_oid
+            );
+        }
 
-        // Drop the temporary view and rollback
-        self.client.execute(&format!("DROP VIEW {}", view_name), &[])?;
-        self.client.execute("ROLLBACK", &[])?;
-
-        // Apply nullability analysis if we have a SELECT query
+        // Apply nullability analysis
         if let Some(refined_columns) = self.refine_nullability(sql, &columns)? {
-            log::debug!("[INTROSPECT] After refine_nullability: {} columns", refined_columns.len());
+            log::debug!(
+                "[INTROSPECT] After refine_nullability: {} columns",
+                refined_columns.len()
+            );
             Ok(refined_columns)
         } else {
-            log::debug!("[INTROSPECT] No refinement applied, returning {} columns", columns.len());
+            log::debug!(
+                "[INTROSPECT] No refinement applied, returning {} columns",
+                columns.len()
+            );
             Ok(columns)
         }
     }
 
-    /// Introspect columns from INSERT/UPDATE/DELETE with RETURNING clause
-    fn introspect_returning_columns(&mut self, stmt_name: &str, sql: &str) -> Result<Vec<QueryColumn>> {
-        // Parse column names from RETURNING clause
-        let column_names = self.parse_returning_column_names(sql)?;
-        if column_names.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Extract target table to look up column types from table definition
-        let target_table = self.extract_dml_target_table(sql)?;
-        let table_rel = self.rel_index.values().find(|rel| rel.id.name() == target_table);
-
-        // Get column types by creating a temporary view that selects the RETURNING columns from the target table
-        let result_types = self.get_returning_column_types(&target_table, &column_names)?;
-
-        // Build columns with types and nullability
-        let columns: Vec<QueryColumn> = column_names
-            .into_iter()
-            .zip(result_types.into_iter())
-            .map(|(name, type_oid)| {
-                let nullable = table_rel
-                    .map(|rel| !self.is_column_not_null(rel, &name))
-                    .unwrap_or(true);
-                QueryColumn { name, type_oid, nullable }
-            })
-            .collect();
-
-        Ok(columns)
-    }
-
-    /// Get column types for RETURNING columns by querying the target table's column definitions
-    fn get_returning_column_types(&mut self, table_name: &str, column_names: &[String]) -> Result<Vec<OID>> {
-        // Build a SELECT statement that retrieves just those columns from the table
-        // This lets PostgreSQL resolve the types for us
-        let columns_sql = column_names.join(", ");
-        let select_sql = format!("SELECT {} FROM {} WHERE false", columns_sql, table_name);
-
-        // Create a temporary view to introspect the column types
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let view_name = format!("_pgrpc_returning_{}", timestamp);
-
-        self.client.execute("BEGIN", &[])?;
-
-        let create_view_sql = format!("CREATE TEMP VIEW {} AS {}", view_name, select_sql);
-        let view_result = self.client.execute(&create_view_sql, &[]);
-
-        if let Err(e) = view_result {
-            self.client.execute("ROLLBACK", &[])?;
-            return Err(anyhow!("Failed to create temp view for RETURNING introspection: {}", e));
-        }
-
-        // Query column types from pg_attribute
-        let columns_query = r#"
-            SELECT a.atttypid AS type_oid
-            FROM pg_class c
-            JOIN pg_attribute a ON a.attrelid = c.oid
-            WHERE c.relname = $1
-              AND a.attnum > 0
-              AND NOT a.attisdropped
-            ORDER BY a.attnum
-        "#;
-
-        let rows = self.client.query(columns_query, &[&view_name])?;
-        let type_oids: Vec<OID> = rows.iter().map(|row| row.get(0)).collect();
-
-        self.client.execute(&format!("DROP VIEW {}", view_name), &[])?;
-        self.client.execute("ROLLBACK", &[])?;
-
-        Ok(type_oids)
-    }
-
-    /// Parse RETURNING clause to extract column names
-    fn parse_returning_column_names(&self, sql: &str) -> Result<Vec<String>> {
-        // Use pg_query to parse the SQL and extract RETURNING column names
-        let parse_result = pg_query::parse(sql)
-            .with_context(|| format!("Failed to parse SQL for RETURNING clause: {}", sql))?;
-
-        let mut column_names = Vec::new();
-
-        if let Some(stmt) = parse_result.protobuf.stmts.first() {
-            if let Some(node) = &stmt.stmt {
-                let returning_list = match &node.node {
-                    Some(pg_query::protobuf::node::Node::InsertStmt(insert)) => {
-                        &insert.returning_list
-                    }
-                    Some(pg_query::protobuf::node::Node::UpdateStmt(update)) => {
-                        &update.returning_list
-                    }
-                    Some(pg_query::protobuf::node::Node::DeleteStmt(delete)) => {
-                        &delete.returning_list
-                    }
-                    _ => return Ok(Vec::new()),
-                };
-
-                for target in returning_list {
-                    if let Some(pg_query::protobuf::node::Node::ResTarget(res_target)) = &target.node {
-                        // If there's an alias, use it
-                        if !res_target.name.is_empty() {
-                            column_names.push(res_target.name.clone());
-                        } else if let Some(val) = &res_target.val {
-                            // Extract column name from the expression
-                            if let Some(name) = self.extract_column_name_from_node(val) {
-                                column_names.push(name);
-                            } else {
-                                // Fallback: use a placeholder name
-                                column_names.push(format!("column_{}", column_names.len() + 1));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(column_names)
-    }
-
-    /// Extract column name from a pg_query Node
-    fn extract_column_name_from_node(&self, node: &pg_query::protobuf::Node) -> Option<String> {
-        match &node.node {
-            Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) => {
-                // Get the last field as the column name
-                if let Some(last_field) = col_ref.fields.last() {
-                    if let Some(pg_query::protobuf::node::Node::String(s)) = &last_field.node {
-                        return Some(s.sval.clone());
-                    }
-                }
-                None
-            }
-            Some(pg_query::protobuf::node::Node::TypeCast(type_cast)) => {
-                // For type casts, extract from the argument
-                if let Some(arg) = &type_cast.arg {
-                    return self.extract_column_name_from_node(arg);
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    /// Extract target table name from INSERT/UPDATE/DELETE statement
-    fn extract_dml_target_table(&self, sql: &str) -> Result<String> {
-        let parse_result = pg_query::parse(sql)
-            .with_context(|| format!("Failed to parse SQL for target table: {}", sql))?;
-
-        if let Some(stmt) = parse_result.protobuf.stmts.first() {
-            if let Some(node) = &stmt.stmt {
-                let relation = match &node.node {
-                    Some(pg_query::protobuf::node::Node::InsertStmt(insert)) => {
-                        insert.relation.as_ref()
-                    }
-                    Some(pg_query::protobuf::node::Node::UpdateStmt(update)) => {
-                        update.relation.as_ref()
-                    }
-                    Some(pg_query::protobuf::node::Node::DeleteStmt(delete)) => {
-                        delete.relation.as_ref()
-                    }
-                    _ => None,
-                };
-
-                if let Some(range_var) = relation {
-                    return Ok(range_var.relname.clone());
-                }
-            }
-        }
-
-        Err(anyhow!("Could not extract target table from SQL: {}", sql))
-    }
-
-    /// Check if column has NOT NULL constraint
-    fn is_column_not_null(&self, rel: &crate::pg_rel::PgRel, column_name: &str) -> bool {
-        use crate::pg_constraint::Constraint;
-        rel.constraints.iter().any(|c| {
-            matches!(c, Constraint::NotNull(n) if n.column.as_str() == column_name)
-        })
-    }
-
-    /// Refine column nullability using ViewNullabilityAnalyzer
+    /// Refine column nullability using ViewNullabilityAnalyzer or DML table analysis
     fn refine_nullability(&self, sql: &str, columns: &[QueryColumn]) -> Result<Option<Vec<QueryColumn>>> {
         log::info!("[REFINE] Starting nullability refinement for query: {}", sql);
-        log::info!("[REFINE] Input columns from pg_attribute:");
+        log::info!("[REFINE] Input columns:");
         for col in columns {
             log::info!("[REFINE]   {} -> nullable={}", col.name, col.nullable);
         }
 
-        // Try to apply view nullability analysis
+        // First, try to refine using DML target table (for INSERT/UPDATE/DELETE with RETURNING)
+        if let Some(refined) = self.refine_nullability_from_dml_target(sql, columns)? {
+            log::info!("[REFINE] DML target analysis succeeded");
+            return Ok(Some(refined));
+        }
+
+        // Fall back to view nullability analysis (for SELECT queries)
         let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
         let mut analyzer = ViewNullabilityAnalyzer::new(self.rel_index, self.view_nullability_cache);
@@ -500,7 +205,7 @@ impl<'a> QueryIntrospector<'a> {
                     .map(|col| {
                         let is_not_null = nullability_map.get(&col.name).copied().unwrap_or(false);
                         let new_nullable = !is_not_null;
-                        log::info!("[REFINE] Column '{}': pg_attribute says nullable={}, analyzer says is_not_null={}, final nullable={}",
+                        log::info!("[REFINE] Column '{}': says nullable={}, analyzer says is_not_null={}, final nullable={}",
                             col.name, col.nullable, is_not_null, new_nullable);
                         QueryColumn {
                             name: col.name.clone(),
@@ -520,17 +225,85 @@ impl<'a> QueryIntrospector<'a> {
         }
     }
 
-    /// Resolve a PostgreSQL type name to an OID
-    fn resolve_type_name(&mut self, type_name: &str) -> Result<OID> {
-        let row = self
-            .client
-            .query_one(
-                "SELECT oid FROM pg_type WHERE typname = $1",
-                &[&type_name],
-            )
-            .with_context(|| format!("Failed to resolve type name: {}", type_name))?;
+    /// Refine nullability for INSERT/UPDATE/DELETE RETURNING by looking at the target table
+    fn refine_nullability_from_dml_target(
+        &self,
+        sql: &str,
+        columns: &[QueryColumn],
+    ) -> Result<Option<Vec<QueryColumn>>> {
+        use crate::pg_constraint::Constraint;
 
-        Ok(row.get(0))
+        // Try to extract the target table from a DML statement
+        let target_table = match self.extract_dml_target_table(sql) {
+            Some(table) => table,
+            None => return Ok(None), // Not a DML statement
+        };
+
+        log::info!("[REFINE-DML] Found DML target table: {}", target_table);
+
+        // Find the table in rel_index
+        let table_rel = self.rel_index.values().find(|rel| rel.id.name() == target_table);
+
+        let table_rel = match table_rel {
+            Some(rel) => rel,
+            None => {
+                log::warn!("[REFINE-DML] Could not find table '{}' in rel_index", target_table);
+                return Ok(None);
+            }
+        };
+
+        // Refine nullability based on table constraints
+        let refined_columns: Vec<QueryColumn> = columns
+            .iter()
+            .map(|col| {
+                // Check if this column has a NOT NULL constraint
+                let is_not_null = table_rel.constraints.iter().any(|c| {
+                    matches!(c, Constraint::NotNull(n) if n.column.as_str() == col.name)
+                });
+                let nullable = !is_not_null;
+                log::info!(
+                    "[REFINE-DML] Column '{}': is_not_null={}, nullable={}",
+                    col.name,
+                    is_not_null,
+                    nullable
+                );
+                QueryColumn {
+                    name: col.name.clone(),
+                    type_oid: col.type_oid,
+                    nullable,
+                }
+            })
+            .collect();
+
+        Ok(Some(refined_columns))
+    }
+
+    /// Extract target table name from INSERT/UPDATE/DELETE statement
+    fn extract_dml_target_table(&self, sql: &str) -> Option<String> {
+        let parse_result = pg_query::parse(sql).ok()?;
+
+        if let Some(stmt) = parse_result.protobuf.stmts.first() {
+            if let Some(node) = &stmt.stmt {
+                let relation = match &node.node {
+                    Some(pg_query::protobuf::node::Node::InsertStmt(insert)) => {
+                        insert.relation.as_ref()
+                    }
+                    Some(pg_query::protobuf::node::Node::UpdateStmt(update)) => {
+                        update.relation.as_ref()
+                    }
+                    Some(pg_query::protobuf::node::Node::DeleteStmt(delete)) => {
+                        delete.relation.as_ref()
+                    }
+                    _ => None,
+                };
+
+                if let Some(range_var) = relation {
+                    return Some(range_var.relname.clone());
+                }
+            }
+        }
+
+        None
     }
 
     /// Determine parameter names and nullable flags from specs, inference, or fallback
@@ -580,7 +353,7 @@ impl<'a> QueryIntrospector<'a> {
     fn infer_param_name_from_ast(&self, sql: &str, position: usize) -> Option<String> {
         // Parse the SQL to find column references near this parameter
         match pg_query::parse(sql) {
-            Ok(parse_result) => {
+            Ok(_) => {
                 // Look for patterns like "column_name = $N" or "column_name IN ($N)"
                 // For now, use a simple heuristic: look for the param marker in the SQL
                 let param_marker = format!("${}", position);

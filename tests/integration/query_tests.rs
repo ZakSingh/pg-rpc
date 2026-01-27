@@ -1025,3 +1025,100 @@ SELECT id, name, parent_id, depth FROM category_tree;
         assert!(generated_code.contains("pub depth:"), "Should have depth field");
     });
 }
+
+/// Test CTE with data-modifying statement (INSERT inside WITH)
+/// This was previously failing with: "ERROR: views must not contain data-modifying statements in WITH"
+#[test]
+fn test_cte_with_data_modifying_statement() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create test tables
+        client
+            .execute(
+                "CREATE TABLE messages (
+                message_id SERIAL PRIMARY KEY,
+                account_id INT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+                &[],
+            )
+            .unwrap();
+
+        client
+            .execute(
+                "CREATE TABLE items (
+                item_id SERIAL PRIMARY KEY,
+                item_nanoid TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL
+            )",
+                &[],
+            )
+            .unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // CTE with INSERT...RETURNING followed by SELECT with JOIN
+        // This pattern was previously failing because we tried to create a VIEW
+        // which doesn't allow data-modifying CTEs
+        let sql = r#"
+-- name: InsertAndSelectMessage :one
+WITH inserted AS (
+    INSERT INTO messages (account_id, content)
+    VALUES (:account_id, :content)
+    RETURNING message_id, account_id, content, created_at
+)
+SELECT ins.message_id, ins.account_id, ins.content, ins.created_at,
+       i.title as item_title
+FROM inserted ins
+LEFT JOIN items i ON i.item_nanoid = :item_nanoid;
+"#;
+
+        std::fs::write(&sql_file_path, sql).unwrap();
+
+        let output_dir = temp_dir.path().join("generated");
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir)
+            .queries_config(pgrpc::QueriesConfig {
+                paths: vec![sql_file_path.to_string_lossy().to_string()],
+            });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).unwrap();
+
+        println!(
+            "=== GENERATED CODE (DATA-MODIFYING CTE) ===\n{}\n======================",
+            generated_code
+        );
+
+        // Verify struct has all 5 columns
+        assert!(
+            generated_code.contains("struct InsertAndSelectMessageRow"),
+            "Should generate InsertAndSelectMessageRow struct"
+        );
+        assert!(
+            generated_code.contains("pub message_id:"),
+            "Should have message_id field"
+        );
+        assert!(
+            generated_code.contains("pub account_id:"),
+            "Should have account_id field"
+        );
+        assert!(
+            generated_code.contains("pub content:"),
+            "Should have content field"
+        );
+        assert!(
+            generated_code.contains("pub created_at:"),
+            "Should have created_at field"
+        );
+        assert!(
+            generated_code.contains("pub item_title:"),
+            "Should have item_title field"
+        );
+    });
+}
