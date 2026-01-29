@@ -545,9 +545,12 @@ fn generate_query_code(
 
                 let return_type = quote! { Result<#struct_name, #error_enum_name> };
                 let execution = quote! {
-                    let row = client.query_opt(query, &params).await?
-                        .expect("query returned no rows");
-                    Ok(row.try_into()?)
+                    client.query_opt(query, &params).await
+                        .and_then(|opt_row| {
+                            let row = opt_row.expect("query returned no rows");
+                            row.try_into()
+                        })
+                        .map_err(#error_enum_name::from)
                 };
 
                 (return_type, execution, row_struct)
@@ -569,11 +572,12 @@ fn generate_query_code(
 
                 let return_type = quote! { Result<Option<#struct_name>, #error_enum_name> };
                 let execution = quote! {
-                    let row = client.query_opt(query, &params).await?;
-                    match row {
-                        Some(row) => Ok(Some(row.try_into()?)),
-                        None => Ok(None),
-                    }
+                    client.query_opt(query, &params).await
+                        .and_then(|row| match row {
+                            Some(row) => Ok(Some(row.try_into()?)),
+                            None => Ok(None),
+                        })
+                        .map_err(#error_enum_name::from)
                 };
 
                 (return_type, execution, row_struct)
@@ -594,8 +598,9 @@ fn generate_query_code(
 
                 let return_type = quote! { Result<Vec<#struct_name>, #error_enum_name> };
                 let execution = quote! {
-                    let rows = client.query(query, &params).await?;
-                    rows.into_iter().map(|row| row.try_into()).collect()
+                    client.query(query, &params).await
+                        .and_then(|rows| rows.into_iter().map(|row| row.try_into()).collect())
+                        .map_err(#error_enum_name::from)
                 };
 
                 (return_type, execution, row_struct)
