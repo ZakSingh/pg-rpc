@@ -106,7 +106,7 @@ impl<'a> QueryIntrospector<'a> {
 
         // Get return columns using statement metadata
         let return_columns = match parsed.query_type {
-            QueryType::One | QueryType::Many => {
+            QueryType::One | QueryType::Opt | QueryType::Many => {
                 Some(self.introspect_return_columns_from_stmt(&stmt, &parsed.postgres_sql)?)
             }
             QueryType::Exec | QueryType::ExecRows => None,

@@ -535,6 +535,30 @@ fn generate_query_code(
                 let struct_name = quote::format_ident!("{}", struct_name_str);
                 let row_struct = generate_row_struct(&struct_name, columns, type_index);
 
+                let return_type = quote! { Result<#struct_name, tokio_postgres::Error> };
+                let execution = quote! {
+                    let row = client.query_opt(query, &params).await?
+                        .expect("query returned no rows");
+                    Ok(row.try_into()?)
+                };
+
+                (return_type, execution, row_struct)
+            } else {
+                // Should not happen for :one queries
+                let return_type = quote! { Result<(), tokio_postgres::Error> };
+                let execution = quote! {
+                    client.execute(query, &params).await?;
+                    Ok(())
+                };
+                (return_type, execution, quote! {})
+            }
+        }
+        crate::sql_parser::QueryType::Opt => {
+            if let Some(columns) = &query.return_columns {
+                let struct_name_str = format!("{}Row", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
+                let struct_name = quote::format_ident!("{}", struct_name_str);
+                let row_struct = generate_row_struct(&struct_name, columns, type_index);
+
                 let return_type = quote! { Result<Option<#struct_name>, tokio_postgres::Error> };
                 let execution = quote! {
                     let row = client.query_opt(query, &params).await?;
@@ -546,11 +570,10 @@ fn generate_query_code(
 
                 (return_type, execution, row_struct)
             } else {
-                // Should not happen for :one queries
-                let return_type = quote! { Result<(), tokio_postgres::Error> };
+                let return_type = quote! { Result<Option<()>, tokio_postgres::Error> };
                 let execution = quote! {
                     client.execute(query, &params).await?;
-                    Ok(())
+                    Ok(Some(()))
                 };
                 (return_type, execution, quote! {})
             }

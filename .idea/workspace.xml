@@ -13,7 +13,9 @@
   <component name="ChangeListManager">
     <list default="true" id="945f98b6-7558-4dca-911e-a71f09b8ebf1" name="Changes" comment="basic support for tsvector/tsquery">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/codegen.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/codegen.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/query_introspector.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/query_introspector.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/sql_parser.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/sql_parser.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/tests/integration/query_tests.rs" beforeDir="false" afterPath="$PROJECT_DIR$/tests/integration/query_tests.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />

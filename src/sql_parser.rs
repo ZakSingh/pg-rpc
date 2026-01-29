@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum QueryType {
-    /// Returns Option<T> - query_opt, single row or None
+    /// Returns Result<T, Error> - expects exactly one row, panics if none
     One,
-    /// Returns Vec<T> - query, multiple rows
+    /// Returns Result<Option<T>, Error> - zero or one row
+    Opt,
+    /// Returns Result<Vec<T>, Error> - multiple rows
     Many,
     /// Returns Result<(), Error> - execute, no return value
     Exec,
@@ -19,6 +21,7 @@ impl QueryType {
     pub fn from_str(s: &str) -> Result<Self> {
         match s {
             "one" => Ok(QueryType::One),
+            "opt" => Ok(QueryType::Opt),
             "many" => Ok(QueryType::Many),
             "exec" => Ok(QueryType::Exec),
             "execrows" => Ok(QueryType::ExecRows),
@@ -491,5 +494,26 @@ RETURNING *;
             }
             _ => panic!("Expected positional parameter"),
         }
+    }
+
+    #[test]
+    fn test_opt_query_type() {
+        let parser = SqlParser::new();
+
+        let content = r#"
+-- name: FindUserByEmail :opt
+SELECT * FROM users WHERE email = :email;
+
+-- name: GetUserRequired :one
+SELECT * FROM users WHERE id = :id;
+        "#;
+
+        let queries = parser.parse_content(content, PathBuf::from("test.sql")).unwrap();
+        assert_eq!(queries.len(), 2);
+
+        assert_eq!(queries[0].name, "FindUserByEmail");
+        assert_eq!(queries[0].query_type, QueryType::Opt);
+        assert_eq!(queries[1].name, "GetUserRequired");
+        assert_eq!(queries[1].query_type, QueryType::One);
     }
 }

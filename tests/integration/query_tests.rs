@@ -87,6 +87,9 @@ fn test_sql_parser_query_types() {
 -- name: GetOne :one
 SELECT * FROM users WHERE id = :id;
 
+-- name: GetOpt :opt
+SELECT * FROM users WHERE email = :email;
+
 -- name: GetMany :many
 SELECT * FROM users;
 
@@ -100,11 +103,12 @@ DELETE FROM users WHERE inactive = true;
     let parser = pgrpc::sql_parser::SqlParser::new();
     let queries = parser.parse_content(sql, PathBuf::from("test.sql")).unwrap();
 
-    assert_eq!(queries.len(), 4);
+    assert_eq!(queries.len(), 5);
     assert_eq!(queries[0].query_type, pgrpc::sql_parser::QueryType::One);
-    assert_eq!(queries[1].query_type, pgrpc::sql_parser::QueryType::Many);
-    assert_eq!(queries[2].query_type, pgrpc::sql_parser::QueryType::Exec);
-    assert_eq!(queries[3].query_type, pgrpc::sql_parser::QueryType::ExecRows);
+    assert_eq!(queries[1].query_type, pgrpc::sql_parser::QueryType::Opt);
+    assert_eq!(queries[2].query_type, pgrpc::sql_parser::QueryType::Many);
+    assert_eq!(queries[3].query_type, pgrpc::sql_parser::QueryType::Exec);
+    assert_eq!(queries[4].query_type, pgrpc::sql_parser::QueryType::ExecRows);
 }
 
 /// Test query introspection with real database
@@ -270,6 +274,9 @@ fn test_query_code_generation() {
 -- name: GetUser :one
 SELECT id, username, email FROM users WHERE id = :user_id;
 
+-- name: FindUserByEmail :opt
+SELECT id, username, email FROM users WHERE email = :email;
+
 -- name: ListUsers :many
 SELECT id, username, email FROM users ORDER BY username;
 
@@ -306,20 +313,27 @@ DELETE FROM users WHERE id = :user_id;
 
         let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
 
-        // Verify GetUser function
+        // Verify GetUser function - :one returns Result<T, Error> (not Option)
         assert!(generated_code.contains("pub async fn get_user"), "Should generate get_user function");
         assert!(generated_code.contains("user_id:"), "Should have user_id parameter");
-        assert!(generated_code.contains("Result<Option<GetUserRow>"), "Should return Option<GetUserRow>");
+        assert!(generated_code.contains("Result<GetUserRow, tokio_postgres::Error>"), "Should return Result<GetUserRow, Error> for :one");
         assert!(generated_code.contains("struct GetUserRow"), "Should generate GetUserRow struct");
+        assert!(generated_code.contains(".expect(\"query returned no rows\")"), ":one should use .expect() for panic on no rows");
+
+        // Verify FindUserByEmail function - :opt returns Result<Option<T>, Error>
+        assert!(generated_code.contains("pub async fn find_user_by_email"), "Should generate find_user_by_email function");
+        assert!(generated_code.contains("Result<Option<FindUserByEmailRow>, tokio_postgres::Error>"), "Should return Result<Option<T>, Error> for :opt");
+        assert!(generated_code.contains("struct FindUserByEmailRow"), "Should generate FindUserByEmailRow struct");
 
         // Verify ListUsers function
         assert!(generated_code.contains("pub async fn list_users"), "Should generate list_users function");
         assert!(generated_code.contains("Result<Vec<ListUsersRow>"), "Should return Vec<ListUsersRow>");
 
-        // Verify CreateUser function
+        // Verify CreateUser function - :one returns Result<T, Error>
         assert!(generated_code.contains("pub async fn create_user"), "Should generate create_user function");
         assert!(generated_code.contains("username:"), "Should have username parameter");
         assert!(generated_code.contains("email:"), "Should have email parameter");
+        assert!(generated_code.contains("Result<CreateUserRow, tokio_postgres::Error>"), "Should return Result<T, Error> for :one");
 
         // Verify UpdateUser function
         assert!(generated_code.contains("pub async fn update_user"), "Should generate update_user function");
