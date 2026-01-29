@@ -151,6 +151,7 @@ fn test_query_introspection() {
             &rel_index,
             &temp_type_index,
             &view_cache,
+            None, // No trigger index for this test
         );
 
         let introspected = introspector.introspect(parsed).unwrap();
@@ -233,6 +234,7 @@ WHERE u.id = :user_id;
             &rel_index,
             &temp_type_index,
             &view_cache,
+            None, // No trigger index for this test
         );
 
         let introspected = introspector.introspect(parsed).unwrap();
@@ -316,32 +318,34 @@ DELETE FROM users WHERE id = :user_id;
         // Verify GetUser function - :one returns Result<T, Error> (not Option)
         assert!(generated_code.contains("pub async fn get_user"), "Should generate get_user function");
         assert!(generated_code.contains("user_id:"), "Should have user_id parameter");
-        assert!(generated_code.contains("Result<GetUserRow, tokio_postgres::Error>"), "Should return Result<GetUserRow, Error> for :one");
+        // Now uses typed error enum instead of tokio_postgres::Error
+        assert!(generated_code.contains("Result<GetUserRow, GetUserError>"), "Should return Result<GetUserRow, GetUserError> for :one");
         assert!(generated_code.contains("struct GetUserRow"), "Should generate GetUserRow struct");
+        assert!(generated_code.contains("pub enum GetUserError"), "Should generate GetUserError enum");
         assert!(generated_code.contains(".expect(\"query returned no rows\")"), ":one should use .expect() for panic on no rows");
 
         // Verify FindUserByEmail function - :opt returns Result<Option<T>, Error>
         assert!(generated_code.contains("pub async fn find_user_by_email"), "Should generate find_user_by_email function");
-        assert!(generated_code.contains("Result<Option<FindUserByEmailRow>, tokio_postgres::Error>"), "Should return Result<Option<T>, Error> for :opt");
+        assert!(generated_code.contains("Result<Option<FindUserByEmailRow>, FindUserByEmailError>"), "Should return Result<Option<T>, FindUserByEmailError> for :opt");
         assert!(generated_code.contains("struct FindUserByEmailRow"), "Should generate FindUserByEmailRow struct");
 
         // Verify ListUsers function
         assert!(generated_code.contains("pub async fn list_users"), "Should generate list_users function");
-        assert!(generated_code.contains("Result<Vec<ListUsersRow>"), "Should return Vec<ListUsersRow>");
+        assert!(generated_code.contains("Result<Vec<ListUsersRow>, ListUsersError>"), "Should return Vec<ListUsersRow>");
 
         // Verify CreateUser function - :one returns Result<T, Error>
         assert!(generated_code.contains("pub async fn create_user"), "Should generate create_user function");
         assert!(generated_code.contains("username:"), "Should have username parameter");
         assert!(generated_code.contains("email:"), "Should have email parameter");
-        assert!(generated_code.contains("Result<CreateUserRow, tokio_postgres::Error>"), "Should return Result<T, Error> for :one");
+        assert!(generated_code.contains("Result<CreateUserRow, CreateUserError>"), "Should return Result<T, CreateUserError> for :one");
 
         // Verify UpdateUser function
         assert!(generated_code.contains("pub async fn update_user"), "Should generate update_user function");
-        assert!(generated_code.contains("Result<()"), "Should return Result<()> for exec");
+        assert!(generated_code.contains("Result<(), UpdateUserError>"), "Should return Result<(), UpdateUserError> for exec");
 
         // Verify DeleteUser function
         assert!(generated_code.contains("pub async fn delete_user"), "Should generate delete_user function");
-        assert!(generated_code.contains("Result<u64"), "Should return Result<u64> for execrows");
+        assert!(generated_code.contains("Result<u64, DeleteUserError>"), "Should return Result<u64, DeleteUserError> for execrows");
 
         // Verify row structs have proper types
         assert!(generated_code.contains("pub id: i32"), "Should have i32 id field");

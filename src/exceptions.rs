@@ -1,9 +1,8 @@
 use crate::config::Config;
+use crate::constraint_analysis::{extract_queries, get_rel_deps, Cmd, ConflictTarget};
 use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
 use crate::pg_constraint::Constraint;
-use crate::pg_fn::{extract_queries, ConflictTarget};
-use crate::pg_fn::{get_rel_deps, Cmd};
 use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
 use crate::trigger_index::TriggerIndex;
 use anyhow::anyhow;

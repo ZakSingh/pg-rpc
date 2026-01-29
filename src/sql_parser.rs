@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use regex::Regex;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -52,6 +53,12 @@ pub struct ParsedQuery {
     pub file_path: PathBuf,
     /// Line number in file
     pub line_number: usize,
+    /// Column names annotated as NOT NULL with @pgrpc_not_null(col1, col2)
+    pub not_null_annotations: HashSet<String>,
+    /// SQL state codes that this query can throw via @pgrpc_throws XXXXX
+    pub throws_annotations: Vec<String>,
+    /// Parameter names annotated as nullable with @pgrpc_nullable(param1, param2)
+    pub nullable_param_annotations: HashSet<String>,
 }
 
 pub struct SqlParser {
@@ -61,6 +68,12 @@ pub struct SqlParser {
     named_param_regex: Regex,
     /// Regex for matching nullable parameters pgrpc.narg('param_name')
     nullable_param_regex: Regex,
+    /// Regex for matching @pgrpc_not_null(col1, col2, ...)
+    not_null_annotation_regex: Regex,
+    /// Regex for matching @pgrpc_throws XXXXX
+    throws_annotation_regex: Regex,
+    /// Regex for matching @pgrpc_nullable(param1, param2, ...)
+    nullable_param_annotation_regex: Regex,
 }
 
 impl SqlParser {
@@ -70,6 +83,9 @@ impl SqlParser {
                 .unwrap(),
             named_param_regex: Regex::new(r":([a-zA-Z_][a-zA-Z0-9_]*)").unwrap(),
             nullable_param_regex: Regex::new(r"pgrpc\.narg\('([a-zA-Z_][a-zA-Z0-9_]*)'\)").unwrap(),
+            not_null_annotation_regex: Regex::new(r"@pgrpc_not_null\(([^)]+)\)").unwrap(),
+            throws_annotation_regex: Regex::new(r"@pgrpc_throws\s+([A-Za-z0-9]{5})").unwrap(),
+            nullable_param_annotation_regex: Regex::new(r"@pgrpc_nullable\(([^)]+)\)").unwrap(),
         }
     }
 
@@ -121,16 +137,23 @@ impl SqlParser {
 
                 let line_number = i + 1;
 
-                // Collect the SQL query (all lines until next annotation or EOF)
+                // Collect comment lines (for @pgrpc annotations) and SQL query lines
                 i += 1;
                 let mut sql_lines = Vec::new();
+                let mut comment_lines = Vec::new();
 
                 while i < lines.len() {
                     let sql_line = lines[i];
+                    let trimmed = sql_line.trim();
 
-                    // Stop if we hit another annotation
-                    if self.annotation_regex.is_match(sql_line.trim()) {
+                    // Stop if we hit another name annotation
+                    if self.annotation_regex.is_match(trimmed) {
                         break;
+                    }
+
+                    // Collect comment lines that might contain annotations
+                    if trimmed.starts_with("--") {
+                        comment_lines.push(trimmed);
                     }
 
                     sql_lines.push(sql_line);
@@ -148,8 +171,13 @@ impl SqlParser {
                     ));
                 }
 
+                // Parse @pgrpc_not_null, @pgrpc_throws, and @pgrpc_nullable annotations from comments
+                let (not_null_annotations, throws_annotations, nullable_param_annotations) =
+                    self.parse_annotations(&comment_lines);
+
                 // Transform parameters and extract specifications
-                let (postgres_sql, parameters) = self.transform_parameters(&original_sql)?;
+                let (postgres_sql, parameters) =
+                    self.transform_parameters(&original_sql, &nullable_param_annotations)?;
 
                 queries.push(ParsedQuery {
                     name,
@@ -159,6 +187,9 @@ impl SqlParser {
                     parameters,
                     file_path: file_path.clone(),
                     line_number,
+                    not_null_annotations,
+                    throws_annotations,
+                    nullable_param_annotations,
                 });
             } else {
                 i += 1;
@@ -168,12 +199,63 @@ impl SqlParser {
         Ok(queries)
     }
 
+    /// Parse @pgrpc_not_null, @pgrpc_throws, and @pgrpc_nullable annotations from comment lines
+    fn parse_annotations(
+        &self,
+        comment_lines: &[&str],
+    ) -> (HashSet<String>, Vec<String>, HashSet<String>) {
+        let mut not_null_annotations = HashSet::new();
+        let mut throws_annotations = Vec::new();
+        let mut nullable_param_annotations = HashSet::new();
+
+        for line in comment_lines {
+            // Parse @pgrpc_not_null(col1, col2, ...)
+            for cap in self.not_null_annotation_regex.captures_iter(line) {
+                if let Some(cols) = cap.get(1) {
+                    for col in cols.as_str().split(',') {
+                        let col = col.trim();
+                        if !col.is_empty() {
+                            not_null_annotations.insert(col.to_string());
+                        }
+                    }
+                }
+            }
+
+            // Parse @pgrpc_throws XXXXX
+            for cap in self.throws_annotation_regex.captures_iter(line) {
+                if let Some(code) = cap.get(1) {
+                    throws_annotations.push(code.as_str().to_string());
+                }
+            }
+
+            // Parse @pgrpc_nullable(param1, param2, ...)
+            for cap in self.nullable_param_annotation_regex.captures_iter(line) {
+                if let Some(params) = cap.get(1) {
+                    for param in params.as_str().split(',') {
+                        let param = param.trim();
+                        if !param.is_empty() {
+                            nullable_param_annotations.insert(param.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        (not_null_annotations, throws_annotations, nullable_param_annotations)
+    }
+
     /// Transform named parameters (:param) and nullable parameters (pgrpc.narg('param'))
-    /// to positional ($N) and extract parameter specs
-    fn transform_parameters(&self, sql: &str) -> Result<(String, Vec<ParameterSpec>)> {
+    /// to positional ($N) and extract parameter specs.
+    /// Parameters in `nullable_annotations` will be marked as nullable.
+    fn transform_parameters(
+        &self,
+        sql: &str,
+        nullable_annotations: &HashSet<String>,
+    ) -> Result<(String, Vec<ParameterSpec>)> {
         let mut position = 1;
         let mut parameters = Vec::new();
-        let mut seen_params: std::collections::HashMap<String, (usize, bool)> = std::collections::HashMap::new();
+        let mut seen_params: std::collections::HashMap<String, (usize, bool)> =
+            std::collections::HashMap::new();
 
         // Temporarily replace :: (type cast operator) with a placeholder to avoid matching it
         const TYPECAST_PLACEHOLDER: &str = "___PGRPC_TYPECAST___";
@@ -223,12 +305,15 @@ impl SqlParser {
                 }
                 format!("${}", existing_pos)
             } else {
+                // Check if this parameter is marked nullable via @pgrpc_nullable annotation
+                let is_nullable = nullable_annotations.contains(&param_name);
+
                 // New parameter, assign a position
-                seen_params.insert(param_name.clone(), (position, false));
+                seen_params.insert(param_name.clone(), (position, is_nullable));
                 parameters.push(ParameterSpec::Named {
                     name: param_name,
                     position,
-                    nullable: false,
+                    nullable: is_nullable,
                 });
 
                 let replacement = format!("${}", position);
@@ -320,7 +405,7 @@ DELETE FROM authors WHERE id = :author_id;
         let parser = SqlParser::new();
 
         let sql = "SELECT * FROM users WHERE id = :user_id AND status = :status";
-        let (transformed, params) = parser.transform_parameters(sql).unwrap();
+        let (transformed, params) = parser.transform_parameters(sql, &HashSet::new()).unwrap();
 
         assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND status = $2");
         assert_eq!(params.len(), 2);
@@ -373,7 +458,7 @@ RETURNING *;
         let parser = SqlParser::new();
 
         let sql = "SELECT * FROM users WHERE id = $1 AND status = $2";
-        let (transformed, params) = parser.transform_parameters(sql).unwrap();
+        let (transformed, params) = parser.transform_parameters(sql, &HashSet::new()).unwrap();
 
         // Should remain unchanged
         assert_eq!(transformed, sql);
@@ -397,7 +482,7 @@ RETURNING *;
 
         // Named parameter gets transformed first
         let sql = "SELECT * FROM users WHERE id = :user_id AND created > $2";
-        let (transformed, params) = parser.transform_parameters(sql).unwrap();
+        let (transformed, params) = parser.transform_parameters(sql, &HashSet::new()).unwrap();
 
         assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND created > $2");
         assert_eq!(params.len(), 2);
@@ -417,7 +502,7 @@ RETURNING *;
         let parser = SqlParser::new();
 
         let sql = "SELECT * FROM users WHERE id = :user_id AND email = pgrpc.narg('email')";
-        let (transformed, params) = parser.transform_parameters(sql).unwrap();
+        let (transformed, params) = parser.transform_parameters(sql, &HashSet::new()).unwrap();
 
         assert_eq!(transformed, "SELECT * FROM users WHERE id = $2 AND email = $1");
         assert_eq!(params.len(), 2);
@@ -446,7 +531,7 @@ RETURNING *;
         let parser = SqlParser::new();
 
         let sql = "SELECT * FROM users WHERE id = $1? AND status = $2";
-        let (transformed, params) = parser.transform_parameters(sql).unwrap();
+        let (transformed, params) = parser.transform_parameters(sql, &HashSet::new()).unwrap();
 
         assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND status = $2");
         assert_eq!(params.len(), 2);
@@ -473,7 +558,7 @@ RETURNING *;
         let parser = SqlParser::new();
 
         let sql = "SELECT * FROM users WHERE id = pgrpc.narg('user_id') AND created > $2";
-        let (transformed, params) = parser.transform_parameters(sql).unwrap();
+        let (transformed, params) = parser.transform_parameters(sql, &HashSet::new()).unwrap();
 
         assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND created > $2");
         assert_eq!(params.len(), 2);
@@ -515,5 +600,97 @@ SELECT * FROM users WHERE id = :id;
         assert_eq!(queries[0].query_type, QueryType::Opt);
         assert_eq!(queries[1].name, "GetUserRequired");
         assert_eq!(queries[1].query_type, QueryType::One);
+    }
+
+    #[test]
+    fn test_pgrpc_annotations() {
+        let parser = SqlParser::new();
+
+        let content = r#"
+-- name: CreateUser :one
+-- @pgrpc_not_null(id, created_at)
+-- @pgrpc_throws 23505
+INSERT INTO users (email, name) VALUES (:email, :name) RETURNING *;
+
+-- name: UpdateUser :exec
+-- @pgrpc_throws P0001
+-- @pgrpc_throws 23503
+UPDATE users SET name = :name WHERE id = :id;
+        "#;
+
+        let queries = parser.parse_content(content, PathBuf::from("test.sql")).unwrap();
+        assert_eq!(queries.len(), 2);
+
+        // Check first query annotations
+        assert_eq!(queries[0].name, "CreateUser");
+        assert!(queries[0].not_null_annotations.contains("id"));
+        assert!(queries[0].not_null_annotations.contains("created_at"));
+        assert_eq!(queries[0].not_null_annotations.len(), 2);
+        assert_eq!(queries[0].throws_annotations, vec!["23505"]);
+
+        // Check second query annotations
+        assert_eq!(queries[1].name, "UpdateUser");
+        assert!(queries[1].not_null_annotations.is_empty());
+        assert_eq!(queries[1].throws_annotations, vec!["P0001", "23503"]);
+    }
+
+    #[test]
+    fn test_pgrpc_nullable_annotation() {
+        let parser = SqlParser::new();
+
+        let content = r#"
+-- name: FindUsers :many
+-- @pgrpc_nullable(name, email)
+SELECT * FROM users WHERE name = :name OR email = :email;
+
+-- name: FindUsersByStatus :many
+-- @pgrpc_nullable(status)
+SELECT * FROM users WHERE status = :status AND active = :active;
+        "#;
+
+        let queries = parser.parse_content(content, PathBuf::from("test.sql")).unwrap();
+        assert_eq!(queries.len(), 2);
+
+        // Check first query - both name and email should be nullable
+        assert_eq!(queries[0].name, "FindUsers");
+        assert!(queries[0].nullable_param_annotations.contains("name"));
+        assert!(queries[0].nullable_param_annotations.contains("email"));
+        assert_eq!(queries[0].nullable_param_annotations.len(), 2);
+        assert_eq!(queries[0].parameters.len(), 2);
+
+        // Verify parameters are marked as nullable
+        for param in &queries[0].parameters {
+            match param {
+                ParameterSpec::Named { name, nullable, .. } => {
+                    assert!(
+                        *nullable,
+                        "Parameter '{}' should be nullable",
+                        name
+                    );
+                }
+                _ => panic!("Expected named parameter"),
+            }
+        }
+
+        // Check second query - status is nullable, active is not
+        assert_eq!(queries[1].name, "FindUsersByStatus");
+        assert!(queries[1].nullable_param_annotations.contains("status"));
+        assert!(!queries[1].nullable_param_annotations.contains("active"));
+        assert_eq!(queries[1].nullable_param_annotations.len(), 1);
+        assert_eq!(queries[1].parameters.len(), 2);
+
+        // Verify status is nullable, active is not
+        for param in &queries[1].parameters {
+            match param {
+                ParameterSpec::Named { name, nullable, .. } => {
+                    if name == "status" {
+                        assert!(*nullable, "status should be nullable");
+                    } else if name == "active" {
+                        assert!(!*nullable, "active should not be nullable");
+                    }
+                }
+                _ => panic!("Expected named parameter"),
+            }
+        }
     }
 }

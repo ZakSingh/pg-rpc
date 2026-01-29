@@ -1,10 +1,16 @@
 use crate::codegen::OID;
+use crate::constraint_analysis::analyze_sql_for_constraints;
+use crate::exceptions::PgException;
+use crate::pg_constraint::Constraint;
+use crate::pg_id::PgId;
 use crate::rel_index::RelIndex;
 use crate::sql_parser::{ParameterSpec, ParsedQuery, QueryType};
+use crate::trigger_index::TriggerIndex;
 use crate::ty_index::TypeIndex;
 use crate::view_nullability::ViewNullabilityAnalyzer;
 use anyhow::{Context, Result};
 use postgres::Client;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct QueryParam {
@@ -30,6 +36,10 @@ pub struct IntrospectedQuery {
     pub return_columns: Option<Vec<QueryColumn>>,
     pub file_path: String,
     pub line_number: usize,
+    /// Exceptions that could be raised by this query
+    pub exceptions: Vec<PgException>,
+    /// Map of table ID to constraints that apply to this query
+    pub table_dependencies: HashMap<PgId, Vec<Constraint>>,
 }
 
 pub struct QueryIntrospector<'a> {
@@ -38,6 +48,7 @@ pub struct QueryIntrospector<'a> {
     #[allow(dead_code)]
     type_index: &'a TypeIndex,
     view_nullability_cache: &'a crate::view_nullability::ViewNullabilityCache,
+    trigger_index: Option<&'a TriggerIndex>,
 }
 
 impl<'a> QueryIntrospector<'a> {
@@ -46,12 +57,14 @@ impl<'a> QueryIntrospector<'a> {
         rel_index: &'a RelIndex,
         type_index: &'a TypeIndex,
         view_nullability_cache: &'a crate::view_nullability::ViewNullabilityCache,
+        trigger_index: Option<&'a TriggerIndex>,
     ) -> Self {
         Self {
             client,
             rel_index,
             type_index,
             view_nullability_cache,
+            trigger_index,
         }
     }
 
@@ -112,6 +125,13 @@ impl<'a> QueryIntrospector<'a> {
             QueryType::Exec | QueryType::ExecRows => None,
         };
 
+        // Analyze exceptions and table dependencies
+        let (exceptions, table_dependencies) = analyze_sql_for_constraints(
+            &parsed.postgres_sql,
+            self.rel_index,
+            self.trigger_index,
+        );
+
         // No need to DEALLOCATE - Statement is dropped automatically
 
         Ok(IntrospectedQuery {
@@ -122,6 +142,8 @@ impl<'a> QueryIntrospector<'a> {
             return_columns,
             file_path: parsed.file_path.display().to_string(),
             line_number: parsed.line_number,
+            exceptions,
+            table_dependencies,
         })
     }
 

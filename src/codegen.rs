@@ -488,16 +488,19 @@ fn collect_fn_refs(pg_fn: &PgFn, types: &TypeIndex) -> HashSet<String> {
 pub fn codegen_queries(
     query_index: &crate::query_index::QueryIndex,
     type_index: &TypeIndex,
+    rel_index: &RelIndex,
     config: &Config,
 ) -> TokenStream {
     use crate::query_introspector::IntrospectedQuery;
-    use crate::sql_parser::QueryType;
+
+    // Collect table constraints for error generation
+    let table_constraints = unified_error::collect_table_constraints(rel_index);
 
     let queries: Vec<&IntrospectedQuery> = query_index.values().collect();
 
     let query_code: Vec<TokenStream> = queries
         .iter()
-        .map(|query| generate_query_code(query, type_index, config))
+        .map(|query| generate_query_code(query, type_index, &table_constraints, config))
         .collect();
 
     quote! {
@@ -509,12 +512,17 @@ pub fn codegen_queries(
 fn generate_query_code(
     query: &crate::query_introspector::IntrospectedQuery,
     type_index: &TypeIndex,
-    _config: &Config,
+    table_constraints: &std::collections::HashMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
+    config: &Config,
 ) -> TokenStream {
     use crate::ident::{sql_to_rs_ident, CaseType};
 
     let fn_name = sql_to_rs_ident(&query.name, CaseType::Snake);
     let sql = &query.sql;
+
+    // Generate error enum for this query
+    let error_enum = generate_query_error_enum(query, table_constraints, config);
+    let error_enum_name = quote::format_ident!("{}Error", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
 
     // Generate parameter list
     let params: Vec<TokenStream> = query
@@ -535,7 +543,7 @@ fn generate_query_code(
                 let struct_name = quote::format_ident!("{}", struct_name_str);
                 let row_struct = generate_row_struct(&struct_name, columns, type_index);
 
-                let return_type = quote! { Result<#struct_name, tokio_postgres::Error> };
+                let return_type = quote! { Result<#struct_name, #error_enum_name> };
                 let execution = quote! {
                     let row = client.query_opt(query, &params).await?
                         .expect("query returned no rows");
@@ -545,7 +553,7 @@ fn generate_query_code(
                 (return_type, execution, row_struct)
             } else {
                 // Should not happen for :one queries
-                let return_type = quote! { Result<(), tokio_postgres::Error> };
+                let return_type = quote! { Result<(), #error_enum_name> };
                 let execution = quote! {
                     client.execute(query, &params).await?;
                     Ok(())
@@ -559,7 +567,7 @@ fn generate_query_code(
                 let struct_name = quote::format_ident!("{}", struct_name_str);
                 let row_struct = generate_row_struct(&struct_name, columns, type_index);
 
-                let return_type = quote! { Result<Option<#struct_name>, tokio_postgres::Error> };
+                let return_type = quote! { Result<Option<#struct_name>, #error_enum_name> };
                 let execution = quote! {
                     let row = client.query_opt(query, &params).await?;
                     match row {
@@ -570,7 +578,7 @@ fn generate_query_code(
 
                 (return_type, execution, row_struct)
             } else {
-                let return_type = quote! { Result<Option<()>, tokio_postgres::Error> };
+                let return_type = quote! { Result<Option<()>, #error_enum_name> };
                 let execution = quote! {
                     client.execute(query, &params).await?;
                     Ok(Some(()))
@@ -584,7 +592,7 @@ fn generate_query_code(
                 let struct_name = quote::format_ident!("{}", struct_name_str);
                 let row_struct = generate_row_struct(&struct_name, columns, type_index);
 
-                let return_type = quote! { Result<Vec<#struct_name>, tokio_postgres::Error> };
+                let return_type = quote! { Result<Vec<#struct_name>, #error_enum_name> };
                 let execution = quote! {
                     let rows = client.query(query, &params).await?;
                     rows.into_iter().map(|row| row.try_into()).collect()
@@ -593,7 +601,7 @@ fn generate_query_code(
                 (return_type, execution, row_struct)
             } else {
                 // Should not happen for :many queries
-                let return_type = quote! { Result<Vec<()>, tokio_postgres::Error> };
+                let return_type = quote! { Result<Vec<()>, #error_enum_name> };
                 let execution = quote! {
                     let rows = client.query(query, &params).await?;
                     Ok(vec![(); rows.len()])
@@ -602,7 +610,7 @@ fn generate_query_code(
             }
         }
         crate::sql_parser::QueryType::Exec => {
-            let return_type = quote! { Result<(), tokio_postgres::Error> };
+            let return_type = quote! { Result<(), #error_enum_name> };
             let execution = quote! {
                 client.execute(query, &params).await?;
                 Ok(())
@@ -610,7 +618,7 @@ fn generate_query_code(
             (return_type, execution, quote! {})
         }
         crate::sql_parser::QueryType::ExecRows => {
-            let return_type = quote! { Result<u64, tokio_postgres::Error> };
+            let return_type = quote! { Result<u64, #error_enum_name> };
             let execution = quote! {
                 let rows_affected = client.execute(query, &params).await?;
                 Ok(rows_affected)
@@ -647,6 +655,8 @@ fn generate_query_code(
     quote! {
         #row_struct
 
+        #error_enum
+
         #[doc = #doc_comment]
         pub async fn #fn_name(
             client: &impl deadpool_postgres::GenericClient,
@@ -656,6 +666,258 @@ fn generate_query_code(
             let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#param_refs),*];
 
             #query_execution
+        }
+    }
+}
+
+/// Generate error enum for a single query
+fn generate_query_error_enum(
+    query: &crate::query_introspector::IntrospectedQuery,
+    table_constraints: &std::collections::HashMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
+    config: &Config,
+) -> TokenStream {
+    use crate::exceptions::PgException;
+    use crate::ident::{sql_to_rs_ident, CaseType};
+    use crate::pg_constraint::Constraint;
+    use heck::ToPascalCase;
+
+    let error_enum_name = quote::format_ident!("{}Error", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
+    let mut error_variants = Vec::new();
+    let mut unique_arms = Vec::new();
+    let mut check_arms = Vec::new();
+    let mut fk_arms = Vec::new();
+    let mut not_null_arms = Vec::new();
+    let mut custom_arms = Vec::new();
+    let mut to_pgrpc_arms = Vec::new();
+    let mut as_db_error_arms = Vec::new();
+    let mut handled_exceptions = HashSet::new();
+
+    // Process table dependencies that were collected during introspection
+    for (table_id, constraints) in &query.table_dependencies {
+        let table_name_str = table_id.name();
+        let table_name_pascal = table_name_str.to_pascal_case();
+        let variant_name = quote::format_ident!("{}Constraint", table_name_pascal);
+        let constraint_enum = quote::format_ident!("{}Constraint", table_name_pascal);
+
+        // Add error variant for this table's constraints
+        error_variants.push(quote! {
+            #[error("{} table constraint violation", #table_name_str)]
+            #variant_name(super::errors::#constraint_enum, #[source] tokio_postgres::error::DbError)
+        });
+
+        // Add conversion arm to PgRpcError
+        to_pgrpc_arms.push(quote! {
+            #error_enum_name::#variant_name(constraint, db_error) => {
+                super::errors::PgRpcError::#variant_name(constraint, db_error)
+            }
+        });
+
+        // Add AsDbError arm
+        as_db_error_arms.push(quote! {
+            #error_enum_name::#variant_name(_, db_error) => Some(db_error)
+        });
+
+        // Generate match arms for From<tokio_postgres::Error>
+        for constraint in constraints {
+            match constraint {
+                Constraint::PrimaryKey(pk) => {
+                    let constraint_name = pk.name.as_str();
+                    unique_arms.push(quote! {
+                        Some(#constraint_name) => #error_enum_name::#variant_name(
+                            super::errors::#constraint_enum::PrimaryKey,
+                            db_error.to_owned()
+                        )
+                    });
+                }
+                Constraint::Unique(u) => {
+                    let constraint_name = u.name.as_str();
+                    let u_variant_name_str = u.name.to_pascal_case();
+                    let u_variant_name = quote::format_ident!("{}", u_variant_name_str);
+                    unique_arms.push(quote! {
+                        Some(#constraint_name) => #error_enum_name::#variant_name(
+                            super::errors::#constraint_enum::#u_variant_name,
+                            db_error.to_owned()
+                        )
+                    });
+                }
+                Constraint::Check(c) => {
+                    let constraint_name = c.name.as_str();
+                    let c_variant_name_str = c.name.to_pascal_case();
+                    let c_variant_name = quote::format_ident!("{}", c_variant_name_str);
+                    check_arms.push(quote! {
+                        Some(#constraint_name) => #error_enum_name::#variant_name(
+                            super::errors::#constraint_enum::#c_variant_name,
+                            db_error.to_owned()
+                        )
+                    });
+                }
+                Constraint::ForeignKey(fk) => {
+                    let constraint_name = fk.name.as_str();
+                    let fk_variant_name_str = fk.name.to_pascal_case();
+                    let fk_variant_name = quote::format_ident!("{}", fk_variant_name_str);
+                    fk_arms.push(quote! {
+                        Some(#constraint_name) => #error_enum_name::#variant_name(
+                            super::errors::#constraint_enum::#fk_variant_name,
+                            db_error.to_owned()
+                        )
+                    });
+                }
+                Constraint::NotNull(nn) => {
+                    let column_name = nn.column.as_str();
+                    let col_variant_str = nn.column.to_pascal_case();
+                    let nn_variant_name = quote::format_ident!("{}NotNull", col_variant_str);
+                    not_null_arms.push(quote! {
+                        (Some(#table_name_str), Some(#column_name)) => #error_enum_name::#variant_name(
+                            super::errors::#constraint_enum::#nn_variant_name,
+                            db_error.to_owned()
+                        )
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Process exceptions (including from @pgrpc_throws annotations)
+    for exception in &query.exceptions {
+        if let PgException::Explicit(sql_state) = exception {
+            let code = sql_state.code();
+            let ex_variant_name = if let Some(description) = config.exceptions.get(code) {
+                sql_to_rs_ident(description, CaseType::Pascal)
+            } else {
+                exception.rs_name(config)
+            };
+
+            if handled_exceptions.insert(ex_variant_name.to_string()) {
+                if let Some(description) = config.exceptions.get(code) {
+                    error_variants.push(quote! {
+                        #[error(#description)]
+                        #ex_variant_name(#[source] tokio_postgres::error::DbError)
+                    });
+                } else {
+                    error_variants.push(quote! {
+                        #[error("SQL state {}", #code)]
+                        #ex_variant_name(#[source] tokio_postgres::error::DbError)
+                    });
+                }
+
+                to_pgrpc_arms.push(quote! {
+                    #error_enum_name::#ex_variant_name(db_error) => {
+                        super::errors::PgRpcError::#ex_variant_name(db_error)
+                    }
+                });
+
+                as_db_error_arms.push(quote! {
+                    #error_enum_name::#ex_variant_name(db_error) => Some(db_error)
+                });
+
+                custom_arms.push(quote! {
+                    code if code == &tokio_postgres::error::SqlState::from_code(#code) => {
+                        #error_enum_name::#ex_variant_name(db_error.to_owned())
+                    }
+                });
+            }
+        }
+    }
+
+    // Add catch-all Other variant
+    error_variants.push(quote! {
+        #[error(transparent)]
+        Other(super::errors::PgRpcError)
+    });
+
+    // Build match arms for From<tokio_postgres::Error>
+    let mut all_from_arms = Vec::new();
+
+    if !unique_arms.is_empty() {
+        all_from_arms.push(quote! {
+            &tokio_postgres::error::SqlState::UNIQUE_VIOLATION => {
+                match db_error.constraint() {
+                    #(#unique_arms,)*
+                    _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                }
+            },
+        });
+    }
+
+    if !check_arms.is_empty() {
+        all_from_arms.push(quote! {
+            &tokio_postgres::error::SqlState::CHECK_VIOLATION => {
+                match db_error.constraint() {
+                    #(#check_arms,)*
+                    _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                }
+            },
+        });
+    }
+
+    if !fk_arms.is_empty() {
+        all_from_arms.push(quote! {
+            &tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION => {
+                match db_error.constraint() {
+                    #(#fk_arms,)*
+                    _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                }
+            },
+        });
+    }
+
+    if !not_null_arms.is_empty() {
+        all_from_arms.push(quote! {
+            &tokio_postgres::error::SqlState::NOT_NULL_VIOLATION => {
+                match (db_error.table(), db_error.column()) {
+                    #(#not_null_arms,)*
+                    _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                }
+            },
+        });
+    }
+
+    all_from_arms.extend(custom_arms);
+
+    let from_postgres_arms: TokenStream = all_from_arms.into_iter().collect();
+
+    // Build the complete error enum
+    quote! {
+        #[derive(Debug, thiserror::Error)]
+        pub enum #error_enum_name {
+            #(#error_variants),*
+        }
+
+        impl From<tokio_postgres::Error> for #error_enum_name {
+            fn from(e: tokio_postgres::Error) -> Self {
+                match e.as_db_error() {
+                    Some(db_error) => match db_error.code() {
+                        #from_postgres_arms
+                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                    },
+                    None => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                }
+            }
+        }
+
+        impl From<#error_enum_name> for super::errors::PgRpcError {
+            fn from(err: #error_enum_name) -> Self {
+                match err {
+                    #error_enum_name::Other(e) => e,
+                    #(#to_pgrpc_arms),*
+                }
+            }
+        }
+
+        impl From<super::errors::PgRpcError> for #error_enum_name {
+            fn from(err: super::errors::PgRpcError) -> Self {
+                #error_enum_name::Other(err)
+            }
+        }
+
+        impl super::errors::AsDbError for #error_enum_name {
+            fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError> {
+                match self {
+                    #(#as_db_error_arms,)*
+                    #error_enum_name::Other(e) => e.as_db_error(),
+                }
+            }
         }
     }
 }

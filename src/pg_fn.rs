@@ -11,27 +11,24 @@ use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
 use crate::pg_type::PgType;
 use crate::rel_index::RelIndex;
-use crate::trigger_index::{TriggerEvent, TriggerIndex};
+use crate::trigger_index::TriggerIndex;
 use config::Config;
 use heck::ToPascalCase;
 use itertools::{izip, Itertools};
-use jsonpath_rust::JsonPath;
 use log::warn;
 use pg_query::protobuf::node::Node;
-use pg_query::protobuf::{
-    CallStmt, DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, UpdateStmt,
-};
-use pg_query::{parse_plpgsql, NodeRef, ParseResult};
+use pg_query::{parse_plpgsql, ParseResult};
 use postgres::Row;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use regex::Regex;
-use serde_json::Value;
-use std::cmp::PartialEq;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::ops::Deref;
-use ustr::Ustr;
+
+// Re-export constraint analysis types for backward compatibility
+pub use crate::constraint_analysis::{
+    extract_queries, get_rel_deps, populate_trigger_exceptions, Cmd, ConflictTarget,
+};
 
 const VOID_TYPE_OID: u32 = 2278;
 const RECORD_TYPE_OID: u32 = 2249;
@@ -1364,76 +1361,7 @@ impl ToRust for PgFn {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConflictTarget {
-    Columns(Vec<Ustr>), // ON CONFLICT (col1, col2)
-    Constraint(Ustr),   // ON CONFLICT ON CONSTRAINT constraint_name
-    Any,                // ON CONFLICT without target
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConflictAction {
-    DoNothing,
-    DoUpdate,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConflictClause {
-    pub target: ConflictTarget,
-    pub action: ConflictAction,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JoinType {
-    Inner,
-    Outer,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Cmd {
-    Select {
-        cols: Vec<Ustr>,
-        join_type: JoinType,
-    },
-    Update {
-        cols: Vec<Ustr>,
-    },
-    Insert {
-        cols: Vec<Ustr>,
-        on_conflict: Option<ConflictClause>,
-    },
-    Delete,
-}
-
-/// A function's dependency on a relation
-#[derive(Debug, Clone)]
-pub struct RelDep {
-    pub(crate) rel_oid: OID,
-    pub(crate) cmd: Cmd,
-    /// Exceptions that could be raised by triggers on this relation for this command
-    pub(crate) trigger_exceptions: Vec<crate::exceptions::PgException>,
-}
-
-/// Extract and parse all SQL queries inside a PlPgSQL function
-pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
-    let query_path = JsonPath::try_from("$..PLpgSQL_expr.query").unwrap();
-
-    query_path
-        .find_slice(fn_json)
-        .into_iter()
-        .filter_map(|x| {
-            let data = x.to_data();
-            match data.as_str() {
-                Some(query_str) => Some(pg_query::parse(query_str)),
-                None => {
-                    warn!("Failed to extract query string from JSON value: {:?}", data);
-                    None
-                }
-            }
-        })
-        .flatten() // remove unparsable queries
-        .collect()
-}
 
 /// Extract custom error types from parsed queries by looking for calls to the raise_error function
 /// Returns a set of error type names and optionally their SQLSTATEs
@@ -1549,194 +1477,7 @@ fn extract_error_type_from_node(
     None
 }
 
-/// Get the relations the given queries depend upon.
-pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> Vec<RelDep> {
-    queries
-        .iter()
-        .flat_map(|q| get_query_deps(q, rel_index))
-        .collect()
-}
 
-/// Populate trigger exceptions for relation dependencies
-pub fn populate_trigger_exceptions(rel_deps: &mut [RelDep], trigger_index: &TriggerIndex) {
-    for rel_dep in rel_deps {
-        let trigger_event = match &rel_dep.cmd {
-            Cmd::Insert { .. } => Some(TriggerEvent::Insert),
-            Cmd::Update { .. } => Some(TriggerEvent::Update),
-            Cmd::Delete => Some(TriggerEvent::Delete),
-            _ => None,
-        };
-
-        if let Some(event) = trigger_event {
-            rel_dep.trigger_exceptions =
-                trigger_index.get_exceptions_for_event(rel_dep.rel_oid, &event);
-        }
-    }
-}
-
-fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
-    query
-        .protobuf
-        .nodes()
-        .iter()
-        .filter_map(|(node, _, _, _)| match node.to_enum() {
-            Node::SelectStmt(stmt) => get_select_deps(stmt.as_ref(), rel_index),
-            Node::InsertStmt(stmt) => get_insert_deps(stmt.as_ref(), rel_index),
-            Node::UpdateStmt(stmt) => get_update_deps(stmt.as_ref(), rel_index),
-            Node::DeleteStmt(stmt) => get_delete_deps(stmt.as_ref(), rel_index),
-            Node::CallStmt(_stmt) => None, // We'll handle CallStmt separately for custom errors
-            _ => None,
-        })
-        .collect()
-}
-
-fn get_select_deps(_stmt: &SelectStmt, _rel_index: &RelIndex) -> Option<RelDep> {
-    // TODO
-    None
-}
-
-/// Collect all dependencies from an `insert`.
-fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
-    let Some(rel_oid) = stmt
-        .relation
-        .as_ref()
-        .map(|r| rel_index.id_to_oid(&PgId::from(r)))
-        .flatten()
-    else {
-        // Could not determine what relation was being inserted into
-        // This can happen with CTEs, temp tables, or relations not in our index
-        warn!("Skipping INSERT statement dependency analysis: {stmt:?}");
-        return None;
-    };
-
-    // Collect the inserted column names
-    let cols: Vec<Ustr> = {
-        let referenced_cols: Vec<Ustr> = stmt
-            .cols
-            .iter()
-            .flat_map(|n| n.node.as_ref().map(|n| n.nodes()).unwrap_or_default())
-            .filter_map(|(n, _, _, _)| match n {
-                NodeRef::ResTarget(t) => Some(t.name.as_str().into()),
-                _ => None,
-            })
-            .collect_vec();
-
-        if referenced_cols.is_empty() {
-            // If column names aren't explicitly stated, e.g. `insert into account (1, 'Zak')`,
-            // all columns must be inserted.
-            rel_index
-                .deref()
-                .get(&rel_oid)
-                .expect("Referenced relation to be in relation index")
-                .columns
-                .clone()
-        } else {
-            referenced_cols
-        }
-    };
-
-    // Parse ON CONFLICT clause if present
-    let on_conflict = stmt.on_conflict_clause.as_ref().map(|conflict| {
-        let action = match OnConflictAction::from_i32(conflict.action).unwrap() {
-            OnConflictAction::OnconflictNothing => ConflictAction::DoNothing,
-            OnConflictAction::OnconflictUpdate => ConflictAction::DoUpdate,
-            _ => unreachable!("Invalid ON CONFLICT action"),
-        };
-
-        // Get conflict target - either columns, constraint name, or none
-        let target = if let Some(infer) = &conflict.infer {
-            // ON CONFLICT (col1, col2)
-            let cols = infer
-                .index_elems
-                .iter()
-                .filter_map(|col| {
-                    col.node.as_ref().map(|n| match n {
-                        Node::InferenceElem(elem) => elem.expr.as_ref().and_then(|e| {
-                            if let Some(Node::ColumnRef(col_ref)) = &e.node {
-                                col_ref.fields.last().and_then(|f| {
-                                    if let Some(Node::String(s)) = &f.node {
-                                        Some(s.sval.as_str().into())
-                                    } else {
-                                        None
-                                    }
-                                })
-                            } else {
-                                None
-                            }
-                        }),
-                        _ => None,
-                    })
-                })
-                .flatten()
-                .collect::<Vec<_>>();
-
-            if !cols.is_empty() {
-                ConflictTarget::Columns(cols)
-            } else {
-                ConflictTarget::Any
-            }
-        } else if let Some(infer) = &conflict.infer {
-            // ON CONFLICT ON CONSTRAINT name
-            ConflictTarget::Constraint(infer.conname.as_str().into())
-        } else {
-            // ON CONFLICT
-            ConflictTarget::Any
-        };
-
-        ConflictClause { target, action }
-    });
-
-    Some(RelDep {
-        rel_oid,
-        cmd: Cmd::Insert { cols, on_conflict },
-        trigger_exceptions: Vec::new(), // Will be populated later with trigger analysis
-    })
-}
-
-fn get_delete_deps(stmt: &DeleteStmt, rel_index: &RelIndex) -> Option<RelDep> {
-    let Some(rel_oid) = stmt
-        .relation
-        .as_ref()
-        .map(|r| rel_index.id_to_oid(&PgId::from(r)))
-        .flatten()
-    else {
-        unreachable!("Delete statement without relation")
-    };
-
-    Some(RelDep {
-        rel_oid,
-        cmd: Cmd::Delete,
-        trigger_exceptions: Vec::new(), // Will be populated later with trigger analysis
-    })
-}
-
-fn get_update_deps(stmt: &UpdateStmt, rel_index: &RelIndex) -> Option<RelDep> {
-    let Some(rel_oid) = stmt
-        .relation
-        .as_ref()
-        .map(|r| rel_index.id_to_oid(&PgId::from(r)))
-        .flatten()
-    else {
-        unreachable!("Update statement without relation")
-    };
-
-    let cols: Vec<Ustr> = stmt
-        .target_list
-        .iter()
-        .flat_map(|n| n.node.as_ref().unwrap().nodes())
-        .map(|(n, _, _, _)| n)
-        .filter_map(|n| match n {
-            NodeRef::ResTarget(t) => Some(t.name.as_str().into()),
-            _ => None,
-        })
-        .collect();
-
-    Some(RelDep {
-        rel_oid,
-        cmd: Cmd::Update { cols },
-        trigger_exceptions: Vec::new(), // Will be populated later with trigger analysis
-    })
-}
 
 /// Get the position of the first `$...$` tag
 fn quote_ind(src: &str) -> Option<(&str, usize)> {

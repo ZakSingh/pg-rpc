@@ -3,6 +3,7 @@ use crate::config::QueriesConfig;
 use crate::query_introspector::{IntrospectedQuery, QueryIntrospector};
 use crate::rel_index::RelIndex;
 use crate::sql_parser::{SqlParser, QueryType};
+use crate::trigger_index::TriggerIndex;
 use crate::ty_index::TypeIndex;
 use anyhow::Result;
 use postgres::Client;
@@ -35,6 +36,7 @@ impl QueryIndex {
         type_index: &TypeIndex,
         view_nullability_cache: &crate::view_nullability::ViewNullabilityCache,
         config: &QueriesConfig,
+        trigger_index: Option<&TriggerIndex>,
     ) -> Result<Self> {
         let parser = SqlParser::new();
 
@@ -45,7 +47,7 @@ impl QueryIndex {
 
         // Introspect each query
         let mut introspector =
-            QueryIntrospector::new(client, rel_index, type_index, view_nullability_cache);
+            QueryIntrospector::new(client, rel_index, type_index, view_nullability_cache, trigger_index);
 
         let mut queries = HashMap::new();
 

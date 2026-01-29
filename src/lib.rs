@@ -17,6 +17,7 @@ pub use crate::config::{ErrorsConfig, QueriesConfig, TaskQueueConfig};
 
 mod codegen;
 mod config;
+pub mod constraint_analysis;
 mod db;
 mod error_type_index;
 mod exceptions;
@@ -334,13 +335,14 @@ impl PgrpcBuilder {
             // Build a temporary type index with what we have so far
             let temp_ty_index = TypeIndex::new(&mut db.client, type_oids.as_slice())?;
 
-            // Build query index using the shared view nullability cache
+            // Build query index using the shared view nullability cache and trigger index
             let query_index = query_index::QueryIndex::new(
                 &mut db.client,
                 &rel_index,
                 &temp_ty_index,
                 &view_nullability_cache,
                 queries_config,
+                Some(&trigger_index),
             )?;
 
             // Collect query type OIDs
@@ -431,7 +433,7 @@ impl PgrpcBuilder {
         // Generate queries if configured
         if let Some(query_index) = &query_index_opt {
             if !query_index.is_empty() {
-                match generate_query_code(query_index, &ty_index, &config) {
+                match generate_query_code(query_index, &ty_index, &rel_index, &config) {
                     Ok(query_code) => {
                         let query_file_path = output_path.join("queries.rs");
                         if write_if_changed(&query_file_path, &query_code)? {
@@ -777,11 +779,12 @@ fn build_view_nullability_cache(
 fn generate_query_code(
     query_index: &query_index::QueryIndex,
     ty_index: &TypeIndex,
+    rel_index: &rel_index::RelIndex,
     config: &Config,
 ) -> anyhow::Result<String> {
     let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
 
-    let query_code_tokens = codegen::codegen_queries(query_index, ty_index, config);
+    let query_code_tokens = codegen::codegen_queries(query_index, ty_index, rel_index, config);
 
     let query_code = prettyplease::unparse(
         &syn::parse2::<syn::File>(quote! {
