@@ -147,6 +147,10 @@ pub fn generate_constraint_enums(
                     let name = d.name.to_pascal_case();
                     quote::format_ident!("{}", name)
                 }
+                Constraint::Exclusion(x) => {
+                    let name = x.name.to_pascal_case();
+                    quote::format_ident!("{}", name)
+                }
                 Constraint::Default(_) => continue, // Skip default constraints
             };
 
