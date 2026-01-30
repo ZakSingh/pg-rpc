@@ -15,6 +15,7 @@ use std::time::Instant;
 // Re-export public types for use in tests and external code
 pub use crate::config::{ErrorsConfig, QueriesConfig, TaskQueueConfig};
 
+pub mod cardinality_inference;
 mod codegen;
 mod config;
 pub mod constraint_analysis;

@@ -1,3 +1,4 @@
+use crate::cardinality_inference::CardinalityAnalyzer;
 use crate::codegen::OID;
 use crate::constraint_analysis::analyze_sql_for_constraints;
 use crate::exceptions::PgException;
@@ -77,6 +78,42 @@ impl<'a> QueryIntrospector<'a> {
             parsed.line_number
         );
 
+        // Determine the final query type: use explicit if specified, otherwise infer
+        let final_query_type = match &parsed.explicit_query_type {
+            Some(explicit) => {
+                log::info!(
+                    "Query '{}' has explicit type: {:?}",
+                    parsed.name,
+                    explicit
+                );
+                explicit.clone()
+            }
+            None => {
+                // Infer cardinality from SQL structure and database constraints
+                let analyzer = CardinalityAnalyzer::new(self.rel_index);
+                match analyzer.infer(&parsed.postgres_sql) {
+                    Ok(inference) => {
+                        log::info!(
+                            "Inferred {:?} for '{}': {:?} (confidence: {:?})",
+                            inference.cardinality,
+                            parsed.name,
+                            inference.reason,
+                            inference.confidence
+                        );
+                        inference.cardinality.into()
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to infer cardinality for '{}': {}. Defaulting to :many",
+                            parsed.name,
+                            e
+                        );
+                        QueryType::Many
+                    }
+                }
+            }
+        };
+
         // Use rust-postgres prepare() to get statement metadata
         // This works for ALL query types including CTEs with data-modifying statements
         let stmt = self
@@ -118,7 +155,7 @@ impl<'a> QueryIntrospector<'a> {
             .collect();
 
         // Get return columns using statement metadata
-        let return_columns = match parsed.query_type {
+        let return_columns = match final_query_type {
             QueryType::One | QueryType::Opt | QueryType::Many => {
                 Some(self.introspect_return_columns_from_stmt(&stmt, &parsed.postgres_sql)?)
             }
@@ -136,7 +173,7 @@ impl<'a> QueryIntrospector<'a> {
 
         Ok(IntrospectedQuery {
             name: parsed.name.clone(),
-            query_type: parsed.query_type.clone(),
+            query_type: final_query_type,
             sql: parsed.postgres_sql.clone(),
             params,
             return_columns,

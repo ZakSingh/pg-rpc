@@ -799,10 +799,11 @@ fn test_nullable_parameters() {
 
         let sql = r#"
 -- name: FindUsers :many
+-- @pgrpc_nullable(email, age)
 SELECT id, username, email, age
 FROM users
-WHERE (email = pgrpc.narg('email') OR pgrpc.narg('email') IS NULL)
-  AND (age = pgrpc.narg('age') OR pgrpc.narg('age') IS NULL);
+WHERE (email = :email OR :email IS NULL)
+  AND (age = :age OR :age IS NULL);
 "#;
 
         std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
@@ -1138,5 +1139,294 @@ LEFT JOIN items i ON i.item_nanoid = :item_nanoid;
             generated_code.contains("pub item_title:"),
             "Should have item_title field"
         );
+    });
+}
+
+/// Test automatic cardinality inference for queries without explicit type annotation
+#[test]
+fn test_cardinality_inference_basic() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create test tables
+        client.execute(
+            "CREATE TABLE users (
+                id SERIAL PRIMARY KEY,
+                username TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                status TEXT
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // Test various query patterns WITHOUT explicit type annotations
+        let sql = r#"
+-- name: UpdateUser
+UPDATE users SET username = $1 WHERE id = $2;
+
+-- name: CreateUser
+INSERT INTO users (username, email) VALUES ($1, $2) RETURNING *;
+
+-- name: GetFirstUser
+SELECT * FROM users ORDER BY id LIMIT 1;
+
+-- name: CountUsers
+SELECT COUNT(*) as count FROM users;
+
+-- name: GetUsersByStatus
+SELECT * FROM users WHERE status = $1;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE (INFERENCE) ===\n{}\n======================", generated_code);
+
+        // UpdateUser - UPDATE without RETURNING should infer :exec
+        assert!(generated_code.contains("pub async fn update_user"), "Should generate update_user function");
+        assert!(generated_code.contains("Result<(), UpdateUserError>"), "UPDATE without RETURNING should return Result<()>");
+
+        // CreateUser - INSERT with RETURNING should infer :one
+        assert!(generated_code.contains("pub async fn create_user"), "Should generate create_user function");
+        assert!(generated_code.contains("Result<CreateUserRow, CreateUserError>"), "INSERT RETURNING should return Result<T>");
+        assert!(generated_code.contains(".expect(\"query returned no rows\")"), ":one should use .expect()");
+
+        // GetFirstUser - SELECT with LIMIT 1 should infer :opt
+        assert!(generated_code.contains("pub async fn get_first_user"), "Should generate get_first_user function");
+        assert!(generated_code.contains("Result<Option<GetFirstUserRow>, GetFirstUserError>"), "LIMIT 1 should return Result<Option<T>>");
+
+        // CountUsers - Aggregate without GROUP BY should infer :one
+        assert!(generated_code.contains("pub async fn count_users"), "Should generate count_users function");
+        assert!(generated_code.contains("Result<CountUsersRow, CountUsersError>"), "COUNT(*) should return Result<T>");
+
+        // GetUsersByStatus - Regular SELECT should infer :many
+        assert!(generated_code.contains("pub async fn get_users_by_status"), "Should generate get_users_by_status function");
+        assert!(generated_code.contains("Result<Vec<GetUsersByStatusRow>, GetUsersByStatusError>"), "Regular SELECT should return Result<Vec<T>>");
+    });
+}
+
+/// Test that explicit type annotations override inference
+#[test]
+fn test_explicit_type_overrides_inference() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client.execute(
+            "CREATE TABLE users (
+                id SERIAL PRIMARY KEY,
+                username TEXT NOT NULL
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // Explicit :many should override what would be inferred as :opt
+        let sql = r#"
+-- name: GetUserLimitOne :many
+SELECT * FROM users LIMIT 1;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        // Explicit :many should win over inferred :opt
+        assert!(generated_code.contains("Result<Vec<GetUserLimitOneRow>, GetUserLimitOneError>"),
+            "Explicit :many should return Vec even with LIMIT 1");
+    });
+}
+
+/// Test cardinality inference for INSERT ON CONFLICT patterns
+#[test]
+fn test_cardinality_inference_upsert() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client.execute(
+            "CREATE TABLE users (
+                id SERIAL PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                username TEXT NOT NULL
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        let sql = r#"
+-- name: UpsertUser
+INSERT INTO users (email, username)
+VALUES ($1, $2)
+ON CONFLICT (email) DO UPDATE SET username = $2
+RETURNING *;
+
+-- name: InsertOrIgnore
+INSERT INTO users (email, username)
+VALUES ($1, $2)
+ON CONFLICT (email) DO NOTHING
+RETURNING *;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE (UPSERT) ===\n{}\n======================", generated_code);
+
+        // UpsertUser - ON CONFLICT DO UPDATE RETURNING should infer :one
+        assert!(generated_code.contains("pub async fn upsert_user"), "Should generate upsert_user function");
+        assert!(generated_code.contains("Result<UpsertUserRow, UpsertUserError>"),
+            "ON CONFLICT DO UPDATE RETURNING should return Result<T> (one)");
+        assert!(generated_code.contains(".expect(\"query returned no rows\")"),
+            "Upsert should use .expect() since it always returns exactly one row");
+
+        // InsertOrIgnore - ON CONFLICT DO NOTHING RETURNING should infer :opt
+        assert!(generated_code.contains("pub async fn insert_or_ignore"), "Should generate insert_or_ignore function");
+        assert!(generated_code.contains("Result<Option<InsertOrIgnoreRow>, InsertOrIgnoreError>"),
+            "ON CONFLICT DO NOTHING RETURNING should return Result<Option<T>> (opt)");
+    });
+}
+
+/// Test cardinality inference with primary key lookup
+#[test]
+fn test_cardinality_inference_primary_key() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client.execute(
+            "CREATE TABLE users (
+                id SERIAL PRIMARY KEY,
+                username TEXT NOT NULL
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // Query by primary key should infer :opt
+        let sql = r#"
+-- name: GetUserById
+SELECT * FROM users WHERE id = $1;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE (PK LOOKUP) ===\n{}\n======================", generated_code);
+
+        // GetUserById - WHERE id = $1 (primary key) should infer :opt
+        assert!(generated_code.contains("pub async fn get_user_by_id"), "Should generate get_user_by_id function");
+        assert!(generated_code.contains("Result<Option<GetUserByIdRow>, GetUserByIdError>"),
+            "Primary key lookup should return Result<Option<T>> (opt, may not exist)");
+    });
+}
+
+/// Test cardinality inference for DELETE statements
+#[test]
+fn test_cardinality_inference_delete() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client.execute(
+            "CREATE TABLE users (
+                id SERIAL PRIMARY KEY,
+                username TEXT NOT NULL
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        let sql = r#"
+-- name: DeleteUser
+DELETE FROM users WHERE id = $1;
+
+-- name: DeleteAndReturnUser
+DELETE FROM users WHERE id = $1 RETURNING *;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        // DeleteUser - DELETE without RETURNING should infer :exec
+        assert!(generated_code.contains("pub async fn delete_user"), "Should generate delete_user function");
+        assert!(generated_code.contains("Result<(), DeleteUserError>"),
+            "DELETE without RETURNING should return Result<()>");
+
+        // DeleteAndReturnUser - DELETE with RETURNING on PK should infer :opt
+        assert!(generated_code.contains("pub async fn delete_and_return_user"), "Should generate delete_and_return_user function");
+        assert!(generated_code.contains("Result<Option<DeleteAndReturnUserRow>, DeleteAndReturnUserError>"),
+            "DELETE RETURNING with PK should return Result<Option<T>>");
     });
 }

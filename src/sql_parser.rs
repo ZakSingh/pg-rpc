@@ -33,7 +33,7 @@ impl QueryType {
 
 #[derive(Debug, Clone)]
 pub enum ParameterSpec {
-    /// Named parameter: :param_name or pgrpc.narg('param_name') (nullable)
+    /// Named parameter: :param_name (use @pgrpc_nullable annotation for nullable params)
     Named { name: String, position: usize, nullable: bool },
     /// Positional parameter: $N or $N? (nullable)
     Positional { position: usize, nullable: bool },
@@ -43,6 +43,8 @@ pub enum ParameterSpec {
 pub struct ParsedQuery {
     pub name: String,
     pub query_type: QueryType,
+    /// Explicitly specified query type (None if inferred)
+    pub explicit_query_type: Option<QueryType>,
     /// Original SQL as written in file
     pub original_sql: String,
     /// SQL transformed for PostgreSQL ($1, $2, ...)
@@ -66,8 +68,6 @@ pub struct SqlParser {
     annotation_regex: Regex,
     /// Regex for matching named parameters :param_name
     named_param_regex: Regex,
-    /// Regex for matching nullable parameters pgrpc.narg('param_name')
-    nullable_param_regex: Regex,
     /// Regex for matching @pgrpc_not_null(col1, col2, ...)
     not_null_annotation_regex: Regex,
     /// Regex for matching @pgrpc_throws XXXXX
@@ -79,10 +79,10 @@ pub struct SqlParser {
 impl SqlParser {
     pub fn new() -> Self {
         Self {
-            annotation_regex: Regex::new(r"^--\s*name:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:([a-z]+)\s*$")
+            // Query type is now optional - (?::([a-z]+))? makes the :type part optional
+            annotation_regex: Regex::new(r"^--\s*name:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?::([a-z]+))?\s*$")
                 .unwrap(),
             named_param_regex: Regex::new(r":([a-zA-Z_][a-zA-Z0-9_]*)").unwrap(),
-            nullable_param_regex: Regex::new(r"pgrpc\.narg\('([a-zA-Z_][a-zA-Z0-9_]*)'\)").unwrap(),
             not_null_annotation_regex: Regex::new(r"@pgrpc_not_null\(([^)]+)\)").unwrap(),
             throws_annotation_regex: Regex::new(r"@pgrpc_throws\s+([A-Za-z0-9]{5})").unwrap(),
             nullable_param_annotation_regex: Regex::new(r"@pgrpc_nullable\(([^)]+)\)").unwrap(),
@@ -131,9 +131,17 @@ impl SqlParser {
             // Check if this line is an annotation
             if let Some(captures) = self.annotation_regex.captures(line) {
                 let name = captures.get(1).unwrap().as_str().to_string();
-                let type_str = captures.get(2).unwrap().as_str();
-                let query_type = QueryType::from_str(type_str)
-                    .map_err(|e| anyhow!("Error at {}:{}: {}", file_path.display(), i + 1, e))?;
+
+                // Query type is now optional - if not specified, it will be inferred later
+                let explicit_query_type = if let Some(type_match) = captures.get(2) {
+                    Some(QueryType::from_str(type_match.as_str())
+                        .map_err(|e| anyhow!("Error at {}:{}: {}", file_path.display(), i + 1, e))?)
+                } else {
+                    None
+                };
+
+                // Use explicit type or placeholder (Many) - will be replaced during introspection
+                let query_type = explicit_query_type.clone().unwrap_or(QueryType::Many);
 
                 let line_number = i + 1;
 
@@ -182,6 +190,7 @@ impl SqlParser {
                 queries.push(ParsedQuery {
                     name,
                     query_type,
+                    explicit_query_type,
                     original_sql,
                     postgres_sql,
                     parameters,
@@ -244,8 +253,7 @@ impl SqlParser {
         (not_null_annotations, throws_annotations, nullable_param_annotations)
     }
 
-    /// Transform named parameters (:param) and nullable parameters (pgrpc.narg('param'))
-    /// to positional ($N) and extract parameter specs.
+    /// Transform named parameters (:param) to positional ($N) and extract parameter specs.
     /// Parameters in `nullable_annotations` will be marked as nullable.
     fn transform_parameters(
         &self,
@@ -261,48 +269,13 @@ impl SqlParser {
         const TYPECAST_PLACEHOLDER: &str = "___PGRPC_TYPECAST___";
         let sql_with_placeholder = sql.replace("::", TYPECAST_PLACEHOLDER);
 
-        // Step 1: Process nullable parameters first (pgrpc.narg('param_name'))
-        let sql_after_nullable = self.nullable_param_regex.replace_all(&sql_with_placeholder, |caps: &regex::Captures| {
+        // Process named parameters (:param_name)
+        let sql_after_named = self.named_param_regex.replace_all(&sql_with_placeholder, |caps: &regex::Captures| {
             let param_name = caps[1].to_string();
 
             // Check if we've seen this parameter name before
-            if let Some(&(existing_pos, existing_nullable)) = seen_params.get(&param_name) {
+            if let Some(&(existing_pos, _)) = seen_params.get(&param_name) {
                 // Reuse the same position for duplicate parameter names
-                if !existing_nullable {
-                    log::warn!(
-                        "Parameter '{}' has inconsistent nullable annotations (both pgrpc.narg and non-nullable)",
-                        param_name
-                    );
-                }
-                format!("${}", existing_pos)
-            } else {
-                // New parameter, assign a position
-                seen_params.insert(param_name.clone(), (position, true));
-                parameters.push(ParameterSpec::Named {
-                    name: param_name,
-                    position,
-                    nullable: true,
-                });
-
-                let replacement = format!("${}", position);
-                position += 1;
-                replacement
-            }
-        }).to_string();
-
-        // Step 2: Process regular named parameters (:param_name)
-        let sql_after_named = self.named_param_regex.replace_all(&sql_after_nullable, |caps: &regex::Captures| {
-            let param_name = caps[1].to_string();
-
-            // Check if we've seen this parameter name before
-            if let Some(&(existing_pos, existing_nullable)) = seen_params.get(&param_name) {
-                // Reuse the same position for duplicate parameter names
-                if existing_nullable {
-                    log::warn!(
-                        "Parameter '{}' has inconsistent nullable annotations (both pgrpc.narg and non-nullable)",
-                        param_name
-                    );
-                }
                 format!("${}", existing_pos)
             } else {
                 // Check if this parameter is marked nullable via @pgrpc_nullable annotation
@@ -322,7 +295,7 @@ impl SqlParser {
             }
         }).to_string();
 
-        // Step 3: Check for any existing $N or $N? parameters in the ORIGINAL SQL
+        // Check for any existing $N or $N? parameters in the ORIGINAL SQL
         let positional_regex = Regex::new(r"\$(\d+)(\?)?").unwrap();
         let mut positional_params: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
 
@@ -498,29 +471,32 @@ RETURNING *;
     }
 
     #[test]
-    fn test_nullable_named_parameters() {
+    fn test_nullable_named_parameters_via_annotation() {
         let parser = SqlParser::new();
 
-        let sql = "SELECT * FROM users WHERE id = :user_id AND email = pgrpc.narg('email')";
-        let (transformed, params) = parser.transform_parameters(sql, &HashSet::new()).unwrap();
+        // Test that @pgrpc_nullable annotation marks parameters as nullable
+        let sql = "SELECT * FROM users WHERE id = :user_id AND email = :email";
+        let mut nullable_annotations = HashSet::new();
+        nullable_annotations.insert("email".to_string());
+        let (transformed, params) = parser.transform_parameters(sql, &nullable_annotations).unwrap();
 
-        assert_eq!(transformed, "SELECT * FROM users WHERE id = $2 AND email = $1");
+        assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND email = $2");
         assert_eq!(params.len(), 2);
 
         match &params[0] {
             ParameterSpec::Named { name, position, nullable } => {
-                assert_eq!(name, "email");
+                assert_eq!(name, "user_id");
                 assert_eq!(*position, 1);
-                assert_eq!(*nullable, true);
+                assert_eq!(*nullable, false);
             }
             _ => panic!("Expected named parameter"),
         }
 
         match &params[1] {
             ParameterSpec::Named { name, position, nullable } => {
-                assert_eq!(name, "user_id");
+                assert_eq!(name, "email");
                 assert_eq!(*position, 2);
-                assert_eq!(*nullable, false);
+                assert_eq!(*nullable, true);
             }
             _ => panic!("Expected named parameter"),
         }
@@ -554,11 +530,14 @@ RETURNING *;
     }
 
     #[test]
-    fn test_mixed_nullable_parameters() {
+    fn test_mixed_nullable_parameters_via_annotation() {
         let parser = SqlParser::new();
 
-        let sql = "SELECT * FROM users WHERE id = pgrpc.narg('user_id') AND created > $2";
-        let (transformed, params) = parser.transform_parameters(sql, &HashSet::new()).unwrap();
+        // Test mixing nullable named parameter (via annotation) with positional parameter
+        let sql = "SELECT * FROM users WHERE id = :user_id AND created > $2";
+        let mut nullable_annotations = HashSet::new();
+        nullable_annotations.insert("user_id".to_string());
+        let (transformed, params) = parser.transform_parameters(sql, &nullable_annotations).unwrap();
 
         assert_eq!(transformed, "SELECT * FROM users WHERE id = $1 AND created > $2");
         assert_eq!(params.len(), 2);
@@ -692,5 +671,39 @@ SELECT * FROM users WHERE status = :status AND active = :active;
                 _ => panic!("Expected named parameter"),
             }
         }
+    }
+
+    #[test]
+    fn test_optional_query_type() {
+        let parser = SqlParser::new();
+
+        let content = r#"
+-- name: InferredQuery
+SELECT * FROM users WHERE id = :id;
+
+-- name: ExplicitOneQuery :one
+SELECT * FROM users WHERE id = :id;
+
+-- name: InferredInsert
+INSERT INTO users (name) VALUES (:name) RETURNING *;
+        "#;
+
+        let queries = parser.parse_content(content, PathBuf::from("test.sql")).unwrap();
+        assert_eq!(queries.len(), 3);
+
+        // First query - no explicit type, should have None for explicit_query_type
+        assert_eq!(queries[0].name, "InferredQuery");
+        assert!(queries[0].explicit_query_type.is_none());
+        // Default placeholder is Many when not specified
+        assert_eq!(queries[0].query_type, QueryType::Many);
+
+        // Second query - explicit :one type
+        assert_eq!(queries[1].name, "ExplicitOneQuery");
+        assert_eq!(queries[1].explicit_query_type, Some(QueryType::One));
+        assert_eq!(queries[1].query_type, QueryType::One);
+
+        // Third query - no explicit type
+        assert_eq!(queries[2].name, "InferredInsert");
+        assert!(queries[2].explicit_query_type.is_none());
     }
 }
