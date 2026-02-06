@@ -236,3 +236,92 @@ fn test_mixed_out_param_scenarios() {
         println!("✅ Mixed OUT parameter scenarios correctly handled!");
     });
 }
+
+/// Test that o_ prefix is stripped from OUT parameter field names
+#[test]
+fn test_out_param_prefix_stripping() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        execute_sql(
+            client,
+            r#"
+            CREATE SCHEMA prefix_test;
+            SET search_path TO prefix_test;
+
+            -- Function with o_ prefixed OUT parameters
+            CREATE OR REPLACE FUNCTION get_user_data(
+                IN p_user_id INTEGER,
+                OUT o_name TEXT,
+                OUT o_email TEXT,
+                OUT o_created_at TIMESTAMP
+            )
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                o_name := 'Test User';
+                o_email := 'test@example.com';
+                o_created_at := NOW();
+            END;
+            $$;
+
+            COMMENT ON FUNCTION get_user_data IS '@pgrpc_not_null(o_name) @pgrpc_not_null(o_email)';
+        "#,
+        )
+        .expect("Should create test schema");
+
+        // Generate code
+        let temp_dir = TempDir::new().expect("Should create temp directory");
+        let output_path = temp_dir.path();
+
+        pgrpc::PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("prefix_test")
+            .output_path(output_path)
+            .build()
+            .expect("Should generate code");
+
+        let content = std::fs::read_to_string(output_path.join("prefix_test.rs"))
+            .expect("Should read generated file");
+
+        // Verify the struct is generated
+        assert!(
+            content.contains("pub struct GetUserDataOut"),
+            "Should generate Out struct"
+        );
+
+        // Verify o_ prefixes are stripped from field names
+        assert!(
+            content.contains("pub name: String"),
+            "o_name should become 'name' field (o_ prefix stripped)"
+        );
+        assert!(
+            content.contains("pub email: String"),
+            "o_email should become 'email' field (o_ prefix stripped)"
+        );
+        assert!(
+            content.contains("pub created_at: Option<time::OffsetDateTime>"),
+            "o_created_at should become 'created_at' field (o_ prefix stripped)"
+        );
+
+        // Verify o_ prefixed names are NOT present
+        assert!(
+            !content.contains("pub o_name"),
+            "Should NOT have o_name field (prefix should be stripped)"
+        );
+        assert!(
+            !content.contains("pub o_email"),
+            "Should NOT have o_email field (prefix should be stripped)"
+        );
+        assert!(
+            !content.contains("pub o_created_at"),
+            "Should NOT have o_created_at field (prefix should be stripped)"
+        );
+
+        // Verify serde derives are present
+        assert!(
+            content.contains("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]"),
+            "Out struct should have serde derives"
+        );
+
+        println!("✅ OUT parameter o_ prefix stripping works correctly!");
+    });
+}

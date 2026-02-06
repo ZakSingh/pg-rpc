@@ -97,6 +97,17 @@ impl PgArg {
         sql_to_rs_ident(clean_name, CaseType::Snake)
     }
 
+    /// Returns the Rust name for this argument when used as an OUT parameter field
+    pub fn rs_out_name(&self) -> TokenStream {
+        // Strip 'o_' prefix if present for cleaner Rust field names
+        let clean_name = if self.name.starts_with("o_") {
+            &self.name[2..]
+        } else {
+            &self.name
+        };
+        sql_to_rs_ident(clean_name, CaseType::Snake)
+    }
+
     /// Returns whether this argument needs an additional `&` when passed to the params vector
     pub fn needs_reference(&self, types: &HashMap<OID, PgType>) -> bool {
         param_needs_reference(self.type_oid, types)
@@ -1297,7 +1308,7 @@ impl ToRust for PgFn {
             let field_names: Vec<TokenStream> = self
                 .out_args
                 .iter()
-                .map(|arg| sql_to_rs_ident(&arg.name, CaseType::Snake))
+                .map(|arg| arg.rs_out_name())
                 .collect();
             let field_types: Vec<TokenStream> = self
                 .out_args
@@ -1325,7 +1336,7 @@ impl ToRust for PgFn {
             let field_indices: Vec<usize> = (0..self.out_args.len()).collect();
 
             quote! {
-                #[derive(Debug, Clone)]
+                #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
                 pub struct #struct_name {
                     #(pub #field_names: #field_types),*
                 }
