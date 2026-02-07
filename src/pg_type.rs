@@ -300,8 +300,8 @@ impl PgType {
             PgType::Record => quote! { tokio_postgres::Row },
             PgType::Geography => quote! { postgis_butmaintained::ewkb::Geometry },
             PgType::Geometry => quote! { postgis_butmaintained::ewkb::Geometry },
-            PgType::TsVector => quote! { pgrpc::TsVector },
-            PgType::TsQuery => quote! { pgrpc::TsQuery },
+            PgType::TsVector => quote! { tsvector::TsVector },
+            PgType::TsQuery => quote! { tsvector::TsQuery },
             x => unimplemented!("unknown type {:?}", x),
         }
     }
@@ -359,8 +359,8 @@ impl PgType {
             PgType::Record => quote! { tokio_postgres::Row },
             PgType::Geography => quote! { postgis_butmaintained::ewkb::Geometry },
             PgType::Geometry => quote! { postgis_butmaintained::ewkb::Geometry },
-            PgType::TsVector => quote! { pgrpc::TsVector },
-            PgType::TsQuery => quote! { pgrpc::TsQuery },
+            PgType::TsVector => quote! { tsvector::TsVector },
+            PgType::TsQuery => quote! { tsvector::TsQuery },
             x => unimplemented!("unknown type {:?}", x),
         };
 
