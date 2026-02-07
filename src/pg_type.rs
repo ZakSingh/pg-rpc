@@ -194,6 +194,8 @@ pub enum PgType {
     Int16,
     Int32,
     Int64,
+    Float32,
+    Float64,
     Numeric,
     Bool,
     Text,
@@ -245,6 +247,8 @@ impl PgType {
             PgType::Int16 => "int16",
             PgType::Int32 => "int32",
             PgType::Int64 => "int64",
+            PgType::Float32 => "float32",
+            PgType::Float64 => "float64",
             PgType::Numeric => "numeric",
             PgType::Text => "text",
             PgType::Json => "json",
@@ -288,6 +292,8 @@ impl PgType {
             PgType::Int16 => quote! { i16 },
             PgType::Int32 => quote! { i32 },
             PgType::Int64 => quote! { i64 },
+            PgType::Float32 => quote! { f32 },
+            PgType::Float64 => quote! { f64 },
             PgType::Numeric => quote! { rust_decimal::Decimal },
             PgType::Bool => quote! { bool },
             PgType::Text => quote! { String },
@@ -347,6 +353,8 @@ impl PgType {
             PgType::Int16 => quote! { i16 },
             PgType::Int32 => quote! { i32 },
             PgType::Int64 => quote! { i64 },
+            PgType::Float32 => quote! { f32 },
+            PgType::Float64 => quote! { f64 },
             PgType::Numeric => quote! { rust_decimal::Decimal },
             PgType::Bool => quote! { bool },
             PgType::Text => quote! { String },
@@ -392,8 +400,8 @@ impl TryFrom<Row> for PgType {
                 "time" => PgType::Text,             // time types map to String
                 "timetz" => PgType::Text,
                 "uuid" => PgType::Text, // UUID as string for now
-                "float4" | "real" => PgType::Numeric, // float types map to numeric
-                "float8" | "double precision" => PgType::Numeric,
+                "float4" | "real" => PgType::Float32,
+                "float8" | "double precision" => PgType::Float64,
                 _ if t.get::<&str, u32>("array_element_type") != 0 => PgType::Array {
                     schema,
                     element_type_oid: t.get("array_element_type"),
@@ -542,21 +550,29 @@ fn determine_domain_traits(
     let mut derives = Vec::new();
     let mut impls = Vec::new();
 
-    // Always add these useful traits for all domain types
-    derives.push(quote! { PartialEq });
-    derives.push(quote! { Eq });
-    derives.push(quote! { Hash });
-
     match inner_type {
         // Copy types - add Copy and ordering traits
         PgType::Int16 | PgType::Int32 | PgType::Int64 | PgType::Bool => {
+            derives.push(quote! { PartialEq });
+            derives.push(quote! { Eq });
+            derives.push(quote! { Hash });
             derives.push(quote! { Copy });
             derives.push(quote! { PartialOrd });
             derives.push(quote! { Ord });
         }
 
+        // Float types - Copy but only partial equality/ordering (no Eq/Ord/Hash due to NaN)
+        PgType::Float32 | PgType::Float64 => {
+            derives.push(quote! { PartialEq });
+            derives.push(quote! { Copy });
+            derives.push(quote! { PartialOrd });
+        }
+
         // String types - add ordering traits and custom Display impl
         PgType::Text => {
+            derives.push(quote! { PartialEq });
+            derives.push(quote! { Eq });
+            derives.push(quote! { Hash });
             derives.push(quote! { PartialOrd });
             derives.push(quote! { Ord });
 
@@ -572,12 +588,19 @@ fn determine_domain_traits(
 
         // Other orderable types - add ordering traits but not Copy
         PgType::Numeric | PgType::Timestamptz | PgType::Date => {
+            derives.push(quote! { PartialEq });
+            derives.push(quote! { Eq });
+            derives.push(quote! { Hash });
             derives.push(quote! { PartialOrd });
             derives.push(quote! { Ord });
         }
 
-        // For all other types, just the basic traits (PartialEq, Eq, Hash) are sufficient
-        _ => {}
+        // For all other types, just the basic traits
+        _ => {
+            derives.push(quote! { PartialEq });
+            derives.push(quote! { Eq });
+            derives.push(quote! { Hash });
+        }
     }
 
     (derives, impls)
@@ -991,6 +1014,8 @@ impl ToRust for PgType {
             PgType::Int32
             | PgType::Int64
             | PgType::Int16
+            | PgType::Float32
+            | PgType::Float64
             | PgType::Text
             | PgType::Bool
             | PgType::Timestamptz
