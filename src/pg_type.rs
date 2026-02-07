@@ -1,3 +1,4 @@
+use crate::annotations;
 use crate::codegen::ToRust;
 use crate::codegen::{SchemaName, OID};
 use crate::config::Config;
@@ -10,28 +11,15 @@ use postgres::Row;
 use postgres_types::FromSql;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 
 /// Parse @pgrpc_not_null(col1, col2, ...) annotations from a comment
 pub fn parse_bulk_not_null_columns(comment: &Option<String>) -> HashSet<String> {
-    let mut columns = HashSet::new();
-    if let Some(comment_text) = comment {
-        // Match @pgrpc_not_null(col1, col2, col3) pattern
-        let re = Regex::new(r"@pgrpc_not_null\(([^)]+)\)").unwrap();
-        for cap in re.captures_iter(comment_text) {
-            // Split the column list by comma and trim whitespace
-            let cols_str = &cap[1];
-            for col in cols_str.split(',') {
-                let col = col.trim();
-                if !col.is_empty() {
-                    columns.insert(col.to_string());
-                }
-            }
-        }
-    }
-    columns
+    comment
+        .as_ref()
+        .map(|c| annotations::parse_not_null(c))
+        .unwrap_or_default()
 }
 
 // Temporarily inline flatten types until module import is resolved
@@ -218,6 +206,8 @@ pub enum PgType {
     Record,
     Geography,
     Geometry,
+    TsVector,
+    TsQuery,
 }
 
 #[derive(Debug)]
@@ -265,6 +255,8 @@ impl PgType {
             PgType::Void => "void",
             PgType::Geography => "geography",
             PgType::Geometry => "geometry",
+            PgType::TsVector => "tsvector",
+            PgType::TsQuery => "tsquery",
         }
     }
 
@@ -308,6 +300,8 @@ impl PgType {
             PgType::Record => quote! { tokio_postgres::Row },
             PgType::Geography => quote! { postgis_butmaintained::ewkb::Geometry },
             PgType::Geometry => quote! { postgis_butmaintained::ewkb::Geometry },
+            PgType::TsVector => quote! { pgrpc::TsVector },
+            PgType::TsQuery => quote! { pgrpc::TsQuery },
             x => unimplemented!("unknown type {:?}", x),
         }
     }
@@ -365,6 +359,8 @@ impl PgType {
             PgType::Record => quote! { tokio_postgres::Row },
             PgType::Geography => quote! { postgis_butmaintained::ewkb::Geometry },
             PgType::Geometry => quote! { postgis_butmaintained::ewkb::Geometry },
+            PgType::TsVector => quote! { pgrpc::TsVector },
+            PgType::TsQuery => quote! { pgrpc::TsQuery },
             x => unimplemented!("unknown type {:?}", x),
         };
 
@@ -409,8 +405,8 @@ impl TryFrom<Row> for PgType {
                 "json" | "jsonb" => PgType::Json,
                 "geography" => PgType::Geography,
                 "geometry" => PgType::Geometry,
-                "tsvector" => PgType::Text,
-                "tsquery" => PgType::Text,
+                "tsvector" => PgType::TsVector,
+                "tsquery" => PgType::TsQuery,
                 x => unimplemented!("base type not implemented {}", x),
             },
             'c' => {
@@ -473,8 +469,8 @@ impl TryFrom<Row> for PgType {
                             let is_bulk_not_null = bulk_not_null_columns.contains(&field_name);
                             let is_column_not_null = comment
                                 .as_ref()
-                                .is_some_and(|c| c.contains("@pgrpc_not_null"));
-                            
+                                .is_some_and(|c| annotations::has_not_null(c));
+
                             PgField {
                                 name: field_name,
                                 type_oid: ty,
@@ -482,7 +478,7 @@ impl TryFrom<Row> for PgType {
                                 comment: comment.clone(),
                                 flatten: comment
                                     .as_ref()
-                                    .is_some_and(|c| c.contains("@pgrpc_flatten")),
+                                    .is_some_and(|c| annotations::has_flatten(c)),
                             }
                         })
                         .collect(),
@@ -1004,9 +1000,11 @@ impl ToRust for PgType {
             | PgType::Numeric
             | PgType::Json
             | PgType::Void
-            | PgType::Record 
+            | PgType::Record
             | PgType::Geography
-            | PgType::Geometry => {
+            | PgType::Geometry
+            | PgType::TsVector
+            | PgType::TsQuery => {
                 quote! {}
             }
             // No need to create type aliases for arrays. Instead they'll be used as Vec<Inner>

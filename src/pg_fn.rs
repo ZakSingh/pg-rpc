@@ -1,3 +1,4 @@
+use crate::annotations;
 use crate::codegen::ToRust;
 use crate::codegen::{FunctionName, SchemaName, OID};
 use crate::config;
@@ -59,15 +60,10 @@ pub struct PgArg {
 
 /// Parse @pgrpc_not_null(param_name) annotations from function comments
 fn parse_out_param_not_null_annotations(comment: &Option<String>) -> HashSet<String> {
-    let mut not_null_params = HashSet::new();
-    if let Some(comment) = comment {
-        // Match @pgrpc_not_null(param_name) pattern
-        let re = Regex::new(r"@pgrpc_not_null\((\w+)\)").unwrap();
-        for cap in re.captures_iter(comment) {
-            not_null_params.insert(cap[1].to_string());
-        }
-    }
-    not_null_params
+    comment
+        .as_ref()
+        .map(|c| annotations::parse_not_null(c))
+        .unwrap_or_default()
 }
 
 /// Returns whether a parameter with this type needs an additional `&` when passed to the params vector.
@@ -951,7 +947,7 @@ impl ToRust for PgFn {
         let return_opt = self
             .comment
             .as_ref()
-            .is_some_and(|c| c.contains("@pgrpc_return_opt"));
+            .is_some_and(|c| annotations::has_return_opt(c));
         if return_opt && !self.returns_set {
             panic!(
                 "{}: Only set-returning functions can have @pgrpc_return_opt.",
@@ -1124,7 +1120,7 @@ impl ToRust for PgFn {
                             let return_not_null = self
                                 .comment
                                 .as_ref()
-                                .is_some_and(|c| c.contains("@pgrpc_not_null"));
+                                .is_some_and(|c| annotations::has_not_null(c));
                             if return_not_null {
                                 quote! {
                                     client
@@ -1271,7 +1267,7 @@ impl ToRust for PgFn {
                 let return_not_null = self
                     .comment
                     .as_ref()
-                    .is_some_and(|c| c.contains("@pgrpc_not_null"));
+                    .is_some_and(|c| annotations::has_not_null(c));
                 if return_not_null {
                     inner_ty
                 } else {

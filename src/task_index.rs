@@ -1,3 +1,4 @@
+use crate::annotations;
 use crate::codegen::OID;
 use crate::config::{Config, TaskQueueConfig};
 use crate::ident::{sql_to_rs_string, CaseType};
@@ -461,7 +462,7 @@ fn generate_payload_struct(
                 // 2. Their name is in the bulk_not_null_columns set from type-level comment
                 let is_nullable = !field.comment
                     .as_ref()
-                    .is_some_and(|c| c.contains("@pgrpc_not_null"))
+                    .is_some_and(|c| annotations::has_not_null(c))
                     && !bulk_not_null_columns.contains(&field.name);
 
                 let rust_type = if is_nullable {
@@ -477,7 +478,7 @@ fn generate_payload_struct(
                          field.name, field.type_oid, field.postgres_type);
                 let is_nullable = !field.comment
                     .as_ref()
-                    .is_some_and(|c| c.contains("@pgrpc_not_null"))
+                    .is_some_and(|c| annotations::has_not_null(c))
                     && !bulk_not_null_columns.contains(&field.name);
                 let rust_type = generate_task_field_type(field, type_index, &bulk_not_null_columns);
                 (rust_type, is_nullable, None)
@@ -571,7 +572,7 @@ fn generate_task_field_type(field: &TaskField, type_index: &HashMap<OID, PgType>
     let is_nullable = !field
         .comment
         .as_ref()
-        .is_some_and(|c| c.contains("@pgrpc_not_null"))
+        .is_some_and(|c| annotations::has_not_null(c))
         && !bulk_not_null_columns.contains(&field.name);
 
     // Get the base Rust type

@@ -1,3 +1,4 @@
+use crate::annotations;
 use crate::config::Config;
 use crate::constraint_analysis::{extract_queries, get_rel_deps, Cmd, ConflictTarget};
 use crate::ident::sql_to_rs_ident;
@@ -10,7 +11,6 @@ use itertools::Itertools;
 use jsonpath_rust::{JsonPath, JsonPathValue};
 use proc_macro2::TokenStream;
 use quote::ToTokens;
-use regex::Regex;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::ops::Deref;
@@ -276,12 +276,9 @@ fn get_strict_exceptions(parsed: &Value) -> Option<PgException> {
 }
 
 pub fn get_comment_exceptions(comment: &str) -> Vec<PgException> {
-    let re = Regex::new(r"@pgrpc_throws\s+([a-zA-Z0-9]{5})").unwrap();
-    re.captures_iter(comment)
-        .filter_map(|cap| {
-            cap.get(1)
-                .map(|m| PgException::Explicit(SqlState::from_code(m.as_str())))
-        })
+    annotations::parse_throws(comment)
+        .into_iter()
+        .map(|code| PgException::Explicit(SqlState::from_code(&code)))
         .collect()
 }
 

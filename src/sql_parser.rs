@@ -1,3 +1,4 @@
+use crate::annotations;
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use std::collections::HashSet;
@@ -68,12 +69,6 @@ pub struct SqlParser {
     annotation_regex: Regex,
     /// Regex for matching named parameters :param_name
     named_param_regex: Regex,
-    /// Regex for matching @pgrpc_not_null(col1, col2, ...)
-    not_null_annotation_regex: Regex,
-    /// Regex for matching @pgrpc_throws XXXXX
-    throws_annotation_regex: Regex,
-    /// Regex for matching @pgrpc_nullable(param1, param2, ...)
-    nullable_param_annotation_regex: Regex,
 }
 
 impl SqlParser {
@@ -83,9 +78,6 @@ impl SqlParser {
             annotation_regex: Regex::new(r"^--\s*name:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?::([a-z]+))?\s*$")
                 .unwrap(),
             named_param_regex: Regex::new(r":([a-zA-Z_][a-zA-Z0-9_]*)").unwrap(),
-            not_null_annotation_regex: Regex::new(r"@pgrpc_not_null\(([^)]+)\)").unwrap(),
-            throws_annotation_regex: Regex::new(r"@pgrpc_throws\s+([A-Za-z0-9]{5})").unwrap(),
-            nullable_param_annotation_regex: Regex::new(r"@pgrpc_nullable\(([^)]+)\)").unwrap(),
         }
     }
 
@@ -219,35 +211,13 @@ impl SqlParser {
 
         for line in comment_lines {
             // Parse @pgrpc_not_null(col1, col2, ...)
-            for cap in self.not_null_annotation_regex.captures_iter(line) {
-                if let Some(cols) = cap.get(1) {
-                    for col in cols.as_str().split(',') {
-                        let col = col.trim();
-                        if !col.is_empty() {
-                            not_null_annotations.insert(col.to_string());
-                        }
-                    }
-                }
-            }
+            not_null_annotations.extend(annotations::parse_not_null(line));
 
             // Parse @pgrpc_throws XXXXX
-            for cap in self.throws_annotation_regex.captures_iter(line) {
-                if let Some(code) = cap.get(1) {
-                    throws_annotations.push(code.as_str().to_string());
-                }
-            }
+            throws_annotations.extend(annotations::parse_throws(line));
 
             // Parse @pgrpc_nullable(param1, param2, ...)
-            for cap in self.nullable_param_annotation_regex.captures_iter(line) {
-                if let Some(params) = cap.get(1) {
-                    for param in params.as_str().split(',') {
-                        let param = param.trim();
-                        if !param.is_empty() {
-                            nullable_param_annotations.insert(param.to_string());
-                        }
-                    }
-                }
-            }
+            nullable_param_annotations.extend(annotations::parse_nullable(line));
         }
 
         (not_null_annotations, throws_annotations, nullable_param_annotations)

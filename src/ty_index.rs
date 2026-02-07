@@ -1,3 +1,4 @@
+use crate::annotations;
 use crate::codegen::OID;
 use crate::pg_type::PgType;
 use crate::rel_index::RelIndex;
@@ -171,16 +172,16 @@ impl TypeIndex {
                                 if let PgType::Composite { fields, comment, .. } = pg_type {
                                     // Parse type-level bulk not null annotations
                                     let bulk_not_null_columns = crate::pg_type::parse_bulk_not_null_columns(comment);
-                                    
+
                                     for field in fields.iter_mut() {
                                         // Check for column-level @pgrpc_not_null annotation (highest priority)
                                         let has_column_annotation = field.comment
                                             .as_ref()
-                                            .is_some_and(|c| c.contains("@pgrpc_not_null"));
-                                        
+                                            .is_some_and(|c| annotations::has_not_null(c));
+
                                         // Check for type-level bulk annotation
                                         let has_bulk_annotation = bulk_not_null_columns.contains(&field.name);
-                                        
+
                                         // Apply annotations or inferred nullability
                                         if has_column_annotation || has_bulk_annotation {
                                             // Annotations take precedence over inference
@@ -266,7 +267,7 @@ impl TypeIndex {
                                 let has_column_annotation = field
                                     .comment
                                     .as_ref()
-                                    .is_some_and(|c| c.contains("@pgrpc_not_null"));
+                                    .is_some_and(|c| annotations::has_not_null(c));
 
                                 // Check for type-level bulk annotation
                                 let has_bulk_annotation = bulk_not_null_columns.contains(&field.name);

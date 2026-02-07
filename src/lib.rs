@@ -15,6 +15,7 @@ use std::time::Instant;
 // Re-export public types for use in tests and external code
 pub use crate::config::{ErrorsConfig, QueriesConfig, TaskQueueConfig};
 
+pub mod annotations;
 pub mod cardinality_inference;
 mod codegen;
 mod config;
@@ -39,10 +40,14 @@ mod sql_state;
 pub(crate) mod task_index;
 mod tests;
 mod trigger_index;
+mod tsvector;
 pub mod ty_index;
 mod types;
 mod unified_error;
 pub mod view_nullability;
+
+// Re-export tsvector types for use in generated code
+pub use tsvector::{TsQuery, TsVector};
 
 /// Builder for configuring and running pgrpc code generation
 pub struct PgrpcBuilder {
