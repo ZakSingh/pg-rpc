@@ -1601,6 +1601,7 @@ mod tests {
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
             queries: None,
+            tracing: None,
         };
 
         // Generate Rust code

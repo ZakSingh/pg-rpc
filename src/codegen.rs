@@ -962,12 +962,27 @@ fn generate_query_code(
     // Generate doc comment with SQL
     let doc_comment = format!("Query: {}\n\nSQL:\n```sql\n{}\n```", query.name, sql);
 
+    // Check if tracing is enabled
+    let tracing_enabled = config.tracing.as_ref().map(|t| t.enabled).unwrap_or(false);
+
+    // Generate the tracing::instrument attribute if enabled
+    let tracing_attr = if tracing_enabled {
+        // Use "queries.<query_name>" as the span name for SQL queries
+        let span_name = format!("queries.{}", query.name);
+        quote! {
+            #[tracing::instrument(name = #span_name, skip(client), err)]
+        }
+    } else {
+        quote! {}
+    };
+
     quote! {
         #row_struct
 
         #error_enum
 
         #[doc = #doc_comment]
+        #tracing_attr
         pub async fn #fn_name(
             client: &impl deadpool_postgres::GenericClient,
             #(#params),*

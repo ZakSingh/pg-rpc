@@ -1353,10 +1353,26 @@ impl ToRust for PgFn {
             quote! {}
         };
 
+        // Check if tracing is enabled
+        let tracing_enabled = config.tracing.as_ref().map(|t| t.enabled).unwrap_or(false);
+        let schema_str = &self.schema;
+
+        // Generate the tracing::instrument attribute if enabled
+        let tracing_attr = if tracing_enabled {
+            // Build the span name as "schema.function_name"
+            let span_name = format!("{}.{}", schema_str, fn_name_str);
+            quote! {
+                #[tracing::instrument(name = #span_name, skip(client), err)]
+            }
+        } else {
+            quote! {}
+        };
+
         quote! {
             #struct_def
 
             #comment_macro
+            #tracing_attr
             #[builder(finish_fn = exec)]
             pub async fn #rs_fn_name(
                 #[builder(finish_fn)]
@@ -1591,6 +1607,7 @@ mod test {
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
             queries: None,
+            tracing: None,
         };
 
         // Generate the code
@@ -1670,6 +1687,7 @@ mod test {
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
             queries: None,
+            tracing: None,
         };
 
         // Generate the code
@@ -1682,5 +1700,124 @@ mod test {
         );
         // Should NOT contain try_get(0) for composite types
         assert!(!generated_str.contains("row . try_get (0)"));
+    }
+
+    #[test]
+    fn test_tracing_enabled_codegen() {
+        use crate::codegen::ToRust;
+        use crate::config::TracingConfig;
+        use crate::pg_fn::PgFn;
+        use crate::pg_type::PgType;
+        use std::collections::HashMap;
+
+        // Create a simple function
+        let pg_fn = PgFn {
+            oid: 1234,
+            schema: "public".to_string(),
+            name: "get_user".to_string(),
+            args: vec![],
+            out_args: vec![],
+            returns_set: false,
+            is_procedure: false,
+            has_table_params: false,
+            return_type_oid: 25, // TEXT OID
+            comment: None,
+            definition: "".to_string(),
+            exceptions: vec![],
+        };
+
+        let mut types = HashMap::new();
+        types.insert(25, PgType::Text);
+
+        // Create config with tracing enabled
+        let config = crate::config::Config {
+            connection_string: None,
+            output_path: None,
+            schemas: vec!["public".to_string()],
+            types: HashMap::new(),
+            exceptions: HashMap::new(),
+            task_queue: None,
+            errors: None,
+            infer_view_nullability: true,
+            disable_deserialize: Vec::new(),
+            queries: None,
+            tracing: Some(TracingConfig {
+                enabled: true,
+            }),
+        };
+
+        // Generate the code
+        let generated = pg_fn.to_rust(&types, &config);
+        let generated_str = generated.to_string();
+
+        // Verify that tracing::instrument attribute is included
+        assert!(
+            generated_str.contains("tracing :: instrument"),
+            "Generated code should contain tracing::instrument attribute"
+        );
+        assert!(
+            generated_str.contains("public.get_user"),
+            "Span name should be schema.function_name"
+        );
+        assert!(
+            generated_str.contains("skip (client)"),
+            "Should skip client parameter"
+        );
+        assert!(
+            generated_str.contains("err"),
+            "Should include err to capture error results"
+        );
+    }
+
+    #[test]
+    fn test_tracing_disabled_codegen() {
+        use crate::codegen::ToRust;
+        use crate::pg_fn::PgFn;
+        use crate::pg_type::PgType;
+        use std::collections::HashMap;
+
+        // Create a simple function
+        let pg_fn = PgFn {
+            oid: 1234,
+            schema: "public".to_string(),
+            name: "get_user".to_string(),
+            args: vec![],
+            out_args: vec![],
+            returns_set: false,
+            is_procedure: false,
+            has_table_params: false,
+            return_type_oid: 25, // TEXT OID
+            comment: None,
+            definition: "".to_string(),
+            exceptions: vec![],
+        };
+
+        let mut types = HashMap::new();
+        types.insert(25, PgType::Text);
+
+        // Create config with tracing disabled (default)
+        let config = crate::config::Config {
+            connection_string: None,
+            output_path: None,
+            schemas: vec!["public".to_string()],
+            types: HashMap::new(),
+            exceptions: HashMap::new(),
+            task_queue: None,
+            errors: None,
+            infer_view_nullability: true,
+            disable_deserialize: Vec::new(),
+            queries: None,
+            tracing: None,
+        };
+
+        // Generate the code
+        let generated = pg_fn.to_rust(&types, &config);
+        let generated_str = generated.to_string();
+
+        // Verify that tracing::instrument attribute is NOT included
+        assert!(
+            !generated_str.contains("tracing :: instrument"),
+            "Generated code should NOT contain tracing::instrument when disabled"
+        );
     }
 }

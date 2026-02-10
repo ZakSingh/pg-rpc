@@ -14,6 +14,13 @@ pub struct Config {
     pub infer_view_nullability: bool,
     pub disable_deserialize: Vec<String>,
     pub queries: Option<QueriesConfig>,
+    pub tracing: Option<TracingConfig>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct TracingConfig {
+    /// Enable tracing spans around generated functions
+    pub enabled: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -50,6 +57,7 @@ impl Default for Config {
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
             queries: None,
+            tracing: None,
         }
     }
 }

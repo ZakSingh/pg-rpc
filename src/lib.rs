@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 // Re-export public types for use in tests and external code
-pub use crate::config::{ErrorsConfig, QueriesConfig, TaskQueueConfig};
+pub use crate::config::{ErrorsConfig, QueriesConfig, TaskQueueConfig, TracingConfig};
 
 pub mod annotations;
 pub mod cardinality_inference;
@@ -61,6 +61,7 @@ pub struct PgrpcBuilder {
     infer_view_nullability: bool,
     disable_deserialize: Vec<String>,
     queries: Option<config::QueriesConfig>,
+    tracing: Option<config::TracingConfig>,
 }
 
 impl Default for PgrpcBuilder {
@@ -83,6 +84,7 @@ impl PgrpcBuilder {
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
             queries: None,
+            tracing: None,
         }
     }
 
@@ -243,6 +245,19 @@ impl PgrpcBuilder {
         self
     }
 
+    /// Enable or disable tracing spans around generated functions
+    ///
+    /// When enabled, generated functions will be wrapped with tracing spans
+    /// that include the function name and schema. This makes it easier to
+    /// identify which function caused an error when using tracing.
+    ///
+    /// Users must add `tracing = "0.1"` to their Cargo.toml when this is enabled.
+    pub fn enable_tracing(mut self, enabled: bool) -> Self {
+        let tracing_config = self.tracing.get_or_insert(config::TracingConfig::default());
+        tracing_config.enabled = enabled;
+        self
+    }
+
     /// Load configuration from a TOML file
     pub fn from_config_file(config_path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let conf_str = fs::read_to_string(config_path)?;
@@ -259,6 +274,7 @@ impl PgrpcBuilder {
             infer_view_nullability: config.infer_view_nullability,
             disable_deserialize: config.disable_deserialize,
             queries: config.queries,
+            tracing: config.tracing,
         })
     }
 
@@ -298,6 +314,7 @@ impl PgrpcBuilder {
             infer_view_nullability: self.infer_view_nullability,
             disable_deserialize: self.disable_deserialize.clone(),
             queries: self.queries.clone(),
+            tracing: self.tracing.clone(),
         };
 
         let mut db = Db::new(&connection_string)?;
