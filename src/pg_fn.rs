@@ -1301,15 +1301,12 @@ impl ToRust for PgFn {
             } else {
                 self.out_params_struct_name()
             };
-            let field_names: Vec<TokenStream> = self
-                .out_args
-                .iter()
-                .map(|arg| arg.rs_out_name())
-                .collect();
-            let field_types: Vec<TokenStream> = self
+            let field_tokens: Vec<TokenStream> = self
                 .out_args
                 .iter()
                 .map(|arg| {
+                    let field_name = arg.rs_out_name();
+                    let pg_name = &arg.name;
                     let base_type = match types.get(&arg.type_oid).unwrap() {
                         PgType::Int16 => quote! { i16 },
                         PgType::Int32 => quote! { i32 },
@@ -1321,20 +1318,36 @@ impl ToRust for PgFn {
                             quote! { #id }
                         }
                     };
-                    if arg.nullable {
+                    let field_type = if arg.nullable {
                         quote! { Option<#base_type> }
                     } else {
                         base_type
+                    };
+
+                    let serde_attr = if arg.nullable {
+                        quote! { #[serde(rename = #pg_name, default)] }
+                    } else {
+                        quote! { #[serde(rename = #pg_name)] }
+                    };
+
+                    quote! {
+                        #serde_attr
+                        pub #field_name: #field_type
                     }
                 })
                 .collect();
 
+            let field_names: Vec<TokenStream> = self
+                .out_args
+                .iter()
+                .map(|arg| arg.rs_out_name())
+                .collect();
             let field_indices: Vec<usize> = (0..self.out_args.len()).collect();
 
             quote! {
                 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
                 pub struct #struct_name {
-                    #(pub #field_names: #field_types),*
+                    #(#field_tokens),*
                 }
 
                 impl TryFrom<tokio_postgres::Row> for #struct_name {

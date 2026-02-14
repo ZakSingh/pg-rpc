@@ -156,25 +156,34 @@ pub fn generate_error_payload_structs(
             .iter()
             .map(|field| {
                 let field_name = sql_to_rs_ident(&field.name, CaseType::Snake);
-                let field_type = ty_index
+                let pg_name = &field.name;
+                let base_field_type = ty_index
                     .deref()
                     .get(&field.type_oid)
                     .map(|pg_type| pg_type.to_rust(ty_index.deref(), config))
                     .unwrap_or_else(|| quote! { serde_json::Value });
 
-                let field_type = if field.not_null {
-                    field_type
+                let (field_type, is_nullable) = if field.not_null {
+                    (base_field_type, false)
                 } else {
-                    quote! { Option<#field_type> }
+                    (quote! { Option<#base_field_type> }, true)
+                };
+
+                let serde_attr = if is_nullable {
+                    quote! { #[serde(rename = #pg_name, default)] }
+                } else {
+                    quote! { #[serde(rename = #pg_name)] }
                 };
 
                 if let Some(comment) = &field.comment {
                     quote! {
                         #[doc = #comment]
+                        #serde_attr
                         pub #field_name: #field_type
                     }
                 } else {
                     quote! {
+                        #serde_attr
                         pub #field_name: #field_type
                     }
                 }

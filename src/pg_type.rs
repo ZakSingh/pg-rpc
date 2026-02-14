@@ -1095,12 +1095,19 @@ impl PgField {
         // Generate datetime serde annotation if needed
         let pg_type = types.get(&self.type_oid).unwrap();
         let datetime_serde_attr = generate_datetime_serde_attr(pg_type, self.nullable);
-        let serde_attr = match datetime_serde_attr {
-            Some(attr) => quote! {
+        let serde_attr = match (datetime_serde_attr, self.nullable) {
+            (Some(attr), true) => quote! {
+                #[serde(rename = #pg_name, default)]
+                #attr
+            },
+            (Some(attr), false) => quote! {
                 #[serde(rename = #pg_name)]
                 #attr
             },
-            None => quote! {
+            (None, true) => quote! {
+                #[serde(rename = #pg_name, default)]
+            },
+            (None, false) => quote! {
                 #[serde(rename = #pg_name)]
             },
         };
@@ -1142,12 +1149,19 @@ fn generate_flattened_field_token(
     // Generate datetime serde annotation if needed
     let pg_type = types.get(&flattened_field.type_oid).unwrap();
     let datetime_serde_attr = generate_datetime_serde_attr(pg_type, flattened_field.nullable);
-    let serde_attr = match datetime_serde_attr {
-        Some(attr) => quote! {
+    let serde_attr = match (datetime_serde_attr, flattened_field.nullable) {
+        (Some(attr), true) => quote! {
+            #[serde(rename = #pg_name, default)]
+            #attr
+        },
+        (Some(attr), false) => quote! {
             #[serde(rename = #pg_name)]
             #attr
         },
-        None => quote! {
+        (None, true) => quote! {
+            #[serde(rename = #pg_name, default)]
+        },
+        (None, false) => quote! {
             #[serde(rename = #pg_name)]
         },
     };

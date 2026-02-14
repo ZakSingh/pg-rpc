@@ -492,12 +492,19 @@ fn generate_payload_struct(
                 generate_task_datetime_serde_attr_from_string(&field.postgres_type, is_nullable)
             };
 
-            let serde_attr = match datetime_serde_attr {
-                Some(attr) => quote! {
+            let serde_attr = match (datetime_serde_attr, is_nullable) {
+                (Some(attr), true) => quote! {
+                    #[serde(rename = #pg_field_name, default)]
+                    #attr
+                },
+                (Some(attr), false) => quote! {
                     #[serde(rename = #pg_field_name)]
                     #attr
                 },
-                None => quote! {
+                (None, true) => quote! {
+                    #[serde(rename = #pg_field_name, default)]
+                },
+                (None, false) => quote! {
                     #[serde(rename = #pg_field_name)]
                 },
             };

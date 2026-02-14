@@ -1291,12 +1291,19 @@ fn generate_row_struct(
             };
 
             // Generate serde attributes
-            let serde_attr = match datetime_serde_attr {
-                Some(attr) => quote! {
+            let serde_attr = match (datetime_serde_attr, col.nullable) {
+                (Some(attr), true) => quote! {
+                    #[serde(rename = #column_name, default)]
+                    #attr
+                },
+                (Some(attr), false) => quote! {
                     #[serde(rename = #column_name)]
                     #attr
                 },
-                None => quote! {
+                (None, true) => quote! {
+                    #[serde(rename = #column_name, default)]
+                },
+                (None, false) => quote! {
                     #[serde(rename = #column_name)]
                 },
             };
