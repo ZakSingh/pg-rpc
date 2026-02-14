@@ -196,8 +196,8 @@
       <item itemvalue="Cargo.Run pgrpc" />
       <item itemvalue="Cargo.Test pgrpc" />
       <item itemvalue="Cargo.Test parse_domain::tests" />
-      <item itemvalue="Cargo.Test parse_domain::tests::nullable_value_works" />
       <item itemvalue="Cargo.Test parse_domain::tests::nullable_value_works_2" />
+      <item itemvalue="Cargo.Test parse_domain::tests::nullable_value_works" />
       <item itemvalue="Cargo.Test pg_fn::test::test_get_rels" />
     </list>
     <recent_temporary>
@@ -258,6 +258,7 @@
       <workItem from="1769457108651" duration="606000" />
       <workItem from="1769482016577" duration="837000" />
       <workItem from="1771033947145" duration="422000" />
+      <workItem from="1771054131372" duration="708000" />
     </task>
     <task id="LOCAL-00001" summary="basic support for tsvector/tsquery">
       <option name="closed" value="true" />

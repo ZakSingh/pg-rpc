@@ -210,6 +210,7 @@ pub enum PgType {
     Geometry,
     TsVector,
     TsQuery,
+    Vector,
 }
 
 #[derive(Debug)]
@@ -261,6 +262,7 @@ impl PgType {
             PgType::Geometry => "geometry",
             PgType::TsVector => "tsvector",
             PgType::TsQuery => "tsquery",
+            PgType::Vector => "vector",
         }
     }
 
@@ -308,6 +310,7 @@ impl PgType {
             PgType::Geometry => quote! { postgis_butmaintained::ewkb::Geometry },
             PgType::TsVector => quote! { tsvector::TsVector },
             PgType::TsQuery => quote! { tsvector::TsQuery },
+            PgType::Vector => quote! { pgvector::Vector },
             x => unimplemented!("unknown type {:?}", x),
         }
     }
@@ -369,6 +372,7 @@ impl PgType {
             PgType::Geometry => quote! { postgis_butmaintained::ewkb::Geometry },
             PgType::TsVector => quote! { tsvector::TsVector },
             PgType::TsQuery => quote! { tsvector::TsQuery },
+            PgType::Vector => quote! { pgvector::Vector },
             x => unimplemented!("unknown type {:?}", x),
         };
 
@@ -415,6 +419,7 @@ impl TryFrom<Row> for PgType {
                 "geometry" => PgType::Geometry,
                 "tsvector" => PgType::TsVector,
                 "tsquery" => PgType::TsQuery,
+                "vector" => PgType::Vector,
                 x => unimplemented!("base type not implemented {}", x),
             },
             'c' => {
@@ -1029,7 +1034,8 @@ impl ToRust for PgType {
             | PgType::Geography
             | PgType::Geometry
             | PgType::TsVector
-            | PgType::TsQuery => {
+            | PgType::TsQuery
+            | PgType::Vector => {
                 quote! {}
             }
             // No need to create type aliases for arrays. Instead they'll be used as Vec<Inner>

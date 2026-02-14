@@ -1596,6 +1596,7 @@ dependencies = [
  "once_cell",
  "petgraph",
  "pg_query",
+ "pgvector",
  "phf",
  "postgis-butmaintained",
  "postgres",
@@ -1621,6 +1622,16 @@ dependencies = [
  "toml",
  "ustr",
  "uuid",
+]
+
+[[package]]
+name = "pgvector"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc58e2d255979a31caa7cabfa7aac654af0354220719ab7a68520ae7a91e8c0b"
+dependencies = [
+ "bytes",
+ "postgres-types",
 ]
 
 [[package]]
