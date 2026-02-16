@@ -946,14 +946,19 @@ fn generate_query_code(
         .map(|param| {
             let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
 
-            // Check if this is a domain type that needs unwrapping
-            let is_domain = matches!(
-                type_index.get(&param.type_oid),
-                Some(PgType::Domain { .. })
-            );
+            // Check if this is a domain type over a primitive that needs unwrapping.
+            // Domains over composite types have custom ToSql implementations that handle
+            // domain unwrapping internally, so we don't unwrap those at the call site.
+            let is_primitive_domain = match type_index.get(&param.type_oid) {
+                Some(PgType::Domain { type_oid: base_oid, .. }) => {
+                    // Only unwrap if the base type is NOT a composite
+                    !matches!(type_index.get(base_oid), Some(PgType::Composite { .. }))
+                }
+                _ => false,
+            };
 
             if param.nullable {
-                if is_domain {
+                if is_primitive_domain {
                     // For nullable domain: create a let binding to unwrap, then reference it
                     // Use the same snake_case conversion as param_name, then append _unwrapped
                     use heck::ToSnakeCase;
@@ -969,7 +974,7 @@ fn generate_query_code(
                     quote! { &#param_name }
                 }
             } else {
-                if is_domain {
+                if is_primitive_domain {
                     // For non-nullable domain: pass &param.0 (unwrap the newtype)
                     quote! { &#param_name.0 }
                 } else if param_needs_reference(param.type_oid, type_index) {
