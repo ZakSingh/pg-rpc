@@ -46,11 +46,8 @@ impl TryFrom<Row> for PgRel {
                 .map(|s| s.into())
                 .collect(),
             column_types: row
-                .try_get::<_, Option<Vec<i32>>>("column_types")?
-                .unwrap_or_default()
-                .into_iter()
-                .map(|oid| oid as OID)
-                .collect(),
+                .try_get::<_, Option<Vec<u32>>>("column_types")?
+                .unwrap_or_default(),
         })
     }
 }
