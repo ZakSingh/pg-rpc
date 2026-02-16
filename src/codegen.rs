@@ -938,6 +938,8 @@ fn generate_query_code(
     };
 
     // Build parameter references for query call
+    // For nullable domain types, we need let bindings to unwrap the domain before referencing
+    let mut nullable_domain_bindings: Vec<TokenStream> = Vec::new();
     let param_refs: Vec<TokenStream> = query
         .params
         .iter()
@@ -952,8 +954,15 @@ fn generate_query_code(
 
             if param.nullable {
                 if is_domain {
-                    // For nullable domain: Option<DomainType> -> pass inner.as_ref().map(|v| &v.0)
-                    quote! { #param_name.as_ref().map(|v| &v.0) }
+                    // For nullable domain: create a let binding to unwrap, then reference it
+                    // Use the same snake_case conversion as param_name, then append _unwrapped
+                    use heck::ToSnakeCase;
+                    let unwrapped_name_str = format!("{}_unwrapped", param.name.to_snake_case());
+                    let unwrapped_name = sql_to_rs_ident(&unwrapped_name_str, CaseType::Snake);
+                    nullable_domain_bindings.push(
+                        quote! { let #unwrapped_name = #param_name.as_ref().map(|v| &v.0); }
+                    );
+                    quote! { &#unwrapped_name }
                 } else {
                     // For nullable parameters, Option<T> implements ToSql, so always use reference
                     // This handles both Option<&T> and Option<T>
@@ -1001,6 +1010,7 @@ fn generate_query_code(
             #(#params),*
         ) -> #return_type {
             let query = #sql;
+            #(#nullable_domain_bindings)*
             let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#param_refs),*];
 
             #query_execution
