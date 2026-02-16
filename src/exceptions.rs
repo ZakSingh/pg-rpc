@@ -12,7 +12,7 @@ use jsonpath_rust::{JsonPath, JsonPathValue};
 use proc_macro2::TokenStream;
 use quote::ToTokens;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ops::Deref;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -181,7 +181,7 @@ pub fn get_exceptions_with_triggers(
 fn get_raised_sql_states_and_custom_errors(
     fn_json: &Value,
     errors_config: Option<&crate::config::ErrorsConfig>,
-) -> anyhow::Result<(HashSet<SqlState>, HashSet<String>)> {
+) -> anyhow::Result<(BTreeSet<SqlState>, BTreeSet<String>)> {
     let err_raises = JsonPath::try_from("$..PLpgSQL_stmt_raise[?(@.elog_level == 21)].condname")?;
 
     let code_as_option =
@@ -199,7 +199,7 @@ fn get_raised_sql_states_and_custom_errors(
         errs.len()
     };
 
-    let mut sql_states: HashSet<SqlState> = code_as_option
+    let mut sql_states: BTreeSet<SqlState> = code_as_option
         .find_slice(fn_json)
         .into_iter()
         .chain(err_raises.find_slice(fn_json).into_iter())
@@ -215,7 +215,7 @@ fn get_raised_sql_states_and_custom_errors(
                 })
                 .ok_or_else(|| anyhow!("Failed to parse sql state"))
         })
-        .collect::<Result<HashSet<_>, _>>()?;
+        .collect::<Result<BTreeSet<_>, _>>()?;
 
     // add P0001 code if errors exist w/o code
     if err_count > sql_states.len() {
@@ -223,7 +223,7 @@ fn get_raised_sql_states_and_custom_errors(
     }
 
     // Detect custom errors if errors_config is provided using AST parsing
-    let mut custom_errors = HashSet::new();
+    let mut custom_errors = BTreeSet::new();
     if let Some(config) = errors_config {
         // Extract queries from the function JSON and parse them
         let queries = crate::pg_fn::extract_queries(fn_json);

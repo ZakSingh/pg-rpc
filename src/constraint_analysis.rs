@@ -15,7 +15,7 @@ use pg_query::protobuf::node::Node;
 use pg_query::protobuf::{DeleteStmt, InsertStmt, OnConflictAction, SelectStmt, UpdateStmt};
 use pg_query::{NodeRef, ParseResult};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ops::Deref;
 use ustr::Ustr;
 
@@ -131,12 +131,12 @@ pub fn analyze_sql_for_constraints(
     sql: &str,
     rel_index: &RelIndex,
     trigger_index: Option<&TriggerIndex>,
-) -> (Vec<PgException>, HashMap<PgId, Vec<Constraint>>) {
+) -> (Vec<PgException>, BTreeMap<PgId, Vec<Constraint>>) {
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,
         Err(e) => {
             warn!("Failed to parse SQL for constraint analysis: {}", e);
-            return (Vec::new(), HashMap::new());
+            return (Vec::new(), BTreeMap::new());
         }
     };
 
@@ -149,7 +149,7 @@ pub fn analyze_sql_for_constraints(
     }
 
     let mut exceptions = Vec::new();
-    let mut table_constraints: HashMap<PgId, Vec<Constraint>> = HashMap::new();
+    let mut table_constraints: BTreeMap<PgId, Vec<Constraint>> = BTreeMap::new();
 
     for dep in &rel_deps {
         // Find the PgId for this OID

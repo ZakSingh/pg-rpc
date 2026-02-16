@@ -11,7 +11,7 @@ use crate::ty_index::TypeIndex;
 use crate::view_nullability::ViewNullabilityAnalyzer;
 use anyhow::{Context, Result};
 use postgres::Client;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]
 pub struct QueryParam {
@@ -40,7 +40,7 @@ pub struct IntrospectedQuery {
     /// Exceptions that could be raised by this query
     pub exceptions: Vec<PgException>,
     /// Map of table ID to constraints that apply to this query
-    pub table_dependencies: HashMap<PgId, Vec<Constraint>>,
+    pub table_dependencies: BTreeMap<PgId, Vec<Constraint>>,
 }
 
 pub struct QueryIntrospector<'a> {
