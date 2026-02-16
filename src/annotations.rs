@@ -70,6 +70,11 @@ pub fn has_return_opt(comment: &str) -> bool {
     comment.contains("@pgrpc_return_opt")
 }
 
+/// Check if comment contains @pgrpc_builder
+pub fn has_builder(comment: &str) -> bool {
+    comment.contains("@pgrpc_builder")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +153,13 @@ mod tests {
         assert!(has_return_opt("@pgrpc_return_opt"));
         assert!(has_return_opt("some text @pgrpc_return_opt more"));
         assert!(!has_return_opt("no annotation here"));
+    }
+
+    #[test]
+    fn test_has_builder() {
+        assert!(has_builder("@pgrpc_builder"));
+        assert!(has_builder("@pgrpc_builder Filter for listing items"));
+        assert!(has_builder("some text @pgrpc_builder more"));
+        assert!(!has_builder("no annotation here"));
     }
 }

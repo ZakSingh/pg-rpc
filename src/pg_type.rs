@@ -751,9 +751,15 @@ impl ToRust for PgType {
                     quote! { serde::Deserialize, }
                 };
 
+                let builder_derive = if comment.as_ref().map_or(false, |c| annotations::has_builder(c)) {
+                    quote! { bon::Builder, }
+                } else {
+                    quote! {}
+                };
+
                 quote! {
                     #comment_macro
-                    #[derive(Clone, Debug, bon::Builder, serde::Serialize, #deserialize_derive postgres_types::FromSql, postgres_types::ToSql)]
+                    #[derive(Clone, Debug, #builder_derive serde::Serialize, #deserialize_derive postgres_types::FromSql, postgres_types::ToSql)]
                     #[postgres(name = #name)]
                     pub struct #rs_name {
                         #(#field_tokens),*
@@ -844,9 +850,15 @@ impl ToRust for PgType {
                             quote! { serde::Deserialize, }
                         };
 
+                        let builder_derive = if comment.as_ref().map_or(false, |c| annotations::has_builder(c)) {
+                            quote! { bon::Builder, }
+                        } else {
+                            quote! {}
+                        };
+
                         quote! {
                             #comment_macro
-                            #[derive(Clone, Debug, bon::Builder, serde::Serialize, #deserialize_derive)]
+                            #[derive(Clone, Debug, #builder_derive serde::Serialize, #deserialize_derive)]
                             pub struct #rs_name {
                                 #(#field_tokens),*
                             }
