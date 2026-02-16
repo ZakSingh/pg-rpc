@@ -944,13 +944,26 @@ fn generate_query_code(
         .map(|param| {
             let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
 
+            // Check if this is a domain type that needs unwrapping
+            let is_domain = matches!(
+                type_index.get(&param.type_oid),
+                Some(PgType::Domain { .. })
+            );
+
             if param.nullable {
-                // For nullable parameters, Option<T> implements ToSql, so always use reference
-                // This handles both Option<&T> and Option<T>
-                quote! { &#param_name }
+                if is_domain {
+                    // For nullable domain: Option<DomainType> -> pass inner.as_ref().map(|v| &v.0)
+                    quote! { #param_name.as_ref().map(|v| &v.0) }
+                } else {
+                    // For nullable parameters, Option<T> implements ToSql, so always use reference
+                    // This handles both Option<&T> and Option<T>
+                    quote! { &#param_name }
+                }
             } else {
-                // For non-nullable, check if we need to add a reference
-                if param_needs_reference(param.type_oid, type_index) {
+                if is_domain {
+                    // For non-nullable domain: pass &param.0 (unwrap the newtype)
+                    quote! { &#param_name.0 }
+                } else if param_needs_reference(param.type_oid, type_index) {
                     quote! { &#param_name }
                 } else {
                     quote! { #param_name }
