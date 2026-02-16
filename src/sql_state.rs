@@ -27,6 +27,18 @@ impl Hash for SqlState {
     }
 }
 
+impl PartialOrd for SqlState {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SqlState {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.code().cmp(other.0.code())
+    }
+}
+
 impl Deref for SqlState {
     type Target = tokio_postgres::error::SqlState;
 

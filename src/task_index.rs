@@ -9,7 +9,7 @@ use postgres::Client;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::{Deref, DerefMut};
 
 const TASK_INTROSPECTION_QUERY: &'static str = include_str!("./queries/task_introspection.sql");
@@ -33,10 +33,10 @@ pub struct TaskField {
 }
 
 #[derive(Debug, Default)]
-pub struct TaskIndex(HashMap<String, TaskType>);
+pub struct TaskIndex(BTreeMap<String, TaskType>);
 
 impl Deref for TaskIndex {
-    type Target = HashMap<String, TaskType>;
+    type Target = BTreeMap<String, TaskType>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -72,7 +72,7 @@ impl TaskIndex {
             query_result.len()
         );
 
-        let task_types: HashMap<String, TaskType> = query_result
+        let task_types: BTreeMap<String, TaskType> = query_result
             .into_iter()
             .enumerate()
             .map(|(row_idx, row)| {
@@ -151,7 +151,7 @@ impl TaskIndex {
                     }
                 ))
             })
-            .collect::<Result<HashMap<_, _>, _>>()?;
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
 
         eprintln!(
             "[PGRPC] Found {} task types in schema '{}'",
@@ -249,8 +249,8 @@ pub fn generate_task_enum(
     task_index: &TaskIndex,
     type_index: &TypeIndex,
     config: &Config,
-) -> (TokenStream, HashSet<String>) {
-    let mut referenced_schemas = HashSet::new();
+) -> (TokenStream, BTreeSet<String>) {
+    let mut referenced_schemas = BTreeSet::new();
 
     if task_index.is_empty() {
         return (TokenStream::new(), referenced_schemas);
@@ -419,8 +419,8 @@ fn generate_payload_struct(
     task_type: &TaskType,
     type_index: &TypeIndex,
     config: &Config,
-) -> (TokenStream, std::collections::HashSet<String>) {
-    let mut referenced_schemas = std::collections::HashSet::new();
+) -> (TokenStream, BTreeSet<String>) {
+    let mut referenced_schemas = BTreeSet::new();
     let struct_name = format_ident!(
         "{}Payload",
         sql_to_rs_string(&task_type.task_name, CaseType::Pascal)
@@ -570,7 +570,7 @@ fn generate_task_variant(
 }
 
 /// Generate Rust type for a task field, properly handling nullability and @pgrpc_not_null annotations
-fn generate_task_field_type(field: &TaskField, type_index: &HashMap<OID, PgType>, bulk_not_null_columns: &HashSet<String>) -> TokenStream {
+fn generate_task_field_type(field: &TaskField, type_index: &BTreeMap<OID, PgType>, bulk_not_null_columns: &BTreeSet<String>) -> TokenStream {
     // Determine if field should be nullable
     // Fields are nullable by default in PostgreSQL composite types
     // They become NOT nullable if:
@@ -631,7 +631,7 @@ mod tests {
     use serde_json::json;
 
     fn create_test_task_index() -> TaskIndex {
-        let mut task_index = TaskIndex(HashMap::new());
+        let mut task_index = TaskIndex(BTreeMap::new());
 
         // Create a task type with fields (like send_verification_code)
         let task_with_fields = TaskType {
@@ -672,8 +672,8 @@ mod tests {
         task_index
     }
 
-    fn create_test_type_index() -> HashMap<OID, PgType> {
-        let mut type_map = HashMap::new();
+    fn create_test_type_index() -> BTreeMap<OID, PgType> {
+        let mut type_map = BTreeMap::new();
 
         // Just add basic types - we don't need domain types for our test
         type_map.insert(25, PgType::Text);

@@ -1,6 +1,6 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 // Compiled regex patterns (compiled once, reused everywhere)
 static NOT_NULL_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -16,8 +16,8 @@ static NULLABLE_REGEX: Lazy<Regex> = Lazy::new(|| {
 });
 
 /// Parse @pgrpc_not_null(col1, col2, ...) from a comment string
-pub fn parse_not_null(comment: &str) -> HashSet<String> {
-    let mut result = HashSet::new();
+pub fn parse_not_null(comment: &str) -> BTreeSet<String> {
+    let mut result = BTreeSet::new();
     for cap in NOT_NULL_REGEX.captures_iter(comment) {
         if let Some(cols) = cap.get(1) {
             for col in cols.as_str().split(',') {
@@ -40,8 +40,8 @@ pub fn parse_throws(comment: &str) -> Vec<String> {
 }
 
 /// Parse @pgrpc_nullable(param1, param2, ...) from a comment string
-pub fn parse_nullable(comment: &str) -> HashSet<String> {
-    let mut result = HashSet::new();
+pub fn parse_nullable(comment: &str) -> BTreeSet<String> {
+    let mut result = BTreeSet::new();
     for cap in NULLABLE_REGEX.captures_iter(comment) {
         if let Some(params) = cap.get(1) {
             for param in params.as_str().split(',') {

@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::ops::Deref;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PgException {
     Explicit(SqlState),
     Constraint(Constraint),

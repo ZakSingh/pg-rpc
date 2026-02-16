@@ -11,11 +11,11 @@ use postgres::Row;
 use postgres_types::FromSql;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
 
 /// Parse @pgrpc_not_null(col1, col2, ...) annotations from a comment
-pub fn parse_bulk_not_null_columns(comment: &Option<String>) -> HashSet<String> {
+pub fn parse_bulk_not_null_columns(comment: &Option<String>) -> BTreeSet<String> {
     comment
         .as_ref()
         .map(|c| annotations::parse_not_null(c))
@@ -48,7 +48,7 @@ pub enum FlattenError {
 /// Recursive flatten analysis for composite types
 pub fn analyze_flatten_dependencies(
     composite_type: &PgType,
-    types: &HashMap<OID, PgType>,
+    types: &BTreeMap<OID, PgType>,
 ) -> Result<FlattenAnalysis, FlattenError> {
     let mut visited = HashSet::new();
     let mut path = Vec::new();
@@ -70,7 +70,7 @@ pub fn analyze_flatten_dependencies(
 
 fn flatten_composite_recursive(
     composite_type: &PgType,
-    types: &HashMap<OID, PgType>,
+    types: &BTreeMap<OID, PgType>,
     visited: &mut HashSet<String>,
     path: &mut Vec<String>,
     dependencies: &mut HashSet<OID>,
@@ -266,7 +266,7 @@ impl PgType {
         }
     }
 
-    pub fn to_rust_ident(&self, types: &HashMap<OID, PgType>) -> TokenStream {
+    pub fn to_rust_ident(&self, types: &BTreeMap<OID, PgType>) -> TokenStream {
         match self {
             // For user-defined types, qualify with schema name
             PgType::Domain { schema, name, .. } => {
@@ -318,9 +318,9 @@ impl PgType {
     /// Get the Rust type identifier and collect referenced schemas
     pub fn to_rust_ident_with_schemas(
         &self,
-        types: &HashMap<OID, PgType>,
-    ) -> (TokenStream, HashSet<String>) {
-        let mut schemas = HashSet::new();
+        types: &BTreeMap<OID, PgType>,
+    ) -> (TokenStream, BTreeSet<String>) {
+        let mut schemas = BTreeSet::new();
 
         let tokens = match self {
             // For user-defined types, use schema-qualified name without super::
@@ -612,7 +612,7 @@ fn determine_domain_traits(
 }
 
 impl ToRust for PgType {
-    fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
+    fn to_rust(&self, types: &BTreeMap<OID, PgType>, config: &Config) -> TokenStream {
         match self {
             PgType::Composite {
                 name,
@@ -1046,7 +1046,7 @@ impl ToRust for PgType {
 }
 
 impl ToRust for PgField {
-    fn to_rust(&self, types: &HashMap<OID, PgType>, _config: &Config) -> TokenStream {
+    fn to_rust(&self, types: &BTreeMap<OID, PgType>, _config: &Config) -> TokenStream {
         self.to_rust_inner(types, true)
     }
 }
@@ -1075,7 +1075,7 @@ fn generate_datetime_serde_attr(pg_type: &PgType, nullable: bool) -> Option<Toke
 impl PgField {
     pub fn to_rust_inner(
         &self,
-        types: &HashMap<OID, PgType>,
+        types: &BTreeMap<OID, PgType>,
         include_pg_derive: bool,
     ) -> TokenStream {
         let ident = types.get(&self.type_oid).unwrap().to_rust_ident(types);
@@ -1130,7 +1130,7 @@ impl PgField {
 /// Generate a Rust field token for a flattened field
 fn generate_flattened_field_token(
     flattened_field: &FlattenedField,
-    types: &HashMap<OID, PgType>,
+    types: &BTreeMap<OID, PgType>,
 ) -> TokenStream {
     let field_name = sql_to_rs_ident(&flattened_field.name, CaseType::Snake);
     let type_ident = types
@@ -1184,7 +1184,7 @@ fn generate_flattened_try_from_impl(
     struct_name: &TokenStream,
     analysis: &FlattenAnalysis,
     original_fields: &[PgField],
-    types: &HashMap<OID, PgType>,
+    types: &BTreeMap<OID, PgType>,
 ) -> TokenStream {
     // Generate field extraction logic for each flattened field
     let field_extractions: Vec<TokenStream> = analysis
@@ -1232,7 +1232,7 @@ fn generate_flattened_try_from_impl(
 fn generate_field_extraction_code(
     flattened_field: &FlattenedField,
     original_fields: &[PgField],
-    types: &HashMap<OID, PgType>,
+    types: &BTreeMap<OID, PgType>,
 ) -> TokenStream {
     if flattened_field.original_path.len() == 1 {
         // Simple field - direct access from row
@@ -1359,7 +1359,7 @@ mod tests {
 
     #[test]
     fn test_flatten_analysis_simple() {
-        let mut types = HashMap::new();
+        let mut types = BTreeMap::new();
 
         // Create address type
         let address_type = create_test_composite(
@@ -1401,7 +1401,7 @@ mod tests {
 
     #[test]
     fn test_flatten_analysis_no_flatten() {
-        let mut types = HashMap::new();
+        let mut types = BTreeMap::new();
 
         // Create simple person type without any flattening
         let person_type = create_test_composite(
@@ -1425,7 +1425,7 @@ mod tests {
 
     #[test]
     fn test_flatten_analysis_error_cases() {
-        let types = HashMap::new();
+        let types = BTreeMap::new();
 
         // Try to flatten a field that references a non-existent type
         let person_type = create_test_composite(
@@ -1440,7 +1440,7 @@ mod tests {
         assert!(result.is_err());
 
         // Try to flatten a non-composite type
-        let mut types = HashMap::new();
+        let mut types = BTreeMap::new();
         types.insert(100, PgType::Text); // Text is not a composite type
 
         let person_type = create_test_composite(
@@ -1494,7 +1494,7 @@ mod tests {
 
     #[test]
     fn test_select_clause_generation() {
-        let mut types = HashMap::new();
+        let mut types = BTreeMap::new();
 
         // Create address type
         let address_type = create_test_composite(
@@ -1535,7 +1535,7 @@ mod tests {
 
     #[test]
     fn test_nested_select_clause_generation() {
-        let mut types = HashMap::new();
+        let mut types = BTreeMap::new();
 
         // Create contact_info type
         let contact_type = create_test_composite(
@@ -1586,7 +1586,7 @@ mod tests {
 
     #[test]
     fn test_flattened_try_from_generation() {
-        let mut types = HashMap::new();
+        let mut types = BTreeMap::new();
 
         // Create address type
         let address_type = create_test_composite(
@@ -1614,8 +1614,8 @@ mod tests {
             connection_string: None,
             output_path: None,
             schemas: vec![],
-            types: HashMap::new(),
-            exceptions: HashMap::new(),
+            types: std::collections::HashMap::new(),
+            exceptions: std::collections::HashMap::new(),
             task_queue: None,
             errors: None,
             infer_view_nullability: true,
@@ -1650,7 +1650,7 @@ mod tests {
     fn test_domain_smart_derives() {
         use std::collections::HashMap;
 
-        let mut types = HashMap::new();
+        let mut types = BTreeMap::new();
 
         // Test int32 domain (should get Copy + ordering traits)
         types.insert(1, PgType::Int32);

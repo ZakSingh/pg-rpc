@@ -23,8 +23,7 @@ use postgres::Row;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use regex::Regex;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 // Re-export constraint analysis types for backward compatibility
 pub use crate::constraint_analysis::{
@@ -59,7 +58,7 @@ pub struct PgArg {
 }
 
 /// Parse @pgrpc_not_null(param_name) annotations from function comments
-fn parse_out_param_not_null_annotations(comment: &Option<String>) -> HashSet<String> {
+fn parse_out_param_not_null_annotations(comment: &Option<String>) -> BTreeSet<String> {
     comment
         .as_ref()
         .map(|c| annotations::parse_not_null(c))
@@ -71,7 +70,7 @@ fn parse_out_param_not_null_annotations(comment: &Option<String>) -> HashSet<Str
 /// For parameters declared as reference types (like `&str`), we need to add another `&` to create
 /// the correct type for the ToSql trait. For example, a `&str` parameter becomes `&&str` in the
 /// params vector because `ToSql` is implemented for `&str`, not `str`.
-pub fn param_needs_reference(type_oid: OID, types: &HashMap<OID, PgType>) -> bool {
+pub fn param_needs_reference(type_oid: OID, types: &BTreeMap<OID, PgType>) -> bool {
     match types.get(&type_oid) {
         Some(PgType::Int16) | Some(PgType::Int32) | Some(PgType::Int64)
         | Some(PgType::Bool) => true, // Primitive types need refs
@@ -105,12 +104,12 @@ impl PgArg {
     }
 
     /// Returns whether this argument needs an additional `&` when passed to the params vector
-    pub fn needs_reference(&self, types: &HashMap<OID, PgType>) -> bool {
+    pub fn needs_reference(&self, types: &BTreeMap<OID, PgType>) -> bool {
         param_needs_reference(self.type_oid, types)
     }
 
     /// Returns the appropriate reference for this argument in the params vector
-    pub fn param_reference(&self, types: &HashMap<OID, PgType>) -> TokenStream {
+    pub fn param_reference(&self, types: &BTreeMap<OID, PgType>) -> TokenStream {
         let name = self.rs_name();
         if self.needs_reference(types) {
             quote! { &#name }
@@ -147,7 +146,7 @@ impl PgFn {
     /// Generate match arms for From<tokio_postgres::Error> implementation
     fn generate_from_postgres_match_arms(
         &self,
-        used_constraints: &HashMap<PgId, Vec<Constraint>>,
+        used_constraints: &BTreeMap<PgId, Vec<Constraint>>,
         config: &Config,
     ) -> TokenStream {
         let error_enum_name = self.error_enum_name();
@@ -349,12 +348,12 @@ impl PgFn {
     pub fn generate_error_enum(
         &self,
         rel_index: &crate::rel_index::RelIndex,
-        table_constraints: &HashMap<PgId, Vec<Constraint>>,
+        table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
         config: &Config,
     ) -> TokenStream {
         let error_enum_name = self.error_enum_name();
         let mut error_variants = Vec::new();
-        let mut used_constraints: HashMap<PgId, Vec<Constraint>> = HashMap::new();
+        let mut used_constraints: BTreeMap<PgId, Vec<Constraint>> = BTreeMap::new();
 
         // Analyze both PL/pgSQL and SQL functions
         let rel_deps = if self.definition.contains("LANGUAGE plpgsql")
@@ -433,7 +432,7 @@ impl PgFn {
         }
 
         // Add variants for explicit exceptions raised by this function
-        let mut handled_exceptions = HashSet::new();
+        let mut handled_exceptions = BTreeSet::new();
         for exception in &self.exceptions {
             match exception {
                 PgException::Explicit(sql_state) => {
@@ -900,7 +899,7 @@ impl PgFn {
 }
 
 impl ToRust for PgArg {
-    fn to_rust(&self, types: &HashMap<OID, PgType>, _config: &Config) -> TokenStream {
+    fn to_rust(&self, types: &BTreeMap<OID, PgType>, _config: &Config) -> TokenStream {
         // Strip 'p_' prefix if present for cleaner Rust parameter names
         let clean_name = if self.name.starts_with("p_") {
             &self.name[2..]
@@ -938,7 +937,7 @@ impl ToRust for PgArg {
 }
 
 impl ToRust for PgFn {
-    fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream {
+    fn to_rust(&self, types: &BTreeMap<OID, PgType>, config: &Config) -> TokenStream {
         // Use function-specific error type
         let error_enum_name = self.error_enum_name();
         let err_type = quote! { #error_enum_name };
@@ -1404,8 +1403,8 @@ impl ToRust for PgFn {
 pub fn extract_custom_errors_from_queries(
     queries: &[ParseResult],
     errors_config: &crate::config::ErrorsConfig,
-) -> HashSet<String> {
-    let mut custom_errors = HashSet::new();
+) -> BTreeSet<String> {
+    let mut custom_errors = BTreeSet::new();
     let raise_function = errors_config.get_raise_function();
     let errors_schema = &errors_config.schema;
 
@@ -1588,7 +1587,7 @@ mod test {
         use crate::codegen::ToRust;
         use crate::pg_fn::PgFn;
         use crate::pg_type::PgType;
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         // Create a function that returns SETOF text
         let pg_fn = PgFn {
@@ -1607,7 +1606,7 @@ mod test {
         };
 
         // Create type index with Text type
-        let mut types = HashMap::new();
+        let mut types = BTreeMap::new();
         types.insert(25, PgType::Text);
 
         // Create a simple config
@@ -1615,8 +1614,8 @@ mod test {
             connection_string: None,
             output_path: None,
             schemas: vec!["public".to_string()],
-            types: HashMap::new(),
-            exceptions: HashMap::new(),
+            types: std::collections::HashMap::new(),
+            exceptions: std::collections::HashMap::new(),
             task_queue: None,
             errors: None,
             infer_view_nullability: true,
@@ -1641,7 +1640,7 @@ mod test {
         use crate::codegen::ToRust;
         use crate::pg_fn::PgFn;
         use crate::pg_type::{PgField, PgType};
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         // Create a function that returns SETOF composite_type
         let pg_fn = PgFn {
@@ -1660,7 +1659,7 @@ mod test {
         };
 
         // Create type index with a composite type
-        let mut types = HashMap::new();
+        let mut types = BTreeMap::new();
         types.insert(
             1000,
             PgType::Composite {
@@ -1695,8 +1694,8 @@ mod test {
             connection_string: None,
             output_path: None,
             schemas: vec!["public".to_string()],
-            types: HashMap::new(),
-            exceptions: HashMap::new(),
+            types: std::collections::HashMap::new(),
+            exceptions: std::collections::HashMap::new(),
             task_queue: None,
             errors: None,
             infer_view_nullability: true,
@@ -1723,7 +1722,7 @@ mod test {
         use crate::config::TracingConfig;
         use crate::pg_fn::PgFn;
         use crate::pg_type::PgType;
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         // Create a simple function
         let pg_fn = PgFn {
@@ -1741,7 +1740,7 @@ mod test {
             exceptions: vec![],
         };
 
-        let mut types = HashMap::new();
+        let mut types = BTreeMap::new();
         types.insert(25, PgType::Text);
 
         // Create config with tracing enabled
@@ -1749,8 +1748,8 @@ mod test {
             connection_string: None,
             output_path: None,
             schemas: vec!["public".to_string()],
-            types: HashMap::new(),
-            exceptions: HashMap::new(),
+            types: std::collections::HashMap::new(),
+            exceptions: std::collections::HashMap::new(),
             task_queue: None,
             errors: None,
             infer_view_nullability: true,
@@ -1789,7 +1788,7 @@ mod test {
         use crate::codegen::ToRust;
         use crate::pg_fn::PgFn;
         use crate::pg_type::PgType;
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         // Create a simple function
         let pg_fn = PgFn {
@@ -1807,7 +1806,7 @@ mod test {
             exceptions: vec![],
         };
 
-        let mut types = HashMap::new();
+        let mut types = BTreeMap::new();
         types.insert(25, PgType::Text);
 
         // Create config with tracing disabled (default)
@@ -1815,8 +1814,8 @@ mod test {
             connection_string: None,
             output_path: None,
             schemas: vec!["public".to_string()],
-            types: HashMap::new(),
-            exceptions: HashMap::new(),
+            types: std::collections::HashMap::new(),
+            exceptions: std::collections::HashMap::new(),
             task_queue: None,
             errors: None,
             infer_view_nullability: true,

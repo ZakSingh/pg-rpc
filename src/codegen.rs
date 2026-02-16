@@ -18,11 +18,11 @@ pub type FunctionName = String;
 use itertools::Itertools;
 use proc_macro2::TokenStream;
 use quote::quote;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
 pub trait ToRust {
-    fn to_rust(&self, types: &HashMap<OID, PgType>, config: &Config) -> TokenStream;
+    fn to_rust(&self, types: &BTreeMap<OID, PgType>, config: &Config) -> TokenStream;
 }
 
 /// Generate code split by schema
@@ -31,7 +31,7 @@ pub fn codegen_split(
     ty_index: &TypeIndex,
     rel_index: &RelIndex,
     config: &Config,
-) -> anyhow::Result<HashMap<SchemaName, String>> {
+) -> anyhow::Result<BTreeMap<SchemaName, String>> {
     let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
 
     // Generate unified error types
@@ -52,7 +52,7 @@ pub fn codegen_split(
     );
 
     // Merge schema references
-    let mut all_schema_refs: HashMap<SchemaName, HashSet<SchemaName>> = HashMap::new();
+    let mut all_schema_refs: BTreeMap<SchemaName, BTreeSet<SchemaName>> = BTreeMap::new();
     for (schema, refs) in type_schema_refs {
         all_schema_refs.entry(schema).or_default().extend(refs);
     }
@@ -61,7 +61,7 @@ pub fn codegen_split(
     }
 
     // Add error types to a common module
-    let mut schema_code: HashMap<SchemaName, String> = type_def_code
+    let mut schema_code: BTreeMap<SchemaName, String> = type_def_code
         .into_iter()
         .chain(fn_code)
         .into_grouping_map()
@@ -468,7 +468,7 @@ pub fn codegen_split(
     Ok(schema_code)
 }
 
-fn codegen_types(type_index: &TypeIndex, config: &Config) -> HashMap<SchemaName, TokenStream> {
+fn codegen_types(type_index: &TypeIndex, config: &Config) -> BTreeMap<SchemaName, TokenStream> {
     type_index
         .deref()
         .values()
@@ -492,12 +492,12 @@ fn codegen_types_with_refs(
     type_index: &TypeIndex,
     config: &Config,
 ) -> (
-    HashMap<SchemaName, TokenStream>,
-    HashMap<SchemaName, HashSet<SchemaName>>,
+    BTreeMap<SchemaName, TokenStream>,
+    BTreeMap<SchemaName, BTreeSet<SchemaName>>,
 ) {
-    let mut schema_refs: HashMap<SchemaName, HashSet<SchemaName>> = HashMap::new();
+    let mut schema_refs: BTreeMap<SchemaName, BTreeSet<SchemaName>> = BTreeMap::new();
 
-    let type_code: HashMap<SchemaName, Vec<(TokenStream, HashSet<String>)>> = type_index
+    let type_code: BTreeMap<SchemaName, Vec<(TokenStream, BTreeSet<String>)>> = type_index
         .deref()
         .values()
         .map(|t| {
@@ -507,12 +507,14 @@ fn codegen_types_with_refs(
             (schema, (tokens, refs))
         })
         .filter(|(_, (tokens, _))| !tokens.is_empty())
-        .into_group_map();
+        .into_group_map()
+        .into_iter()
+        .collect();
 
-    let result: HashMap<SchemaName, TokenStream> = type_code
+    let result: BTreeMap<SchemaName, TokenStream> = type_code
         .into_iter()
         .map(|(schema, items)| {
-            let mut all_refs = HashSet::new();
+            let mut all_refs = BTreeSet::new();
             let token_streams: Vec<TokenStream> = items
                 .into_iter()
                 .map(|(tokens, refs)| {
@@ -536,8 +538,8 @@ fn codegen_types_with_refs(
 }
 
 /// Collect all schema references for a type
-fn collect_type_refs(pg_type: &PgType, type_index: &TypeIndex) -> HashSet<String> {
-    let mut refs = HashSet::new();
+fn collect_type_refs(pg_type: &PgType, type_index: &TypeIndex) -> BTreeSet<String> {
+    let mut refs = BTreeSet::new();
 
     match pg_type {
         PgType::Composite { fields, .. } => {
@@ -589,12 +591,12 @@ fn generate_unified_errors(
     fn_index: &FunctionIndex,
     rel_index: &RelIndex,
     config: &Config,
-) -> (TokenStream, HashSet<PgException>) {
+) -> (TokenStream, BTreeSet<PgException>) {
     // Collect all constraints from tables
     let table_constraints = unified_error::collect_table_constraints(rel_index);
 
     // Collect all custom exceptions from functions
-    let mut all_exceptions = HashSet::new();
+    let mut all_exceptions = BTreeSet::new();
     for pg_fn in fn_index.deref().values() {
         all_exceptions.extend(pg_fn.exceptions.iter().cloned());
     }
@@ -692,12 +694,14 @@ fn codegen_fns(
     fns: &FunctionIndex,
     types: &TypeIndex,
     config: &Config,
-    _all_exceptions: &HashSet<PgException>,
-) -> HashMap<SchemaName, TokenStream> {
-    let schemas: HashMap<&str, Vec<&PgFn>> = fns
+    _all_exceptions: &BTreeSet<PgException>,
+) -> BTreeMap<SchemaName, TokenStream> {
+    let schemas: BTreeMap<&str, Vec<&PgFn>> = fns
         .deref()
         .values()
-        .into_group_map_by(|f| f.schema.as_str());
+        .into_group_map_by(|f| f.schema.as_str())
+        .into_iter()
+        .collect();
 
     schemas
         .into_iter()
@@ -714,24 +718,26 @@ fn codegen_fns_with_refs(
     fns: &FunctionIndex,
     types: &TypeIndex,
     rel_index: &RelIndex,
-    table_constraints: &HashMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
+    table_constraints: &BTreeMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
     config: &Config,
-    _all_exceptions: &HashSet<PgException>,
+    _all_exceptions: &BTreeSet<PgException>,
 ) -> (
-    HashMap<SchemaName, TokenStream>,
-    HashMap<SchemaName, HashSet<SchemaName>>,
+    BTreeMap<SchemaName, TokenStream>,
+    BTreeMap<SchemaName, BTreeSet<SchemaName>>,
 ) {
-    let mut schema_refs: HashMap<SchemaName, HashSet<SchemaName>> = HashMap::new();
+    let mut schema_refs: BTreeMap<SchemaName, BTreeSet<SchemaName>> = BTreeMap::new();
 
-    let schemas: HashMap<&str, Vec<&PgFn>> = fns
+    let schemas: BTreeMap<&str, Vec<&PgFn>> = fns
         .deref()
         .values()
-        .into_group_map_by(|f| f.schema.as_str());
+        .into_group_map_by(|f| f.schema.as_str())
+        .into_iter()
+        .collect();
 
-    let result: HashMap<SchemaName, TokenStream> = schemas
+    let result: BTreeMap<SchemaName, TokenStream> = schemas
         .into_iter()
         .map(|(schema, fns)| {
-            let mut all_refs = HashSet::new();
+            let mut all_refs = BTreeSet::new();
 
             // Collect references from all functions in this schema
             for pg_fn in &fns {
@@ -765,8 +771,8 @@ fn codegen_fns_with_refs(
 }
 
 /// Collect all schema references for a function
-fn collect_fn_refs(pg_fn: &PgFn, types: &TypeIndex) -> HashSet<String> {
-    let mut refs = HashSet::new();
+fn collect_fn_refs(pg_fn: &PgFn, types: &TypeIndex) -> BTreeSet<String> {
+    let mut refs = BTreeSet::new();
 
     // Collect from return type
     if let Some(ret_type) = types.get(&pg_fn.return_type_oid) {
@@ -817,7 +823,7 @@ pub fn codegen_queries(
 fn generate_query_code(
     query: &crate::query_introspector::IntrospectedQuery,
     type_index: &TypeIndex,
-    table_constraints: &std::collections::HashMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
+    table_constraints: &BTreeMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
     config: &Config,
 ) -> TokenStream {
     use crate::ident::{sql_to_rs_ident, CaseType};
@@ -1026,7 +1032,7 @@ fn generate_query_code(
 /// Generate error enum for a single query
 fn generate_query_error_enum(
     query: &crate::query_introspector::IntrospectedQuery,
-    table_constraints: &std::collections::HashMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
+    table_constraints: &BTreeMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
     config: &Config,
 ) -> TokenStream {
     use crate::exceptions::PgException;
@@ -1043,7 +1049,7 @@ fn generate_query_error_enum(
     let mut custom_arms = Vec::new();
     let mut to_pgrpc_arms = Vec::new();
     let mut as_db_error_arms = Vec::new();
-    let mut handled_exceptions = HashSet::new();
+    let mut handled_exceptions = BTreeSet::new();
 
     // Process table dependencies that were collected during introspection
     for (table_id, constraints) in &query.table_dependencies {

@@ -8,7 +8,7 @@ use crate::rel_index::RelIndex;
 use heck::ToPascalCase;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
 /// Trait for types that can provide access to an underlying DbError
@@ -85,8 +85,8 @@ impl<T: AsDbError> PgRpcErrorExt for T {}
 
 /// Collects all constraints from all tables and groups them by table
 /// Only includes constraints that will generate enum variants (excludes Default constraints)
-pub fn collect_table_constraints(rel_index: &RelIndex) -> HashMap<PgId, Vec<Constraint>> {
-    let mut table_constraints: HashMap<PgId, Vec<Constraint>> = HashMap::new();
+pub fn collect_table_constraints(rel_index: &RelIndex) -> BTreeMap<PgId, Vec<Constraint>> {
+    let mut table_constraints: BTreeMap<PgId, Vec<Constraint>> = BTreeMap::new();
 
     for rel in rel_index.deref().values() {
         // Only process actual tables, not views
@@ -112,7 +112,7 @@ pub fn collect_table_constraints(rel_index: &RelIndex) -> HashMap<PgId, Vec<Cons
 
 /// Generates constraint enums for each table
 pub fn generate_constraint_enums(
-    table_constraints: &HashMap<PgId, Vec<Constraint>>,
+    table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
 ) -> Vec<TokenStream> {
     let mut enums = Vec::new();
 
@@ -122,7 +122,7 @@ pub fn generate_constraint_enums(
         let enum_name = quote::format_ident!("{}Constraint", table_name_pascal);
 
         let mut variants = Vec::new();
-        let mut seen_names = HashSet::new();
+        let mut seen_names = BTreeSet::new();
 
         for constraint in constraints {
             let variant_name = match constraint {
@@ -185,8 +185,8 @@ pub fn generate_constraint_enums(
 
 /// Generates the unified PgRpcError enum (without wrapper)
 pub fn generate_unified_error(
-    table_constraints: &HashMap<PgId, Vec<Constraint>>,
-    custom_exceptions: &HashSet<PgException>,
+    table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
+    custom_exceptions: &BTreeSet<PgException>,
     config: &Config,
 ) -> TokenStream {
     let mut error_variants: Vec<TokenStream> = Vec::new();
@@ -205,7 +205,7 @@ pub fn generate_unified_error(
     }
 
     // Add custom SQL state exceptions from config
-    let mut config_variants = HashSet::new();
+    let mut config_variants = BTreeSet::new();
     for (_sql_code, description) in &config.exceptions {
         let variant_name = sql_to_rs_ident(description, Pascal);
         if config_variants.insert(variant_name.to_string()) {
@@ -217,7 +217,7 @@ pub fn generate_unified_error(
     }
 
     // Add any custom SQL state exceptions not already covered by config
-    let mut additional_custom_variants = HashSet::new();
+    let mut additional_custom_variants = BTreeSet::new();
     for exception in custom_exceptions {
         if let PgException::Explicit(sql_state) = exception {
             let sql_code = sql_state.code();
@@ -291,8 +291,8 @@ pub fn generate_unified_error(
 /// This is now used by function-specific error enums
 /// Note: Constraint names are unique within a schema in PostgreSQL
 pub fn generate_from_impl_arms(
-    table_constraints: &HashMap<PgId, Vec<Constraint>>,
-    custom_exceptions: &HashSet<PgException>,
+    table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
+    custom_exceptions: &BTreeSet<PgException>,
     config: &Config,
 ) -> TokenStream {
     let mut unique_arms: Vec<TokenStream> = Vec::new();
@@ -453,8 +453,8 @@ pub fn generate_from_impl_arms(
 
 /// Generates helper methods for the PgRpcError enum
 fn generate_helper_methods(
-    table_constraints: &HashMap<PgId, Vec<Constraint>>,
-    custom_exceptions: &HashSet<PgException>,
+    table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
+    custom_exceptions: &BTreeSet<PgException>,
     config: &Config,
 ) -> TokenStream {
     let mut methods = Vec::new();
@@ -485,8 +485,8 @@ fn generate_helper_methods(
 /// Implementation of AsDbError for PgRpcError
 /// This allows all error types to use the helper methods via PgRpcErrorExt
 pub fn generate_as_db_error_impl(
-    table_constraints: &HashMap<PgId, Vec<Constraint>>,
-    custom_exceptions: &HashSet<PgException>,
+    table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
+    custom_exceptions: &BTreeSet<PgException>,
     config: &Config,
 ) -> TokenStream {
     // Collect all constraint variant arms
@@ -546,13 +546,13 @@ mod tests {
     use crate::pg_id::PgId;
     use crate::pg_rel::{PgRel, PgRelKind};
     use smallvec::SmallVec;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet};
     use ustr::ustr;
 
     #[test]
     fn test_constraint_enum_generation() {
         // Create test constraints
-        let mut table_constraints = HashMap::new();
+        let mut table_constraints = BTreeMap::new();
 
         let users_constraints = vec![
             Constraint::Unique(UniqueConstraint {
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn test_unified_error_generation() {
         // Create test data
-        let mut table_constraints = HashMap::new();
+        let mut table_constraints = BTreeMap::new();
 
         let users_constraints = vec![Constraint::Unique(UniqueConstraint {
             name: ustr("users_email_key"),
@@ -594,7 +594,7 @@ mod tests {
         let users_id = PgId::new(Some(ustr("public")), ustr("users"));
         table_constraints.insert(users_id, users_constraints);
 
-        let custom_exceptions = HashSet::new();
+        let custom_exceptions = BTreeSet::new();
 
         let mut config = Config::default();
         config

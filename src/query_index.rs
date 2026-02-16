@@ -7,21 +7,21 @@ use crate::trigger_index::TriggerIndex;
 use crate::ty_index::TypeIndex;
 use anyhow::Result;
 use postgres::Client;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct QueryId {
     pub name: String,
 }
 
 #[derive(Debug)]
 pub struct QueryIndex {
-    queries: HashMap<QueryId, IntrospectedQuery>,
+    queries: BTreeMap<QueryId, IntrospectedQuery>,
 }
 
 impl Deref for QueryIndex {
-    type Target = HashMap<QueryId, IntrospectedQuery>;
+    type Target = BTreeMap<QueryId, IntrospectedQuery>;
 
     fn deref(&self) -> &Self::Target {
         &self.queries
@@ -49,7 +49,7 @@ impl QueryIndex {
         let mut introspector =
             QueryIntrospector::new(client, rel_index, type_index, view_nullability_cache, trigger_index);
 
-        let mut queries = HashMap::new();
+        let mut queries = BTreeMap::new();
 
         for parsed in parsed_queries {
             let introspected = introspector.introspect(&parsed)?;

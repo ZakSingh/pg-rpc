@@ -3,17 +3,17 @@ use crate::pg_id::PgId;
 use crate::pg_rel::PgRel;
 use anyhow::Context;
 use postgres::Client;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 
 const RELATION_INTROSPECTION_QUERY: &'static str =
     include_str!("./queries/relation_introspection.sql");
 
 #[derive(Debug, Default)]
-pub struct RelIndex(HashMap<OID, PgRel>);
+pub struct RelIndex(BTreeMap<OID, PgRel>);
 
 impl Deref for RelIndex {
-    type Target = HashMap<OID, PgRel>;
+    type Target = BTreeMap<OID, PgRel>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -29,14 +29,14 @@ impl DerefMut for RelIndex {
 impl RelIndex {
     /// Construct the relation index.
     pub fn new(db: &mut Client) -> anyhow::Result<Self> {
-        let relations = db
+        let relations: BTreeMap<OID, PgRel> = db
             .query(RELATION_INTROSPECTION_QUERY, &[])
             .context("Relation introspection query failed")?
             .into_iter()
             .map(|row| {
                 Ok::<_, postgres::Error>((row.try_get::<_, u32>("oid")?, PgRel::try_from(row)?))
             })
-            .collect::<Result<HashMap<_, _>, _>>()?;
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
 
         Ok(Self(relations))
     }

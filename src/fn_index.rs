@@ -6,17 +6,17 @@ use anyhow::Context;
 use postgres::Client;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 
 const FUNCTION_INTROSPECTION_QUERY: &'static str =
     include_str!("./queries/function_introspection.sql");
 
 #[derive(Debug)]
-pub struct FunctionIndex(HashMap<OID, PgFn>);
+pub struct FunctionIndex(BTreeMap<OID, PgFn>);
 
 impl Deref for FunctionIndex {
-    type Target = HashMap<OID, PgFn>;
+    type Target = BTreeMap<OID, PgFn>;
 
     fn deref(&self) -> &Self::Target {
         &self.0

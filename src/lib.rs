@@ -7,7 +7,7 @@ use crate::task_index::{generate_task_enum, TaskIndex};
 use crate::ty_index::TypeIndex;
 use proc_macro2::TokenStream;
 use quote::quote;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -641,12 +641,10 @@ fn generate_error_code(
     Ok(Some(warning_ignores.to_string() + &error_code))
 }
 
-fn generate_mod_file(schema_files: &HashMap<String, String>) -> String {
-    let mut sorted_schemas: Vec<_> = schema_files.keys().collect();
-    sorted_schemas.sort();
-
-    let mod_declarations: Vec<String> = sorted_schemas
-        .iter()
+fn generate_mod_file(schema_files: &BTreeMap<String, String>) -> String {
+    // BTreeMap is already sorted by key, so no need to sort
+    let mod_declarations: Vec<String> = schema_files
+        .keys()
         .map(|schema| {
             let schema_name =
                 crate::ident::sql_to_rs_ident(schema, crate::ident::CaseType::Snake).to_string();

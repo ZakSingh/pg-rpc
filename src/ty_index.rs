@@ -7,17 +7,17 @@ use anyhow::Context;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use postgres::Client;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 // Force recompilation with updated SQL
 const TYPES_INTROSPECTION_QUERY: &'static str = include_str!("./queries/type_introspection.sql");
 
 #[derive(Debug)]
-pub struct TypeIndex(HashMap<OID, PgType>);
+pub struct TypeIndex(BTreeMap<OID, PgType>);
 
 impl Deref for TypeIndex {
-    type Target = HashMap<OID, PgType>;
+    type Target = BTreeMap<OID, PgType>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -32,7 +32,7 @@ impl DerefMut for TypeIndex {
 
 impl TypeIndex {
     pub fn new(db: &mut Client, type_oids: &[OID]) -> anyhow::Result<Self> {
-        let types = db
+        let types: BTreeMap<OID, PgType> = db
             .query(TYPES_INTROSPECTION_QUERY, &[&Vec::from_iter(type_oids)])
             .context("Type introspection query failed")?
             .into_iter()

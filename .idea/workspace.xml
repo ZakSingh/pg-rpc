@@ -11,7 +11,24 @@
     </cargoProject>
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="945f98b6-7558-4dca-911e-a71f09b8ebf1" name="Changes" comment="basic support for tsvector/tsquery" />
+    <list default="true" id="945f98b6-7558-4dca-911e-a71f09b8ebf1" name="Changes" comment="basic support for tsvector/tsquery">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/annotations.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/annotations.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/codegen.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/codegen.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/exceptions.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/exceptions.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/fn_index.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/fn_index.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/lib.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/pg_constraint.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/pg_constraint.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/pg_fn.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/pg_fn.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/pg_id.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/pg_id.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/pg_type.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/pg_type.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/query_index.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/query_index.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/rel_index.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/rel_index.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/sql_state.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/sql_state.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/task_index.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/task_index.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/ty_index.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/ty_index.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/unified_error.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/unified_error.rs" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -256,7 +273,7 @@
       <workItem from="1769457108651" duration="606000" />
       <workItem from="1769482016577" duration="837000" />
       <workItem from="1771033947145" duration="422000" />
-      <workItem from="1771054131372" duration="5542000" />
+      <workItem from="1771054131372" duration="6776000" />
     </task>
     <task id="LOCAL-00001" summary="basic support for tsvector/tsquery">
       <option name="closed" value="true" />

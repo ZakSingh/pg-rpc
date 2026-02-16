@@ -3,7 +3,7 @@ use serde::Deserialize;
 use ustr::{ustr, Ustr};
 
 /// Namespaced identifier (e.g. `schema.function`)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct PgId(Ustr, Ustr);
 
 impl PgId {

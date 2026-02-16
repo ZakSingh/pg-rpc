@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 use std::error::Error;
 use ustr::Ustr;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub enum OnDelete {
     #[serde(rename = "r")]
     Restrict,
@@ -23,56 +23,56 @@ pub enum OnDelete {
     SetDefault,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct CheckConstraint {
     pub(crate) name: Ustr,
     pub(crate) columns: SmallVec<Ustr, 2>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct ForeignKeyConstraint {
     pub(crate) name: Ustr,
     pub(crate) columns: SmallVec<Ustr, 2>,
     pub(crate) on_delete: OnDelete,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct PrimaryKeyConstraint {
     pub(crate) name: Ustr,
     pub(crate) columns: SmallVec<Ustr, 2>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct UniqueConstraint {
     pub(crate) name: Ustr,
     pub columns: SmallVec<Ustr, 2>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct NotNullConstraint {
     pub(crate) name: Ustr,
     pub column: Ustr,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct DefaultConstraint {
     pub(crate) name: Ustr,
     pub column: Ustr,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct DomainConstraint {
     pub(crate) name: Ustr,
     pub column: Ustr,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct ExclusionConstraint {
     pub(crate) name: Ustr,
     pub(crate) columns: SmallVec<Ustr, 2>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 #[serde(tag = "type")]
 pub enum Constraint {
     #[serde(rename = "c")]
