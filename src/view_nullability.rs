@@ -1041,6 +1041,7 @@ mod tests {
                 }),
             ],
             columns: vec!["id".into(), "name".into(), "email".into()],
+            column_types: vec![],
         };
 
         let posts_rel = PgRel {
@@ -1057,6 +1058,7 @@ mod tests {
                 "title".into(),
                 "content".into(),
             ],
+            column_types: vec![],
         };
 
         rel_index.insert(1001, users_rel);

@@ -430,6 +430,7 @@ mod tests {
                 id: PgId::new(None, ustr("a")),
                 constraints: Vec::default(),
                 columns: vec![ustr("field_1")],
+                column_types: vec![],
             },
         );
 
@@ -441,6 +442,7 @@ mod tests {
                 id: PgId::new(None, ustr("b")),
                 constraints: Vec::default(),
                 columns: Vec::default(),
+                column_types: vec![],
             },
         );
 
@@ -476,6 +478,7 @@ mod tests {
                     }),
                 ],
                 columns: vec![ustr("id"), ustr("email"), ustr("name")],
+                column_types: vec![],
             },
         );
 

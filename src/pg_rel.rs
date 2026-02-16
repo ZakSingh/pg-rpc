@@ -17,6 +17,7 @@ pub struct PgRel {
     pub kind: PgRelKind,
     pub constraints: Vec<Constraint>,
     pub columns: Vec<Ustr>,
+    pub column_types: Vec<OID>,
 }
 
 impl TryFrom<Row> for PgRel {
@@ -43,6 +44,12 @@ impl TryFrom<Row> for PgRel {
                 .try_get::<_, Vec<&str>>("column_names")?
                 .into_iter()
                 .map(|s| s.into())
+                .collect(),
+            column_types: row
+                .try_get::<_, Option<Vec<i32>>>("column_types")?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|oid| oid as OID)
                 .collect(),
         })
     }

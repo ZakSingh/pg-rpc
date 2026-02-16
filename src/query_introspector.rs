@@ -130,21 +130,31 @@ impl<'a> QueryIntrospector<'a> {
             })?;
 
         // Get parameter types directly from the statement
-        let param_types: Vec<OID> = stmt.params().iter().map(|t| t.oid()).collect();
+        // Note: PostgreSQL resolves domain types to their base types here
+        let postgres_param_types: Vec<OID> = stmt.params().iter().map(|t| t.oid()).collect();
 
-        // Determine parameter names and nullable flags
-        let param_info =
-            self.determine_parameter_info(&parsed.parameters, &parsed.postgres_sql, param_types.len())?;
+        // Determine parameter names, nullable flags, and inferred column types
+        // The inferred types preserve domain types by looking up the actual column type
+        let param_info = self.determine_parameter_info(
+            &parsed.parameters,
+            &parsed.postgres_sql,
+            postgres_param_types.len(),
+        )?;
 
-        // Build parameter list
-        let params: Vec<QueryParam> = param_types
+        // Build parameter list, preferring inferred column types (preserves domains)
+        // over PostgreSQL's resolved types
+        let params: Vec<QueryParam> = postgres_param_types
             .into_iter()
             .enumerate()
-            .map(|(i, type_oid)| {
-                let (name, nullable) = param_info
+            .map(|(i, postgres_type_oid)| {
+                let (name, nullable, inferred_type) = param_info
                     .get(i)
                     .cloned()
-                    .unwrap_or_else(|| (format!("param_{}", i + 1), false));
+                    .unwrap_or_else(|| (format!("param_{}", i + 1), false, None));
+
+                // Prefer inferred type (preserves domain) over PostgreSQL's resolved type
+                let type_oid = inferred_type.unwrap_or(postgres_type_oid);
+
                 QueryParam {
                     name,
                     type_oid,
@@ -365,17 +375,31 @@ impl<'a> QueryIntrospector<'a> {
         None
     }
 
-    /// Determine parameter names and nullable flags from specs, inference, or fallback
+    /// Determine parameter names, nullable flags, and inferred type OIDs from specs, inference, or fallback.
+    /// Returns Vec of (name, nullable, Option<inferred_type_oid>).
+    /// The inferred type OID comes from looking up the actual column type in RelIndex,
+    /// which preserves domain types that PostgreSQL's type inference resolves to base types.
     fn determine_parameter_info(
         &self,
         param_specs: &[ParameterSpec],
         sql: &str,
         param_count: usize,
-    ) -> Result<Vec<(String, bool)>> {
+    ) -> Result<Vec<(String, bool, Option<OID>)>> {
+        // Build alias-to-table map from FROM clause for resolving qualified column references
+        let alias_map = self.build_alias_map(sql);
+
         let mut param_info = Vec::new();
 
         for i in 0..param_count {
             let position = i + 1;
+
+            // Try to infer column info (table_name, column_name) from AST
+            let column_info = self.infer_column_info_from_ast(sql, position, &alias_map);
+
+            // Look up the actual column type from RelIndex (preserves domain types)
+            let inferred_type = column_info.as_ref().and_then(|(table, column)| {
+                self.rel_index.get_column_type(table, column)
+            });
 
             // Priority 1: Check for explicit @name or @name?
             if let Some(param_spec) = param_specs.iter().find(|s| match s {
@@ -385,62 +409,172 @@ impl<'a> QueryIntrospector<'a> {
                 let (name, nullable) = match param_spec {
                     ParameterSpec::Named { name, nullable, .. } => (name.clone(), *nullable),
                     ParameterSpec::Positional { nullable, .. } => {
-                        // For positional, try to infer name, otherwise use fallback
-                        let inferred_name = self.infer_param_name_from_ast(sql, position)
+                        // For positional, try to infer name from column info, otherwise use fallback
+                        let inferred_name = column_info
+                            .as_ref()
+                            .map(|(_, col)| col.clone())
                             .unwrap_or_else(|| format!("param_{}", position));
                         (inferred_name, *nullable)
                     }
                 };
-                param_info.push((name, nullable));
+                param_info.push((name, nullable, inferred_type));
                 continue;
             }
 
             // Priority 2: Try AST inference (no spec found)
-            if let Some(inferred_name) = self.infer_param_name_from_ast(sql, position) {
-                param_info.push((inferred_name, false));
+            if let Some((_, column_name)) = column_info {
+                param_info.push((column_name, false, inferred_type));
                 continue;
             }
 
             // Priority 3: Fallback
-            param_info.push((format!("param_{}", position), false));
+            param_info.push((format!("param_{}", position), false, None));
         }
 
         Ok(param_info)
     }
 
-    /// Infer parameter name from SQL AST by finding column_name = $N patterns
-    fn infer_param_name_from_ast(&self, sql: &str, position: usize) -> Option<String> {
-        // Parse the SQL to find column references near this parameter
-        match pg_query::parse(sql) {
-            Ok(_) => {
-                // Look for patterns like "column_name = $N" or "column_name IN ($N)"
-                // For now, use a simple heuristic: look for the param marker in the SQL
-                let param_marker = format!("${}", position);
+    /// Build a map of table aliases to actual table names from the FROM clause.
+    /// This helps resolve qualified column references like `u.id` to `users.id`.
+    fn build_alias_map(&self, sql: &str) -> HashMap<String, String> {
+        let mut alias_map = HashMap::new();
 
-                // Find the parameter in the SQL text
-                if let Some(param_pos) = sql.find(&param_marker) {
-                    // Look backwards for a potential column name
-                    let before = &sql[..param_pos];
+        let parse_result = match pg_query::parse(sql) {
+            Ok(result) => result,
+            Err(_) => return alias_map,
+        };
 
-                    // Try to extract column name using regex
-                    // Look for patterns like "column_name = $N" or "column_name > $N"
-                    if let Some(captures) =
-                        regex::Regex::new(r"(\w+)\s*[=<>!]+\s*$").unwrap().captures(before)
-                    {
-                        if let Some(col_name) = captures.get(1) {
-                            let name = col_name.as_str().to_string();
-                            // Avoid SQL keywords
-                            if !Self::is_sql_keyword(&name) {
-                                return Some(name);
-                            }
-                        }
-                    }
-                }
-
-                None
+        // Extract table references from the parsed query
+        if let Some(stmt) = parse_result.protobuf.stmts.first() {
+            if let Some(node) = &stmt.stmt {
+                self.extract_table_aliases_from_node(node, &mut alias_map);
             }
-            Err(_) => None,
         }
+
+        alias_map
+    }
+
+    /// Recursively extract table aliases from a query node
+    fn extract_table_aliases_from_node(
+        &self,
+        node: &pg_query::protobuf::Node,
+        alias_map: &mut HashMap<String, String>,
+    ) {
+        use pg_query::protobuf::node::Node;
+
+        match &node.node {
+            Some(Node::SelectStmt(select)) => {
+                // Process FROM clause
+                for from_item in &select.from_clause {
+                    self.extract_table_aliases_from_node(from_item, alias_map);
+                }
+            }
+            Some(Node::RangeVar(range_var)) => {
+                let table_name = &range_var.relname;
+                // If there's an alias, map alias -> table
+                // If no alias, map table -> table (for unqualified references)
+                if let Some(alias) = &range_var.alias {
+                    alias_map.insert(alias.aliasname.clone(), table_name.clone());
+                }
+                // Always map the table name to itself for direct references
+                alias_map.insert(table_name.clone(), table_name.clone());
+            }
+            Some(Node::JoinExpr(join)) => {
+                if let Some(larg) = &join.larg {
+                    self.extract_table_aliases_from_node(larg, alias_map);
+                }
+                if let Some(rarg) = &join.rarg {
+                    self.extract_table_aliases_from_node(rarg, alias_map);
+                }
+            }
+            Some(Node::UpdateStmt(update)) => {
+                if let Some(relation) = &update.relation {
+                    let table_name = &relation.relname;
+                    if let Some(alias) = &relation.alias {
+                        alias_map.insert(alias.aliasname.clone(), table_name.clone());
+                    }
+                    alias_map.insert(table_name.clone(), table_name.clone());
+                }
+                for from_item in &update.from_clause {
+                    self.extract_table_aliases_from_node(from_item, alias_map);
+                }
+            }
+            Some(Node::DeleteStmt(delete)) => {
+                if let Some(relation) = &delete.relation {
+                    let table_name = &relation.relname;
+                    if let Some(alias) = &relation.alias {
+                        alias_map.insert(alias.aliasname.clone(), table_name.clone());
+                    }
+                    alias_map.insert(table_name.clone(), table_name.clone());
+                }
+            }
+            Some(Node::InsertStmt(insert)) => {
+                if let Some(relation) = &insert.relation {
+                    let table_name = &relation.relname;
+                    alias_map.insert(table_name.clone(), table_name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Infer column info (table_name, column_name) from SQL AST by finding column = $N patterns.
+    /// Returns the actual table name (resolved from alias if needed) and column name.
+    fn infer_column_info_from_ast(
+        &self,
+        sql: &str,
+        position: usize,
+        alias_map: &HashMap<String, String>,
+    ) -> Option<(String, String)> {
+        let param_marker = format!("${}", position);
+
+        // Find the parameter in the SQL text
+        let param_pos = sql.find(&param_marker)?;
+        let before = &sql[..param_pos];
+
+        // Try to extract qualified column reference: "table.column = $N" or "alias.column = $N"
+        if let Some(captures) = regex::Regex::new(r"(\w+)\.(\w+)\s*[=<>!]+\s*$")
+            .ok()?
+            .captures(before)
+        {
+            let table_or_alias = captures.get(1)?.as_str();
+            let column_name = captures.get(2)?.as_str();
+
+            // Resolve alias to actual table name
+            let table_name = alias_map
+                .get(table_or_alias)
+                .cloned()
+                .unwrap_or_else(|| table_or_alias.to_string());
+
+            return Some((table_name, column_name.to_string()));
+        }
+
+        // Try to extract unqualified column reference: "column = $N"
+        if let Some(captures) = regex::Regex::new(r"(\w+)\s*[=<>!]+\s*$")
+            .ok()?
+            .captures(before)
+        {
+            let column_name = captures.get(1)?.as_str();
+
+            // Avoid SQL keywords
+            if Self::is_sql_keyword(column_name) {
+                return None;
+            }
+
+            // For unqualified columns, try to find which table this column belongs to
+            // by checking all tables in the alias map
+            for table_name in alias_map.values() {
+                if self.rel_index.get_column_type(table_name, column_name).is_some() {
+                    return Some((table_name.clone(), column_name.to_string()));
+                }
+            }
+
+            // If we can't find the table, return just the column name with empty table
+            // The type lookup will fail but we still have the column name for the parameter
+            return Some((String::new(), column_name.to_string()));
+        }
+
+        None
     }
 
     /// Check if a string is a SQL keyword (simple heuristic)

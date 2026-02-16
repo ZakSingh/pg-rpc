@@ -1559,6 +1559,7 @@ mod test {
                 id: PgId::new(None, ustr("a")),
                 constraints: Vec::default(),
                 columns: vec![ustr("field_1")],
+                column_types: vec![],
             },
         );
 
@@ -1570,6 +1571,7 @@ mod test {
                 id: PgId::new(None, ustr("b")),
                 constraints: Vec::default(),
                 columns: Vec::default(),
+                column_types: vec![],
             },
         );
 

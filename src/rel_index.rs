@@ -93,4 +93,17 @@ impl RelIndex {
     pub fn id_to_oid(&self, id: &PgId) -> Option<OID> {
         self.get_by_id(id).map(|rel| rel.oid)
     }
+
+    /// Get the type OID for a column in a relation by table and column name.
+    /// This preserves domain types (unlike PostgreSQL's parameter type inference).
+    pub fn get_column_type(&self, table_name: &str, column_name: &str) -> Option<OID> {
+        self.values()
+            .find(|rel| rel.id.name() == table_name)
+            .and_then(|rel| {
+                rel.columns
+                    .iter()
+                    .position(|c| c.as_str() == column_name)
+                    .and_then(|idx| rel.column_types.get(idx).copied())
+            })
+    }
 }

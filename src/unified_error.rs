@@ -639,6 +639,7 @@ mod tests {
                 columns: SmallVec::from_slice(&[ustr("email")]),
             })],
             columns: vec![ustr("id"), ustr("email"), ustr("name")],
+            column_types: vec![],
         };
 
         rel_index.insert(1, users_rel);

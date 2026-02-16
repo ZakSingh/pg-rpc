@@ -8,7 +8,12 @@ with recursive user_relations as (
             from pg_attribute a
             where a.attrelid = c.oid
               and a.attnum > 0
-              and not a.attisdropped) as column_names
+              and not a.attisdropped) as column_names,
+           (select array_agg(a.atttypid order by a.attnum)
+            from pg_attribute a
+            where a.attrelid = c.oid
+              and a.attnum > 0
+              and not a.attisdropped) as column_types
     from pg_class c
              join pg_namespace n on n.oid = c.relnamespace
     where n.nspname not in ('pg_catalog', 'information_schema')
@@ -134,6 +139,7 @@ select ur.relation_name as name,
        ur.kind,
        ur.view_definition,
        ur.column_names,
+       ur.column_types,
        coalesce(gc.constraints, array[]::json[]) as constraints
 from user_relations ur
          left join grouped_constraints gc on gc.oid = ur.oid
