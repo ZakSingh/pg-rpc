@@ -1113,21 +1113,37 @@ impl PgField {
         // Generate datetime serde annotation if needed
         let pg_type = types.get(&self.type_oid).unwrap();
         let datetime_serde_attr = generate_datetime_serde_attr(pg_type, self.nullable);
-        let serde_attr = match (datetime_serde_attr, self.nullable) {
-            (Some(attr), true) => quote! {
+
+        // Only add serde rename if the Rust name differs from the PostgreSQL name
+        let rs_name_str = sql_to_rs_string(&self.name, CaseType::Snake);
+        let needs_rename = rs_name_str != self.name;
+
+        let serde_attr = match (datetime_serde_attr, self.nullable, needs_rename) {
+            (Some(attr), true, true) => quote! {
                 #[serde(rename = #pg_name, default)]
                 #attr
             },
-            (Some(attr), false) => quote! {
+            (Some(attr), true, false) => quote! {
+                #[serde(default)]
+                #attr
+            },
+            (Some(attr), false, true) => quote! {
                 #[serde(rename = #pg_name)]
                 #attr
             },
-            (None, true) => quote! {
+            (Some(attr), false, false) => quote! {
+                #attr
+            },
+            (None, true, true) => quote! {
                 #[serde(rename = #pg_name, default)]
             },
-            (None, false) => quote! {
+            (None, true, false) => quote! {
+                #[serde(default)]
+            },
+            (None, false, true) => quote! {
                 #[serde(rename = #pg_name)]
             },
+            (None, false, false) => quote! {},
         };
 
         quote! {
@@ -1167,21 +1183,37 @@ fn generate_flattened_field_token(
     // Generate datetime serde annotation if needed
     let pg_type = types.get(&flattened_field.type_oid).unwrap();
     let datetime_serde_attr = generate_datetime_serde_attr(pg_type, flattened_field.nullable);
-    let serde_attr = match (datetime_serde_attr, flattened_field.nullable) {
-        (Some(attr), true) => quote! {
+
+    // Only add serde rename if the Rust name differs from the PostgreSQL name
+    let rs_name_str = sql_to_rs_string(&flattened_field.name, CaseType::Snake);
+    let needs_rename = rs_name_str != pg_name;
+
+    let serde_attr = match (datetime_serde_attr, flattened_field.nullable, needs_rename) {
+        (Some(attr), true, true) => quote! {
             #[serde(rename = #pg_name, default)]
             #attr
         },
-        (Some(attr), false) => quote! {
+        (Some(attr), true, false) => quote! {
+            #[serde(default)]
+            #attr
+        },
+        (Some(attr), false, true) => quote! {
             #[serde(rename = #pg_name)]
             #attr
         },
-        (None, true) => quote! {
+        (Some(attr), false, false) => quote! {
+            #attr
+        },
+        (None, true, true) => quote! {
             #[serde(rename = #pg_name, default)]
         },
-        (None, false) => quote! {
+        (None, true, false) => quote! {
+            #[serde(default)]
+        },
+        (None, false, true) => quote! {
             #[serde(rename = #pg_name)]
         },
+        (None, false, false) => quote! {},
     };
 
     quote! {
