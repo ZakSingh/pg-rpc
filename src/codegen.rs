@@ -952,13 +952,21 @@ fn generate_query_code(
         .map(|param| {
             let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
 
-            // Check if this is a domain type over a primitive that needs unwrapping.
-            // Domains over composite types have custom ToSql implementations that handle
-            // domain unwrapping internally, so we don't unwrap those at the call site.
+            // Check if this is a domain type over a true built-in primitive that needs unwrapping.
+            //
+            // When PostgreSQL infers the parameter type for a domain column, behavior differs:
+            // - Domain over built-in type (text, int, etc.): PG expects the base type
+            // - Domain over extension type (citext, etc.): PG expects the domain type
+            //
+            // We detect this by checking if the base type OID is a well-known built-in OID.
+            // Built-in types have low OIDs (< 10000), extension types have high OIDs.
             let is_primitive_domain = match type_index.get(&param.type_oid) {
                 Some(PgType::Domain { type_oid: base_oid, .. }) => {
-                    // Only unwrap if the base type is NOT a composite
-                    !matches!(type_index.get(base_oid), Some(PgType::Composite { .. }))
+                    // Only unwrap if the base type is a built-in primitive (low OID)
+                    // and not a composite type
+                    let is_builtin = *base_oid < 10000;
+                    let is_composite = matches!(type_index.get(base_oid), Some(PgType::Composite { .. }));
+                    is_builtin && !is_composite
                 }
                 _ => false,
             };
