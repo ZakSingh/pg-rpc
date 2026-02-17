@@ -18,7 +18,7 @@ null_tracking = []
 tokio-postgres = { version = "0.7.12", features = ["with-serde_json-1", "array-impls", "with-time-0_3", "with-uuid-1"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
-pg_query = { git = "https://github.com/ZakSingh/pg_query.git?branch=fix-typecast-node-traversal#147b7c4e" }
+pg_query = { git = "https://github.com/ZakSingh/pg_query.git", branch = "fix-typecast-node-traversal" }
 clap = { version = "4.5.26", features = ["derive"] }
 tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "macros", "time"] }
 thiserror = "2.0.11"
