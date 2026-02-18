@@ -6,6 +6,7 @@ use crate::exceptions::{get_comment_exceptions, get_exceptions_with_triggers, Pg
 use crate::fn_index::FunctionId;
 use crate::ident::{
     sql_to_rs_ident,
+    sql_to_rs_string,
     CaseType::{self, Pascal},
 };
 use crate::pg_constraint::Constraint;
@@ -1305,7 +1306,18 @@ impl ToRust for PgFn {
                 .iter()
                 .map(|arg| {
                     let field_name = arg.rs_out_name();
-                    let pg_name = &arg.name;
+
+                    // Strip 'o_' prefix to get the clean name for serialization
+                    let clean_name = if arg.name.starts_with("o_") {
+                        &arg.name[2..]
+                    } else {
+                        &arg.name
+                    };
+
+                    // Only add serde rename if the Rust name differs from the clean PostgreSQL name
+                    let rs_name_str = sql_to_rs_string(clean_name, CaseType::Snake);
+                    let needs_rename = rs_name_str != clean_name;
+
                     let base_type = match types.get(&arg.type_oid).unwrap() {
                         PgType::Int16 => quote! { i16 },
                         PgType::Int32 => quote! { i32 },
@@ -1323,10 +1335,11 @@ impl ToRust for PgFn {
                         base_type
                     };
 
-                    let serde_attr = if arg.nullable {
-                        quote! { #[serde(rename = #pg_name, default)] }
-                    } else {
-                        quote! { #[serde(rename = #pg_name)] }
+                    let serde_attr = match (needs_rename, arg.nullable) {
+                        (true, true) => quote! { #[serde(rename = #clean_name, default)] },
+                        (true, false) => quote! { #[serde(rename = #clean_name)] },
+                        (false, true) => quote! { #[serde(default)] },
+                        (false, false) => quote! {},
                     };
 
                     quote! {
