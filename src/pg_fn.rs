@@ -973,17 +973,9 @@ impl ToRust for PgFn {
                 req_args.iter().map(|a| a.param_reference(types)).collect();
             let opt_arg_names: Vec<TokenStream> = opt_args.iter().map(|a| a.rs_name()).collect();
 
-            // Check if return type needs special handling
-            let return_pg_type = types.get(&self.return_type_oid);
-            let needs_expansion = if let Some(PgType::Composite { fields, .. }) = return_pg_type {
-                fields.iter().any(|f| f.flatten)
-            } else {
-                false
-            };
-
             let query_string = if self.is_procedure {
                 format!("CALL {}.{}", self.schema, self.name)
-            } else if self.returns_set || needs_expansion || (!self.is_procedure && self.out_args.len() > 1) {
+            } else if self.returns_set || (!self.is_procedure && self.out_args.len() > 1) {
                 format!("select * from {}.{}", self.schema, self.name)
             } else {
                 format!("select {}.{}", self.schema, self.name)
@@ -1108,57 +1100,13 @@ impl ToRust for PgFn {
                         .map_err(#err_type::from)
                 }
             } else {
-                // Check if return type is a composite type with custom TryFrom
-                let return_pg_type = types.get(&self.return_type_oid).unwrap();
-                match return_pg_type {
-                    PgType::Composite { fields, .. } => {
-                        // Check if any fields have flatten annotation
-                        let has_flatten = fields.iter().any(|f| f.flatten);
-                        if has_flatten {
-                            // For composite types with flatten, we use SELECT * FROM function()
-                            // which expands the composite type into columns that our TryFrom can handle
-                            let return_not_null = self
-                                .comment
-                                .as_ref()
-                                .is_some_and(|c| annotations::has_not_null(c));
-                            if return_not_null {
-                                quote! {
-                                    client
-                                        .query_one(&query, &params)
-                                        .await
-                                        .and_then(|r| r.try_into())
-                                        .map_err(#err_type::from)
-                                }
-                            } else {
-                                quote! {
-                                    client
-                                        .query_one(&query, &params)
-                                        .await
-                                        .and_then(|r| Ok(Some(r.try_into()?)))
-                                        .map_err(#err_type::from)
-                                }
-                            }
-                        } else {
-                            // Regular composite types can use try_get
-                            quote! {
-                                client
-                                    .query_one(&query, &params)
-                                    .await
-                                    .and_then(|r| r.try_get(0))
-                                    .map_err(#err_type::from)
-                            }
-                        }
-                    }
-                    _ => {
-                        // Non-composite types use try_get
-                        quote! {
-                            client
-                                .query_one(&query, &params)
-                                .await
-                                .and_then(|r| r.try_get(0))
-                                .map_err(#err_type::from)
-                        }
-                    }
+                // Use try_get for single return value
+                quote! {
+                    client
+                        .query_one(&query, &params)
+                        .await
+                        .and_then(|r| r.try_get(0))
+                        .map_err(#err_type::from)
                 }
             };
 
@@ -1684,14 +1632,12 @@ mod test {
                         type_oid: 23, // INT4
                         nullable: false,
                         comment: None,
-                        flatten: false,
                     },
                     PgField {
                         name: "name".to_string(),
                         type_oid: 25, // TEXT
                         nullable: true,
                         comment: None,
-                        flatten: false,
                     },
                 ],
                 comment: None,

@@ -9,8 +9,6 @@ pub mod compile_helpers;
 pub mod composite_fromsql_tests;
 pub mod custom_error_tests;
 pub mod error_tests;
-pub mod flatten_tests;
-pub mod function_flatten_tests;
 pub mod function_out_params_tests;
 pub mod miniswap_view_nullability_tests;
 pub mod out_param_nullability_tests;

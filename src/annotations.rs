@@ -60,11 +60,6 @@ pub fn has_not_null(comment: &str) -> bool {
     comment.contains("@pgrpc_not_null")
 }
 
-/// Check if comment contains @pgrpc_flatten
-pub fn has_flatten(comment: &str) -> bool {
-    comment.contains("@pgrpc_flatten")
-}
-
 /// Check if comment contains @pgrpc_return_opt
 pub fn has_return_opt(comment: &str) -> bool {
     comment.contains("@pgrpc_return_opt")
@@ -139,13 +134,6 @@ mod tests {
         assert!(has_not_null("@pgrpc_not_null"));
         assert!(has_not_null("some text @pgrpc_not_null(id)"));
         assert!(!has_not_null("no annotation here"));
-    }
-
-    #[test]
-    fn test_has_flatten() {
-        assert!(has_flatten("@pgrpc_flatten"));
-        assert!(has_flatten("some text @pgrpc_flatten more"));
-        assert!(!has_flatten("no annotation here"));
     }
 
     #[test]

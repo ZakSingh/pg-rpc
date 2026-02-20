@@ -23,7 +23,6 @@ pub mod constraint_analysis;
 mod db;
 mod error_type_index;
 mod exceptions;
-mod flatten;
 mod fn_index;
 mod ident;
 mod parse_domain;
