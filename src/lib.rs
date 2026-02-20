@@ -37,11 +37,9 @@ pub mod rel_index;
 pub mod sql_parser;
 mod sql_state;
 pub(crate) mod task_index;
-mod tests;
 mod trigger_index;
 mod tsvector;
 pub mod ty_index;
-mod types;
 mod unified_error;
 pub mod view_nullability;
 

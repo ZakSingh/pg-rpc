@@ -52,67 +52,28 @@ impl DerefMut for TaskIndex {
 impl TaskIndex {
     /// Construct the task index by introspecting the configured task schema
     pub fn new(db: &mut Client, task_config: &TaskQueueConfig) -> anyhow::Result<Self> {
-        eprintln!(
-            "[PGRPC] Introspecting task types from schema: {}",
-            task_config.schema
-        );
-
-        // First, let's log the actual SQL query being executed
-        eprintln!(
-            "[PGRPC] Executing task introspection query with schema parameter: '{}'",
-            task_config.schema
-        );
-
         let query_result = db
             .query(TASK_INTROSPECTION_QUERY, &[&task_config.schema])
             .context("Task introspection query failed")?;
 
-        eprintln!(
-            "[PGRPC] Task introspection query returned {} rows",
-            query_result.len()
-        );
-
         let task_types: BTreeMap<String, TaskType> = query_result
             .into_iter()
-            .enumerate()
-            .map(|(row_idx, row)| {
-                eprintln!("[PGRPC] Processing row {}", row_idx);
-
+            .map(|row| {
                 let task_name: String = row.try_get("task_name")?;
                 let type_oid: u32 = row.try_get("type_oid")?;
                 let type_comment: Option<String> = row.try_get("type_comment")?;
                 let fields_json: Value = row.try_get("fields")?;
 
-                eprintln!("[PGRPC] Row {}: Processing task type '{}' (OID: {})", row_idx, task_name, type_oid);
-                eprintln!("[PGRPC] Row {}: Raw fields JSON: {}", row_idx, fields_json);
-
-                // Check if fields_json is null or empty array
-                let fields_vec = if fields_json.is_null() {
-                    eprintln!("[PGRPC] Row {}: Fields JSON is null for task '{}'", row_idx, task_name);
+                let fields_vec: Vec<Value> = if fields_json.is_null() {
                     Vec::new()
                 } else {
-                    match serde_json::from_value::<Vec<Value>>(fields_json.clone()) {
-                        Ok(vec) => {
-                            eprintln!("[PGRPC] Row {}: Successfully parsed {} field entries for task '{}'", row_idx, vec.len(), task_name);
-                            for (field_idx, field_json) in vec.iter().enumerate() {
-                                eprintln!("[PGRPC] Row {}: Field {}: {}", row_idx, field_idx, field_json);
-                            }
-                            vec
-                        }
-                        Err(e) => {
-                            eprintln!("[PGRPC] Row {}: Failed to parse fields JSON for task '{}': {}", row_idx, task_name, e);
-                            eprintln!("[PGRPC] Row {}: Problematic JSON: {}", row_idx, fields_json);
-                            return Err(e.into());
-                        }
-                    }
+                    serde_json::from_value(fields_json)?
                 };
 
                 let fields: Vec<TaskField> = fields_vec
                     .into_iter()
                     .filter_map(|field_json: Value| {
-                        // Extract all required fields, logging and skipping if any are missing
                         let name = field_json["name"].as_str();
-                        // Handle type_oid as either number or string
                         let type_oid = field_json["type_oid"].as_u64()
                             .or_else(|| field_json["type_oid"].as_str().and_then(|s| s.parse().ok()));
                         let postgres_type = field_json["postgres_type"].as_str();
@@ -121,7 +82,6 @@ impl TaskIndex {
 
                         match (name, type_oid, postgres_type, position, not_null) {
                             (Some(n), Some(t), Some(pt), Some(p), Some(nn)) => {
-                                eprintln!("[PGRPC]   Field '{}': {} (OID: {})", n, pt, t);
                                 Some(TaskField {
                                     name: n.to_string(),
                                     type_oid: t as u32,
@@ -131,15 +91,10 @@ impl TaskIndex {
                                     comment: field_json["comment"].as_str().map(|s| s.to_string()),
                                 })
                             }
-                            _ => {
-                                eprintln!("[PGRPC] Skipping malformed task field JSON: {:?}", field_json);
-                                None
-                            }
+                            _ => None,
                         }
                     })
                     .collect();
-
-                eprintln!("[PGRPC] Task '{}' has {} fields after filtering", task_name, fields.len());
 
                 Ok::<_, anyhow::Error>((
                     task_name.clone(),
@@ -153,11 +108,6 @@ impl TaskIndex {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
 
-        eprintln!(
-            "[PGRPC] Found {} task types in schema '{}'",
-            task_types.len(),
-            task_config.schema
-        );
         Ok(Self(task_types))
     }
 
@@ -224,22 +174,10 @@ pub fn collect_task_type_oids(
 
     let rows = db_client.query(query, &[&task_config.schema])?;
 
-    eprintln!(
-        "[PGRPC] collect_task_type_oids: Query returned {} rows",
-        rows.len()
-    );
-
     for row in rows {
         let type_oid: OID = row.try_get("oid")?;
-        eprintln!("[PGRPC] collect_task_type_oids: Adding OID {}", type_oid);
         oids.insert(type_oid);
     }
-
-    eprintln!(
-        "[PGRPC] collect_task_type_oids: Collected {} type OIDs from task schema '{}'",
-        oids.len(),
-        task_config.schema
-    );
 
     Ok(oids.into_iter().collect())
 }
@@ -427,22 +365,8 @@ fn generate_payload_struct(
     );
     let task_name = &task_type.task_name;
 
-    eprintln!(
-        "[PGRPC] Generating payload struct for task '{}' with {} fields",
-        task_name,
-        task_type.fields.len()
-    );
-
     // Parse bulk not null annotations from type-level comment
     let bulk_not_null_columns = crate::pg_type::parse_bulk_not_null_columns(&task_type.comment);
-    eprintln!("[PGRPC] Task type comment: {:?}", task_type.comment);
-    eprintln!("[PGRPC] Bulk not null columns: {:?}", bulk_not_null_columns);
-
-    // Debug: print all fields
-    for (idx, field) in task_type.fields.iter().enumerate() {
-        eprintln!("[PGRPC]   Field {}: name='{}', type_oid={}, postgres_type='{}', not_null={}, comment={:?}",
-                  idx, field.name, field.type_oid, field.postgres_type, field.not_null, field.comment);
-    }
 
     let fields: Vec<TokenStream> = task_type.fields
         .iter()
@@ -452,7 +376,6 @@ fn generate_payload_struct(
 
             // Generate field type with proper nullability handling
             let (rust_type, is_nullable, pg_type_opt) = if let Some(pg_type) = type_index.get(&field.type_oid) {
-                eprintln!("[PGRPC]     Field '{}' (OID {}) found in TypeIndex", field.name, field.type_oid);
                 let (type_tokens, schemas) = pg_type.to_rust_ident_with_schemas(type_index);
                 referenced_schemas.extend(schemas);
 
@@ -474,8 +397,6 @@ fn generate_payload_struct(
                 (rust_type, is_nullable, Some(pg_type))
             } else {
                 // Use fallback mapping with proper nullability handling
-                eprintln!("[PGRPC]     Field '{}' (OID {}) NOT found in TypeIndex, using fallback mapping for '{}'",
-                         field.name, field.type_oid, field.postgres_type);
                 let is_nullable = !field.comment
                     .as_ref()
                     .is_some_and(|c| annotations::has_not_null(c))
@@ -515,8 +436,6 @@ fn generate_payload_struct(
             }
         })
         .collect();
-
-    eprintln!("[PGRPC]   Generated {} field tokens", fields.len());
 
     // Get the task queue schema from config
     let task_schema = config

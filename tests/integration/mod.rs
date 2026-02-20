@@ -75,11 +75,6 @@ impl PostgresTestContainer {
         Client::connect(&self.connection_string, NoTls)
     }
 
-    /// Get connection string for the admin postgres database
-    pub fn admin_connection_string(&self) -> &str {
-        &self.connection_string
-    }
-
     /// Create a new isolated database and return its name
     pub fn create_test_database(&self) -> Result<String, postgres::Error> {
         let db_name = format!("test_{}", Uuid::new_v4().to_string().replace('-', "_"));
@@ -175,44 +170,6 @@ pub fn setup_test_schema(client: &mut Client) -> Result<(), postgres::Error> {
     Ok(())
 }
 
-/// Clean up the database between tests
-pub fn cleanup_database(client: &mut Client) -> Result<(), postgres::Error> {
-    // Drop all objects more thoroughly to avoid conflicts
-    // Execute each drop separately to continue on errors
-    let drop_commands = vec![
-        // Drop views first
-        "DROP VIEW IF EXISTS account_view CASCADE",
-        "DROP VIEW IF EXISTS post_with_author CASCADE",
-        // Drop trigger test tables
-        "DROP TABLE IF EXISTS test_trigger_table CASCADE",
-        "DROP TABLE IF EXISTS multi_trigger_table CASCADE",
-        "DROP TABLE IF EXISTS event_specific_table CASCADE",
-        "DROP TABLE IF EXISTS error_code_table CASCADE",
-        // Drop regular test tables
-        "DROP TABLE IF EXISTS new_table CASCADE",
-        "DROP TABLE IF EXISTS test_table CASCADE",
-        "DROP TABLE IF EXISTS post CASCADE",
-        "DROP TABLE IF EXISTS login_details CASCADE",
-        "DROP TABLE IF EXISTS account CASCADE",
-        // Drop schemas (this will cascade to functions)
-        "DROP SCHEMA IF EXISTS trigger_api CASCADE",
-        "DROP SCHEMA IF EXISTS api CASCADE",
-        "DROP SCHEMA IF EXISTS test_schema CASCADE",
-        // Drop custom types
-        "DROP TYPE IF EXISTS role CASCADE",
-    ];
-
-    for cmd in drop_commands {
-        // Ignore errors on individual drops - some objects might not exist
-        let _ = execute_sql(client, cmd);
-    }
-
-    // Recreate the test schema
-    setup_test_schema(client)?;
-
-    Ok(())
-}
-
 /// Create a test database connection with isolated database
 pub fn with_isolated_database<F, R>(test_fn: F) -> R
 where
@@ -272,29 +229,9 @@ where
     result
 }
 
-/// Legacy function for backwards compatibility during transition
-pub fn with_clean_database<F, R>(test_fn: F) -> R
-where
-    F: FnOnce(&mut Client) -> R,
-{
-    with_isolated_database(test_fn)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_basic_functionality() {
-        // Basic test that doesn't require Docker to show the test infrastructure works
-        assert_eq!(2 + 2, 4);
-
-        // Test that we can create SQL statements with indoc
-        let sql = indoc! {"
-            SELECT 1 as test_value
-        "};
-        assert!(sql.contains("SELECT 1"));
-    }
 
     #[test]
     fn test_container_setup() {
