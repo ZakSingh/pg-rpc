@@ -25,6 +25,63 @@ pub trait ToRust {
     fn to_rust(&self, types: &BTreeMap<OID, PgType>, config: &Config) -> TokenStream;
 }
 
+/// Generate the date_serde module for serializing time::Date types
+pub fn generate_date_serde_module() -> TokenStream {
+    quote! {
+        /// Custom serde module for time::Date using YYYY-MM-DD format
+        pub mod date_serde {
+            use serde::{self, Deserialize, Deserializer, Serializer};
+            use time::Date;
+
+            const FORMAT: &[time::format_description::FormatItem] = time::macros::format_description!("[year]-[month]-[day]");
+
+            pub fn serialize<S>(date: &Date, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                let s = date.format(&FORMAT).map_err(serde::ser::Error::custom)?;
+                serializer.serialize_str(&s)
+            }
+
+            pub fn deserialize<'de, D>(deserializer: D) -> Result<Date, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let s = String::deserialize(deserializer)?;
+                Date::parse(&s, &FORMAT).map_err(serde::de::Error::custom)
+            }
+
+            pub mod option {
+                use serde::{Deserialize, Deserializer, Serializer};
+                use time::Date;
+
+                const FORMAT: &[time::format_description::FormatItem] = time::macros::format_description!("[year]-[month]-[day]");
+
+                pub fn serialize<S>(date: &Option<Date>, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: Serializer,
+                {
+                    match date {
+                        Some(d) => {
+                            let s = d.format(&FORMAT).map_err(serde::ser::Error::custom)?;
+                            serializer.serialize_some(&s)
+                        }
+                        None => serializer.serialize_none(),
+                    }
+                }
+
+                pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Date>, D::Error>
+                where
+                    D: Deserializer<'de>,
+                {
+                    let opt = Option::<String>::deserialize(deserializer)?;
+                    opt.map(|s| Date::parse(&s, &FORMAT).map_err(serde::de::Error::custom)).transpose()
+                }
+            }
+        }
+    }
+}
+
 /// Generate code split by schema
 pub fn codegen_split(
     fn_index: &FunctionIndex,
@@ -81,6 +138,8 @@ pub fn codegen_split(
                 })
                 .collect();
 
+            let date_serde_module = generate_date_serde_module();
+
             let code = prettyplease::unparse(
                 &syn::parse2::<syn::File>(quote! {
                     #(#schema_imports)*
@@ -91,57 +150,7 @@ pub fn codegen_split(
                     use bon::builder;
                     use postgis_butmaintained::ewkb;
 
-                    /// Custom serde module for time::Date using YYYY-MM-DD format
-                    pub mod date_serde {
-                        use serde::{self, Deserialize, Deserializer, Serializer};
-                        use time::Date;
-
-                        const FORMAT: &[time::format_description::FormatItem] = time::macros::format_description!("[year]-[month]-[day]");
-
-                        pub fn serialize<S>(date: &Date, serializer: S) -> Result<S::Ok, S::Error>
-                        where
-                            S: Serializer,
-                        {
-                            let s = date.format(&FORMAT).map_err(serde::ser::Error::custom)?;
-                            serializer.serialize_str(&s)
-                        }
-
-                        pub fn deserialize<'de, D>(deserializer: D) -> Result<Date, D::Error>
-                        where
-                            D: Deserializer<'de>,
-                        {
-                            let s = String::deserialize(deserializer)?;
-                            Date::parse(&s, &FORMAT).map_err(serde::de::Error::custom)
-                        }
-
-                        pub mod option {
-                            use serde::{Deserialize, Deserializer, Serializer};
-                            use time::Date;
-
-                            const FORMAT: &[time::format_description::FormatItem] = time::macros::format_description!("[year]-[month]-[day]");
-
-                            pub fn serialize<S>(date: &Option<Date>, serializer: S) -> Result<S::Ok, S::Error>
-                            where
-                                S: Serializer,
-                            {
-                                match date {
-                                    Some(d) => {
-                                        let s = d.format(&FORMAT).map_err(serde::ser::Error::custom)?;
-                                        serializer.serialize_some(&s)
-                                    }
-                                    None => serializer.serialize_none(),
-                                }
-                            }
-
-                            pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Date>, D::Error>
-                            where
-                                D: Deserializer<'de>,
-                            {
-                                let opt = Option::<String>::deserialize(deserializer)?;
-                                opt.map(|s| Date::parse(&s, &FORMAT).map_err(serde::de::Error::custom)).transpose()
-                            }
-                        }
-                    }
+                    #date_serde_module
 
                     /// PostgreSQL full-text search types with proper binary protocol support.
                     pub mod tsvector {

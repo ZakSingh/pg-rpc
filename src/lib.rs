@@ -1,4 +1,4 @@
-use crate::codegen::codegen_split;
+use crate::codegen::{codegen_split, generate_date_serde_module};
 use crate::config::Config;
 use crate::db::Db;
 use crate::fn_index::FunctionIndex;
@@ -527,6 +527,8 @@ fn generate_task_code(
         })
         .collect();
 
+    let date_serde_module = generate_date_serde_module();
+
     let task_code = prettyplease::unparse(
         &syn::parse2::<syn::File>(quote::quote! {
             #(#schema_imports)*
@@ -537,57 +539,7 @@ fn generate_task_code(
             use rust_decimal;
             use std::net::IpAddr;
 
-            /// Custom serde module for time::Date using YYYY-MM-DD format
-            pub mod date_serde {
-                use serde::{self, Deserialize, Deserializer, Serializer};
-                use time::Date;
-
-                const FORMAT: &[time::format_description::FormatItem] = time::macros::format_description!("[year]-[month]-[day]");
-
-                pub fn serialize<S>(date: &Date, serializer: S) -> Result<S::Ok, S::Error>
-                where
-                    S: Serializer,
-                {
-                    let s = date.format(&FORMAT).map_err(serde::ser::Error::custom)?;
-                    serializer.serialize_str(&s)
-                }
-
-                pub fn deserialize<'de, D>(deserializer: D) -> Result<Date, D::Error>
-                where
-                    D: Deserializer<'de>,
-                {
-                    let s = String::deserialize(deserializer)?;
-                    Date::parse(&s, &FORMAT).map_err(serde::de::Error::custom)
-                }
-
-                pub mod option {
-                    use serde::{Deserialize, Deserializer, Serializer};
-                    use time::Date;
-
-                    const FORMAT: &[time::format_description::FormatItem] = time::macros::format_description!("[year]-[month]-[day]");
-
-                    pub fn serialize<S>(date: &Option<Date>, serializer: S) -> Result<S::Ok, S::Error>
-                    where
-                        S: Serializer,
-                    {
-                        match date {
-                            Some(d) => {
-                                let s = d.format(&FORMAT).map_err(serde::ser::Error::custom)?;
-                                serializer.serialize_some(&s)
-                            }
-                            None => serializer.serialize_none(),
-                        }
-                    }
-
-                    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Date>, D::Error>
-                    where
-                        D: Deserializer<'de>,
-                    {
-                        let opt = Option::<String>::deserialize(deserializer)?;
-                        opt.map(|s| Date::parse(&s, &FORMAT).map_err(serde::de::Error::custom)).transpose()
-                    }
-                }
-            }
+            #date_serde_module
 
             #task_enum_code
         })
@@ -803,6 +755,7 @@ fn generate_query_code(
     let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
 
     let query_code_tokens = codegen::codegen_queries(query_index, ty_index, rel_index, config);
+    let date_serde_module = generate_date_serde_module();
 
     let query_code = prettyplease::unparse(
         &syn::parse2::<syn::File>(quote! {
@@ -810,57 +763,7 @@ fn generate_query_code(
             use postgres_types::{IsNull, ToSql, Type};
             use rust_decimal::Decimal;
 
-            /// Custom serde module for time::Date using YYYY-MM-DD format
-            pub mod date_serde {
-                use serde::{self, Deserialize, Deserializer, Serializer};
-                use time::Date;
-
-                const FORMAT: &[time::format_description::FormatItem] = time::macros::format_description!("[year]-[month]-[day]");
-
-                pub fn serialize<S>(date: &Date, serializer: S) -> Result<S::Ok, S::Error>
-                where
-                    S: Serializer,
-                {
-                    let s = date.format(&FORMAT).map_err(serde::ser::Error::custom)?;
-                    serializer.serialize_str(&s)
-                }
-
-                pub fn deserialize<'de, D>(deserializer: D) -> Result<Date, D::Error>
-                where
-                    D: Deserializer<'de>,
-                {
-                    let s = String::deserialize(deserializer)?;
-                    Date::parse(&s, &FORMAT).map_err(serde::de::Error::custom)
-                }
-
-                pub mod option {
-                    use serde::{Deserialize, Deserializer, Serializer};
-                    use time::Date;
-
-                    const FORMAT: &[time::format_description::FormatItem] = time::macros::format_description!("[year]-[month]-[day]");
-
-                    pub fn serialize<S>(date: &Option<Date>, serializer: S) -> Result<S::Ok, S::Error>
-                    where
-                        S: Serializer,
-                    {
-                        match date {
-                            Some(d) => {
-                                let s = d.format(&FORMAT).map_err(serde::ser::Error::custom)?;
-                                serializer.serialize_some(&s)
-                            }
-                            None => serializer.serialize_none(),
-                        }
-                    }
-
-                    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Date>, D::Error>
-                    where
-                        D: Deserializer<'de>,
-                    {
-                        let opt = Option::<String>::deserialize(deserializer)?;
-                        opt.map(|s| Date::parse(&s, &FORMAT).map_err(serde::de::Error::custom)).transpose()
-                    }
-                }
-            }
+            #date_serde_module
 
             #query_code_tokens
         })
