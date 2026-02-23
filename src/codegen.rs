@@ -961,34 +961,30 @@ fn generate_query_code(
         .map(|param| {
             let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
 
-            // Check if this is a domain type over a true built-in primitive that needs unwrapping.
-            //
-            // When PostgreSQL infers the parameter type for a domain column, behavior differs:
-            // - Domain over built-in type (text, int, etc.): PG expects the base type
-            // - Domain over extension type (citext, etc.): PG expects the domain type
-            //
-            // We detect this by checking if the base type OID is a well-known built-in OID.
-            // Built-in types have low OIDs (< 10000), extension types have high OIDs.
-            let is_primitive_domain = match type_index.get(&param.type_oid) {
-                Some(PgType::Domain { type_oid: base_oid, .. }) => {
-                    // Only unwrap if the base type is a built-in primitive (low OID)
-                    // and not a composite type
-                    let is_builtin = *base_oid < 10000;
-                    let is_composite = matches!(type_index.get(base_oid), Some(PgType::Composite { .. }));
-                    is_builtin && !is_composite
-                }
-                _ => false,
-            };
+            // Compute how many domain layers to unwrap.
+            // This handles nested domains (e.g., level3 → level2 → level1 → citext).
+            let unwrap_depth = compute_domain_unwrap_depth(
+                param.type_oid,
+                param.postgres_type_oid,
+                type_index,
+            );
 
             if param.nullable {
-                if is_primitive_domain {
+                if unwrap_depth > 0 {
                     // For nullable domain: create a let binding to unwrap, then reference it
                     // Use the same snake_case conversion as param_name, then append _unwrapped
                     use heck::ToSnakeCase;
                     let unwrapped_name_str = format!("{}_unwrapped", param.name.to_snake_case());
                     let unwrapped_name = sql_to_rs_ident(&unwrapped_name_str, CaseType::Snake);
+
+                    // Generate chained .0 accesses for nested domains
+                    // e.g., depth=1 → &v.0, depth=2 → &v.0.0, depth=3 → &v.0.0.0
+                    let unwrap_chain: TokenStream = (0..unwrap_depth)
+                        .map(|_| quote! { .0 })
+                        .collect();
+
                     nullable_domain_bindings.push(
-                        quote! { let #unwrapped_name = #param_name.as_ref().map(|v| &v.0); }
+                        quote! { let #unwrapped_name = #param_name.as_ref().map(|v| &v #unwrap_chain); }
                     );
                     quote! { &#unwrapped_name }
                 } else {
@@ -997,9 +993,12 @@ fn generate_query_code(
                     quote! { &#param_name }
                 }
             } else {
-                if is_primitive_domain {
-                    // For non-nullable domain: pass &param.0 (unwrap the newtype)
-                    quote! { &#param_name.0 }
+                if unwrap_depth > 0 {
+                    // For non-nullable domain: pass &param.0.0... (depth times)
+                    let unwrap_chain: TokenStream = (0..unwrap_depth)
+                        .map(|_| quote! { .0 })
+                        .collect();
+                    quote! { &#param_name #unwrap_chain }
                 } else if param_needs_reference(param.type_oid, type_index) {
                     quote! { &#param_name }
                 } else {
@@ -1399,6 +1398,8 @@ fn get_param_type(type_oid: OID, type_index: &TypeIndex, nullable: bool) -> Toke
             PgType::Int16 => quote! { i16 },
             PgType::Int32 => quote! { i32 },
             PgType::Int64 => quote! { i64 },
+            PgType::Float32 => quote! { f32 },
+            PgType::Float64 => quote! { f64 },
             PgType::Bool => quote! { bool },
             PgType::Text => quote! { &str },
             PgType::Enum { .. } => {
@@ -1420,6 +1421,50 @@ fn get_param_type(type_oid: OID, type_index: &TypeIndex, nullable: bool) -> Toke
     } else {
         base_type
     }
+}
+
+/// Compute how many domain layers to unwrap to reach the target type.
+/// Returns 0 if no unwrapping needed, or the number of `.0` accesses required.
+///
+/// PostgreSQL's parameter type inference varies by context:
+/// - Comparisons (WHERE slug = $1): PostgreSQL expects the base type (citext)
+/// - Assignments (SET slug = $1): PostgreSQL expects the domain type (slug)
+///
+/// For nested domains like `level3` → `level2` → `level1` → `citext`:
+/// - PostgreSQL may expect `citext` (the ultimate base)
+/// - Single `.0` unwrap only removes one layer
+/// - This function computes how many `.0` unwraps are needed
+fn compute_domain_unwrap_depth(
+    from_oid: OID,
+    to_oid: OID,
+    type_index: &TypeIndex,
+) -> usize {
+    if from_oid == to_oid {
+        return 0;
+    }
+
+    let mut current = from_oid;
+    let mut depth = 0;
+
+    while current != to_oid {
+        match type_index.get(&current) {
+            Some(PgType::Domain { type_oid: base_oid, .. }) => {
+                // Skip composite domains (they have custom ToSql)
+                if matches!(type_index.get(base_oid), Some(PgType::Composite { .. })) {
+                    return 0;
+                }
+                current = *base_oid;
+                depth += 1;
+            }
+            _ => {
+                // Reached a non-domain type but haven't found target.
+                // This means we've unwrapped as far as we can.
+                break;
+            }
+        }
+    }
+
+    depth
 }
 
 /// Get Rust type for a column

@@ -16,7 +16,11 @@ use std::collections::{BTreeMap, HashMap};
 #[derive(Debug, Clone)]
 pub struct QueryParam {
     pub name: String,
+    /// The type OID to use for the Rust parameter type (may be a domain type).
     pub type_oid: OID,
+    /// The type OID that PostgreSQL actually expects at runtime.
+    /// This may differ from `type_oid` when PostgreSQL resolves a domain to its base type.
+    pub postgres_type_oid: OID,
     pub position: usize,
     pub nullable: bool,
 }
@@ -158,6 +162,7 @@ impl<'a> QueryIntrospector<'a> {
                 QueryParam {
                     name,
                     type_oid,
+                    postgres_type_oid,
                     position: i + 1,
                     nullable,
                 }
@@ -243,7 +248,8 @@ impl<'a> QueryIntrospector<'a> {
         }
     }
 
-    /// Refine column nullability using ViewNullabilityAnalyzer or DML table analysis
+    /// Refine column nullability and types using ViewNullabilityAnalyzer or DML table analysis.
+    /// Also looks up actual column types from the table schema to preserve domain types.
     fn refine_nullability(&self, sql: &str, columns: &[QueryColumn]) -> Result<Option<Vec<QueryColumn>>> {
         log::info!("[REFINE] Starting nullability refinement for query: {}", sql);
         log::info!("[REFINE] Input columns:");
@@ -269,16 +275,26 @@ impl<'a> QueryIntrospector<'a> {
                     log::info!("[REFINE]   {} -> is_not_null={} (nullable={})", name, is_not_null, !is_not_null);
                 }
 
+                // Build a map of column name -> (table_name, inferred_type_oid) from the query
+                let column_type_map = self.infer_column_types_from_query(sql);
+
                 let refined_columns = columns
                     .iter()
                     .map(|col| {
                         let is_not_null = nullability_map.get(&col.name).copied().unwrap_or(false);
                         let new_nullable = !is_not_null;
-                        log::info!("[REFINE] Column '{}': says nullable={}, analyzer says is_not_null={}, final nullable={}",
-                            col.name, col.nullable, is_not_null, new_nullable);
+
+                        // Try to get the actual column type from the table schema (preserves domains)
+                        let refined_type_oid = column_type_map
+                            .get(&col.name)
+                            .and_then(|(table, _)| self.rel_index.get_column_type(table, &col.name))
+                            .unwrap_or(col.type_oid);
+
+                        log::info!("[REFINE] Column '{}': nullable={}, type_oid={} -> {}",
+                            col.name, new_nullable, col.type_oid, refined_type_oid);
                         QueryColumn {
                             name: col.name.clone(),
-                            type_oid: col.type_oid,
+                            type_oid: refined_type_oid,
                             nullable: new_nullable,
                         }
                     })
@@ -294,7 +310,104 @@ impl<'a> QueryIntrospector<'a> {
         }
     }
 
-    /// Refine nullability for INSERT/UPDATE/DELETE RETURNING by looking at the target table
+    /// Infer which table each selected column comes from by parsing the query.
+    /// Returns a map of column_name -> (table_name, column_name).
+    fn infer_column_types_from_query(&self, sql: &str) -> HashMap<String, (String, String)> {
+        let mut result = HashMap::new();
+
+        let parse_result = match pg_query::parse(sql) {
+            Ok(r) => r,
+            Err(_) => return result,
+        };
+
+        // Build alias map first
+        let alias_map = self.build_alias_map(sql);
+
+        // Extract the SELECT statement
+        if let Some(stmt) = parse_result.protobuf.stmts.first() {
+            if let Some(node) = &stmt.stmt {
+                if let Some(pg_query::protobuf::node::Node::SelectStmt(select)) = &node.node {
+                    for target in &select.target_list {
+                        if let Some(pg_query::protobuf::node::Node::ResTarget(res_target)) = &target.node {
+                            // Get the output column name
+                            let output_name = if !res_target.name.is_empty() {
+                                res_target.name.clone()
+                            } else if let Some(val) = &res_target.val {
+                                self.extract_column_name_from_node(val).unwrap_or_default()
+                            } else {
+                                continue;
+                            };
+
+                            // Try to extract table.column from the expression
+                            if let Some(val) = &res_target.val {
+                                if let Some((table_or_alias, col_name)) = self.extract_table_column_from_node(val) {
+                                    // Resolve alias to actual table name
+                                    let table_name = alias_map
+                                        .get(&table_or_alias)
+                                        .cloned()
+                                        .unwrap_or(table_or_alias);
+                                    result.insert(output_name, (table_name, col_name));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Extract the column name from a node (for simple column references)
+    fn extract_column_name_from_node(&self, node: &pg_query::protobuf::Node) -> Option<String> {
+        if let Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) = &node.node {
+            // Get the last field (column name)
+            if let Some(last) = col_ref.fields.last() {
+                if let Some(pg_query::protobuf::node::Node::String(s)) = &last.node {
+                    return Some(s.sval.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract (table_or_alias, column_name) from a column reference node
+    fn extract_table_column_from_node(&self, node: &pg_query::protobuf::Node) -> Option<(String, String)> {
+        if let Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) = &node.node {
+            let fields: Vec<_> = col_ref.fields.iter()
+                .filter_map(|f| {
+                    if let Some(pg_query::protobuf::node::Node::String(s)) = &f.node {
+                        Some(s.sval.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            match fields.len() {
+                1 => {
+                    // Unqualified column - try to find which table it belongs to
+                    let col_name = &fields[0];
+                    for rel in self.rel_index.values() {
+                        let table_name = rel.id.name();
+                        if self.rel_index.get_column_type(table_name, col_name).is_some() {
+                            return Some((table_name.to_string(), col_name.clone()));
+                        }
+                    }
+                    None
+                }
+                2 => {
+                    // Qualified: table.column or alias.column
+                    Some((fields[0].clone(), fields[1].clone()))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Refine nullability and types for INSERT/UPDATE/DELETE RETURNING by looking at the target table
     fn refine_nullability_from_dml_target(
         &self,
         sql: &str,
@@ -321,7 +434,7 @@ impl<'a> QueryIntrospector<'a> {
             }
         };
 
-        // Refine nullability based on table constraints
+        // Refine nullability and type based on table schema
         let refined_columns: Vec<QueryColumn> = columns
             .iter()
             .map(|col| {
@@ -330,15 +443,23 @@ impl<'a> QueryIntrospector<'a> {
                     matches!(c, Constraint::NotNull(n) if n.column.as_str() == col.name)
                 });
                 let nullable = !is_not_null;
+
+                // Look up the actual column type from the table (preserves domain types)
+                let refined_type_oid = self.rel_index
+                    .get_column_type(&target_table, &col.name)
+                    .unwrap_or(col.type_oid);
+
                 log::info!(
-                    "[REFINE-DML] Column '{}': is_not_null={}, nullable={}",
+                    "[REFINE-DML] Column '{}': is_not_null={}, nullable={}, type_oid={} -> {}",
                     col.name,
                     is_not_null,
-                    nullable
+                    nullable,
+                    col.type_oid,
+                    refined_type_oid
                 );
                 QueryColumn {
                     name: col.name.clone(),
-                    type_oid: col.type_oid,
+                    type_oid: refined_type_oid,
                     nullable,
                 }
             })
