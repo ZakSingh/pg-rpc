@@ -804,6 +804,46 @@ fn collect_fn_refs(pg_fn: &PgFn, types: &TypeIndex) -> BTreeSet<String> {
     refs
 }
 
+/// Given a set of param positions to replace with DEFAULT,
+/// rewrite SQL and return the new SQL string.
+/// Parameters are renumbered after DEFAULT replacements.
+fn rewrite_sql_for_defaults(
+    sql: &str,
+    total_params: usize,
+    default_positions: &[usize], // 1-indexed positions to replace with DEFAULT
+) -> String {
+    // Build mapping: old position -> new position (or None if DEFAULT)
+    let mut new_positions: Vec<Option<usize>> = Vec::with_capacity(total_params);
+    let mut next_pos = 1usize;
+
+    for pos in 1..=total_params {
+        if default_positions.contains(&pos) {
+            new_positions.push(None);
+        } else {
+            new_positions.push(Some(next_pos));
+            next_pos += 1;
+        }
+    }
+
+    // Use regex to find and replace parameter markers
+    // This ensures we match whole parameter markers (e.g., $1 not matching inside $10)
+    let re = regex::Regex::new(r"\$(\d+)").unwrap();
+
+    re.replace_all(sql, |caps: &regex::Captures| {
+        let param_num: usize = caps[1].parse().unwrap();
+        if param_num >= 1 && param_num <= total_params {
+            match new_positions[param_num - 1] {
+                Some(new_pos) => format!("${}", new_pos),
+                None => "DEFAULT".to_string(),
+            }
+        } else {
+            // Keep unchanged if out of range
+            caps[0].to_string()
+        }
+    })
+    .to_string()
+}
+
 /// Generate code for SQL query files
 pub fn codegen_queries(
     query_index: &crate::query_index::QueryIndex,
@@ -952,60 +992,13 @@ fn generate_query_code(
         }
     };
 
-    // Build parameter references for query call
-    // For nullable domain types, we need let bindings to unwrap the domain before referencing
-    let mut nullable_domain_bindings: Vec<TokenStream> = Vec::new();
-    let param_refs: Vec<TokenStream> = query
+    // Identify default-eligible params: nullable params where the column is NOT NULL but has DEFAULT
+    // These should emit DEFAULT instead of NULL when None is passed
+    let default_eligible_params: Vec<(usize, &crate::query_introspector::QueryParam)> = query
         .params
         .iter()
-        .map(|param| {
-            let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
-
-            // Compute how many domain layers to unwrap.
-            // This handles nested domains (e.g., level3 → level2 → level1 → citext).
-            let unwrap_depth = compute_domain_unwrap_depth(
-                param.type_oid,
-                param.postgres_type_oid,
-                type_index,
-            );
-
-            if param.nullable {
-                if unwrap_depth > 0 {
-                    // For nullable domain: create a let binding to unwrap, then reference it
-                    // Use the same snake_case conversion as param_name, then append _unwrapped
-                    use heck::ToSnakeCase;
-                    let unwrapped_name_str = format!("{}_unwrapped", param.name.to_snake_case());
-                    let unwrapped_name = sql_to_rs_ident(&unwrapped_name_str, CaseType::Snake);
-
-                    // Generate chained .0 accesses for nested domains
-                    // e.g., depth=1 → &v.0, depth=2 → &v.0.0, depth=3 → &v.0.0.0
-                    let unwrap_chain: TokenStream = (0..unwrap_depth)
-                        .map(|_| quote! { .0 })
-                        .collect();
-
-                    nullable_domain_bindings.push(
-                        quote! { let #unwrapped_name = #param_name.as_ref().map(|v| &v #unwrap_chain); }
-                    );
-                    quote! { &#unwrapped_name }
-                } else {
-                    // For nullable parameters, Option<T> implements ToSql, so always use reference
-                    // This handles both Option<&T> and Option<T>
-                    quote! { &#param_name }
-                }
-            } else {
-                if unwrap_depth > 0 {
-                    // For non-nullable domain: pass &param.0.0... (depth times)
-                    let unwrap_chain: TokenStream = (0..unwrap_depth)
-                        .map(|_| quote! { .0 })
-                        .collect();
-                    quote! { &#param_name #unwrap_chain }
-                } else if param_needs_reference(param.type_oid, type_index) {
-                    quote! { &#param_name }
-                } else {
-                    quote! { #param_name }
-                }
-            }
-        })
+        .enumerate()
+        .filter(|(_, p)| p.nullable && p.has_default)
         .collect();
 
     // Generate doc comment with SQL
@@ -1025,6 +1018,28 @@ fn generate_query_code(
         quote! {}
     };
 
+    // Generate query and params setup based on whether we have default-eligible params
+    let query_and_params_setup = if default_eligible_params.is_empty() {
+        // No default-eligible params - use simple approach
+        let mut nullable_domain_bindings: Vec<TokenStream> = Vec::new();
+        let param_refs: Vec<TokenStream> = query
+            .params
+            .iter()
+            .map(|param| {
+                generate_param_ref(param, type_index, &mut nullable_domain_bindings)
+            })
+            .collect();
+
+        quote! {
+            let query = #sql;
+            #(#nullable_domain_bindings)*
+            let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#param_refs),*];
+        }
+    } else {
+        // Generate match arms for all 2^N combinations of default-eligible params
+        generate_default_match_arms(query, &default_eligible_params, sql, type_index)
+    };
+
     quote! {
         #row_struct
 
@@ -1036,11 +1051,219 @@ fn generate_query_code(
             client: &impl deadpool_postgres::GenericClient,
             #(#params),*
         ) -> #return_type {
-            let query = #sql;
-            #(#nullable_domain_bindings)*
-            let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#param_refs),*];
+            #query_and_params_setup
 
             #query_execution
+        }
+    }
+}
+
+/// Generate a parameter reference for query execution
+fn generate_param_ref(
+    param: &crate::query_introspector::QueryParam,
+    type_index: &TypeIndex,
+    nullable_domain_bindings: &mut Vec<TokenStream>,
+) -> TokenStream {
+    use crate::ident::{sql_to_rs_ident, CaseType};
+
+    let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
+
+    // Compute how many domain layers to unwrap.
+    // This handles nested domains (e.g., level3 → level2 → level1 → citext).
+    let unwrap_depth = compute_domain_unwrap_depth(
+        param.type_oid,
+        param.postgres_type_oid,
+        type_index,
+    );
+
+    if param.nullable {
+        if unwrap_depth > 0 {
+            // For nullable domain: create a let binding to unwrap, then reference it
+            use heck::ToSnakeCase;
+            let unwrapped_name_str = format!("{}_unwrapped", param.name.to_snake_case());
+            let unwrapped_name = sql_to_rs_ident(&unwrapped_name_str, CaseType::Snake);
+
+            // Generate chained .0 accesses for nested domains
+            let unwrap_chain: TokenStream = (0..unwrap_depth)
+                .map(|_| quote! { .0 })
+                .collect();
+
+            nullable_domain_bindings.push(
+                quote! { let #unwrapped_name = #param_name.as_ref().map(|v| &v #unwrap_chain); }
+            );
+            quote! { &#unwrapped_name }
+        } else {
+            // For nullable parameters, Option<T> implements ToSql, so always use reference
+            quote! { &#param_name }
+        }
+    } else {
+        if unwrap_depth > 0 {
+            // For non-nullable domain: pass &param.0.0... (depth times)
+            let unwrap_chain: TokenStream = (0..unwrap_depth)
+                .map(|_| quote! { .0 })
+                .collect();
+            quote! { &#param_name #unwrap_chain }
+        } else if param_needs_reference(param.type_oid, type_index) {
+            quote! { &#param_name }
+        } else {
+            quote! { #param_name }
+        }
+    }
+}
+
+/// Generate match arms for all 2^N combinations of default-eligible params
+fn generate_default_match_arms(
+    query: &crate::query_introspector::IntrospectedQuery,
+    default_eligible_params: &[(usize, &crate::query_introspector::QueryParam)],
+    sql: &str,
+    type_index: &TypeIndex,
+) -> TokenStream {
+    use crate::ident::{sql_to_rs_string, CaseType};
+
+    let n = default_eligible_params.len();
+    let total_combinations = 1usize << n; // 2^n
+
+    // Get param names for match tuple
+    let match_param_names: Vec<proc_macro2::Ident> = default_eligible_params
+        .iter()
+        .map(|(_, p)| quote::format_ident!("{}", sql_to_rs_string(&p.name, CaseType::Snake)))
+        .collect();
+
+    let mut match_arms: Vec<TokenStream> = Vec::with_capacity(total_combinations);
+
+    for combination in 0..total_combinations {
+        // For this combination, determine which default-eligible params are Some (bit=1) vs None (bit=0)
+        let mut default_positions: Vec<usize> = Vec::new();
+        let mut pattern_parts: Vec<TokenStream> = Vec::with_capacity(n);
+        let mut some_val_names: Vec<(usize, proc_macro2::Ident)> = Vec::new(); // (param_index, val_name)
+
+        for (bit_index, (param_index, param)) in default_eligible_params.iter().enumerate() {
+            let is_some = (combination >> bit_index) & 1 == 1;
+            if is_some {
+                // This param is Some - use a binding
+                let val_name = quote::format_ident!("{}_val", sql_to_rs_string(&param.name, CaseType::Snake));
+                pattern_parts.push(quote! { Some(#val_name) });
+                some_val_names.push((*param_index, val_name));
+            } else {
+                // This param is None - will use DEFAULT
+                pattern_parts.push(quote! { None });
+                default_positions.push(param.position);
+            }
+        }
+
+        // Generate the rewritten SQL for this combination
+        let rewritten_sql = rewrite_sql_for_defaults(sql, query.params.len(), &default_positions);
+
+        // Generate params vec for this combination
+        // Include all non-default-eligible params plus the Some values from default-eligible params
+        let mut param_refs: Vec<TokenStream> = Vec::new();
+        let mut nullable_domain_bindings: Vec<TokenStream> = Vec::new();
+
+        for (param_index, param) in query.params.iter().enumerate() {
+            // Check if this is a default-eligible param
+            if let Some((bit_index, _)) = default_eligible_params.iter().enumerate().find(|(_, (idx, _))| *idx == param_index) {
+                let is_some = (combination >> bit_index) & 1 == 1;
+                if is_some {
+                    // Find the val_name for this param
+                    let val_name = some_val_names.iter().find(|(idx, _)| *idx == param_index).map(|(_, name)| name).unwrap();
+
+                    // Handle domain unwrapping for the Some value
+                    let unwrap_depth = compute_domain_unwrap_depth(
+                        param.type_oid,
+                        param.postgres_type_oid,
+                        type_index,
+                    );
+
+                    if unwrap_depth > 0 {
+                        let unwrap_chain: TokenStream = (0..unwrap_depth)
+                            .map(|_| quote! { .0 })
+                            .collect();
+                        param_refs.push(quote! { &#val_name #unwrap_chain as &(dyn postgres_types::ToSql + Sync) });
+                    } else {
+                        param_refs.push(quote! { #val_name as &(dyn postgres_types::ToSql + Sync) });
+                    }
+                }
+                // If None, don't add to params (it's DEFAULT in the SQL)
+            } else {
+                // Regular param (not default-eligible)
+                let param_ref = generate_param_ref_for_match(param, type_index, &mut nullable_domain_bindings);
+                param_refs.push(param_ref);
+            }
+        }
+
+        let pattern = if n == 1 {
+            // Single param - don't use tuple
+            let p = &pattern_parts[0];
+            quote! { #p }
+        } else {
+            quote! { (#(#pattern_parts),*) }
+        };
+
+        match_arms.push(quote! {
+            #pattern => {
+                #(#nullable_domain_bindings)*
+                (#rewritten_sql, vec![#(#param_refs),*])
+            }
+        });
+    }
+
+    let match_expr = if n == 1 {
+        let name = &match_param_names[0];
+        quote! { &#name }
+    } else {
+        quote! { (#(&#match_param_names),*) }
+    };
+
+    quote! {
+        let (query, params): (&str, Vec<&(dyn postgres_types::ToSql + Sync)>) = match #match_expr {
+            #(#match_arms),*
+        };
+    }
+}
+
+/// Generate a parameter reference for use inside match arms (slightly different from normal)
+fn generate_param_ref_for_match(
+    param: &crate::query_introspector::QueryParam,
+    type_index: &TypeIndex,
+    nullable_domain_bindings: &mut Vec<TokenStream>,
+) -> TokenStream {
+    use crate::ident::{sql_to_rs_ident, CaseType};
+
+    let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
+
+    let unwrap_depth = compute_domain_unwrap_depth(
+        param.type_oid,
+        param.postgres_type_oid,
+        type_index,
+    );
+
+    if param.nullable {
+        if unwrap_depth > 0 {
+            use heck::ToSnakeCase;
+            let unwrapped_name_str = format!("{}_unwrapped", param.name.to_snake_case());
+            let unwrapped_name = sql_to_rs_ident(&unwrapped_name_str, CaseType::Snake);
+
+            let unwrap_chain: TokenStream = (0..unwrap_depth)
+                .map(|_| quote! { .0 })
+                .collect();
+
+            nullable_domain_bindings.push(
+                quote! { let #unwrapped_name = #param_name.as_ref().map(|v| &v #unwrap_chain); }
+            );
+            quote! { &#unwrapped_name as &(dyn postgres_types::ToSql + Sync) }
+        } else {
+            quote! { &#param_name as &(dyn postgres_types::ToSql + Sync) }
+        }
+    } else {
+        if unwrap_depth > 0 {
+            let unwrap_chain: TokenStream = (0..unwrap_depth)
+                .map(|_| quote! { .0 })
+                .collect();
+            quote! { &#param_name #unwrap_chain as &(dyn postgres_types::ToSql + Sync) }
+        } else if param_needs_reference(param.type_oid, type_index) {
+            quote! { &#param_name as &(dyn postgres_types::ToSql + Sync) }
+        } else {
+            quote! { #param_name as &(dyn postgres_types::ToSql + Sync) }
         }
     }
 }
@@ -1497,5 +1720,65 @@ fn get_column_type(
         } else {
             quote! { serde_json::Value }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rewrite_sql_for_defaults_no_defaults() {
+        let sql = "INSERT INTO t (a, b, c) VALUES ($1, $2, $3)";
+        let result = rewrite_sql_for_defaults(sql, 3, &[]);
+        assert_eq!(result, "INSERT INTO t (a, b, c) VALUES ($1, $2, $3)");
+    }
+
+    #[test]
+    fn test_rewrite_sql_for_defaults_single_default() {
+        let sql = "INSERT INTO t (a, b) VALUES ($1, $2)";
+        // Replace $2 with DEFAULT
+        let result = rewrite_sql_for_defaults(sql, 2, &[2]);
+        assert_eq!(result, "INSERT INTO t (a, b) VALUES ($1, DEFAULT)");
+    }
+
+    #[test]
+    fn test_rewrite_sql_for_defaults_first_param() {
+        let sql = "INSERT INTO t (a, b) VALUES ($1, $2)";
+        // Replace $1 with DEFAULT, $2 becomes $1
+        let result = rewrite_sql_for_defaults(sql, 2, &[1]);
+        assert_eq!(result, "INSERT INTO t (a, b) VALUES (DEFAULT, $1)");
+    }
+
+    #[test]
+    fn test_rewrite_sql_for_defaults_multiple_defaults() {
+        let sql = "INSERT INTO t (a, b, c) VALUES ($1, $2, $3)";
+        // Replace $2 and $3 with DEFAULT
+        let result = rewrite_sql_for_defaults(sql, 3, &[2, 3]);
+        assert_eq!(result, "INSERT INTO t (a, b, c) VALUES ($1, DEFAULT, DEFAULT)");
+    }
+
+    #[test]
+    fn test_rewrite_sql_for_defaults_middle_param() {
+        let sql = "INSERT INTO t (a, b, c) VALUES ($1, $2, $3)";
+        // Replace $2 with DEFAULT, $3 becomes $2
+        let result = rewrite_sql_for_defaults(sql, 3, &[2]);
+        assert_eq!(result, "INSERT INTO t (a, b, c) VALUES ($1, DEFAULT, $2)");
+    }
+
+    #[test]
+    fn test_rewrite_sql_for_defaults_all_params() {
+        let sql = "INSERT INTO t (a, b) VALUES ($1, $2)";
+        // Replace all with DEFAULT
+        let result = rewrite_sql_for_defaults(sql, 2, &[1, 2]);
+        assert_eq!(result, "INSERT INTO t (a, b) VALUES (DEFAULT, DEFAULT)");
+    }
+
+    #[test]
+    fn test_rewrite_sql_for_defaults_preserves_double_digit_params() {
+        let sql = "SELECT * FROM t WHERE a = $1 AND b = $10 AND c = $11";
+        // Replace $10 with DEFAULT, $11 becomes $10
+        let result = rewrite_sql_for_defaults(sql, 11, &[10]);
+        assert_eq!(result, "SELECT * FROM t WHERE a = $1 AND b = DEFAULT AND c = $10");
     }
 }

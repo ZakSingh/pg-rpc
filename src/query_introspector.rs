@@ -23,6 +23,9 @@ pub struct QueryParam {
     pub postgres_type_oid: OID,
     pub position: usize,
     pub nullable: bool,
+    /// Whether the column has a DEFAULT constraint.
+    /// When true and the column is NOT NULL, passing None will emit DEFAULT instead of NULL.
+    pub has_default: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -151,10 +154,10 @@ impl<'a> QueryIntrospector<'a> {
             .into_iter()
             .enumerate()
             .map(|(i, postgres_type_oid)| {
-                let (name, nullable, inferred_type) = param_info
+                let (name, nullable, inferred_type, has_default) = param_info
                     .get(i)
                     .cloned()
-                    .unwrap_or_else(|| (format!("param_{}", i + 1), false, None));
+                    .unwrap_or_else(|| (format!("param_{}", i + 1), false, None, false));
 
                 // Prefer inferred type (preserves domain) over PostgreSQL's resolved type
                 let type_oid = inferred_type.unwrap_or(postgres_type_oid);
@@ -165,6 +168,7 @@ impl<'a> QueryIntrospector<'a> {
                     postgres_type_oid,
                     position: i + 1,
                     nullable,
+                    has_default,
                 }
             })
             .collect();
@@ -496,8 +500,8 @@ impl<'a> QueryIntrospector<'a> {
         None
     }
 
-    /// Determine parameter names, nullable flags, and inferred type OIDs from specs, inference, or fallback.
-    /// Returns Vec of (name, nullable, Option<inferred_type_oid>).
+    /// Determine parameter names, nullable flags, inferred type OIDs, and has_default from specs, inference, or fallback.
+    /// Returns Vec of (name, nullable, Option<inferred_type_oid>, has_default).
     /// The inferred type OID comes from looking up the actual column type in RelIndex,
     /// which preserves domain types that PostgreSQL's type inference resolves to base types.
     fn determine_parameter_info(
@@ -505,9 +509,15 @@ impl<'a> QueryIntrospector<'a> {
         param_specs: &[ParameterSpec],
         sql: &str,
         param_count: usize,
-    ) -> Result<Vec<(String, bool, Option<OID>)>> {
+    ) -> Result<Vec<(String, bool, Option<OID>, bool)>> {
         // Build alias-to-table map from FROM clause for resolving qualified column references
         let alias_map = self.build_alias_map(sql);
+
+        // Infer nullability from expression context (COALESCE, IS NULL, etc.)
+        let context_nullability = self.infer_parameter_nullability_from_context(sql, param_count);
+
+        // Get INSERT column mapping for column-based nullability inference
+        let insert_param_columns = self.extract_insert_param_columns(sql);
 
         let mut param_info = Vec::new();
 
@@ -522,12 +532,27 @@ impl<'a> QueryIntrospector<'a> {
                 self.rel_index.get_column_type(table, column)
             });
 
+            // Get context-inferred nullability for this parameter
+            let context_nullable = context_nullability.get(i).copied().unwrap_or(false);
+
+            // Check if this parameter maps to a nullable column in an INSERT
+            let column_nullable = insert_param_columns
+                .get(&position)
+                .map(|(table, col)| self.is_column_nullable(table, col))
+                .unwrap_or(false);
+
+            // Check if this parameter maps to a column with DEFAULT constraint
+            let has_default = insert_param_columns
+                .get(&position)
+                .map(|(table, col)| self.column_has_default(table, col))
+                .unwrap_or(false);
+
             // Priority 1: Check for explicit @name or @name?
             if let Some(param_spec) = param_specs.iter().find(|s| match s {
                 ParameterSpec::Named { position: pos, .. } => *pos == position,
                 ParameterSpec::Positional { position: pos, .. } => *pos == position,
             }) {
-                let (name, nullable) = match param_spec {
+                let (name, explicit_nullable) = match param_spec {
                     ParameterSpec::Named { name, nullable, .. } => (name.clone(), *nullable),
                     ParameterSpec::Positional { nullable, .. } => {
                         // For positional, try to infer name from column info, otherwise use fallback
@@ -538,21 +563,139 @@ impl<'a> QueryIntrospector<'a> {
                         (inferred_name, *nullable)
                     }
                 };
-                param_info.push((name, nullable, inferred_type));
+                // Combine all nullability sources
+                let nullable = explicit_nullable || context_nullable || column_nullable;
+                param_info.push((name, nullable, inferred_type, has_default));
                 continue;
             }
 
             // Priority 2: Try AST inference (no spec found)
             if let Some((_, column_name)) = column_info {
-                param_info.push((column_name, false, inferred_type));
+                let nullable = context_nullable || column_nullable;
+                param_info.push((column_name, nullable, inferred_type, has_default));
                 continue;
             }
 
             // Priority 3: Fallback
-            param_info.push((format!("param_{}", position), false, None));
+            let nullable = context_nullable || column_nullable;
+            param_info.push((format!("param_{}", position), nullable, None, false));
         }
 
         Ok(param_info)
+    }
+
+    /// For INSERT statements, returns a map of parameter_position -> (table_name, column_name)
+    /// This maps each parameter in the VALUES clause to its target column.
+    fn extract_insert_param_columns(&self, sql: &str) -> HashMap<usize, (String, String)> {
+        let parse_result = match pg_query::parse(sql) {
+            Ok(r) => r,
+            Err(_) => return HashMap::new(),
+        };
+
+        // Find InsertStmt
+        let insert = match parse_result
+            .protobuf
+            .stmts
+            .first()
+            .and_then(|s| s.stmt.as_ref())
+            .and_then(|n| match &n.node {
+                Some(pg_query::protobuf::node::Node::InsertStmt(i)) => Some(i),
+                _ => None,
+            }) {
+            Some(i) => i,
+            None => return HashMap::new(),
+        };
+
+        let table_name = match &insert.relation {
+            Some(r) => r.relname.clone(),
+            None => return HashMap::new(),
+        };
+
+        // Extract column names from INSERT column list (stmt.cols)
+        let columns: Vec<String> = insert
+            .cols
+            .iter()
+            .filter_map(|n| match &n.node {
+                Some(pg_query::protobuf::node::Node::ResTarget(t)) => Some(t.name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // If no explicit columns, we can't map parameters to columns
+        if columns.is_empty() {
+            return HashMap::new();
+        }
+
+        let mut result = HashMap::new();
+
+        // Extract ParamRef positions from VALUES clause
+        if let Some(select) = &insert.select_stmt {
+            if let Some(pg_query::protobuf::node::Node::SelectStmt(s)) = &select.node {
+                if let Some(first_values) = s.values_lists.first() {
+                    if let Some(pg_query::protobuf::node::Node::List(list)) = &first_values.node {
+                        for (i, item) in list.items.iter().enumerate() {
+                            if let Some(pos) = self.extract_param_position(item) {
+                                if i < columns.len() {
+                                    result.insert(pos, (table_name.clone(), columns[i].clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Extract ParamRef position from a node (handles TypeCast wrapping)
+    fn extract_param_position(&self, node: &pg_query::protobuf::Node) -> Option<usize> {
+        match &node.node {
+            Some(pg_query::protobuf::node::Node::ParamRef(p)) => Some(p.number as usize),
+            Some(pg_query::protobuf::node::Node::TypeCast(tc)) => {
+                tc.arg.as_ref().and_then(|a| self.extract_param_position(a))
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if a column has a DEFAULT constraint.
+    fn column_has_default(&self, table: &str, column: &str) -> bool {
+        let table_rel = self.rel_index.values().find(|rel| rel.id.name() == table);
+
+        match table_rel {
+            Some(rel) => rel.constraints.iter().any(|c| {
+                matches!(c, Constraint::Default(d) if d.column.as_str() == column)
+            }),
+            None => false,
+        }
+    }
+
+    /// Check if a column allows NULL/omission in INSERT statements.
+    /// A parameter is nullable/optional if:
+    /// - The column does NOT have a NOT NULL constraint, OR
+    /// - The column has a DEFAULT value (can be omitted, letting DB use the default)
+    fn is_column_nullable(&self, table: &str, column: &str) -> bool {
+        // Find the table in rel_index
+        let table_rel = self.rel_index.values().find(|rel| rel.id.name() == table);
+
+        match table_rel {
+            Some(rel) => {
+                // Check if column has a DEFAULT constraint (can omit parameter)
+                let has_default = rel.constraints.iter().any(|c| {
+                    matches!(c, Constraint::Default(d) if d.column.as_str() == column)
+                });
+
+                // Check if column allows NULL (no NOT NULL constraint)
+                let allows_null = !rel.constraints.iter().any(|c| {
+                    matches!(c, Constraint::NotNull(n) if n.column.as_str() == column)
+                });
+
+                // Parameter is optional if column has default OR allows null
+                has_default || allows_null
+            }
+            None => false, // Conservative: if we can't find the table, assume not nullable
+        }
     }
 
     /// Build a map of table aliases to actual table names from the FROM clause.
@@ -704,5 +847,252 @@ impl<'a> QueryIntrospector<'a> {
             s.to_uppercase().as_str(),
             "SELECT" | "FROM" | "WHERE" | "AND" | "OR" | "IN" | "NOT" | "NULL" | "IS" | "AS"
         )
+    }
+
+    /// Infer parameter nullability from SQL expression context.
+    /// Parameters are considered nullable when they appear in contexts that expect NULL values:
+    /// - First argument of COALESCE($N, fallback) - COALESCE exists to handle NULL
+    /// - Argument of IS NULL / IS NOT NULL tests
+    /// - NULLIF($N, value) - first argument may be NULL
+    fn infer_parameter_nullability_from_context(&self, sql: &str, param_count: usize) -> Vec<bool> {
+        let mut nullable = vec![false; param_count];
+
+        let parse_result = match pg_query::parse(sql) {
+            Ok(result) => result,
+            Err(_) => return nullable,
+        };
+
+        if let Some(stmt) = parse_result.protobuf.stmts.first() {
+            if let Some(node) = &stmt.stmt {
+                self.check_param_nullability_in_node(node, &mut nullable);
+            }
+        }
+
+        nullable
+    }
+
+    /// Recursively check for parameters in nullable-implying expression contexts
+    fn check_param_nullability_in_node(
+        &self,
+        node: &pg_query::protobuf::Node,
+        nullable: &mut Vec<bool>,
+    ) {
+        use pg_query::protobuf::node::Node;
+
+        match &node.node {
+            Some(Node::CoalesceExpr(coalesce)) => {
+                // All arguments to COALESCE except the last are expected to potentially be NULL
+                // (if they couldn't be NULL, there'd be no need for the fallback)
+                for arg in coalesce.args.iter().take(coalesce.args.len().saturating_sub(1)) {
+                    self.mark_params_nullable_in_expr(arg, nullable);
+                }
+                // Recurse into all arguments for nested expressions
+                for arg in &coalesce.args {
+                    self.check_param_nullability_in_node(arg, nullable);
+                }
+            }
+            Some(Node::NullTest(null_test)) => {
+                // Parameter in IS NULL / IS NOT NULL should be nullable
+                if let Some(arg) = &null_test.arg {
+                    self.mark_params_nullable_in_expr(arg, nullable);
+                    self.check_param_nullability_in_node(arg, nullable);
+                }
+            }
+            Some(Node::FuncCall(func_call)) => {
+                // Check for NULLIF and similar functions
+                let func_name = func_call
+                    .funcname
+                    .iter()
+                    .filter_map(|n| {
+                        if let Some(Node::String(s)) = &n.node {
+                            Some(s.sval.to_lowercase())
+                        } else {
+                            None
+                        }
+                    })
+                    .last();
+
+                if let Some(name) = func_name {
+                    match name.as_str() {
+                        "nullif" => {
+                            // First argument to NULLIF may be NULL
+                            if let Some(first_arg) = func_call.args.first() {
+                                self.mark_params_nullable_in_expr(first_arg, nullable);
+                            }
+                        }
+                        "coalesce" => {
+                            // COALESCE can also appear as a FuncCall
+                            for arg in func_call.args.iter().take(func_call.args.len().saturating_sub(1)) {
+                                self.mark_params_nullable_in_expr(arg, nullable);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // Recurse into arguments
+                for arg in &func_call.args {
+                    self.check_param_nullability_in_node(arg, nullable);
+                }
+            }
+            // Recurse into various statement and expression types
+            Some(Node::SelectStmt(select)) => {
+                for target in &select.target_list {
+                    self.check_param_nullability_in_node(target, nullable);
+                }
+                if let Some(where_clause) = &select.where_clause {
+                    self.check_param_nullability_in_node(where_clause, nullable);
+                }
+                for from_item in &select.from_clause {
+                    self.check_param_nullability_in_node(from_item, nullable);
+                }
+                for group_item in &select.group_clause {
+                    self.check_param_nullability_in_node(group_item, nullable);
+                }
+                if let Some(having) = &select.having_clause {
+                    self.check_param_nullability_in_node(having, nullable);
+                }
+                // Handle VALUES clause (used in INSERT ... VALUES (...))
+                for values_list in &select.values_lists {
+                    self.check_param_nullability_in_node(values_list, nullable);
+                }
+            }
+            Some(Node::InsertStmt(insert)) => {
+                if let Some(select) = &insert.select_stmt {
+                    self.check_param_nullability_in_node(select, nullable);
+                }
+                for col in &insert.returning_list {
+                    self.check_param_nullability_in_node(col, nullable);
+                }
+            }
+            Some(Node::UpdateStmt(update)) => {
+                for target in &update.target_list {
+                    self.check_param_nullability_in_node(target, nullable);
+                }
+                if let Some(where_clause) = &update.where_clause {
+                    self.check_param_nullability_in_node(where_clause, nullable);
+                }
+                for col in &update.returning_list {
+                    self.check_param_nullability_in_node(col, nullable);
+                }
+            }
+            Some(Node::DeleteStmt(delete)) => {
+                if let Some(where_clause) = &delete.where_clause {
+                    self.check_param_nullability_in_node(where_clause, nullable);
+                }
+                for col in &delete.returning_list {
+                    self.check_param_nullability_in_node(col, nullable);
+                }
+            }
+            Some(Node::ResTarget(res_target)) => {
+                if let Some(val) = &res_target.val {
+                    self.check_param_nullability_in_node(val, nullable);
+                }
+            }
+            Some(Node::AExpr(aexpr)) => {
+                if let Some(lexpr) = &aexpr.lexpr {
+                    self.check_param_nullability_in_node(lexpr, nullable);
+                }
+                if let Some(rexpr) = &aexpr.rexpr {
+                    self.check_param_nullability_in_node(rexpr, nullable);
+                }
+            }
+            Some(Node::BoolExpr(bool_expr)) => {
+                for arg in &bool_expr.args {
+                    self.check_param_nullability_in_node(arg, nullable);
+                }
+            }
+            Some(Node::SubLink(sublink)) => {
+                if let Some(subselect) = &sublink.subselect {
+                    self.check_param_nullability_in_node(subselect, nullable);
+                }
+                if let Some(testexpr) = &sublink.testexpr {
+                    self.check_param_nullability_in_node(testexpr, nullable);
+                }
+            }
+            Some(Node::CaseExpr(case_expr)) => {
+                if let Some(arg) = &case_expr.arg {
+                    self.check_param_nullability_in_node(arg, nullable);
+                }
+                for when in &case_expr.args {
+                    self.check_param_nullability_in_node(when, nullable);
+                }
+                if let Some(defresult) = &case_expr.defresult {
+                    self.check_param_nullability_in_node(defresult, nullable);
+                }
+            }
+            Some(Node::CaseWhen(case_when)) => {
+                if let Some(expr) = &case_when.expr {
+                    self.check_param_nullability_in_node(expr, nullable);
+                }
+                if let Some(result) = &case_when.result {
+                    self.check_param_nullability_in_node(result, nullable);
+                }
+            }
+            Some(Node::TypeCast(type_cast)) => {
+                if let Some(arg) = &type_cast.arg {
+                    self.check_param_nullability_in_node(arg, nullable);
+                }
+            }
+            Some(Node::JoinExpr(join)) => {
+                if let Some(larg) = &join.larg {
+                    self.check_param_nullability_in_node(larg, nullable);
+                }
+                if let Some(rarg) = &join.rarg {
+                    self.check_param_nullability_in_node(rarg, nullable);
+                }
+                if let Some(quals) = &join.quals {
+                    self.check_param_nullability_in_node(quals, nullable);
+                }
+            }
+            Some(Node::RangeSubselect(range_subselect)) => {
+                if let Some(subquery) = &range_subselect.subquery {
+                    self.check_param_nullability_in_node(subquery, nullable);
+                }
+            }
+            Some(Node::List(list)) => {
+                for item in &list.items {
+                    self.check_param_nullability_in_node(item, nullable);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Mark any ParamRef nodes in this expression as nullable
+    fn mark_params_nullable_in_expr(
+        &self,
+        node: &pg_query::protobuf::Node,
+        nullable: &mut Vec<bool>,
+    ) {
+        use pg_query::protobuf::node::Node;
+
+        match &node.node {
+            Some(Node::ParamRef(param)) => {
+                let idx = param.number as usize;
+                if idx > 0 && idx <= nullable.len() {
+                    log::debug!(
+                        "[PARAM-NULLABILITY] Marking parameter ${} as nullable from expression context",
+                        idx
+                    );
+                    nullable[idx - 1] = true;
+                }
+            }
+            Some(Node::TypeCast(type_cast)) => {
+                // Handle casted parameters like $1::text
+                if let Some(arg) = &type_cast.arg {
+                    self.mark_params_nullable_in_expr(arg, nullable);
+                }
+            }
+            Some(Node::AExpr(aexpr)) => {
+                // Handle expressions containing parameters
+                if let Some(lexpr) = &aexpr.lexpr {
+                    self.mark_params_nullable_in_expr(lexpr, nullable);
+                }
+                if let Some(rexpr) = &aexpr.rexpr {
+                    self.mark_params_nullable_in_expr(rexpr, nullable);
+                }
+            }
+            _ => {}
+        }
     }
 }

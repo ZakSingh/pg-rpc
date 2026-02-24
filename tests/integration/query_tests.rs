@@ -1430,3 +1430,295 @@ DELETE FROM users WHERE id = $1 RETURNING *;
             "DELETE RETURNING with PK should return Result<Option<T>>");
     });
 }
+
+/// Test that parameters in COALESCE are inferred as nullable
+#[test]
+fn test_parameter_nullability_from_coalesce() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client.execute(
+            "CREATE TABLE articles (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                sort_order INT NOT NULL
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // The sort_order parameter wrapped in COALESCE should be nullable
+        let sql = r#"
+-- name: CreateArticle :one
+INSERT INTO articles (title, sort_order)
+VALUES ($1, COALESCE($2, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM articles)))
+RETURNING id;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir)
+            .infer_view_nullability(true);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        // param_2 (sort_order) should be Option<i32> because it's wrapped in COALESCE
+        assert!(
+            generated_code.contains("param_2: Option<i32>") || generated_code.contains("param_2: &Option<i32>"),
+            "sort_order param should be Option<i32> due to COALESCE, got:\n{}",
+            generated_code
+        );
+
+        // title (param_1) should NOT be nullable
+        assert!(
+            generated_code.contains("param_1: &str") || generated_code.contains("title: &str"),
+            "title param should not be Option"
+        );
+    });
+}
+
+/// Test that parameters in IS NULL / IS NOT NULL are inferred as nullable
+#[test]
+fn test_parameter_nullability_from_null_test() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client.execute(
+            "CREATE TABLE users (
+                id SERIAL PRIMARY KEY,
+                email TEXT
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // Parameter used in IS NULL check should be nullable
+        // Note: We need to cast the parameter so PostgreSQL can infer its type
+        let sql = r#"
+-- name: FindUsers :many
+SELECT * FROM users WHERE ($1::text IS NULL OR email = $1);
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir)
+            .infer_view_nullability(true);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        // param should be Option because it's used in IS NULL check
+        assert!(
+            generated_code.contains("param_1: Option<") || generated_code.contains("param_1: &Option<"),
+            "param used in IS NULL should be Option, got:\n{}",
+            generated_code
+        );
+    });
+}
+
+/// Test that INSERT parameters are nullable when target column allows NULL or has DEFAULT
+#[test]
+fn test_insert_parameter_nullability_from_column() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create a test table with some nullable and some non-nullable columns
+        // Mimics the parcel_template table from miniswap
+        client.execute(
+            "CREATE TYPE mass_unit AS ENUM ('kg', 'lb', 'oz', 'g')",
+            &[],
+        ).unwrap();
+
+        client.execute(
+            "CREATE TABLE parcel_template (
+                id SERIAL PRIMARY KEY,
+                account_id INT NOT NULL,
+                name TEXT NOT NULL,
+                length NUMERIC(10,2) NOT NULL,
+                width NUMERIC(10,2) NOT NULL,
+                height NUMERIC(10,2) NOT NULL,
+                dimensions_unit TEXT NOT NULL,
+                weight NUMERIC(10,2) NOT NULL DEFAULT 0,
+                weight_unit mass_unit,
+                weight_limit NUMERIC(10,2),
+                weight_limit_unit mass_unit
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // INSERT with all columns - some target nullable columns, some with defaults
+        let sql = r#"
+-- name: CreateParcelTemplate :one
+INSERT INTO parcel_template (
+  account_id, name, length, width, height, dimensions_unit,
+  weight, weight_unit, weight_limit, weight_limit_unit)
+VALUES (:account_id, :name, :length, :width, :height, :dimensions_unit,
+        :weight, :weight_unit, :weight_limit, :weight_limit_unit)
+RETURNING *;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir)
+            .infer_view_nullability(true);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE (INSERT PARAM NULLABILITY) ===\n{}\n======================", generated_code);
+
+        // NOT NULL columns without DEFAULT should be non-optional parameters
+        assert!(
+            generated_code.contains("account_id: i32") || generated_code.contains("account_id: &i32"),
+            "account_id should NOT be Option (NOT NULL, no default), got:\n{}",
+            generated_code
+        );
+        assert!(
+            generated_code.contains("name: &str"),
+            "name should NOT be Option (NOT NULL, no default), got:\n{}",
+            generated_code
+        );
+
+        // NOT NULL column WITH DEFAULT should be optional (can omit to use default)
+        assert!(
+            generated_code.contains("weight: Option<") || generated_code.contains("weight: &Option<"),
+            "weight should be Option (has DEFAULT), got:\n{}",
+            generated_code
+        );
+
+        // Nullable columns should be optional parameters
+        assert!(
+            generated_code.contains("weight_unit: Option<") || generated_code.contains("weight_unit: &Option<"),
+            "weight_unit should be Option (nullable column), got:\n{}",
+            generated_code
+        );
+        assert!(
+            generated_code.contains("weight_limit: Option<") || generated_code.contains("weight_limit: &Option<"),
+            "weight_limit should be Option (nullable column), got:\n{}",
+            generated_code
+        );
+        assert!(
+            generated_code.contains("weight_limit_unit: Option<") || generated_code.contains("weight_limit_unit: &Option<"),
+            "weight_limit_unit should be Option (nullable column), got:\n{}",
+            generated_code
+        );
+    });
+}
+
+/// Test that INSERT with NOT NULL DEFAULT columns uses DEFAULT keyword when None is passed
+#[test]
+fn test_insert_default_keyword_for_not_null_default_columns() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create a test table with NOT NULL + DEFAULT columns
+        client.execute(
+            "CREATE TABLE test_defaults (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // INSERT with NOT NULL DEFAULT columns
+        let sql = r#"
+-- name: CreateTestDefault :one
+INSERT INTO test_defaults (name, created_at, updated_at)
+VALUES (:name, :created_at, :updated_at)
+RETURNING *;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir)
+            .infer_view_nullability(true);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE (DEFAULT KEYWORD) ===\n{}\n======================", generated_code);
+
+        // name should NOT be optional (NOT NULL, no DEFAULT)
+        assert!(
+            generated_code.contains("name: &str"),
+            "name should NOT be Option (NOT NULL, no default), got:\n{}",
+            generated_code
+        );
+
+        // created_at and updated_at should be optional (NOT NULL with DEFAULT)
+        assert!(
+            generated_code.contains("created_at: Option<"),
+            "created_at should be Option (has DEFAULT), got:\n{}",
+            generated_code
+        );
+        assert!(
+            generated_code.contains("updated_at: Option<"),
+            "updated_at should be Option (has DEFAULT), got:\n{}",
+            generated_code
+        );
+
+        // The generated code should use DEFAULT keyword when None is passed
+        // This means we should see a match expression that handles Some/None cases
+        assert!(
+            generated_code.contains("DEFAULT"),
+            "Generated code should include DEFAULT keyword for None cases, got:\n{}",
+            generated_code
+        );
+
+        // Verify the match pattern for handling Some/None
+        assert!(
+            generated_code.contains("match") && generated_code.contains("Some(") && generated_code.contains("None"),
+            "Generated code should have match expression for Some/None handling, got:\n{}",
+            generated_code
+        );
+    });
+}
