@@ -516,8 +516,8 @@ impl<'a> QueryIntrospector<'a> {
         // Infer nullability from expression context (COALESCE, IS NULL, etc.)
         let context_nullability = self.infer_parameter_nullability_from_context(sql, param_count);
 
-        // Get INSERT column mapping for column-based nullability inference
-        let insert_param_columns = self.extract_insert_param_columns(sql);
+        // Get column mapping for column-based nullability/default inference (INSERT or UPDATE)
+        let param_columns = self.extract_param_columns(sql);
 
         let mut param_info = Vec::new();
 
@@ -535,14 +535,14 @@ impl<'a> QueryIntrospector<'a> {
             // Get context-inferred nullability for this parameter
             let context_nullable = context_nullability.get(i).copied().unwrap_or(false);
 
-            // Check if this parameter maps to a nullable column in an INSERT
-            let column_nullable = insert_param_columns
+            // Check if this parameter maps to a nullable column (in INSERT or UPDATE)
+            let column_nullable = param_columns
                 .get(&position)
                 .map(|(table, col)| self.is_column_nullable(table, col))
                 .unwrap_or(false);
 
             // Check if this parameter maps to a column with DEFAULT constraint
-            let has_default = insert_param_columns
+            let has_default = param_columns
                 .get(&position)
                 .map(|(table, col)| self.column_has_default(table, col))
                 .unwrap_or(false);
@@ -584,28 +584,94 @@ impl<'a> QueryIntrospector<'a> {
         Ok(param_info)
     }
 
-    /// For INSERT statements, returns a map of parameter_position -> (table_name, column_name)
-    /// This maps each parameter in the VALUES clause to its target column.
-    fn extract_insert_param_columns(&self, sql: &str) -> HashMap<usize, (String, String)> {
+    /// For INSERT/UPDATE statements (including those in CTEs), returns a map of
+    /// parameter_position -> (table_name, column_name).
+    /// This maps each parameter in VALUES/SET clauses to its target column.
+    fn extract_param_columns(&self, sql: &str) -> HashMap<usize, (String, String)> {
         let parse_result = match pg_query::parse(sql) {
             Ok(r) => r,
             Err(_) => return HashMap::new(),
         };
 
-        // Find InsertStmt
-        let insert = match parse_result
-            .protobuf
-            .stmts
-            .first()
-            .and_then(|s| s.stmt.as_ref())
-            .and_then(|n| match &n.node {
-                Some(pg_query::protobuf::node::Node::InsertStmt(i)) => Some(i),
-                _ => None,
-            }) {
-            Some(i) => i,
-            None => return HashMap::new(),
-        };
+        let mut result = HashMap::new();
 
+        // Process all top-level statements
+        for raw_stmt in &parse_result.protobuf.stmts {
+            if let Some(stmt) = &raw_stmt.stmt {
+                self.extract_param_columns_from_node(stmt, &mut result);
+            }
+        }
+
+        result
+    }
+
+    /// Recursively extract param columns from any node, handling CTEs
+    fn extract_param_columns_from_node(
+        &self,
+        node: &pg_query::protobuf::Node,
+        result: &mut HashMap<usize, (String, String)>,
+    ) {
+        use pg_query::protobuf::node::Node;
+
+        match &node.node {
+            Some(Node::InsertStmt(insert)) => {
+                // Process the INSERT statement
+                let insert_result = self.extract_insert_param_columns_from_stmt(insert);
+                result.extend(insert_result);
+
+                // Also check for CTEs within the INSERT
+                if let Some(with_clause) = &insert.with_clause {
+                    self.extract_param_columns_from_ctes(with_clause, result);
+                }
+            }
+            Some(Node::UpdateStmt(update)) => {
+                // Process the UPDATE statement
+                let update_result = self.extract_update_param_columns_from_stmt(update);
+                result.extend(update_result);
+
+                // Also check for CTEs within the UPDATE
+                if let Some(with_clause) = &update.with_clause {
+                    self.extract_param_columns_from_ctes(with_clause, result);
+                }
+            }
+            Some(Node::SelectStmt(select)) => {
+                // Check for CTEs in the SELECT's WITH clause
+                if let Some(with_clause) = &select.with_clause {
+                    self.extract_param_columns_from_ctes(with_clause, result);
+                }
+                // Note: We don't need to recurse into subqueries in FROM/WHERE
+                // as those wouldn't affect parameter optionality for INSERT/UPDATE
+            }
+            Some(Node::DeleteStmt(delete)) => {
+                // Check for CTEs in DELETE
+                if let Some(with_clause) = &delete.with_clause {
+                    self.extract_param_columns_from_ctes(with_clause, result);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract param columns from CTEs in a WITH clause
+    fn extract_param_columns_from_ctes(
+        &self,
+        with_clause: &pg_query::protobuf::WithClause,
+        result: &mut HashMap<usize, (String, String)>,
+    ) {
+        for cte_node in &with_clause.ctes {
+            if let Some(pg_query::protobuf::node::Node::CommonTableExpr(cte)) = &cte_node.node {
+                if let Some(ctequery) = &cte.ctequery {
+                    self.extract_param_columns_from_node(ctequery, result);
+                }
+            }
+        }
+    }
+
+    /// Extract param columns from a parsed InsertStmt
+    fn extract_insert_param_columns_from_stmt(
+        &self,
+        insert: &pg_query::protobuf::InsertStmt,
+    ) -> HashMap<usize, (String, String)> {
         let table_name = match &insert.relation {
             Some(r) => r.relname.clone(),
             None => return HashMap::new(),
@@ -640,6 +706,37 @@ impl<'a> QueryIntrospector<'a> {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Extract param columns from a parsed UpdateStmt
+    fn extract_update_param_columns_from_stmt(
+        &self,
+        update: &pg_query::protobuf::UpdateStmt,
+    ) -> HashMap<usize, (String, String)> {
+        let table_name = match &update.relation {
+            Some(r) => r.relname.clone(),
+            None => return HashMap::new(),
+        };
+
+        let mut result = HashMap::new();
+
+        // Extract column = $N mappings from SET clause (target_list)
+        for target in &update.target_list {
+            if let Some(pg_query::protobuf::node::Node::ResTarget(res_target)) = &target.node {
+                let column_name = &res_target.name;
+                if column_name.is_empty() {
+                    continue;
+                }
+
+                if let Some(val) = &res_target.val {
+                    if let Some(pos) = self.extract_param_position(val) {
+                        result.insert(pos, (table_name.clone(), column_name.clone()));
                     }
                 }
             }

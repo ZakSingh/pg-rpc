@@ -830,9 +830,9 @@ WHERE (email = :email OR :email IS NULL)
 
         println!("=== GENERATED CODE ===\n{}\n======================", generated_code);
 
-        // Verify nullable parameters are Option types
-        assert!(generated_code.contains("email: Option<&str>"), "email parameter should be Option<&str>");
-        assert!(generated_code.contains("age: Option<i32>"), "age parameter should be Option<i32>");
+        // Verify nullable parameters use impl Into<Option<T>> pattern
+        assert!(generated_code.contains("email: impl Into<Option<&str>>"), "email parameter should be impl Into<Option<&str>>");
+        assert!(generated_code.contains("age: impl Into<Option<i32>>"), "age parameter should be impl Into<Option<i32>>");
 
         // Verify function signature
         assert!(generated_code.contains("pub async fn find_users"), "Should generate find_users function");
@@ -974,9 +974,10 @@ RETURNING account_id;
 
         println!("=== GENERATED CODE (CTE INSERT) ===\n{}\n======================", generated_code);
 
-        // Verify the struct has the account_id field from RETURNING
-        assert!(generated_code.contains("struct ConnectProviderRow"), "Should generate ConnectProviderRow struct");
-        assert!(generated_code.contains("pub account_id: i32"), "Should have account_id field");
+        // Single-column RETURNING should return scalar type directly, not a struct
+        assert!(!generated_code.contains("struct ConnectProviderRow"), "Single-column query should not generate Row struct");
+        assert!(generated_code.contains("Result<i32, ConnectProviderError>"), "Should return scalar i32 directly");
+        assert!(generated_code.contains("row.try_get(0)"), "Should use try_get(0) for scalar extraction");
     });
 }
 
@@ -1211,9 +1212,9 @@ SELECT * FROM users WHERE status = $1;
         assert!(generated_code.contains("pub async fn get_first_user"), "Should generate get_first_user function");
         assert!(generated_code.contains("Result<Option<GetFirstUserRow>, GetFirstUserError>"), "LIMIT 1 should return Result<Option<T>>");
 
-        // CountUsers - Aggregate without GROUP BY should infer :one
+        // CountUsers - Aggregate without GROUP BY should infer :one, single-column returns scalar
         assert!(generated_code.contains("pub async fn count_users"), "Should generate count_users function");
-        assert!(generated_code.contains("Result<CountUsersRow, CountUsersError>"), "COUNT(*) should return Result<T>");
+        assert!(generated_code.contains("Result<i64, CountUsersError>"), "COUNT(*) single-column should return Result<i64> scalar");
 
         // GetUsersByStatus - Regular SELECT should infer :many
         assert!(generated_code.contains("pub async fn get_users_by_status"), "Should generate get_users_by_status function");
@@ -1474,10 +1475,10 @@ RETURNING id;
         let queries_file = output_dir.join("queries.rs");
         let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
 
-        // param_2 (sort_order) should be Option<i32> because it's wrapped in COALESCE
+        // param_2 (sort_order) should be impl Into<Option<i32>> because it's wrapped in COALESCE
         assert!(
-            generated_code.contains("param_2: Option<i32>") || generated_code.contains("param_2: &Option<i32>"),
-            "sort_order param should be Option<i32> due to COALESCE, got:\n{}",
+            generated_code.contains("param_2: impl Into<Option<i32>>"),
+            "sort_order param should be impl Into<Option<i32>> due to COALESCE, got:\n{}",
             generated_code
         );
 
@@ -1530,10 +1531,10 @@ SELECT * FROM users WHERE ($1::text IS NULL OR email = $1);
         let queries_file = output_dir.join("queries.rs");
         let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
 
-        // param should be Option because it's used in IS NULL check
+        // param should be impl Into<Option<...>> because it's used in IS NULL check
         assert!(
-            generated_code.contains("param_1: Option<") || generated_code.contains("param_1: &Option<"),
-            "param used in IS NULL should be Option, got:\n{}",
+            generated_code.contains("param_1: impl Into<Option<"),
+            "param used in IS NULL should be impl Into<Option<...>>, got:\n{}",
             generated_code
         );
     });
@@ -1616,25 +1617,25 @@ RETURNING *;
 
         // NOT NULL column WITH DEFAULT should be optional (can omit to use default)
         assert!(
-            generated_code.contains("weight: Option<") || generated_code.contains("weight: &Option<"),
-            "weight should be Option (has DEFAULT), got:\n{}",
+            generated_code.contains("weight: impl Into<Option<"),
+            "weight should be impl Into<Option<...>> (has DEFAULT), got:\n{}",
             generated_code
         );
 
         // Nullable columns should be optional parameters
         assert!(
-            generated_code.contains("weight_unit: Option<") || generated_code.contains("weight_unit: &Option<"),
-            "weight_unit should be Option (nullable column), got:\n{}",
+            generated_code.contains("weight_unit: impl Into<Option<"),
+            "weight_unit should be impl Into<Option<...>> (nullable column), got:\n{}",
             generated_code
         );
         assert!(
-            generated_code.contains("weight_limit: Option<") || generated_code.contains("weight_limit: &Option<"),
-            "weight_limit should be Option (nullable column), got:\n{}",
+            generated_code.contains("weight_limit: impl Into<Option<"),
+            "weight_limit should be impl Into<Option<...>> (nullable column), got:\n{}",
             generated_code
         );
         assert!(
-            generated_code.contains("weight_limit_unit: Option<") || generated_code.contains("weight_limit_unit: &Option<"),
-            "weight_limit_unit should be Option (nullable column), got:\n{}",
+            generated_code.contains("weight_limit_unit: impl Into<Option<"),
+            "weight_limit_unit should be impl Into<Option<...>> (nullable column), got:\n{}",
             generated_code
         );
     });
@@ -1696,13 +1697,13 @@ RETURNING *;
 
         // created_at and updated_at should be optional (NOT NULL with DEFAULT)
         assert!(
-            generated_code.contains("created_at: Option<"),
-            "created_at should be Option (has DEFAULT), got:\n{}",
+            generated_code.contains("created_at: impl Into<Option<"),
+            "created_at should be impl Into<Option<...>> (has DEFAULT), got:\n{}",
             generated_code
         );
         assert!(
-            generated_code.contains("updated_at: Option<"),
-            "updated_at should be Option (has DEFAULT), got:\n{}",
+            generated_code.contains("updated_at: impl Into<Option<"),
+            "updated_at should be impl Into<Option<...>> (has DEFAULT), got:\n{}",
             generated_code
         );
 
@@ -1718,6 +1719,167 @@ RETURNING *;
         assert!(
             generated_code.contains("match") && generated_code.contains("Some(") && generated_code.contains("None"),
             "Generated code should have match expression for Some/None handling, got:\n{}",
+            generated_code
+        );
+    });
+}
+
+#[test]
+fn test_update_default_keyword_for_not_null_default_columns() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create a test table with NOT NULL + DEFAULT columns
+        client.execute(
+            "CREATE TABLE test_updates (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                away_until TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // UPDATE with NOT NULL DEFAULT columns in SET clause
+        let sql = r#"
+-- name: UpdateTestRecord :one
+UPDATE test_updates SET away_until = :away_until, updated_at = :updated_at WHERE id = :id
+RETURNING *;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir)
+            .infer_view_nullability(true);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE (UPDATE DEFAULT KEYWORD) ===\n{}\n======================", generated_code);
+
+        // id should NOT be optional (it's in WHERE clause, not a SET value)
+        assert!(
+            generated_code.contains("id: i32"),
+            "id should NOT be Option (WHERE clause parameter), got:\n{}",
+            generated_code
+        );
+
+        // away_until and updated_at should be optional (NOT NULL with DEFAULT)
+        assert!(
+            generated_code.contains("away_until: impl Into<Option<"),
+            "away_until should be impl Into<Option<...>> (has DEFAULT), got:\n{}",
+            generated_code
+        );
+        assert!(
+            generated_code.contains("updated_at: impl Into<Option<"),
+            "updated_at should be impl Into<Option<...>> (has DEFAULT), got:\n{}",
+            generated_code
+        );
+
+        // The generated code should use DEFAULT keyword when None is passed
+        assert!(
+            generated_code.contains("DEFAULT"),
+            "Generated code should include DEFAULT keyword for None cases, got:\n{}",
+            generated_code
+        );
+
+        // Verify the match pattern for handling Some/None
+        assert!(
+            generated_code.contains("match") && generated_code.contains("Some(") && generated_code.contains("None"),
+            "Generated code should have match expression for Some/None handling, got:\n{}",
+            generated_code
+        );
+    });
+}
+
+/// Test that INSERT inside CTE correctly handles DEFAULT keyword for NOT NULL DEFAULT columns
+#[test]
+fn test_cte_insert_default_keyword() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Create a test table with NOT NULL + DEFAULT columns
+        client.execute(
+            "CREATE TABLE messages (
+                id SERIAL PRIMARY KEY,
+                account_id INT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            &[],
+        ).unwrap();
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let sql_file_path = temp_dir.path().join("test.sql");
+
+        // CTE with INSERT that includes a NOT NULL DEFAULT column
+        let sql = r#"
+-- name: InsertMessageWithCte :one
+WITH inserted AS (
+    INSERT INTO messages (account_id, content, created_at)
+    VALUES (:account_id, :content, :created_at)
+    RETURNING *
+)
+SELECT * FROM inserted;
+"#;
+
+        std::fs::write(&sql_file_path, sql).expect("Failed to write SQL file");
+
+        let output_dir = temp_dir.path().join("generated");
+
+        let mut builder = PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir)
+            .infer_view_nullability(true);
+
+        builder = builder.queries_config(pgrpc::QueriesConfig {
+            paths: vec![sql_file_path.to_string_lossy().to_string()],
+        });
+
+        builder.build().expect("Code generation should succeed");
+
+        let queries_file = output_dir.join("queries.rs");
+        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+
+        println!("=== GENERATED CODE (CTE INSERT DEFAULT) ===\n{}\n======================", generated_code);
+
+        // account_id should NOT be optional (NOT NULL, no DEFAULT)
+        assert!(
+            generated_code.contains("account_id: i32"),
+            "account_id should NOT be Option (NOT NULL, no default), got:\n{}",
+            generated_code
+        );
+
+        // content should NOT be optional (NOT NULL, no DEFAULT)
+        assert!(
+            generated_code.contains("content: &str"),
+            "content should NOT be Option (NOT NULL, no default), got:\n{}",
+            generated_code
+        );
+
+        // created_at should be optional (NOT NULL with DEFAULT) - this is the key assertion
+        // that proves the CTE INSERT handling works correctly
+        assert!(
+            generated_code.contains("created_at: impl Into<Option<"),
+            "created_at should be impl Into<Option<...>> (has DEFAULT) even in CTE, got:\n{}",
+            generated_code
+        );
+
+        // The generated code should use DEFAULT keyword when None is passed
+        assert!(
+            generated_code.contains("DEFAULT"),
+            "Generated code should include DEFAULT keyword for None cases in CTE, got:\n{}",
             generated_code
         );
     });

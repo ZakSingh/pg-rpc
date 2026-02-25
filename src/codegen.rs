@@ -899,21 +899,36 @@ fn generate_query_code(
     let (return_type, query_execution, row_struct) = match &query.query_type {
         crate::sql_parser::QueryType::One => {
             if let Some(columns) = &query.return_columns {
-                let struct_name_str = format!("{}Row", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
-                let struct_name = quote::format_ident!("{}", struct_name_str);
-                let row_struct = generate_row_struct(&struct_name, columns, type_index);
+                // For single-column queries, return the scalar type directly
+                if columns.len() == 1 {
+                    let scalar_type = get_column_type(&columns[0], type_index);
+                    let return_type = quote! { Result<#scalar_type, #error_enum_name> };
+                    let execution = quote! {
+                        client.query_opt(query, &params).await
+                            .and_then(|opt_row| {
+                                let row = opt_row.expect("query returned no rows");
+                                row.try_get(0)
+                            })
+                            .map_err(#error_enum_name::from)
+                    };
+                    (return_type, execution, quote! {})
+                } else {
+                    let struct_name_str = format!("{}Row", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
+                    let struct_name = quote::format_ident!("{}", struct_name_str);
+                    let row_struct = generate_row_struct(&struct_name, columns, type_index);
 
-                let return_type = quote! { Result<#struct_name, #error_enum_name> };
-                let execution = quote! {
-                    client.query_opt(query, &params).await
-                        .and_then(|opt_row| {
-                            let row = opt_row.expect("query returned no rows");
-                            row.try_into()
-                        })
-                        .map_err(#error_enum_name::from)
-                };
+                    let return_type = quote! { Result<#struct_name, #error_enum_name> };
+                    let execution = quote! {
+                        client.query_opt(query, &params).await
+                            .and_then(|opt_row| {
+                                let row = opt_row.expect("query returned no rows");
+                                row.try_into()
+                            })
+                            .map_err(#error_enum_name::from)
+                    };
 
-                (return_type, execution, row_struct)
+                    (return_type, execution, row_struct)
+                }
             } else {
                 // Should not happen for :one queries
                 let return_type = quote! { Result<(), #error_enum_name> };
@@ -926,21 +941,36 @@ fn generate_query_code(
         }
         crate::sql_parser::QueryType::Opt => {
             if let Some(columns) = &query.return_columns {
-                let struct_name_str = format!("{}Row", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
-                let struct_name = quote::format_ident!("{}", struct_name_str);
-                let row_struct = generate_row_struct(&struct_name, columns, type_index);
+                // For single-column queries, return the scalar type directly
+                if columns.len() == 1 {
+                    let scalar_type = get_column_type(&columns[0], type_index);
+                    let return_type = quote! { Result<Option<#scalar_type>, #error_enum_name> };
+                    let execution = quote! {
+                        client.query_opt(query, &params).await
+                            .and_then(|row| match row {
+                                Some(row) => Ok(Some(row.try_get(0)?)),
+                                None => Ok(None),
+                            })
+                            .map_err(#error_enum_name::from)
+                    };
+                    (return_type, execution, quote! {})
+                } else {
+                    let struct_name_str = format!("{}Row", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
+                    let struct_name = quote::format_ident!("{}", struct_name_str);
+                    let row_struct = generate_row_struct(&struct_name, columns, type_index);
 
-                let return_type = quote! { Result<Option<#struct_name>, #error_enum_name> };
-                let execution = quote! {
-                    client.query_opt(query, &params).await
-                        .and_then(|row| match row {
-                            Some(row) => Ok(Some(row.try_into()?)),
-                            None => Ok(None),
-                        })
-                        .map_err(#error_enum_name::from)
-                };
+                    let return_type = quote! { Result<Option<#struct_name>, #error_enum_name> };
+                    let execution = quote! {
+                        client.query_opt(query, &params).await
+                            .and_then(|row| match row {
+                                Some(row) => Ok(Some(row.try_into()?)),
+                                None => Ok(None),
+                            })
+                            .map_err(#error_enum_name::from)
+                    };
 
-                (return_type, execution, row_struct)
+                    (return_type, execution, row_struct)
+                }
             } else {
                 let return_type = quote! { Result<Option<()>, #error_enum_name> };
                 let execution = quote! {
@@ -952,18 +982,30 @@ fn generate_query_code(
         }
         crate::sql_parser::QueryType::Many => {
             if let Some(columns) = &query.return_columns {
-                let struct_name_str = format!("{}Row", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
-                let struct_name = quote::format_ident!("{}", struct_name_str);
-                let row_struct = generate_row_struct(&struct_name, columns, type_index);
+                // For single-column queries, return a Vec of scalar type directly
+                if columns.len() == 1 {
+                    let scalar_type = get_column_type(&columns[0], type_index);
+                    let return_type = quote! { Result<Vec<#scalar_type>, #error_enum_name> };
+                    let execution = quote! {
+                        client.query(query, &params).await
+                            .and_then(|rows| rows.into_iter().map(|row| row.try_get(0)).collect())
+                            .map_err(#error_enum_name::from)
+                    };
+                    (return_type, execution, quote! {})
+                } else {
+                    let struct_name_str = format!("{}Row", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
+                    let struct_name = quote::format_ident!("{}", struct_name_str);
+                    let row_struct = generate_row_struct(&struct_name, columns, type_index);
 
-                let return_type = quote! { Result<Vec<#struct_name>, #error_enum_name> };
-                let execution = quote! {
-                    client.query(query, &params).await
-                        .and_then(|rows| rows.into_iter().map(|row| row.try_into()).collect())
-                        .map_err(#error_enum_name::from)
-                };
+                    let return_type = quote! { Result<Vec<#struct_name>, #error_enum_name> };
+                    let execution = quote! {
+                        client.query(query, &params).await
+                            .and_then(|rows| rows.into_iter().map(|row| row.try_into()).collect())
+                            .map_err(#error_enum_name::from)
+                    };
 
-                (return_type, execution, row_struct)
+                    (return_type, execution, row_struct)
+                }
             } else {
                 // Should not happen for :many queries
                 let return_type = quote! { Result<Vec<()>, #error_enum_name> };
@@ -1018,6 +1060,17 @@ fn generate_query_code(
         quote! {}
     };
 
+    // Generate .into() conversions for nullable parameters (impl Into<Option<T>> -> Option<T>)
+    let param_conversions: Vec<TokenStream> = query
+        .params
+        .iter()
+        .filter(|p| p.nullable)
+        .map(|p| {
+            let name = sql_to_rs_ident(&p.name, CaseType::Snake);
+            quote! { let #name = #name.into(); }
+        })
+        .collect();
+
     // Generate query and params setup based on whether we have default-eligible params
     let query_and_params_setup = if default_eligible_params.is_empty() {
         // No default-eligible params - use simple approach
@@ -1051,6 +1104,7 @@ fn generate_query_code(
             client: &impl deadpool_postgres::GenericClient,
             #(#params),*
         ) -> #return_type {
+            #(#param_conversions)*
             #query_and_params_setup
 
             #query_execution
@@ -1640,7 +1694,7 @@ fn get_param_type(type_oid: OID, type_index: &TypeIndex, nullable: bool) -> Toke
     };
 
     if nullable {
-        quote! { Option<#base_type> }
+        quote! { impl Into<Option<#base_type>> + std::fmt::Debug }
     } else {
         base_type
     }
