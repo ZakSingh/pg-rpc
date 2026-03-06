@@ -46,6 +46,13 @@ pub enum PgType {
         variants: Vec<String>,
         comment: Option<String>,
     },
+    /// Enum type inferred from a CHECK constraint (e.g., `status IN ('a', 'b', 'c')`)
+    CheckInferredEnum {
+        schema: String,
+        name: String,
+        variants: Vec<String>,
+        constraint_name: String,
+    },
     Domain {
         schema: String,
         name: String,
@@ -79,11 +86,16 @@ pub enum PgType {
     Vector,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PgField {
     pub name: String,
     pub type_oid: OID,
     pub nullable: bool,
+    /// True if this field's nullability comes from a LEFT/RIGHT/FULL JOIN
+    /// rather than the base column itself being nullable.
+    /// Used by double-underscore column grouping to determine if a group
+    /// should be `Option<Struct>`.
+    pub nullable_due_to_join: bool,
     pub comment: Option<String>,
 }
 
@@ -92,6 +104,7 @@ impl PgType {
         match self {
             PgType::Composite { schema, .. } => schema,
             PgType::Enum { schema, .. } => schema,
+            PgType::CheckInferredEnum { schema, .. } => schema,
             PgType::Array { schema, .. } => schema,
             PgType::Domain { schema, .. } => schema,
             PgType::Custom { schema, .. } => schema,
@@ -105,6 +118,7 @@ impl PgType {
         match self {
             PgType::Composite { name, .. } => name,
             PgType::Enum { name, .. } => name,
+            PgType::CheckInferredEnum { name, .. } => name,
             PgType::Domain { name, .. } => name,
             PgType::Custom { name, .. } => name,
             PgType::Array { .. } => "array",
@@ -145,6 +159,11 @@ impl PgType {
                 quote! { super::#schema_mod::#type_name }
             }
             PgType::Enum { schema, name, .. } => {
+                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
+                let type_name = sql_to_rs_ident(name, CaseType::Pascal);
+                quote! { super::#schema_mod::#type_name }
+            }
+            PgType::CheckInferredEnum { schema, name, .. } => {
                 let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
                 let type_name = sql_to_rs_ident(name, CaseType::Pascal);
                 quote! { super::#schema_mod::#type_name }
@@ -207,6 +226,12 @@ impl PgType {
                 schemas.insert(schema_mod.to_string());
                 quote! { #schema_mod::#type_name }
             }
+            PgType::CheckInferredEnum { schema, name, .. } => {
+                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
+                let type_name = sql_to_rs_ident(name, CaseType::Pascal);
+                schemas.insert(schema_mod.to_string());
+                quote! { #schema_mod::#type_name }
+            }
             PgType::Array {
                 element_type_oid, ..
             } => {
@@ -242,6 +267,467 @@ impl PgType {
         };
 
         (tokens, schemas)
+    }
+
+    /// Generate code for a composite type (view/matview) with double-underscore
+    /// column grouping. This produces nested structs for grouped columns.
+    ///
+    /// Unlike regular composites, grouped composites do NOT derive
+    /// `postgres_types::FromSql`/`ToSql` because the struct shape doesn't match
+    /// the Postgres wire format. They only use `TryFrom<Row>`.
+    fn to_rust_grouped_composite(
+        &self,
+        rs_name: &TokenStream,
+        pg_name: &str,
+        schema: &str,
+        comment: &Option<String>,
+        fields: &[PgField],
+        types: &BTreeMap<OID, PgType>,
+        config: &Config,
+    ) -> TokenStream {
+        use crate::column_grouping::{group_by_double_underscore, GroupedField};
+
+        let grouped = group_by_double_underscore(
+            fields.to_vec(),
+            |f| &f.name,
+            |f| f.nullable_due_to_join,
+            |f, new_name| f.name = new_name,
+        );
+
+        let mut nested_struct_defs: Vec<TokenStream> = Vec::new();
+        let mut parent_fields: Vec<TokenStream> = Vec::new();
+        let mut parent_extractions: Vec<TokenStream> = Vec::new();
+        let mut parent_assignments: Vec<TokenStream> = Vec::new();
+
+        for grouped_field in &grouped {
+            match grouped_field {
+                GroupedField::Plain(field) => {
+                    let field_token = field.to_rust_inner(types, false);
+                    let sql_name = &field.name;
+                    let var_name = format_ident!("_{}", &field.name);
+                    let rs_field_name = sql_to_rs_ident(&field.name, CaseType::Snake);
+
+                    parent_fields.push(field_token);
+                    parent_extractions.push(quote! {
+                        let #var_name = row.try_get(#sql_name)?;
+                    });
+                    parent_assignments.push(quote! { #rs_field_name: #var_name });
+                }
+                GroupedField::Group {
+                    group_name,
+                    fields: group_fields,
+                    optional,
+                } => {
+                    let nested_name = format_ident!(
+                        "{}{}",
+                        sql_to_rs_string(pg_name, CaseType::Pascal),
+                        sql_to_rs_string(group_name, CaseType::Pascal)
+                    );
+                    let group_field_name = sql_to_rs_ident(group_name, CaseType::Snake);
+
+                    // Generate nested struct fields
+                    let nested_field_tokens: Vec<TokenStream> = group_fields
+                        .iter()
+                        .map(|f| {
+                            // Nested struct fields use their natural nullability.
+                            // Fields nullable on base OR due to join stay Option.
+                            f.to_rust_inner(types, false)
+                        })
+                        .collect();
+
+                    // Generate extraction code — we need to use the ORIGINAL SQL
+                    // column name (with the prefix__) to extract from the row.
+                    // The original name is `{group_name}__{field.name}`.
+                    let nested_extractions: Vec<TokenStream> = group_fields
+                        .iter()
+                        .map(|f| {
+                            let original_sql_name =
+                                format!("{}__{}", group_name, f.name);
+                            let var_name = format_ident!(
+                                "_{}__{}",
+                                group_name,
+                                f.name
+                            );
+                            quote! {
+                                let #var_name = row.try_get(#original_sql_name)?;
+                            }
+                        })
+                        .collect();
+
+                    let nested_assignments: Vec<TokenStream> = group_fields
+                        .iter()
+                        .map(|f| {
+                            let rs_field = sql_to_rs_ident(&f.name, CaseType::Snake);
+                            let var_name = format_ident!(
+                                "_{}__{}",
+                                group_name,
+                                f.name
+                            );
+                            quote! { #rs_field: #var_name }
+                        })
+                        .collect();
+
+                    nested_struct_defs.push(quote! {
+                        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+                        pub struct #nested_name {
+                            #(#nested_field_tokens),*
+                        }
+                    });
+
+                    parent_extractions.extend(nested_extractions);
+
+                    if *optional {
+                        // Use the first field as sentinel for NULL detection
+                        let first_original_name =
+                            format!("{}__{}", group_name, group_fields[0].name);
+                        let sentinel_var = format_ident!(
+                            "_{}__{}",
+                            group_name,
+                            group_fields[0].name
+                        );
+
+                        parent_fields.push(quote! {
+                            pub #group_field_name: Option<#nested_name>
+                        });
+
+                        // We check if the sentinel variable is None.
+                        // Since we already extracted all variables above, we can
+                        // check the sentinel and construct accordingly.
+                        // However, for optional groups, the extracted values are
+                        // wrapped in Option<T> (since Postgres returns NULL for
+                        // LEFT JOIN'd columns). The nested struct expects non-Option
+                        // for base-not-null fields. We need to unwrap.
+                        //
+                        // Actually, `row.try_get` returns `Option<T>` when T is
+                        // the inner type and the column is nullable. But the variable
+                        // type is inferred from usage. Since the nested struct field
+                        // might not be Option, we need a different extraction strategy.
+                        //
+                        // Simplest approach: extract all as raw values in the Some branch.
+                        // Let's restructure to use a conditional extraction.
+
+                        // Clear the extractions we just added for this group —
+                        // we'll do conditional extraction instead.
+                        for _ in 0..group_fields.len() {
+                            parent_extractions.pop();
+                        }
+
+                        let sentinel_sql_name = format!("{}__{}", group_name, group_fields[0].name);
+                        let conditional_extractions: Vec<TokenStream> = group_fields
+                            .iter()
+                            .map(|f| {
+                                let original_sql_name = format!("{}__{}", group_name, f.name);
+                                let var_name = format_ident!("_{}_{}", group_name, f.name);
+                                quote! {
+                                    let #var_name = row.try_get(#original_sql_name)?;
+                                }
+                            })
+                            .collect();
+
+                        let conditional_assignments: Vec<TokenStream> = group_fields
+                            .iter()
+                            .map(|f| {
+                                let rs_field = sql_to_rs_ident(&f.name, CaseType::Snake);
+                                let var_name = format_ident!("_{}_{}", group_name, f.name);
+                                quote! { #rs_field: #var_name }
+                            })
+                            .collect();
+
+                        parent_extractions.push(quote! {
+                            let #sentinel_var: Option<serde_json::Value> = row.try_get(#sentinel_sql_name)?;
+                        });
+
+                        parent_assignments.push(quote! {
+                            #group_field_name: if #sentinel_var.is_none() {
+                                None
+                            } else {
+                                #(#conditional_extractions)*
+                                Some(#nested_name {
+                                    #(#conditional_assignments),*
+                                })
+                            }
+                        });
+                    } else {
+                        parent_fields.push(quote! {
+                            pub #group_field_name: #nested_name
+                        });
+
+                        parent_assignments.push(quote! {
+                            #group_field_name: #nested_name {
+                                #(#nested_assignments),*
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        let comment_macro = if comment.is_some() {
+            quote! { #[doc=#comment] }
+        } else {
+            quote! {}
+        };
+
+        let deserialize_derive = if config.should_disable_deserialize(schema, pg_name) {
+            quote! {}
+        } else {
+            quote! { serde::Deserialize, }
+        };
+
+        let builder_derive =
+            if comment.as_ref().map_or(false, |c| annotations::has_builder(c)) {
+                quote! { bon::Builder, }
+            } else {
+                quote! {}
+            };
+
+        // Generate an inner flat struct that matches the Postgres wire format.
+        // This is needed so that other composite types referencing this view
+        // can still use FromSql/ToSql.
+        let inner_struct_name = format_ident!(
+            "Inner{}",
+            sql_to_rs_string(pg_name, CaseType::Pascal)
+        );
+
+        // Determine which fields belong to optional groups so we can make
+        // ALL their inner struct fields Option (needed for FromSql/ToSql roundtrip
+        // when the group is None).
+        let optional_group_fields: std::collections::HashSet<String> = grouped
+            .iter()
+            .filter_map(|gf| match gf {
+                GroupedField::Group { group_name, fields: gf_fields, optional: true } => {
+                    Some(gf_fields.iter().map(|f| format!("{}__{}", group_name, f.name)).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        // Generate inner struct fields — these use the ORIGINAL flat field names
+        // with #[postgres(name = ...)] attributes for the Postgres derive macros.
+        // All fields in optional groups are made Option so the FromSql/ToSql
+        // roundtrip works when the group is None.
+        // We only emit #[postgres(name = ...)] — no serde attrs since the inner
+        // struct doesn't derive Serialize/Deserialize.
+        let inner_field_tokens: Vec<TokenStream> = fields
+            .iter()
+            .map(|f| {
+                let ident = types.get(&f.type_oid).unwrap().to_rust_ident(types);
+                let field_name = sql_to_rs_ident(&f.name, CaseType::Snake);
+                let pg_name = &f.name;
+                // In the inner struct, field must be Option if:
+                // - it's nullable on base, OR
+                // - it belongs to an optional group (all fields become Option)
+                let is_nullable = f.nullable || optional_group_fields.contains(&f.name);
+                let field_type = if is_nullable {
+                    quote! { Option<#ident> }
+                } else {
+                    quote! { #ident }
+                };
+                quote! {
+                    #[postgres(name = #pg_name)]
+                    pub #field_name: #field_type
+                }
+            })
+            .collect();
+
+        // Generate conversion from inner flat struct to grouped struct.
+        // For each grouped field, we read from the inner struct's flat fields.
+        let mut from_inner_assignments: Vec<TokenStream> = Vec::new();
+        // Generate conversion from grouped struct to inner flat struct.
+        let mut to_inner_assignments: Vec<TokenStream> = Vec::new();
+
+        for grouped_field in &grouped {
+            match grouped_field {
+                GroupedField::Plain(field) => {
+                    let rs_field = sql_to_rs_ident(&field.name, CaseType::Snake);
+                    from_inner_assignments.push(quote! { #rs_field: inner.#rs_field });
+                    to_inner_assignments.push(quote! { #rs_field: self.#rs_field.clone() });
+                }
+                GroupedField::Group {
+                    group_name,
+                    fields: group_fields,
+                    optional,
+                } => {
+                    let group_field_name = sql_to_rs_ident(group_name, CaseType::Snake);
+                    let nested_name = format_ident!(
+                        "{}{}",
+                        sql_to_rs_string(pg_name, CaseType::Pascal),
+                        sql_to_rs_string(group_name, CaseType::Pascal)
+                    );
+
+                    // Field names in the inner struct use the original SQL name
+                    // e.g. owner__account_id -> owner_account_id (Rust ident)
+                    let inner_field_rs_names: Vec<_> = group_fields
+                        .iter()
+                        .map(|f| {
+                            let original = format!("{}__{}", group_name, f.name);
+                            sql_to_rs_ident(&original, CaseType::Snake)
+                        })
+                        .collect();
+
+                    let nested_field_rs_names: Vec<_> = group_fields
+                        .iter()
+                        .map(|f| sql_to_rs_ident(&f.name, CaseType::Snake))
+                        .collect();
+
+                    if *optional {
+                        // inner -> grouped: check sentinel, construct Option<NestedStruct>
+                        //
+                        // ALL inner struct fields in optional groups are Option<T>.
+                        // Nested struct fields use base-only nullability.
+                        // Use first field as sentinel (guaranteed Option in inner).
+                        let sentinel_inner = &inner_field_rs_names[0];
+
+                        // Inner struct: ALL fields in optional groups are Option.
+                        // Nested struct: fields are Option if nullable || nullable_due_to_join.
+                        // When they differ (inner=Option, nested=T), we unwrap/wrap.
+                        let nested_field_conversions: Vec<TokenStream> = group_fields
+                            .iter()
+                            .zip(inner_field_rs_names.iter())
+                            .zip(nested_field_rs_names.iter())
+                            .map(|((f, inner_rs), nested_rs)| {
+                                let nested_is_option = f.nullable || f.nullable_due_to_join;
+                                if nested_is_option {
+                                    // Both Option — direct clone
+                                    quote! { #nested_rs: inner.#inner_rs.clone() }
+                                } else {
+                                    // Inner is Option, nested is T — unwrap (safe:
+                                    // sentinel check ensures the row exists, and this
+                                    // field is NOT NULL on its source table)
+                                    quote! { #nested_rs: inner.#inner_rs.clone().unwrap() }
+                                }
+                            })
+                            .collect();
+
+                        from_inner_assignments.push(quote! {
+                            #group_field_name: if inner.#sentinel_inner.is_none() {
+                                None
+                            } else {
+                                Some(#nested_name {
+                                    #(#nested_field_conversions),*
+                                })
+                            }
+                        });
+
+                        // grouped -> inner: expand Option<NestedStruct> back to flat Option fields
+                        let to_inner_field_conversions: Vec<TokenStream> = group_fields
+                            .iter()
+                            .zip(inner_field_rs_names.iter())
+                            .zip(nested_field_rs_names.iter())
+                            .map(|((f, inner_rs), nested_rs)| {
+                                let nested_is_option = f.nullable || f.nullable_due_to_join;
+                                if nested_is_option {
+                                    // Both Option — flatten
+                                    quote! {
+                                        #inner_rs: match &self.#group_field_name {
+                                            Some(g) => g.#nested_rs.clone(),
+                                            None => None,
+                                        }
+                                    }
+                                } else {
+                                    // Inner is Option, nested is T — wrap in Some
+                                    quote! {
+                                        #inner_rs: self.#group_field_name.as_ref().map(|g| g.#nested_rs.clone())
+                                    }
+                                }
+                            })
+                            .collect();
+
+                        to_inner_assignments.extend(to_inner_field_conversions);
+                    } else {
+                        // Non-optional group: direct field access
+                        let nested_field_conversions: Vec<TokenStream> = inner_field_rs_names
+                            .iter()
+                            .zip(nested_field_rs_names.iter())
+                            .map(|(inner_rs, nested_rs)| {
+                                quote! { #nested_rs: inner.#inner_rs.clone() }
+                            })
+                            .collect();
+
+                        from_inner_assignments.push(quote! {
+                            #group_field_name: #nested_name {
+                                #(#nested_field_conversions),*
+                            }
+                        });
+
+                        let to_inner_field_conversions: Vec<TokenStream> = inner_field_rs_names
+                            .iter()
+                            .zip(nested_field_rs_names.iter())
+                            .map(|(inner_rs, nested_rs)| {
+                                quote! { #inner_rs: self.#group_field_name.#nested_rs.clone() }
+                            })
+                            .collect();
+
+                        to_inner_assignments.extend(to_inner_field_conversions);
+                    }
+                }
+            }
+        }
+
+        quote! {
+            #(#nested_struct_defs)*
+
+            #comment_macro
+            #[derive(Clone, Debug, #builder_derive serde::Serialize, #deserialize_derive)]
+            pub struct #rs_name {
+                #(#parent_fields),*
+            }
+
+            /// Internal flat struct matching the Postgres wire format
+            #[derive(Debug, Clone, postgres_types::FromSql, postgres_types::ToSql)]
+            #[postgres(name = #pg_name)]
+            struct #inner_struct_name {
+                #(#inner_field_tokens),*
+            }
+
+            impl<'a> postgres_types::FromSql<'a> for #rs_name {
+                fn from_sql(
+                    ty: &postgres_types::Type,
+                    buf: &'a [u8],
+                ) -> std::result::Result<#rs_name, Box<dyn std::error::Error + std::marker::Sync + std::marker::Send>> {
+                    let inner = <#inner_struct_name as postgres_types::FromSql>::from_sql(ty, buf)?;
+                    Ok(#rs_name {
+                        #(#from_inner_assignments),*
+                    })
+                }
+
+                fn accepts(ty: &postgres_types::Type) -> bool {
+                    ty.name() == #pg_name
+                }
+            }
+
+            impl postgres_types::ToSql for #rs_name {
+                fn to_sql(
+                    &self,
+                    ty: &postgres_types::Type,
+                    out: &mut postgres_types::private::BytesMut,
+                ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+                    let inner = #inner_struct_name {
+                        #(#to_inner_assignments),*
+                    };
+                    inner.to_sql(ty, out)
+                }
+
+                fn accepts(ty: &postgres_types::Type) -> bool {
+                    ty.name() == #pg_name
+                }
+
+                postgres_types::to_sql_checked!();
+            }
+
+            impl TryFrom<tokio_postgres::Row> for #rs_name {
+                type Error = tokio_postgres::Error;
+
+                fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                    #(#parent_extractions)*
+
+                    Ok(Self {
+                        #(#parent_assignments),*
+                    })
+                }
+            }
+        }
     }
 }
 
@@ -353,6 +839,7 @@ impl TryFrom<Row> for PgType {
                                 name: field_name,
                                 type_oid: ty,
                                 nullable: nullable && !is_column_not_null && !is_bulk_not_null,
+                                nullable_due_to_join: false,
                                 comment: comment.clone(),
                             }
                         })
@@ -481,9 +968,21 @@ impl ToRust for PgType {
                 schema,
                 comment,
                 fields,
+                relkind,
                 ..
             } => {
                 let rs_name = sql_to_rs_ident(name, CaseType::Pascal);
+
+                // Check if this is a view/matview with double-underscore columns
+                let is_view = matches!(relkind.as_deref(), Some("v") | Some("m"));
+                let has_grouped_fields = is_view
+                    && fields.iter().any(|f| f.name.contains("__"));
+
+                if has_grouped_fields {
+                    return self.to_rust_grouped_composite(
+                        &rs_name, name, schema, comment, fields, types, config,
+                    );
+                }
 
                 let field_tokens: Vec<TokenStream> = fields
                     .into_iter()
@@ -494,7 +993,6 @@ impl ToRust for PgType {
                     .iter()
                     .map(|f| {
                         let sql_name = &f.name;
-                        let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
                         let rs_name_str = f.name.clone();
                         let var_name = format_ident!("_{}", rs_name_str);
 
@@ -594,6 +1092,7 @@ impl ToRust for PgType {
                             .map(|f| {
                                 PgField {
                                     nullable: f.nullable && !non_null_cols.contains(&f.name),
+                                    nullable_due_to_join: false,
                                     name: f.name.clone(),
                                     comment: f.comment.clone(),
                                     type_oid: f.type_oid,
@@ -812,6 +1311,113 @@ impl ToRust for PgType {
                     #[postgres(name = #name)]
                     pub enum #rs_enum_name {
                         #(#rs_variants),*
+                    }
+                }
+            }
+            PgType::CheckInferredEnum {
+                name,
+                schema,
+                variants,
+                constraint_name,
+            } => {
+                let rs_enum_name = sql_to_rs_ident(name, CaseType::Pascal);
+                let rs_variants: Vec<TokenStream> = variants
+                    .iter()
+                    .map(|sql_variant| {
+                        let rs_variant = sql_to_rs_ident(sql_variant, CaseType::Pascal);
+                        quote! {
+                            #[serde(rename = #sql_variant)]
+                            #rs_variant
+                        }
+                    })
+                    .collect();
+
+                // Generate FromSql match arms
+                let from_sql_arms: Vec<TokenStream> = variants
+                    .iter()
+                    .map(|sql_variant| {
+                        let rs_variant = sql_to_rs_ident(sql_variant, CaseType::Pascal);
+                        quote! {
+                            #sql_variant => Ok(Self::#rs_variant)
+                        }
+                    })
+                    .collect();
+
+                // Generate ToSql match arms
+                let to_sql_arms: Vec<TokenStream> = variants
+                    .iter()
+                    .map(|sql_variant| {
+                        let rs_variant = sql_to_rs_ident(sql_variant, CaseType::Pascal);
+                        quote! {
+                            Self::#rs_variant => #sql_variant
+                        }
+                    })
+                    .collect();
+
+                let deserialize_derive = if config.should_disable_deserialize(schema, name) {
+                    quote! {}
+                } else {
+                    quote! { serde::Deserialize, }
+                };
+
+                let doc_comment = format!(
+                    "Enum inferred from CHECK constraint `{}`",
+                    constraint_name
+                );
+
+                quote! {
+                    #[doc = #doc_comment]
+                    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, #deserialize_derive serde::Serialize)]
+                    pub enum #rs_enum_name {
+                        #(#rs_variants),*
+                    }
+
+                    impl<'a> postgres_types::FromSql<'a> for #rs_enum_name {
+                        fn from_sql(
+                            _ty: &postgres_types::Type,
+                            raw: &'a [u8],
+                        ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+                            let s = std::str::from_utf8(raw)?;
+                            match s {
+                                #(#from_sql_arms,)*
+                                other => Err(format!("Invalid {} value: {}", #name, other).into()),
+                            }
+                        }
+
+                        fn accepts(ty: &postgres_types::Type) -> bool {
+                            matches!(
+                                *ty,
+                                postgres_types::Type::TEXT
+                                    | postgres_types::Type::VARCHAR
+                                    | postgres_types::Type::BPCHAR
+                            )
+                        }
+                    }
+
+                    impl postgres_types::ToSql for #rs_enum_name {
+                        fn to_sql(
+                            &self,
+                            _ty: &postgres_types::Type,
+                            out: &mut postgres_types::private::BytesMut,
+                        ) -> std::result::Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>>
+                        {
+                            let s = match self {
+                                #(#to_sql_arms,)*
+                            };
+                            out.extend_from_slice(s.as_bytes());
+                            Ok(postgres_types::IsNull::No)
+                        }
+
+                        fn accepts(ty: &postgres_types::Type) -> bool {
+                            matches!(
+                                *ty,
+                                postgres_types::Type::TEXT
+                                    | postgres_types::Type::VARCHAR
+                                    | postgres_types::Type::BPCHAR
+                            )
+                        }
+
+                        postgres_types::to_sql_checked!();
                     }
                 }
             }

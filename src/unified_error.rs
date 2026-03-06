@@ -562,6 +562,7 @@ mod tests {
             Constraint::Check(CheckConstraint {
                 name: ustr("users_age_check"),
                 columns: SmallVec::from_slice(&[ustr("age")]),
+                check_expression: None,
             }),
         ];
 

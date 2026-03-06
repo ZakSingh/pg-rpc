@@ -6,9 +6,37 @@ use indexmap::IndexMap;
 use pg_query::protobuf;
 use std::collections::{HashMap, HashSet};
 
+/// Two-level nullability for a single column.
+///
+/// Distinguishes between "nullable because of a LEFT/RIGHT/FULL JOIN" and
+/// "nullable because the base column itself allows NULLs". This is needed
+/// for double-underscore column grouping: when all grouped columns are
+/// join-nullable, the group becomes `Option<Struct>` while inner fields
+/// use only their base-table nullability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnNullability {
+    /// Column is nullable because its source table/view is on the outer side of a join.
+    pub nullable_due_to_join: bool,
+    /// Column is nullable on its base table/view (independent of joins).
+    pub nullable_on_base: bool,
+}
+
+impl ColumnNullability {
+    /// Returns true if the column is NOT NULL (neither join-nullable nor base-nullable).
+    pub fn is_not_null(&self) -> bool {
+        !self.nullable_due_to_join && !self.nullable_on_base
+    }
+
+    /// Returns true if the column is nullable for any reason.
+    pub fn is_nullable(&self) -> bool {
+        self.nullable_due_to_join || self.nullable_on_base
+    }
+}
+
 /// Cache for storing view nullability analysis results
-/// Key: (schema, view_name), Value: map of column_name -> is_not_null (order-preserving)
-pub type ViewNullabilityCache = HashMap<(Option<String>, String), IndexMap<String, bool>>;
+/// Key: (schema, view_name), Value: map of column_name -> nullability (order-preserving)
+pub type ViewNullabilityCache =
+    HashMap<(Option<String>, String), IndexMap<String, ColumnNullability>>;
 
 /// Analyzes view definitions to infer column nullability
 pub struct ViewNullabilityAnalyzer<'a> {
@@ -36,8 +64,8 @@ enum TableInfo {
     View {
         schema: Option<String>,
         name: String,
-        /// Column name -> is_not_null mapping (order-preserving)
-        nullability: IndexMap<String, bool>,
+        /// Column name -> nullability mapping (order-preserving)
+        nullability: IndexMap<String, ColumnNullability>,
         /// True if this view reference can produce NULL values due to outer joins
         is_nullable: bool,
     },
@@ -134,14 +162,13 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
         Ok(())
     }
 
-    /// Analyze a view definition and return a map of column names to their nullability
-    /// The map value is true if the column is NOT NULL, false if nullable
-    /// Returns an IndexMap to preserve column order
+    /// Analyze a view definition and return a map of column names to their nullability.
+    /// Returns an IndexMap to preserve column order.
     pub fn analyze_view(
         &mut self,
         view_definition: &str,
         view_columns: &[String],
-    ) -> anyhow::Result<IndexMap<String, bool>> {
+    ) -> anyhow::Result<IndexMap<String, ColumnNullability>> {
         log::info!("Analyzing view with {} columns", view_columns.len());
         log::info!("View definition: {}", view_definition);
 
@@ -152,7 +179,7 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
         self.alias_map.clear();
         self.nullable_columns.clear();
 
-        // Track column results
+        // Track column results: (is_not_null_overall, nullable_due_to_join)
         let mut column_nullability = Vec::new();
 
         // Find the main SELECT statement
@@ -171,14 +198,12 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                                 // Check if this is a star expression
                                 if self.is_star_expression(val) {
                                     // Expand star expression into individual columns
-                                    let expanded = self.expand_star_expression(val)?;
-                                    for (_col_name, is_not_null) in expanded {
-                                        column_nullability.push(is_not_null);
-                                    }
+                                    let expanded = self.expand_star_expression_detailed(val)?;
+                                    column_nullability.extend(expanded.into_iter().map(|(_, cn)| cn));
                                 } else {
                                     // Regular column expression
-                                    let is_nullable = self.is_expression_nullable(val)?;
-                                    column_nullability.push(!is_nullable); // true = NOT NULL
+                                    let cn = self.expression_nullability_detailed(val)?;
+                                    column_nullability.push(cn);
                                 }
                             }
                         }
@@ -191,11 +216,17 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
         // Use IndexMap to preserve column order
         let mut result = IndexMap::new();
         for (i, column_name) in view_columns.iter().enumerate() {
-            if let Some(&not_null) = column_nullability.get(i) {
-                result.insert(column_name.clone(), not_null);
+            if let Some(cn) = column_nullability.get(i) {
+                result.insert(column_name.clone(), *cn);
             } else {
                 // Default to nullable if we couldn't analyze
-                result.insert(column_name.clone(), false);
+                result.insert(
+                    column_name.clone(),
+                    ColumnNullability {
+                        nullable_due_to_join: false,
+                        nullable_on_base: true,
+                    },
+                );
             }
         }
 
@@ -461,10 +492,10 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
             } => {
                 log::info!("[GET_COLUMNS] Getting columns for view {:?}.{} (is_nullable={})", schema, name, is_nullable);
                 log::info!("[GET_COLUMNS] View has {} columns in cache", nullability.len());
-                for (col_name, &is_not_null) in nullability {
+                for (col_name, cn) in nullability {
                     // View column nullability is affected by join context
-                    let final_not_null = is_not_null && !is_nullable;
-                    log::info!("[GET_COLUMNS]   Column '{}': cached is_not_null={}, final is_not_null={}", col_name, is_not_null, final_not_null);
+                    let final_not_null = cn.is_not_null() && !is_nullable;
+                    log::info!("[GET_COLUMNS]   Column '{}': cached is_not_null={}, final is_not_null={}", col_name, cn.is_not_null(), final_not_null);
                     result.push((col_name.clone(), final_not_null));
                 }
             }
@@ -472,6 +503,283 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
 
         log::info!("[GET_COLUMNS] Returning {} columns", result.len());
         Ok(result)
+    }
+
+    /// Get two-level nullability for a table's columns.
+    fn get_table_columns_detailed(
+        &self,
+        table_info: &TableInfo,
+    ) -> anyhow::Result<Vec<(String, ColumnNullability)>> {
+        let mut result = Vec::new();
+
+        match table_info {
+            TableInfo::Table {
+                schema,
+                name,
+                is_nullable,
+                ..
+            } => {
+                if let Some(rel) = self.find_relation(schema, name) {
+                    for column in &rel.columns {
+                        let base_not_null = self.is_column_not_null(rel, &column);
+                        result.push((
+                            column.to_string(),
+                            ColumnNullability {
+                                nullable_due_to_join: *is_nullable,
+                                nullable_on_base: !base_not_null,
+                            },
+                        ));
+                    }
+                }
+            }
+            TableInfo::View {
+                nullability,
+                is_nullable,
+                ..
+            } => {
+                for (col_name, cn) in nullability {
+                    result.push((
+                        col_name.clone(),
+                        ColumnNullability {
+                            // Compose: if the view ref itself is join-nullable, OR the
+                            // cached column was already join-nullable
+                            nullable_due_to_join: *is_nullable || cn.nullable_due_to_join,
+                            nullable_on_base: cn.nullable_on_base,
+                        },
+                    ));
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Expand a star expression (SELECT * or SELECT t.*) returning detailed nullability.
+    fn expand_star_expression_detailed(
+        &self,
+        expr: &protobuf::Node,
+    ) -> anyhow::Result<Vec<(String, ColumnNullability)>> {
+        let mut result = Vec::new();
+
+        if let Some(protobuf::node::Node::ColumnRef(col_ref)) = &expr.node {
+            match col_ref.fields.len() {
+                1 => {
+                    // SELECT * - expand all tables
+                    for (_alias, table_info) in &self.alias_map {
+                        let columns = self.get_table_columns_detailed(table_info)?;
+                        result.extend(columns);
+                    }
+                }
+                2 => {
+                    // SELECT table.* - expand specific table
+                    if let Some(protobuf::node::Node::String(table_ref)) =
+                        &col_ref.fields[0].node
+                    {
+                        if let Some(table_info) = self.alias_map.get(&table_ref.sval) {
+                            let columns = self.get_table_columns_detailed(table_info)?;
+                            result.extend(columns);
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "Unknown table reference: {}",
+                                table_ref.sval
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unexpected star expression format"));
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Get two-level nullability for an expression.
+    ///
+    /// For column references, this distinguishes join-nullability from base-nullability.
+    /// For computed expressions (CASE, COALESCE, function calls, etc.), join-nullability
+    /// is always false and the overall nullability goes into `nullable_on_base`.
+    fn expression_nullability_detailed(
+        &self,
+        expr: &protobuf::Node,
+    ) -> anyhow::Result<ColumnNullability> {
+        if let Some(node) = &expr.node {
+            match node {
+                protobuf::node::Node::ColumnRef(col_ref) => {
+                    self.column_ref_nullability_detailed(col_ref)
+                }
+                protobuf::node::Node::TypeCast(type_cast) => {
+                    // Type casts preserve the nullability of the argument
+                    if let Some(arg) = &type_cast.arg {
+                        self.expression_nullability_detailed(arg)
+                    } else {
+                        Ok(ColumnNullability {
+                            nullable_due_to_join: false,
+                            nullable_on_base: true,
+                        })
+                    }
+                }
+                _ => {
+                    // For all other expression types, fall back to the existing
+                    // is_expression_nullable and treat result as base-nullable.
+                    let is_nullable = self.is_expression_nullable(expr)?;
+                    Ok(ColumnNullability {
+                        nullable_due_to_join: false,
+                        nullable_on_base: is_nullable,
+                    })
+                }
+            }
+        } else {
+            Ok(ColumnNullability {
+                nullable_due_to_join: false,
+                nullable_on_base: true,
+            })
+        }
+    }
+
+    /// Get two-level nullability for a column reference.
+    fn column_ref_nullability_detailed(
+        &self,
+        col_ref: &protobuf::ColumnRef,
+    ) -> anyhow::Result<ColumnNullability> {
+        let fields = &col_ref.fields;
+
+        match fields.len() {
+            1 => {
+                if let Some(protobuf::node::Node::String(name)) = &fields[0].node {
+                    // Check if it's a table alias (whole-row reference)
+                    if let Some(table_info) = self.alias_map.get(&name.sval) {
+                        match table_info {
+                            TableInfo::Table { is_nullable, .. }
+                            | TableInfo::View { is_nullable, .. } => {
+                                return Ok(ColumnNullability {
+                                    nullable_due_to_join: *is_nullable,
+                                    nullable_on_base: false,
+                                });
+                            }
+                        }
+                    }
+
+                    // Single column name, try single-table case
+                    if self.alias_map.len() == 1 {
+                        if let Some((_, table_info)) = self.alias_map.iter().next() {
+                            match table_info {
+                                TableInfo::Table {
+                                    schema,
+                                    name: table_name,
+                                    is_nullable,
+                                    ..
+                                } => {
+                                    if let Some(rel) = self.find_relation(schema, table_name) {
+                                        let base_not_null =
+                                            self.is_column_not_null(rel, &name.sval);
+                                        return Ok(ColumnNullability {
+                                            nullable_due_to_join: *is_nullable,
+                                            nullable_on_base: !base_not_null,
+                                        });
+                                    }
+                                }
+                                TableInfo::View {
+                                    nullability,
+                                    is_nullable,
+                                    ..
+                                } => {
+                                    if let Some(cn) = nullability.get(&name.sval) {
+                                        return Ok(ColumnNullability {
+                                            nullable_due_to_join: *is_nullable
+                                                || cn.nullable_due_to_join,
+                                            nullable_on_base: cn.nullable_on_base,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Conservative default
+                    Ok(ColumnNullability {
+                        nullable_due_to_join: false,
+                        nullable_on_base: true,
+                    })
+                } else {
+                    Ok(ColumnNullability {
+                        nullable_due_to_join: false,
+                        nullable_on_base: true,
+                    })
+                }
+            }
+            2 => {
+                if let Some(protobuf::node::Node::String(table_ref)) = &fields[0].node {
+                    if let Some(protobuf::node::Node::String(col_name)) = &fields[1].node {
+                        // Normal table.column reference
+                        if let Some(table_info) = self.alias_map.get(&table_ref.sval) {
+                            match table_info {
+                                TableInfo::Table {
+                                    schema,
+                                    name,
+                                    is_nullable,
+                                    ..
+                                } => {
+                                    if let Some(rel) = self.find_relation(schema, name) {
+                                        let base_not_null =
+                                            self.is_column_not_null(rel, &col_name.sval);
+                                        return Ok(ColumnNullability {
+                                            nullable_due_to_join: *is_nullable,
+                                            nullable_on_base: !base_not_null,
+                                        });
+                                    }
+                                }
+                                TableInfo::View {
+                                    nullability,
+                                    is_nullable,
+                                    ..
+                                } => {
+                                    if let Some(cn) = nullability.get(&col_name.sval) {
+                                        return Ok(ColumnNullability {
+                                            nullable_due_to_join: *is_nullable
+                                                || cn.nullable_due_to_join,
+                                            nullable_on_base: cn.nullable_on_base,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        // Not found — conservative
+                        Ok(ColumnNullability {
+                            nullable_due_to_join: false,
+                            nullable_on_base: true,
+                        })
+                    } else {
+                        // Whole-row reference (table.*)
+                        if let Some(table_info) = self.alias_map.get(&table_ref.sval) {
+                            match table_info {
+                                TableInfo::Table { is_nullable, .. }
+                                | TableInfo::View { is_nullable, .. } => {
+                                    return Ok(ColumnNullability {
+                                        nullable_due_to_join: *is_nullable,
+                                        nullable_on_base: false,
+                                    });
+                                }
+                            }
+                        }
+                        Ok(ColumnNullability {
+                            nullable_due_to_join: false,
+                            nullable_on_base: true,
+                        })
+                    }
+                } else {
+                    Ok(ColumnNullability {
+                        nullable_due_to_join: false,
+                        nullable_on_base: true,
+                    })
+                }
+            }
+            _ => Ok(ColumnNullability {
+                nullable_due_to_join: false,
+                nullable_on_base: true,
+            }),
+        }
     }
 
     fn is_column_ref_nullable(&self, col_ref: &protobuf::ColumnRef) -> anyhow::Result<bool> {
@@ -511,8 +819,8 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                                     }
                                 }
                                 TableInfo::View { nullability, .. } => {
-                                    if let Some(&is_not_null) = nullability.get(&name.sval) {
-                                        return Ok(!is_not_null);
+                                    if let Some(cn) = nullability.get(&name.sval) {
+                                        return Ok(cn.is_nullable());
                                     }
                                 }
                             }
@@ -562,8 +870,8 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                                     }
 
                                     // Look up column nullability from cached view results
-                                    if let Some(&is_not_null) = nullability.get(&col_name.sval) {
-                                        return Ok(!is_not_null);
+                                    if let Some(cn) = nullability.get(&col_name.sval) {
+                                        return Ok(cn.is_nullable());
                                     }
                                 }
                             }
@@ -1022,6 +1330,28 @@ mod tests {
     use crate::pg_id::PgId;
     use crate::pg_rel::PgRelKind;
 
+    /// Helper: assert a column is NOT NULL (neither join-nullable nor base-nullable)
+    fn assert_not_null(result: &IndexMap<String, ColumnNullability>, col: &str) {
+        let cn = result.get(col).unwrap_or_else(|| panic!("column '{}' not found", col));
+        assert!(
+            cn.is_not_null(),
+            "expected '{}' to be NOT NULL, got {:?}",
+            col,
+            cn
+        );
+    }
+
+    /// Helper: assert a column is nullable (for any reason)
+    fn assert_nullable(result: &IndexMap<String, ColumnNullability>, col: &str) {
+        let cn = result.get(col).unwrap_or_else(|| panic!("column '{}' not found", col));
+        assert!(
+            cn.is_nullable(),
+            "expected '{}' to be nullable, got {:?}",
+            col,
+            cn
+        );
+    }
+
     fn create_test_rel_index() -> RelIndex {
         let mut rel_index = RelIndex::default();
 
@@ -1079,9 +1409,9 @@ mod tests {
         let result = analyzer.analyze_view(view_def, &columns).unwrap();
 
         // id and email should be NOT NULL, name should be nullable
-        assert_eq!(result.get("id"), Some(&true));
-        assert_eq!(result.get("name"), Some(&false));
-        assert_eq!(result.get("email"), Some(&true));
+        assert_not_null(&result, "id");
+        assert_nullable(&result, "name");
+        assert_not_null(&result, "email");
     }
 
     #[test]
@@ -1090,17 +1420,50 @@ mod tests {
         let cache = ViewNullabilityCache::new();
         let mut analyzer = ViewNullabilityAnalyzer::new(&rel_index, &cache);
 
-        let view_def = "SELECT u.id, u.name, p.title 
-                        FROM users u 
+        let view_def = "SELECT u.id, u.name, p.title
+                        FROM users u
                         LEFT JOIN posts p ON u.id = p.user_id";
         let columns = vec!["id".to_string(), "name".to_string(), "title".to_string()];
 
         let result = analyzer.analyze_view(view_def, &columns).unwrap();
 
-        // u.id should be NOT NULL, u.name and p.title should be nullable (p.title due to LEFT JOIN)
-        assert_eq!(result.get("id"), Some(&true));
-        assert_eq!(result.get("name"), Some(&false));
-        assert_eq!(result.get("title"), Some(&false)); // nullable due to LEFT JOIN
+        // u.id should be NOT NULL, u.name nullable on base, p.title nullable due to LEFT JOIN
+        assert_not_null(&result, "id");
+        assert_nullable(&result, "name");
+        let title_cn = result.get("title").unwrap();
+        assert!(title_cn.nullable_due_to_join, "title should be join-nullable");
+    }
+
+    #[test]
+    fn test_left_join_two_level_nullability() {
+        let rel_index = create_test_rel_index();
+        let cache = ViewNullabilityCache::new();
+        let mut analyzer = ViewNullabilityAnalyzer::new(&rel_index, &cache);
+
+        // posts.id is NOT NULL, posts.title is nullable
+        let view_def = "SELECT u.id, p.id as post_id, p.title
+                        FROM users u
+                        LEFT JOIN posts p ON u.id = p.user_id";
+        let columns = vec![
+            "id".to_string(),
+            "post_id".to_string(),
+            "title".to_string(),
+        ];
+
+        let result = analyzer.analyze_view(view_def, &columns).unwrap();
+
+        // u.id: NOT NULL
+        assert_not_null(&result, "id");
+
+        // p.id (as post_id): nullable_due_to_join=true, nullable_on_base=false
+        let post_id = result.get("post_id").unwrap();
+        assert!(post_id.nullable_due_to_join);
+        assert!(!post_id.nullable_on_base);
+
+        // p.title: nullable_due_to_join=true, nullable_on_base=true
+        let title = result.get("title").unwrap();
+        assert!(title.nullable_due_to_join);
+        assert!(title.nullable_on_base);
     }
 
     #[test]
@@ -1115,8 +1478,8 @@ mod tests {
         let result = analyzer.analyze_view(view_def, &columns).unwrap();
 
         // COUNT should be NOT NULL, MAX can be NULL
-        assert_eq!(result.get("total"), Some(&true));
-        assert_eq!(result.get("max_id"), Some(&false));
+        assert_not_null(&result, "total");
+        assert_nullable(&result, "max_id");
     }
 
     #[test]
@@ -1131,8 +1494,8 @@ mod tests {
         let result = analyzer.analyze_view(view_def, &columns).unwrap();
 
         // Constants are always NOT NULL
-        assert_eq!(result.get("one"), Some(&true));
-        assert_eq!(result.get("greeting"), Some(&true));
-        assert_eq!(result.get("id"), Some(&true));
+        assert_not_null(&result, "one");
+        assert_not_null(&result, "greeting");
+        assert_not_null(&result, "id");
     }
 }

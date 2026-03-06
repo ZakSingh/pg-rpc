@@ -56,6 +56,7 @@ pub struct PgArg {
     pub type_oid: OID,
     pub has_default: bool,
     pub nullable: bool,
+    pub nullable_due_to_join: bool,
 }
 
 /// Parse @pgrpc_not_null(param_name) annotations from function comments
@@ -691,13 +692,13 @@ impl PgFn {
                     }
 
                     // Apply inferred nullability
-                    if let Some(&is_not_null) = nullability_map.get(&out_arg.name) {
-                        out_arg.nullable = !is_not_null;
+                    if let Some(cn) = nullability_map.get(&out_arg.name) {
+                        out_arg.nullable = cn.is_nullable();
                         log::debug!(
                             "Function {}: OUT param {} inferred as {}",
                             self.name,
                             out_arg.name,
-                            if is_not_null { "NOT NULL" } else { "NULLABLE" }
+                            if cn.is_not_null() { "NOT NULL" } else { "NULLABLE" }
                         );
                     }
                 }
@@ -754,6 +755,7 @@ impl PgFn {
                             type_oid,
                             has_default: arg_defaults.get(args.len()).copied().unwrap_or(false),
                             nullable: false, // IN parameters are never nullable in function signatures
+                            nullable_due_to_join: false,
                         });
                     }
                     _ => {} // Skip for now
@@ -769,6 +771,7 @@ impl PgFn {
                         type_oid,
                         has_default: false,
                         nullable: !not_null_params.contains(name),
+                        nullable_due_to_join: false,
                     });
                 }
             }
@@ -780,6 +783,7 @@ impl PgFn {
                     type_oid: oid,
                     has_default,
                     nullable: false, // IN parameters are never nullable
+                    nullable_due_to_join: false,
                 })
                 .collect();
         }
@@ -1249,78 +1253,17 @@ impl ToRust for PgFn {
             } else {
                 self.out_params_struct_name()
             };
-            let field_tokens: Vec<TokenStream> = self
-                .out_args
-                .iter()
-                .map(|arg| {
-                    let field_name = arg.rs_out_name();
 
-                    // Strip 'o_' prefix to get the clean name for serialization
-                    let clean_name = if arg.name.starts_with("o_") {
-                        &arg.name[2..]
-                    } else {
-                        &arg.name
-                    };
+            // Check if any out_args use double-underscore naming for grouping
+            let has_grouped = self.out_args.iter().any(|a| {
+                let clean = if a.name.starts_with("o_") { &a.name[2..] } else { &a.name };
+                clean.contains("__")
+            });
 
-                    // Only add serde rename if the Rust name differs from the clean PostgreSQL name
-                    let rs_name_str = sql_to_rs_string(clean_name, CaseType::Snake);
-                    let needs_rename = rs_name_str != clean_name;
-
-                    let base_type = match types.get(&arg.type_oid).unwrap() {
-                        PgType::Int16 => quote! { i16 },
-                        PgType::Int32 => quote! { i32 },
-                        PgType::Int64 => quote! { i64 },
-                        PgType::Bool => quote! { bool },
-                        PgType::Text => quote! { String },
-                        t => {
-                            let id = t.to_rust_ident(types);
-                            quote! { #id }
-                        }
-                    };
-                    let field_type = if arg.nullable {
-                        quote! { Option<#base_type> }
-                    } else {
-                        base_type
-                    };
-
-                    let serde_attr = match (needs_rename, arg.nullable) {
-                        (true, true) => quote! { #[serde(rename = #clean_name, default)] },
-                        (true, false) => quote! { #[serde(rename = #clean_name)] },
-                        (false, true) => quote! { #[serde(default)] },
-                        (false, false) => quote! {},
-                    };
-
-                    quote! {
-                        #serde_attr
-                        pub #field_name: #field_type
-                    }
-                })
-                .collect();
-
-            let field_names: Vec<TokenStream> = self
-                .out_args
-                .iter()
-                .map(|arg| arg.rs_out_name())
-                .collect();
-            let field_indices: Vec<usize> = (0..self.out_args.len()).collect();
-
-            quote! {
-                #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-                pub struct #struct_name {
-                    #(#field_tokens),*
-                }
-
-                impl TryFrom<tokio_postgres::Row> for #struct_name {
-                    type Error = tokio_postgres::Error;
-
-                    fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
-                        Ok(Self {
-                            #(
-                                #field_names: row.try_get(#field_indices)?,
-                            )*
-                        })
-                    }
-                }
+            if has_grouped {
+                self.generate_grouped_out_struct(&struct_name, types)
+            } else {
+                self.generate_flat_out_struct(&struct_name, types)
             }
         } else {
             quote! {}
@@ -1352,6 +1295,270 @@ impl ToRust for PgFn {
                 client: &impl deadpool_postgres::GenericClient,
                 #(#args),*) -> Result<#return_type, #err_type> {
                 #fn_body
+            }
+        }
+    }
+}
+
+impl PgFn {
+    /// Generate a flat (non-grouped) struct for OUT parameters / RETURN TABLE
+    fn generate_flat_out_struct(
+        &self,
+        struct_name: &TokenStream,
+        types: &BTreeMap<OID, PgType>,
+    ) -> TokenStream {
+        let field_tokens: Vec<TokenStream> = self
+            .out_args
+            .iter()
+            .map(|arg| {
+                let field_name = arg.rs_out_name();
+                let clean_name = if arg.name.starts_with("o_") {
+                    &arg.name[2..]
+                } else {
+                    &arg.name
+                };
+                let rs_name_str = sql_to_rs_string(clean_name, CaseType::Snake);
+                let needs_rename = rs_name_str != clean_name;
+
+                let base_type = Self::arg_base_type(arg, types);
+                let field_type = if arg.nullable {
+                    quote! { Option<#base_type> }
+                } else {
+                    base_type
+                };
+
+                let serde_attr = match (needs_rename, arg.nullable) {
+                    (true, true) => quote! { #[serde(rename = #clean_name, default)] },
+                    (true, false) => quote! { #[serde(rename = #clean_name)] },
+                    (false, true) => quote! { #[serde(default)] },
+                    (false, false) => quote! {},
+                };
+
+                quote! {
+                    #serde_attr
+                    pub #field_name: #field_type
+                }
+            })
+            .collect();
+
+        let field_names: Vec<TokenStream> = self
+            .out_args
+            .iter()
+            .map(|arg| arg.rs_out_name())
+            .collect();
+        let field_indices: Vec<usize> = (0..self.out_args.len()).collect();
+
+        quote! {
+            #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+            pub struct #struct_name {
+                #(#field_tokens),*
+            }
+
+            impl TryFrom<tokio_postgres::Row> for #struct_name {
+                type Error = tokio_postgres::Error;
+
+                fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                    Ok(Self {
+                        #(
+                            #field_names: row.try_get(#field_indices)?,
+                        )*
+                    })
+                }
+            }
+        }
+    }
+
+    /// Generate a grouped struct for OUT parameters / RETURN TABLE when `__` columns are present
+    fn generate_grouped_out_struct(
+        &self,
+        struct_name: &TokenStream,
+        types: &BTreeMap<OID, PgType>,
+    ) -> TokenStream {
+        use crate::column_grouping::{group_by_double_underscore, GroupedField};
+
+        // Build indexed args with clean names (strip o_ prefix)
+        let indexed_args: Vec<(usize, PgArg)> = self
+            .out_args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let mut arg = a.clone();
+                // Strip o_ prefix for clean naming
+                if arg.name.starts_with("o_") {
+                    arg.name = arg.name[2..].to_string();
+                }
+                (i, arg)
+            })
+            .collect();
+
+        let grouped = group_by_double_underscore(
+            indexed_args,
+            |(_i, a)| &a.name,
+            |(_i, a)| a.nullable_due_to_join,
+            |(_, a), new_name| a.name = new_name,
+        );
+
+        let mut nested_struct_defs: Vec<TokenStream> = Vec::new();
+        let mut parent_fields: Vec<TokenStream> = Vec::new();
+        let mut parent_field_assignments: Vec<TokenStream> = Vec::new();
+
+        for grouped_field in &grouped {
+            match grouped_field {
+                GroupedField::Plain((idx, arg)) => {
+                    let field_name = sql_to_rs_ident(&arg.name, CaseType::Snake);
+                    let clean_name = &arg.name;
+                    let rs_name_str = sql_to_rs_string(clean_name, CaseType::Snake);
+                    let needs_rename = rs_name_str != *clean_name;
+
+                    let base_type = Self::arg_base_type(arg, types);
+                    let field_type = if arg.nullable {
+                        quote! { Option<#base_type> }
+                    } else {
+                        base_type
+                    };
+
+                    let serde_attr = match (needs_rename, arg.nullable) {
+                        (true, true) => quote! { #[serde(rename = #clean_name, default)] },
+                        (true, false) => quote! { #[serde(rename = #clean_name)] },
+                        (false, true) => quote! { #[serde(default)] },
+                        (false, false) => quote! {},
+                    };
+
+                    parent_fields.push(quote! {
+                        #serde_attr
+                        pub #field_name: #field_type
+                    });
+                    parent_field_assignments.push(quote! {
+                        #field_name: row.try_get(#idx)?
+                    });
+                }
+                GroupedField::Group {
+                    group_name,
+                    fields,
+                    optional,
+                } => {
+                    let nested_struct_name = format_ident!(
+                        "{}{}",
+                        struct_name.to_string(),
+                        sql_to_rs_ident(group_name, CaseType::Pascal).to_string()
+                    );
+                    let group_field_name = sql_to_rs_ident(group_name, CaseType::Snake);
+
+                    // Generate nested struct fields
+                    let nested_fields: Vec<TokenStream> = fields
+                        .iter()
+                        .map(|(_idx, arg)| {
+                            // Nested struct fields use their natural nullability:
+                            // nullable on base OR nullable due to join.
+                            let inner_nullable = arg.nullable || arg.nullable_due_to_join;
+
+                            let f_name = sql_to_rs_ident(&arg.name, CaseType::Snake);
+                            let col_name = &arg.name;
+                            let rs_name_str = sql_to_rs_string(col_name, CaseType::Snake);
+                            let needs_rename = rs_name_str != *col_name;
+
+                            let base_type = Self::arg_base_type(arg, types);
+                            let field_type = if inner_nullable {
+                                quote! { Option<#base_type> }
+                            } else {
+                                base_type
+                            };
+
+                            let serde_attr = match (needs_rename, inner_nullable) {
+                                (true, true) => {
+                                    quote! { #[serde(rename = #col_name, default)] }
+                                }
+                                (true, false) => quote! { #[serde(rename = #col_name)] },
+                                (false, true) => quote! { #[serde(default)] },
+                                (false, false) => quote! {},
+                            };
+
+                            quote! {
+                                #serde_attr
+                                pub #f_name: #field_type
+                            }
+                        })
+                        .collect();
+
+                    // Generate nested struct field assignments from row indices
+                    let nested_assignments: Vec<TokenStream> = fields
+                        .iter()
+                        .map(|(idx, arg)| {
+                            let f_name = sql_to_rs_ident(&arg.name, CaseType::Snake);
+                            quote! { #f_name: row.try_get(#idx)? }
+                        })
+                        .collect();
+
+                    nested_struct_defs.push(quote! {
+                        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+                        pub struct #nested_struct_name {
+                            #(#nested_fields),*
+                        }
+                    });
+
+                    if *optional {
+                        let first_idx = fields[0].0;
+                        let group_type = quote! { Option<#nested_struct_name> };
+
+                        parent_fields.push(quote! {
+                            pub #group_field_name: #group_type
+                        });
+
+                        parent_field_assignments.push(quote! {
+                            #group_field_name: if row.try_get::<usize, Option<serde_json::Value>>(#first_idx)?.is_none() {
+                                None
+                            } else {
+                                Some(#nested_struct_name {
+                                    #(#nested_assignments),*
+                                })
+                            }
+                        });
+                    } else {
+                        parent_fields.push(quote! {
+                            pub #group_field_name: #nested_struct_name
+                        });
+
+                        parent_field_assignments.push(quote! {
+                            #group_field_name: #nested_struct_name {
+                                #(#nested_assignments),*
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        quote! {
+            #(#nested_struct_defs)*
+
+            #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+            pub struct #struct_name {
+                #(#parent_fields),*
+            }
+
+            impl TryFrom<tokio_postgres::Row> for #struct_name {
+                type Error = tokio_postgres::Error;
+
+                fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                    Ok(Self {
+                        #(#parent_field_assignments),*
+                    })
+                }
+            }
+        }
+    }
+
+    /// Get the Rust base type for a PgArg
+    fn arg_base_type(arg: &PgArg, types: &BTreeMap<OID, PgType>) -> TokenStream {
+        match types.get(&arg.type_oid).unwrap() {
+            PgType::Int16 => quote! { i16 },
+            PgType::Int32 => quote! { i32 },
+            PgType::Int64 => quote! { i64 },
+            PgType::Bool => quote! { bool },
+            PgType::Text => quote! { String },
+            t => {
+                let id = t.to_rust_ident(types);
+                quote! { #id }
             }
         }
     }
@@ -1631,12 +1838,14 @@ mod test {
                         name: "id".to_string(),
                         type_oid: 23, // INT4
                         nullable: false,
+                        nullable_due_to_join: false,
                         comment: None,
                     },
                     PgField {
                         name: "name".to_string(),
                         type_oid: 25, // TEXT
                         nullable: true,
+                        nullable_due_to_join: false,
                         comment: None,
                     },
                 ],

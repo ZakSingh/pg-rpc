@@ -27,6 +27,8 @@ pub enum OnDelete {
 pub struct CheckConstraint {
     pub(crate) name: Ustr,
     pub(crate) columns: SmallVec<Ustr, 2>,
+    #[serde(default)]
+    pub(crate) check_expression: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
@@ -34,6 +36,12 @@ pub struct ForeignKeyConstraint {
     pub(crate) name: Ustr,
     pub(crate) columns: SmallVec<Ustr, 2>,
     pub(crate) on_delete: OnDelete,
+    /// The referenced table name (schema-qualified if not in search_path)
+    #[serde(default)]
+    pub(crate) ref_table: Option<String>,
+    /// The referenced columns in the foreign table
+    #[serde(default)]
+    pub(crate) ref_columns: Option<SmallVec<Ustr, 2>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]

@@ -1,10 +1,22 @@
 use crate::codegen::OID;
+use crate::parse_check_enum::parse_check_as_enum;
+use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
 use crate::pg_rel::PgRel;
 use anyhow::Context;
 use postgres::Client;
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
+
+/// Information about an enum type inferred from a CHECK constraint
+#[derive(Debug, Clone)]
+pub struct CheckEnumTypeInfo {
+    pub schema: String,
+    pub table_name: String,
+    pub column_name: String,
+    pub constraint_name: String,
+    pub variants: Vec<String>,
+}
 
 const RELATION_INTROSPECTION_QUERY: &'static str =
     include_str!("./queries/relation_introspection.sql");
@@ -105,5 +117,43 @@ impl RelIndex {
                     .position(|c| c.as_str() == column_name)
                     .and_then(|idx| rel.column_types.get(idx).copied())
             })
+    }
+
+    /// Extract CHECK constraint enum information from all relations.
+    /// Returns enum info for single-column CHECK constraints that match
+    /// patterns like `col IN ('a', 'b', 'c')` or `col = 'a' OR col = 'b'`.
+    pub fn get_check_enum_infos(&self) -> Vec<CheckEnumTypeInfo> {
+        let mut infos = Vec::new();
+
+        for rel in self.values() {
+            let schema = rel.id.schema().to_string();
+            let table_name = rel.id.name().to_string();
+
+            for constraint in &rel.constraints {
+                if let Constraint::Check(check) = constraint {
+                    // Only process single-column CHECK constraints
+                    if check.columns.len() != 1 {
+                        continue;
+                    }
+
+                    if let Some(ref check_expr) = check.check_expression {
+                        let column_refs: Vec<&str> =
+                            check.columns.iter().map(|c| c.as_str()).collect();
+
+                        if let Some(enum_info) = parse_check_as_enum(check_expr, &column_refs) {
+                            infos.push(CheckEnumTypeInfo {
+                                schema: schema.clone(),
+                                table_name: table_name.clone(),
+                                column_name: enum_info.column,
+                                constraint_name: check.name.to_string(),
+                                variants: enum_info.variants,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        infos
     }
 }

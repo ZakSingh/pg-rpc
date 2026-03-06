@@ -4,6 +4,7 @@ use std::sync::{Mutex, Once};
 use testcontainers_modules::{postgres as postgres_module, testcontainers::runners::SyncRunner};
 use uuid::Uuid;
 
+pub mod check_enum_tests;
 pub mod codegen_tests;
 pub mod compile_helpers;
 pub mod composite_fromsql_tests;

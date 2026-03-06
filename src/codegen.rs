@@ -89,7 +89,7 @@ pub fn codegen_split(
     rel_index: &RelIndex,
     config: &Config,
 ) -> anyhow::Result<BTreeMap<SchemaName, String>> {
-    let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
+    let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n#![allow(non_snake_case)]\n\n";
 
     // Generate unified error types
     let (error_types_code, all_exceptions) = generate_unified_errors(fn_index, rel_index, config);
@@ -1595,8 +1595,231 @@ fn generate_datetime_serde_attr(pg_type: &PgType, nullable: bool) -> Option<Toke
     }
 }
 
-/// Generate a row struct for query results
+/// Generate a row struct for query results.
+///
+/// Columns with double-underscore names (`prefix__field`) are automatically
+/// grouped into nested structs.
 fn generate_row_struct(
+    struct_name: &proc_macro2::Ident,
+    columns: &[crate::query_introspector::QueryColumn],
+    type_index: &TypeIndex,
+) -> TokenStream {
+    use crate::column_grouping::{group_by_double_underscore, GroupedField};
+    use crate::ident::{sql_to_rs_ident, CaseType};
+    use crate::query_introspector::QueryColumn;
+
+    // Track original indices before grouping (needed for TryFrom<Row>)
+    let indexed_columns: Vec<(usize, QueryColumn)> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, c.clone()))
+        .collect();
+
+    let grouped = group_by_double_underscore(
+        indexed_columns,
+        |(_i, c)| &c.name,
+        |(_i, c)| c.nullable_due_to_join,
+        |(_, c), new_name| c.name = new_name,
+    );
+
+    // Check if any grouping actually happened
+    let has_groups = grouped.iter().any(|g| matches!(g, GroupedField::Group { .. }));
+
+    if !has_groups {
+        // No double-underscore columns — use original flat codegen
+        return generate_row_struct_flat(struct_name, columns, type_index);
+    }
+
+    // Generate nested structs and parent fields
+    let mut nested_struct_defs: Vec<TokenStream> = Vec::new();
+    let mut parent_fields: Vec<TokenStream> = Vec::new();
+    let mut parent_field_assignments: Vec<TokenStream> = Vec::new();
+
+    for grouped_field in &grouped {
+        match grouped_field {
+            GroupedField::Plain((idx, col)) => {
+                let field_name = quote::format_ident!(
+                    "{}",
+                    sql_to_rs_ident(&col.name, CaseType::Snake).to_string()
+                );
+                let field_type = get_column_type(col, type_index);
+                let column_name = &col.name;
+
+                let datetime_serde_attr = type_index
+                    .get(&col.type_oid)
+                    .and_then(|pt| generate_datetime_serde_attr(pt, col.nullable));
+
+                let serde_attr = match (datetime_serde_attr, col.nullable) {
+                    (Some(attr), true) => quote! {
+                        #[serde(rename = #column_name, default)]
+                        #attr
+                    },
+                    (Some(attr), false) => quote! {
+                        #[serde(rename = #column_name)]
+                        #attr
+                    },
+                    (None, true) => quote! {
+                        #[serde(rename = #column_name, default)]
+                    },
+                    (None, false) => quote! {
+                        #[serde(rename = #column_name)]
+                    },
+                };
+
+                parent_fields.push(quote! {
+                    #serde_attr
+                    pub #field_name: #field_type
+                });
+
+                parent_field_assignments.push(quote! {
+                    #field_name: row.try_get(#idx)?
+                });
+            }
+            GroupedField::Group {
+                group_name,
+                fields,
+                optional,
+            } => {
+                let nested_struct_name = quote::format_ident!(
+                    "{}{}",
+                    struct_name,
+                    sql_to_rs_ident(group_name, CaseType::Pascal).to_string()
+                );
+                let group_field_name = quote::format_ident!(
+                    "{}",
+                    sql_to_rs_ident(group_name, CaseType::Snake).to_string()
+                );
+
+                // Generate nested struct fields.
+                // When the group is optional, inner field nullability uses base-only
+                // (strip join-nullability).
+                let nested_fields: Vec<TokenStream> = fields
+                    .iter()
+                    .map(|(_idx, col)| {
+                        // Nested struct fields use their natural nullability:
+                        // nullable on base OR nullable due to join.
+                        let inner_nullable = col.nullable || col.nullable_due_to_join;
+
+                        let inner_col = QueryColumn {
+                            name: col.name.clone(),
+                            type_oid: col.type_oid,
+                            nullable: inner_nullable,
+                            nullable_due_to_join: false,
+                        };
+
+                        let f_name = quote::format_ident!(
+                            "{}",
+                            sql_to_rs_ident(&col.name, CaseType::Snake).to_string()
+                        );
+                        let f_type = get_column_type(&inner_col, type_index);
+                        let col_name = &col.name;
+
+                        let datetime_serde_attr = type_index
+                            .get(&col.type_oid)
+                            .and_then(|pt| generate_datetime_serde_attr(pt, inner_nullable));
+
+                        let serde_attr = match (datetime_serde_attr, inner_nullable) {
+                            (Some(attr), true) => quote! {
+                                #[serde(rename = #col_name, default)]
+                                #attr
+                            },
+                            (Some(attr), false) => quote! {
+                                #[serde(rename = #col_name)]
+                                #attr
+                            },
+                            (None, true) => quote! {
+                                #[serde(rename = #col_name, default)]
+                            },
+                            (None, false) => quote! {
+                                #[serde(rename = #col_name)]
+                            },
+                        };
+
+                        quote! {
+                            #serde_attr
+                            pub #f_name: #f_type
+                        }
+                    })
+                    .collect();
+
+                // Generate the nested struct's field assignments from row indices
+                let nested_assignments: Vec<TokenStream> = fields
+                    .iter()
+                    .map(|(idx, col)| {
+                        let f_name = quote::format_ident!(
+                            "{}",
+                            sql_to_rs_ident(&col.name, CaseType::Snake).to_string()
+                        );
+                        quote! { #f_name: row.try_get(#idx)? }
+                    })
+                    .collect();
+
+                nested_struct_defs.push(quote! {
+                    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+                    pub struct #nested_struct_name {
+                        #(#nested_fields),*
+                    }
+                });
+
+                if *optional {
+                    // For optional groups: check if ALL grouped columns are NULL.
+                    // Use the first column as sentinel — if it's NULL, the whole
+                    // group is NULL (since they come from the same LEFT JOIN'd table).
+                    let first_idx = fields[0].0;
+
+                    let group_type = quote! { Option<#nested_struct_name> };
+
+                    parent_fields.push(quote! {
+                        pub #group_field_name: #group_type
+                    });
+
+                    parent_field_assignments.push(quote! {
+                        #group_field_name: if row.try_get::<usize, Option<serde_json::Value>>(#first_idx)?.is_none() {
+                            None
+                        } else {
+                            Some(#nested_struct_name {
+                                #(#nested_assignments),*
+                            })
+                        }
+                    });
+                } else {
+                    parent_fields.push(quote! {
+                        pub #group_field_name: #nested_struct_name
+                    });
+
+                    parent_field_assignments.push(quote! {
+                        #group_field_name: #nested_struct_name {
+                            #(#nested_assignments),*
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    quote! {
+        #(#nested_struct_defs)*
+
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        pub struct #struct_name {
+            #(#parent_fields),*
+        }
+
+        impl TryFrom<tokio_postgres::Row> for #struct_name {
+            type Error = tokio_postgres::Error;
+
+            fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                Ok(Self {
+                    #(#parent_field_assignments),*
+                })
+            }
+        }
+    }
+}
+
+/// Generate a flat row struct (no double-underscore grouping).
+/// This is the original implementation, used when no grouping is needed.
+fn generate_row_struct_flat(
     struct_name: &proc_macro2::Ident,
     columns: &[crate::query_introspector::QueryColumn],
     type_index: &TypeIndex,
@@ -1606,18 +1829,17 @@ fn generate_row_struct(
     let fields: Vec<TokenStream> = columns
         .iter()
         .map(|col| {
-            let field_name = quote::format_ident!("{}", sql_to_rs_ident(&col.name, CaseType::Snake).to_string());
+            let field_name = quote::format_ident!(
+                "{}",
+                sql_to_rs_ident(&col.name, CaseType::Snake).to_string()
+            );
             let field_type = get_column_type(col, type_index);
             let column_name = &col.name;
 
-            // Generate datetime serde attribute if needed
-            let datetime_serde_attr = if let Some(pg_type) = type_index.get(&col.type_oid) {
-                generate_datetime_serde_attr(pg_type, col.nullable)
-            } else {
-                None
-            };
+            let datetime_serde_attr = type_index
+                .get(&col.type_oid)
+                .and_then(|pt| generate_datetime_serde_attr(pt, col.nullable));
 
-            // Generate serde attributes
             let serde_attr = match (datetime_serde_attr, col.nullable) {
                 (Some(attr), true) => quote! {
                     #[serde(rename = #column_name, default)]
@@ -1645,7 +1867,12 @@ fn generate_row_struct(
     let field_indices: Vec<usize> = (0..columns.len()).collect();
     let field_names: Vec<proc_macro2::Ident> = columns
         .iter()
-        .map(|col| quote::format_ident!("{}", sql_to_rs_ident(&col.name, CaseType::Snake).to_string()))
+        .map(|col| {
+            quote::format_ident!(
+                "{}",
+                sql_to_rs_ident(&col.name, CaseType::Snake).to_string()
+            )
+        })
         .collect();
 
     quote! {

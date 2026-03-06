@@ -75,13 +75,41 @@ with recursive user_relations as (
                             join pg_constraint dc on dc.contypid = t.oid
                    where cth.element_typtype = 'd'
                ),
+               unique_indexes as (
+                   select i.indrelid as oid,
+                          json_build_object(
+                                  'name', c.relname::text,
+                                  'type', 'u',
+                                  'columns', (
+                                      select array_agg(a.attname order by array_position(i.indkey::int[], a.attnum::int))
+                                      from pg_attribute a
+                                      where a.attrelid = i.indrelid
+                                        and a.attnum = any(i.indkey)
+                                  )
+                          )::json as constraint_info
+                   from pg_index i
+                            join pg_class c on c.oid = i.indexrelid
+                   where i.indisunique
+                     and not i.indisprimary
+                     -- Exclude expression indexes (no direct column references)
+                     and i.indexprs is null
+                     -- Exclude partial indexes (would require checking if query WHERE implies index predicate)
+                     and i.indpred is null
+                     -- Exclude indexes that back a constraint (already captured via pg_constraint)
+                     and not exists (
+                       select 1 from pg_constraint con
+                       where con.conindid = i.indexrelid
+                     )
+                     and i.indrelid in (select ur.oid from user_relations ur)
+               ),
                all_constraints as (
                    -- Regular constraints (non-foreign keys)
                    select ur.oid,
                           json_build_object('name', con.conname::text, 'type', con.contype::text, 'columns',
                                             (select array_agg(a.attname order by a.attnum)
                                              from unnest(con.conkey) k
-                                                      join pg_attribute a on a.attrelid = ur.oid and a.attnum = k))::json as constraint_info
+                                                      join pg_attribute a on a.attrelid = ur.oid and a.attnum = k),
+                                            'check_expression', case when con.contype = 'c' then pg_get_constraintdef(con.oid) end)::json as constraint_info
                    from user_relations ur
                             join pg_constraint con on con.conrelid = ur.oid
                    where con.contype not in ('f', 't')
@@ -91,12 +119,17 @@ with recursive user_relations as (
                    -- Foreign key constraints
                    select ur.oid,
                           json_build_object('name', con.conname::text, 'type', con.contype::text, 'columns',
-                                            (select array_agg(a.attname order by a.attnum)
+                                            (select array_agg(a.attname order by array_position(con.conkey::int[], a.attnum::int))
                                              from unnest(con.conkey) k
-                                                      join pg_attribute a on a.attrelid = ur.oid and a.attnum = k), 'on_delete',
-                                            con.confdeltype)::json as constraint_info
+                                                      join pg_attribute a on a.attrelid = ur.oid and a.attnum = k),
+                                            'on_delete', con.confdeltype,
+                                            'ref_table', ref_class.relname::text,
+                                            'ref_columns', (select array_agg(a.attname order by array_position(con.confkey::int[], a.attnum::int))
+                                                            from unnest(con.confkey) k
+                                                                     join pg_attribute a on a.attrelid = con.confrelid and a.attnum = k))::json as constraint_info
                    from user_relations ur
                             join pg_constraint con on con.conrelid = ur.oid
+                            join pg_class ref_class on ref_class.oid = con.confrelid
                    where con.contype = 'f'
 
                    union all
@@ -127,6 +160,11 @@ with recursive user_relations as (
 
                    -- Add domain constraints
                    select * from domain_constraints
+
+                   union all
+
+                   -- Unique indexes (not backing constraints)
+                   select * from unique_indexes
                ),
                grouped_constraints as (
                    select oid, array_agg(constraint_info) as constraints

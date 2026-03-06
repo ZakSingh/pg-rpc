@@ -33,6 +33,9 @@ pub struct QueryColumn {
     pub name: String,
     pub type_oid: OID,
     pub nullable: bool,
+    /// True if this column's nullability comes from a LEFT/RIGHT/FULL JOIN.
+    /// Used by double-underscore column grouping.
+    pub nullable_due_to_join: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +220,7 @@ impl<'a> QueryIntrospector<'a> {
                 name: col.name().to_string(),
                 type_oid: col.type_().oid(),
                 nullable: true, // Default to nullable, will be refined by analysis
+                nullable_due_to_join: false,
             })
             .collect();
 
@@ -275,8 +279,9 @@ impl<'a> QueryIntrospector<'a> {
         match analyzer.analyze_view(sql, &column_names) {
             Ok(nullability_map) => {
                 log::info!("[REFINE] ViewNullabilityAnalyzer results:");
-                for (name, is_not_null) in &nullability_map {
-                    log::info!("[REFINE]   {} -> is_not_null={} (nullable={})", name, is_not_null, !is_not_null);
+                for (name, cn) in &nullability_map {
+                    log::info!("[REFINE]   {} -> is_not_null={} (nullable={}, join_nullable={})",
+                        name, cn.is_not_null(), cn.is_nullable(), cn.nullable_due_to_join);
                 }
 
                 // Build a map of column name -> (table_name, inferred_type_oid) from the query
@@ -285,8 +290,13 @@ impl<'a> QueryIntrospector<'a> {
                 let refined_columns = columns
                     .iter()
                     .map(|col| {
-                        let is_not_null = nullability_map.get(&col.name).copied().unwrap_or(false);
-                        let new_nullable = !is_not_null;
+                        let cn = nullability_map.get(&col.name).copied().unwrap_or(
+                            crate::view_nullability::ColumnNullability {
+                                nullable_due_to_join: false,
+                                nullable_on_base: true,
+                            },
+                        );
+                        let new_nullable = cn.is_nullable();
 
                         // Try to get the actual column type from the table schema (preserves domains)
                         let refined_type_oid = column_type_map
@@ -300,6 +310,7 @@ impl<'a> QueryIntrospector<'a> {
                             name: col.name.clone(),
                             type_oid: refined_type_oid,
                             nullable: new_nullable,
+                            nullable_due_to_join: cn.nullable_due_to_join,
                         }
                     })
                     .collect();
@@ -465,6 +476,7 @@ impl<'a> QueryIntrospector<'a> {
                     name: col.name.clone(),
                     type_oid: refined_type_oid,
                     nullable,
+                    nullable_due_to_join: false, // DML targets a single table, no joins
                 }
             })
             .collect();

@@ -1,7 +1,7 @@
 use crate::annotations;
 use crate::codegen::OID;
 use crate::pg_type::PgType;
-use crate::rel_index::RelIndex;
+use crate::rel_index::{CheckEnumTypeInfo, RelIndex};
 use crate::view_nullability::{ViewNullabilityAnalyzer, ViewNullabilityCache};
 use anyhow::Context;
 use petgraph::algo::toposort;
@@ -13,20 +13,31 @@ use std::ops::{Deref, DerefMut};
 // Force recompilation with updated SQL
 const TYPES_INTROSPECTION_QUERY: &'static str = include_str!("./queries/type_introspection.sql");
 
+/// Starting OID for synthetic types (CHECK-inferred enums).
+/// Uses negative numbers to avoid collision with real PostgreSQL OIDs.
+const SYNTHETIC_OID_START: i64 = -1;
+
+/// Mapping from (schema, table, column) to synthetic OID for CHECK-inferred enums
+pub type CheckEnumColumnMapping = HashMap<(String, String, String), OID>;
+
 #[derive(Debug)]
-pub struct TypeIndex(BTreeMap<OID, PgType>);
+pub struct TypeIndex {
+    types: BTreeMap<OID, PgType>,
+    /// Mapping from (schema, table, column) to synthetic OID for CHECK-inferred enums
+    check_enum_columns: CheckEnumColumnMapping,
+}
 
 impl Deref for TypeIndex {
     type Target = BTreeMap<OID, PgType>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.types
     }
 }
 
 impl DerefMut for TypeIndex {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.types
     }
 }
 
@@ -39,7 +50,82 @@ impl TypeIndex {
             .map(|row| (row.get("oid"), PgType::try_from(row).unwrap()))
             .collect();
 
-        Ok(Self(types))
+        Ok(Self {
+            types,
+            check_enum_columns: HashMap::new(),
+        })
+    }
+
+    /// Create a TypeIndex with CHECK-inferred enum types.
+    /// This generates synthetic OIDs for enums inferred from CHECK constraints.
+    pub fn new_with_check_enums(
+        db: &mut Client,
+        type_oids: &[OID],
+        check_enums: &[CheckEnumTypeInfo],
+    ) -> anyhow::Result<Self> {
+        let mut index = Self::new(db, type_oids)?;
+        index.add_check_enums(check_enums);
+        Ok(index)
+    }
+
+    /// Add CHECK-inferred enum types to the index.
+    /// Generates synthetic OIDs (negative numbers) for each enum type.
+    pub fn add_check_enums(&mut self, check_enums: &[CheckEnumTypeInfo]) {
+        let mut next_synthetic_oid = SYNTHETIC_OID_START;
+
+        for info in check_enums {
+            // Generate enum name: {table}_{column}
+            let enum_name = format!("{}_{}", info.table_name, info.column_name);
+
+            // Use negative OID to avoid collision with real PostgreSQL OIDs
+            let synthetic_oid = next_synthetic_oid as OID;
+            next_synthetic_oid -= 1;
+
+            log::info!(
+                "Creating CHECK-inferred enum {}.{} (OID: {}) from constraint {} with variants: {:?}",
+                info.schema,
+                enum_name,
+                synthetic_oid,
+                info.constraint_name,
+                info.variants
+            );
+
+            // Create the enum type
+            let pg_type = PgType::CheckInferredEnum {
+                schema: info.schema.clone(),
+                name: enum_name,
+                variants: info.variants.clone(),
+                constraint_name: info.constraint_name.clone(),
+            };
+
+            // Insert into type map
+            self.types.insert(synthetic_oid, pg_type);
+
+            // Create column mapping
+            let key = (
+                info.schema.clone(),
+                info.table_name.clone(),
+                info.column_name.clone(),
+            );
+            self.check_enum_columns.insert(key, synthetic_oid);
+        }
+    }
+
+    /// Get the CHECK-inferred enum OID for a column, if any.
+    pub fn get_check_enum_oid(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Option<OID> {
+        self.check_enum_columns
+            .get(&(schema.to_string(), table.to_string(), column.to_string()))
+            .copied()
+    }
+
+    /// Get the column mapping for CHECK-inferred enums
+    pub fn check_enum_columns(&self) -> &CheckEnumColumnMapping {
+        &self.check_enum_columns
     }
 
     /// Apply view nullability inference to types that represent views
@@ -52,14 +138,14 @@ impl TypeIndex {
             return Ok(());
         }
 
-        log::info!("apply_view_nullability: checking {} types", self.0.len());
+        log::info!("apply_view_nullability: checking {} types", self.types.len());
 
         // First, collect all views and their schemas
         let mut views: HashMap<(Option<String>, String), (OID, String, Vec<String>)> =
             HashMap::new();
         let mut view_oids = HashSet::new();
 
-        for (oid, pg_type) in self.0.iter() {
+        for (oid, pg_type) in self.types.iter() {
             if let PgType::Composite {
                 fields,
                 relkind,
@@ -168,7 +254,7 @@ impl TypeIndex {
                             nullability_cache.insert(view_key.clone(), nullability_map.clone());
 
                             // Update the type's field nullability
-                            if let Some(pg_type) = self.0.get_mut(oid) {
+                            if let Some(pg_type) = self.types.get_mut(oid) {
                                 if let PgType::Composite { fields, comment, .. } = pg_type {
                                     // Parse type-level bulk not null annotations
                                     let bulk_not_null_columns = crate::pg_type::parse_bulk_not_null_columns(comment);
@@ -192,15 +278,18 @@ impl TypeIndex {
                                                 );
                                                 field.nullable = false;
                                             }
-                                        } else if let Some(&is_not_null) = nullability_map.get(&field.name) {
+                                        } else if let Some(cn) = nullability_map.get(&field.name) {
                                             // Use inferred nullability if no annotations
-                                            if is_not_null && field.nullable {
+                                            if cn.is_not_null() && field.nullable {
                                                 log::info!(
                                                     "Updating field {} to NOT NULL based on inference",
                                                     field.name
                                                 );
                                                 field.nullable = false;
+                                            } else {
+                                                field.nullable = cn.is_nullable();
                                             }
+                                            field.nullable_due_to_join = cn.nullable_due_to_join;
                                         }
                                     }
                                 }
@@ -229,7 +318,7 @@ impl TypeIndex {
         log::info!("Applying view nullability from pre-built cache");
 
         // Find all view types
-        for (oid, pg_type) in self.0.iter_mut() {
+        for (oid, pg_type) in self.types.iter_mut() {
             if let PgType::Composite {
                 fields,
                 relkind,
@@ -283,16 +372,21 @@ impl TypeIndex {
                                         );
                                         field.nullable = false;
                                     }
-                                } else if let Some(&is_not_null) = nullability_map.get(&field.name) {
+                                } else if let Some(cn) = nullability_map.get(&field.name) {
                                     // Use inferred nullability if no annotations
-                                    if is_not_null && field.nullable {
+                                    if cn.is_not_null() && field.nullable {
                                         log::info!(
                                             "Updating field {}.{} to NOT NULL based on cached inference",
                                             name,
                                             field.name
                                         );
                                         field.nullable = false;
+                                    } else {
+                                        // Preserve the overall nullable status
+                                        field.nullable = cn.is_nullable();
                                     }
+                                    // Always propagate join-nullability info
+                                    field.nullable_due_to_join = cn.nullable_due_to_join;
                                 }
                             }
                         } else {

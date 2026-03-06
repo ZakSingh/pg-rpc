@@ -18,6 +18,7 @@ pub use crate::config::{ErrorsConfig, QueriesConfig, TaskQueueConfig, TracingCon
 pub mod annotations;
 pub mod cardinality_inference;
 mod codegen;
+mod column_grouping;
 mod config;
 pub mod constraint_analysis;
 mod db;
@@ -25,6 +26,7 @@ mod error_type_index;
 mod exceptions;
 mod fn_index;
 mod ident;
+mod parse_check_enum;
 mod parse_domain;
 mod pg_constraint;
 mod pg_fn;
@@ -374,7 +376,12 @@ impl PgrpcBuilder {
             None
         };
 
-        let mut ty_index = TypeIndex::new(&mut db.client, type_oids.as_slice())?;
+        // Extract CHECK-inferred enum types from relations
+        let check_enums = rel_index.get_check_enum_infos();
+        log::info!("Found {} CHECK-inferred enum types", check_enums.len());
+
+        let mut ty_index =
+            TypeIndex::new_with_check_enums(&mut db.client, type_oids.as_slice(), &check_enums)?;
 
         // Apply view nullability inference using the pre-built cache
         if config.infer_view_nullability {
