@@ -261,6 +261,7 @@ pub fn generate_task_enum(
         #(#payload_structs)*
 
         #[doc = #enum_doc]
+        #[non_exhaustive]
         #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
         #[serde(tag = #task_name_column, content = #payload_column)]
         pub enum TaskPayload {
