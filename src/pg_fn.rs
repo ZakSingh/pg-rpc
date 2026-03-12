@@ -1278,7 +1278,7 @@ impl ToRust for PgFn {
             // Build the span name as "schema.function_name"
             let span_name = format!("{}.{}", schema_str, fn_name_str);
             quote! {
-                #[tracing::instrument(name = #span_name, skip(client), err(Debug))]
+                #[tracing::instrument(name = #span_name, skip(client))]
             }
         } else {
             quote! {}
@@ -1946,8 +1946,8 @@ mod test {
             "Should skip client parameter"
         );
         assert!(
-            generated_str.contains("err (Debug)"),
-            "Should include err(Debug) to capture full error chain"
+            !generated_str.contains("err (Debug)"),
+            "Should not include err(Debug)"
         );
     }
 

@@ -1054,7 +1054,7 @@ fn generate_query_code(
         // Use "queries.<query_name>" as the span name for SQL queries
         let span_name = format!("queries.{}", query.name);
         quote! {
-            #[tracing::instrument(name = #span_name, skip(client), err(Debug))]
+            #[tracing::instrument(name = #span_name, skip(client))]
         }
     } else {
         quote! {}
