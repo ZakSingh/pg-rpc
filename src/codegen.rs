@@ -1755,7 +1755,7 @@ fn generate_row_struct(
                     .collect();
 
                 nested_struct_defs.push(quote! {
-                    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+                    #[derive(Debug, Clone, serde::Serialize)]
                     pub struct #nested_struct_name {
                         #(#nested_fields),*
                     }
@@ -1800,7 +1800,7 @@ fn generate_row_struct(
     quote! {
         #(#nested_struct_defs)*
 
-        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        #[derive(Debug, Clone, serde::Serialize)]
         pub struct #struct_name {
             #(#parent_fields),*
         }
@@ -1876,7 +1876,7 @@ fn generate_row_struct_flat(
         .collect();
 
     quote! {
-        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        #[derive(Debug, Clone, serde::Serialize)]
         pub struct #struct_name {
             #(#fields),*
         }
