@@ -7,7 +7,6 @@ use crate::pg_id::PgId;
 use crate::rel_index::RelIndex;
 use crate::sql_parser::{ParameterSpec, ParsedQuery, QueryType};
 use crate::trigger_index::TriggerIndex;
-use crate::ty_index::TypeIndex;
 use crate::view_nullability::ViewNullabilityAnalyzer;
 use anyhow::{Context, Result};
 use postgres::Client;
@@ -56,8 +55,6 @@ pub struct IntrospectedQuery {
 pub struct QueryIntrospector<'a> {
     client: &'a mut Client,
     rel_index: &'a RelIndex,
-    #[allow(dead_code)]
-    type_index: &'a TypeIndex,
     view_nullability_cache: &'a crate::view_nullability::ViewNullabilityCache,
     trigger_index: Option<&'a TriggerIndex>,
 }
@@ -66,14 +63,12 @@ impl<'a> QueryIntrospector<'a> {
     pub fn new(
         client: &'a mut Client,
         rel_index: &'a RelIndex,
-        type_index: &'a TypeIndex,
         view_nullability_cache: &'a crate::view_nullability::ViewNullabilityCache,
         trigger_index: Option<&'a TriggerIndex>,
     ) -> Self {
         Self {
             client,
             rel_index,
-            type_index,
             view_nullability_cache,
             trigger_index,
         }

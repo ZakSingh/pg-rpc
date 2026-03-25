@@ -4,7 +4,6 @@ use crate::query_introspector::{IntrospectedQuery, QueryIntrospector};
 use crate::rel_index::RelIndex;
 use crate::sql_parser::{SqlParser, QueryType};
 use crate::trigger_index::TriggerIndex;
-use crate::ty_index::TypeIndex;
 use anyhow::Result;
 use postgres::Client;
 use std::collections::{BTreeMap, HashMap};
@@ -33,7 +32,6 @@ impl QueryIndex {
     pub fn new(
         client: &mut Client,
         rel_index: &RelIndex,
-        type_index: &TypeIndex,
         view_nullability_cache: &crate::view_nullability::ViewNullabilityCache,
         config: &QueriesConfig,
         trigger_index: Option<&TriggerIndex>,
@@ -41,18 +39,26 @@ impl QueryIndex {
         let parser = SqlParser::new();
 
         // Parse all SQL files
+        let t = std::time::Instant::now();
         let parsed_queries = parser.parse_files(&config.paths)?;
-
-        log::info!("Found {} queries to introspect", parsed_queries.len());
+        println!("cargo:warning=[pgrpc timing]   sql_parse: {:.2?} ({} queries)", t.elapsed(), parsed_queries.len());
 
         // Introspect each query
         let mut introspector =
-            QueryIntrospector::new(client, rel_index, type_index, view_nullability_cache, trigger_index);
+            QueryIntrospector::new(client, rel_index, view_nullability_cache, trigger_index);
 
         let mut queries = BTreeMap::new();
+        let mut total_prepare = std::time::Duration::ZERO;
+        let mut total_analysis = std::time::Duration::ZERO;
 
         for parsed in parsed_queries {
+            let t = std::time::Instant::now();
             let introspected = introspector.introspect(&parsed)?;
+            let elapsed = t.elapsed();
+            if elapsed > std::time::Duration::from_millis(100) {
+                println!("cargo:warning=[pgrpc timing]   slow query '{}': {:.2?}", parsed.name, elapsed);
+            }
+            total_prepare += elapsed;
             let id = QueryId {
                 name: introspected.name.clone(),
             };
@@ -67,6 +73,7 @@ impl QueryIndex {
             queries.insert(id, introspected);
         }
 
+        println!("cargo:warning=[pgrpc timing]   total introspect: {:.2?} for {} queries", total_prepare, queries.len());
         Ok(Self { queries })
     }
 
