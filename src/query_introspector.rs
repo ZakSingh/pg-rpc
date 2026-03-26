@@ -57,6 +57,13 @@ pub struct QueryIntrospector<'a> {
     rel_index: &'a RelIndex,
     view_nullability_cache: &'a crate::view_nullability::ViewNullabilityCache,
     trigger_index: Option<&'a TriggerIndex>,
+    pub _t_cardinality: std::time::Duration,
+    pub _t_prepare: std::time::Duration,
+    pub _t_param_info: std::time::Duration,
+    pub _t_return_cols: std::time::Duration,
+    pub _t_constraints: std::time::Duration,
+    pub _t_pg_parse: std::cell::Cell<std::time::Duration>,
+    pub _n_pg_parse: std::cell::Cell<usize>,
 }
 
 impl<'a> QueryIntrospector<'a> {
@@ -71,7 +78,22 @@ impl<'a> QueryIntrospector<'a> {
             rel_index,
             view_nullability_cache,
             trigger_index,
+            _t_cardinality: std::time::Duration::ZERO,
+            _t_prepare: std::time::Duration::ZERO,
+            _t_param_info: std::time::Duration::ZERO,
+            _t_return_cols: std::time::Duration::ZERO,
+            _t_constraints: std::time::Duration::ZERO,
+            _t_pg_parse: std::cell::Cell::new(std::time::Duration::ZERO),
+            _n_pg_parse: std::cell::Cell::new(0),
         }
+    }
+
+    fn timed_pg_parse(&self, sql: &str) -> std::result::Result<pg_query::ParseResult, pg_query::Error> {
+        let t = std::time::Instant::now();
+        let result = pg_query::parse(sql);
+        self._t_pg_parse.set(self._t_pg_parse.get() + t.elapsed());
+        self._n_pg_parse.set(self._n_pg_parse.get() + 1);
+        result
     }
 
     /// Introspect a parsed query to determine parameter and return types
@@ -84,6 +106,7 @@ impl<'a> QueryIntrospector<'a> {
         );
 
         // Determine the final query type: use explicit if specified, otherwise infer
+        let _t = std::time::Instant::now();
         let final_query_type = match &parsed.explicit_query_type {
             Some(explicit) => {
                 log::info!(
@@ -118,9 +141,11 @@ impl<'a> QueryIntrospector<'a> {
                 }
             }
         };
+        self._t_cardinality += _t.elapsed();
 
         // Use rust-postgres prepare() to get statement metadata
         // This works for ALL query types including CTEs with data-modifying statements
+        let _t = std::time::Instant::now();
         let stmt = self
             .client
             .prepare(&parsed.postgres_sql)
@@ -133,6 +158,7 @@ impl<'a> QueryIntrospector<'a> {
                     parsed.postgres_sql
                 )
             })?;
+        self._t_prepare += _t.elapsed();
 
         // Get parameter types directly from the statement
         // Note: PostgreSQL resolves domain types to their base types here
@@ -140,11 +166,13 @@ impl<'a> QueryIntrospector<'a> {
 
         // Determine parameter names, nullable flags, and inferred column types
         // The inferred types preserve domain types by looking up the actual column type
+        let _t = std::time::Instant::now();
         let param_info = self.determine_parameter_info(
             &parsed.parameters,
             &parsed.postgres_sql,
             postgres_param_types.len(),
         )?;
+        self._t_param_info += _t.elapsed();
 
         // Build parameter list, preferring inferred column types (preserves domains)
         // over PostgreSQL's resolved types
@@ -172,19 +200,23 @@ impl<'a> QueryIntrospector<'a> {
             .collect();
 
         // Get return columns using statement metadata
+        let _t = std::time::Instant::now();
         let return_columns = match final_query_type {
             QueryType::One | QueryType::Opt | QueryType::Many => {
                 Some(self.introspect_return_columns_from_stmt(&stmt, &parsed.postgres_sql)?)
             }
             QueryType::Exec | QueryType::ExecRows => None,
         };
+        self._t_return_cols += _t.elapsed();
 
         // Analyze exceptions and table dependencies
+        let _t = std::time::Instant::now();
         let (exceptions, table_dependencies) = analyze_sql_for_constraints(
             &parsed.postgres_sql,
             self.rel_index,
             self.trigger_index,
         );
+        self._t_constraints += _t.elapsed();
 
         // No need to DEALLOCATE - Statement is dropped automatically
 
@@ -325,7 +357,7 @@ impl<'a> QueryIntrospector<'a> {
     fn infer_column_types_from_query(&self, sql: &str) -> HashMap<String, (String, String)> {
         let mut result = HashMap::new();
 
-        let parse_result = match pg_query::parse(sql) {
+        let parse_result = match self.timed_pg_parse(sql) {
             Ok(r) => r,
             Err(_) => return result,
         };
@@ -481,7 +513,7 @@ impl<'a> QueryIntrospector<'a> {
 
     /// Extract target table name from INSERT/UPDATE/DELETE statement
     fn extract_dml_target_table(&self, sql: &str) -> Option<String> {
-        let parse_result = pg_query::parse(sql).ok()?;
+        let parse_result = self.timed_pg_parse(sql).ok()?;
 
         if let Some(stmt) = parse_result.protobuf.stmts.first() {
             if let Some(node) = &stmt.stmt {
@@ -517,14 +549,17 @@ impl<'a> QueryIntrospector<'a> {
         sql: &str,
         param_count: usize,
     ) -> Result<Vec<(String, bool, Option<OID>, bool)>> {
+        // Parse SQL once and share across all sub-analyses
+        let parse_result = self.timed_pg_parse(sql).ok();
+
         // Build alias-to-table map from FROM clause for resolving qualified column references
-        let alias_map = self.build_alias_map(sql);
+        let alias_map = self.build_alias_map_from_ast(parse_result.as_ref());
 
         // Infer nullability from expression context (COALESCE, IS NULL, etc.)
-        let context_nullability = self.infer_parameter_nullability_from_context(sql, param_count);
+        let context_nullability = self.infer_parameter_nullability_from_ast(parse_result.as_ref(), param_count);
 
         // Get column mapping for column-based nullability/default inference (INSERT or UPDATE)
-        let param_columns = self.extract_param_columns(sql);
+        let param_columns = self.extract_param_columns_from_ast(parse_result.as_ref());
 
         let mut param_info = Vec::new();
 
@@ -595,20 +630,23 @@ impl<'a> QueryIntrospector<'a> {
     /// parameter_position -> (table_name, column_name).
     /// This maps each parameter in VALUES/SET clauses to its target column.
     fn extract_param_columns(&self, sql: &str) -> HashMap<usize, (String, String)> {
-        let parse_result = match pg_query::parse(sql) {
+        let parse_result = match self.timed_pg_parse(sql) {
             Ok(r) => r,
             Err(_) => return HashMap::new(),
         };
+        self.extract_param_columns_from_ast(Some(&parse_result))
+    }
 
+    /// Extract param columns from a pre-parsed AST (avoids re-parsing)
+    fn extract_param_columns_from_ast(&self, parse_result: Option<&pg_query::ParseResult>) -> HashMap<usize, (String, String)> {
         let mut result = HashMap::new();
-
-        // Process all top-level statements
-        for raw_stmt in &parse_result.protobuf.stmts {
-            if let Some(stmt) = &raw_stmt.stmt {
-                self.extract_param_columns_from_node(stmt, &mut result);
+        if let Some(pr) = parse_result {
+            for raw_stmt in &pr.protobuf.stmts {
+                if let Some(stmt) = &raw_stmt.stmt {
+                    self.extract_param_columns_from_node(stmt, &mut result);
+                }
             }
         }
-
         result
     }
 
@@ -807,7 +845,7 @@ impl<'a> QueryIntrospector<'a> {
     fn build_alias_map(&self, sql: &str) -> HashMap<String, String> {
         let mut alias_map = HashMap::new();
 
-        let parse_result = match pg_query::parse(sql) {
+        let parse_result = match self.timed_pg_parse(sql) {
             Ok(result) => result,
             Err(_) => return alias_map,
         };
@@ -819,6 +857,19 @@ impl<'a> QueryIntrospector<'a> {
             }
         }
 
+        alias_map
+    }
+
+    /// Build alias map from a pre-parsed AST (avoids re-parsing)
+    fn build_alias_map_from_ast(&self, parse_result: Option<&pg_query::ParseResult>) -> HashMap<String, String> {
+        let mut alias_map = HashMap::new();
+        if let Some(pr) = parse_result {
+            if let Some(stmt) = pr.protobuf.stmts.first() {
+                if let Some(node) = &stmt.stmt {
+                    self.extract_table_aliases_from_node(node, &mut alias_map);
+                }
+            }
+        }
         alias_map
     }
 
@@ -901,10 +952,10 @@ impl<'a> QueryIntrospector<'a> {
         let before = &sql[..param_pos];
 
         // Try to extract qualified column reference: "table.column = $N" or "alias.column = $N"
-        if let Some(captures) = regex::Regex::new(r"(\w+)\.(\w+)\s*[=<>!]+\s*$")
-            .ok()?
-            .captures(before)
-        {
+        static RE_QUALIFIED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(\w+)\.(\w+)\s*[=<>!]+\s*$").unwrap()
+        });
+        if let Some(captures) = RE_QUALIFIED.captures(before) {
             let table_or_alias = captures.get(1)?.as_str();
             let column_name = captures.get(2)?.as_str();
 
@@ -918,10 +969,10 @@ impl<'a> QueryIntrospector<'a> {
         }
 
         // Try to extract unqualified column reference: "column = $N"
-        if let Some(captures) = regex::Regex::new(r"(\w+)\s*[=<>!]+\s*$")
-            .ok()?
-            .captures(before)
-        {
+        static RE_UNQUALIFIED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(\w+)\s*[=<>!]+\s*$").unwrap()
+        });
+        if let Some(captures) = RE_UNQUALIFIED.captures(before) {
             let column_name = captures.get(1)?.as_str();
 
             // Avoid SQL keywords
@@ -959,19 +1010,20 @@ impl<'a> QueryIntrospector<'a> {
     /// - Argument of IS NULL / IS NOT NULL tests
     /// - NULLIF($N, value) - first argument may be NULL
     fn infer_parameter_nullability_from_context(&self, sql: &str, param_count: usize) -> Vec<bool> {
+        let parse_result = self.timed_pg_parse(sql).ok();
+        self.infer_parameter_nullability_from_ast(parse_result.as_ref(), param_count)
+    }
+
+    /// Infer parameter nullability from a pre-parsed AST (avoids re-parsing)
+    fn infer_parameter_nullability_from_ast(&self, parse_result: Option<&pg_query::ParseResult>, param_count: usize) -> Vec<bool> {
         let mut nullable = vec![false; param_count];
-
-        let parse_result = match pg_query::parse(sql) {
-            Ok(result) => result,
-            Err(_) => return nullable,
-        };
-
-        if let Some(stmt) = parse_result.protobuf.stmts.first() {
-            if let Some(node) = &stmt.stmt {
-                self.check_param_nullability_in_node(node, &mut nullable);
+        if let Some(pr) = parse_result {
+            if let Some(stmt) = pr.protobuf.stmts.first() {
+                if let Some(node) = &stmt.stmt {
+                    self.check_param_nullability_in_node(node, &mut nullable);
+                }
             }
         }
-
         nullable
     }
 

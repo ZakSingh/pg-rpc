@@ -74,6 +74,12 @@ impl QueryIndex {
         }
 
         println!("cargo:warning=[pgrpc timing]   total introspect: {:.2?} for {} queries", total_prepare, queries.len());
+        println!("cargo:warning=[pgrpc timing]     cardinality: {:.2?}", introspector._t_cardinality);
+        println!("cargo:warning=[pgrpc timing]     prepare: {:.2?}", introspector._t_prepare);
+        println!("cargo:warning=[pgrpc timing]     param_info: {:.2?}", introspector._t_param_info);
+        println!("cargo:warning=[pgrpc timing]     return_cols: {:.2?}", introspector._t_return_cols);
+        println!("cargo:warning=[pgrpc timing]     constraints: {:.2?}", introspector._t_constraints);
+        println!("cargo:warning=[pgrpc timing]     pg_query::parse: {:.2?} ({} calls)", introspector._t_pg_parse.get(), introspector._n_pg_parse.get());
         Ok(Self { queries })
     }
 
