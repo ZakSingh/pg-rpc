@@ -157,18 +157,23 @@ with recursive type_tree as (
                where c.relname = t.typname 
                  and c.relnamespace = t.typnamespace
            ) end                                                      as view_definition
-    from pg_type t
-             join pg_namespace n on t.typnamespace = n.oid
-             join type_tree tt on (
-        -- array elements
-        t.oid = ( select typelem from pg_type where oid = tt.oid ) or
-            -- domain base types
-        t.oid = ( select typbasetype from pg_type where oid = tt.oid ) or
-            -- composite type fields
-        (tt.typtype = 'c' and t.oid in ( select atttypid
-                                         from pg_attribute
-                                         where attrelid = ( select typrelid from pg_type where oid = tt.oid )
-                                           and attnum > 0 ))) )
+    from type_tree tt
+             cross join lateral (
+                 -- collect child type OIDs from already-fetched columns
+                 select unnest(
+                     array_remove(
+                         array_cat(
+                             -- array element type and domain base type
+                             ARRAY[nullif(tt.array_element_type, 0), nullif(tt.domain_base_type, 0)],
+                             -- composite field types
+                             tt.composite_field_types
+                         ),
+                         null
+                     )
+                 ) as child_oid
+             ) child_oids
+             join pg_type t on t.oid = child_oids.child_oid
+             join pg_namespace n on t.typnamespace = n.oid )
 select distinct on (oid) oid,
                          typname,
                          typtype,

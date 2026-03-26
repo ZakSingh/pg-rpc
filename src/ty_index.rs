@@ -43,8 +43,15 @@ impl DerefMut for TypeIndex {
 
 impl TypeIndex {
     pub fn new(db: &mut Client, type_oids: &[OID]) -> anyhow::Result<Self> {
+        let deduped: Vec<OID> = {
+            let mut s = std::collections::BTreeSet::new();
+            type_oids.iter().for_each(|o| { s.insert(*o); });
+            s.into_iter().collect()
+        };
+        println!("cargo:warning=[pgrpc timing]   ty_index: {} input oids, {} unique", type_oids.len(), deduped.len());
+        println!("cargo:warning=[pgrpc timing]   ty_index oids: {:?}", &deduped);
         let types: BTreeMap<OID, PgType> = db
-            .query(TYPES_INTROSPECTION_QUERY, &[&Vec::from_iter(type_oids)])
+            .query(TYPES_INTROSPECTION_QUERY, &[&deduped])
             .context("Type introspection query failed")?
             .into_iter()
             .map(|row| (row.get("oid"), PgType::try_from(row).unwrap()))
