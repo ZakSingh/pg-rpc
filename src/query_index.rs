@@ -5,7 +5,8 @@ use crate::rel_index::RelIndex;
 use crate::sql_parser::{SqlParser, QueryType};
 use crate::trigger_index::TriggerIndex;
 use anyhow::Result;
-use postgres::Client;
+use postgres::{Client, NoTls};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 
@@ -30,7 +31,7 @@ impl Deref for QueryIndex {
 impl QueryIndex {
     /// Create a new QueryIndex by parsing and introspecting SQL files
     pub fn new(
-        client: &mut Client,
+        connection_string: &str,
         rel_index: &RelIndex,
         view_nullability_cache: &crate::view_nullability::ViewNullabilityCache,
         config: &QueriesConfig,
@@ -39,47 +40,55 @@ impl QueryIndex {
         let parser = SqlParser::new();
 
         // Parse all SQL files
-        let t = std::time::Instant::now();
         let parsed_queries = parser.parse_files(&config.paths)?;
-        println!("cargo:warning=[pgrpc timing]   sql_parse: {:.2?} ({} queries)", t.elapsed(), parsed_queries.len());
 
-        // Introspect each query
-        let mut introspector =
-            QueryIntrospector::new(client, rel_index, view_nullability_cache, trigger_index);
+        let introspector = QueryIntrospector::new(rel_index, view_nullability_cache, trigger_index);
+
+        // Introspect queries in parallel using rayon with thread-local DB connections
+        use rayon::prelude::*;
+
+        let conn_str = connection_string.to_string();
+
+        thread_local! {
+            static THREAD_CLIENT: RefCell<Option<Client>> = const { RefCell::new(None) };
+        }
+
+        let results: Vec<Result<(QueryId, IntrospectedQuery)>> = parsed_queries
+            .par_iter()
+            .map(|parsed| {
+                THREAD_CLIENT.with(|cell| {
+                    let mut borrow = cell.borrow_mut();
+                    let client = match borrow.as_mut() {
+                        Some(c) => c,
+                        None => {
+                            let mut c = Client::connect(&conn_str, NoTls)?;
+                            c.execute("SET jit = off", &[])?;
+                            *borrow = Some(c);
+                            borrow.as_mut().unwrap()
+                        }
+                    };
+
+                    let introspected = introspector.introspect(client, parsed)?;
+                    let id = QueryId {
+                        name: introspected.name.clone(),
+                    };
+                    Ok((id, introspected))
+                })
+            })
+            .collect();
 
         let mut queries = BTreeMap::new();
-        let mut total_prepare = std::time::Duration::ZERO;
-        let mut total_analysis = std::time::Duration::ZERO;
-
-        for parsed in parsed_queries {
-            let t = std::time::Instant::now();
-            let introspected = introspector.introspect(&parsed)?;
-            let elapsed = t.elapsed();
-            if elapsed > std::time::Duration::from_millis(100) {
-                println!("cargo:warning=[pgrpc timing]   slow query '{}': {:.2?}", parsed.name, elapsed);
-            }
-            total_prepare += elapsed;
-            let id = QueryId {
-                name: introspected.name.clone(),
-            };
-
+        for result in results {
+            let (id, introspected) = result?;
             if queries.contains_key(&id) {
                 log::warn!(
                     "Duplicate query name '{}'. Previous definition will be overwritten.",
                     id.name
                 );
             }
-
             queries.insert(id, introspected);
         }
 
-        println!("cargo:warning=[pgrpc timing]   total introspect: {:.2?} for {} queries", total_prepare, queries.len());
-        println!("cargo:warning=[pgrpc timing]     cardinality: {:.2?}", introspector._t_cardinality);
-        println!("cargo:warning=[pgrpc timing]     prepare: {:.2?}", introspector._t_prepare);
-        println!("cargo:warning=[pgrpc timing]     param_info: {:.2?}", introspector._t_param_info);
-        println!("cargo:warning=[pgrpc timing]     return_cols: {:.2?}", introspector._t_return_cols);
-        println!("cargo:warning=[pgrpc timing]     constraints: {:.2?}", introspector._t_constraints);
-        println!("cargo:warning=[pgrpc timing]     pg_query::parse: {:.2?} ({} calls)", introspector._t_pg_parse.get(), introspector._n_pg_parse.get());
         Ok(Self { queries })
     }
 

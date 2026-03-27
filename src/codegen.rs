@@ -140,8 +140,7 @@ pub fn codegen_split(
 
             let date_serde_module = generate_date_serde_module();
 
-            let code = prettyplease::unparse(
-                &syn::parse2::<syn::File>(quote! {
+            let code = quote! {
                     #(#schema_imports)*
 
                     use postgres_types::private::BytesMut;
@@ -458,17 +457,13 @@ pub fn codegen_split(
                     }
 
                     #tokens
-                })
-                .expect("generated code to parse"),
-            );
+                }.to_string();
             (schema.clone(), warning_ignores.to_string() + &code)
         })
         .collect();
 
     // Add the error types as a separate module
-    let error_module_code = prettyplease::unparse(
-        &syn::parse2::<syn::File>(error_types_code).expect("error module to parse"),
-    );
+    let error_module_code = error_types_code.to_string();
     schema_code.insert(
         "errors".to_string(),
         warning_ignores.to_string() + &error_module_code,

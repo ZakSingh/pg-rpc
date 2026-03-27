@@ -48,8 +48,6 @@ impl TypeIndex {
             type_oids.iter().for_each(|o| { s.insert(*o); });
             s.into_iter().collect()
         };
-        println!("cargo:warning=[pgrpc timing]   ty_index: {} input oids, {} unique", type_oids.len(), deduped.len());
-        println!("cargo:warning=[pgrpc timing]   ty_index oids: {:?}", &deduped);
         let types: BTreeMap<OID, PgType> = db
             .query(TYPES_INTROSPECTION_QUERY, &[&deduped])
             .context("Type introspection query failed")?

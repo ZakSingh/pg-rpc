@@ -83,21 +83,31 @@ impl SqlParser {
 
     /// Parse all SQL files matching the given glob patterns
     pub fn parse_files(&self, patterns: &[String]) -> Result<Vec<ParsedQuery>> {
-        let mut all_queries = Vec::new();
+        use rayon::prelude::*;
 
+        // Collect all file paths first
+        let mut paths = Vec::new();
         for pattern in patterns {
-            let paths = glob::glob(pattern)
+            let glob_paths = glob::glob(pattern)
                 .map_err(|e| anyhow!("Invalid glob pattern '{}': {}", pattern, e))?;
-
-            for path_result in paths {
+            for path_result in glob_paths {
                 let path = path_result
                     .map_err(|e| anyhow!("Error reading path from glob: {}", e))?;
-
                 if path.extension().and_then(|s| s.to_str()) == Some("sql") {
-                    let queries = self.parse_file(&path)?;
-                    all_queries.extend(queries);
+                    paths.push(path);
                 }
             }
+        }
+
+        // Parse files in parallel
+        let results: Vec<Result<Vec<ParsedQuery>>> = paths
+            .par_iter()
+            .map(|path| self.parse_file(path))
+            .collect();
+
+        let mut all_queries = Vec::new();
+        for result in results {
+            all_queries.extend(result?);
         }
 
         Ok(all_queries)

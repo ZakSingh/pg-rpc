@@ -6,7 +6,10 @@ pub struct Db {
 
 impl Db {
     pub fn new(connection_string: &str) -> anyhow::Result<Self> {
-        let client = Client::connect(connection_string, NoTls)?;
+        let mut client = Client::connect(connection_string, NoTls)?;
+        // Disable JIT for introspection queries — the compilation overhead
+        // far exceeds any execution benefit for these short-lived queries.
+        client.execute("SET jit = off", &[])?;
 
         Ok(Db { client })
     }

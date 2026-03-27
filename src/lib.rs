@@ -316,23 +316,12 @@ impl PgrpcBuilder {
             tracing: self.tracing.clone(),
         };
 
-        let t = Instant::now();
         let mut db = Db::new(&connection_string)?;
-        println!("cargo:warning=[pgrpc timing] db connect: {:.2?}", t.elapsed());
-
-        let t = Instant::now();
         let rel_index = RelIndex::new(&mut db.client)?;
-        println!("cargo:warning=[pgrpc timing] rel_index: {:.2?}", t.elapsed());
-
-        let t = Instant::now();
         let trigger_index =
             trigger_index::TriggerIndex::new(&mut db.client, &rel_index, &config.schemas)?;
-        println!("cargo:warning=[pgrpc timing] trigger_index: {:.2?}", t.elapsed());
-
-        let t = Instant::now();
         let mut fn_index =
             FunctionIndex::new(&mut db.client, &rel_index, &trigger_index, &config.schemas)?;
-        println!("cargo:warning=[pgrpc timing] fn_index: {:.2?}", t.elapsed());
 
         // Collect type OIDs from functions, task types, and error types
         let mut type_oids = fn_index.get_type_oids();
@@ -356,21 +345,18 @@ impl PgrpcBuilder {
 
         // Build view nullability cache if enabled
         // This will be shared between TypeIndex (for view types) and QueryIndex (for query analysis)
-        let t = Instant::now();
         let view_nullability_cache = if config.infer_view_nullability {
             build_view_nullability_cache(&mut db.client, &rel_index)?
         } else {
             view_nullability::ViewNullabilityCache::new()
         };
-        println!("cargo:warning=[pgrpc timing] view_nullability: {:.2?}", t.elapsed());
 
         // If queries are configured, parse and introspect to collect type OIDs
         // We need a temporary TypeIndex for introspection, then rebuild with all OIDs
         let query_index_opt = if let Some(queries_config) = &config.queries {
             // Build query index using the shared view nullability cache and trigger index
-            let t = Instant::now();
             let query_index = query_index::QueryIndex::new(
-                &mut db.client,
+                &connection_string,
                 &rel_index,
                 &view_nullability_cache,
                 queries_config,
@@ -381,8 +367,6 @@ impl PgrpcBuilder {
             let query_type_oids = query_index.get_type_oids();
             type_oids.extend(query_type_oids);
 
-            println!("cargo:warning=[pgrpc timing] query_index: {:.2?}", t.elapsed());
-
             Some(query_index)
         } else {
             None
@@ -392,10 +376,8 @@ impl PgrpcBuilder {
         let check_enums = rel_index.get_check_enum_infos();
         log::info!("Found {} CHECK-inferred enum types", check_enums.len());
 
-        let t = Instant::now();
         let mut ty_index =
             TypeIndex::new_with_check_enums(&mut db.client, type_oids.as_slice(), &check_enums)?;
-        println!("cargo:warning=[pgrpc timing] ty_index: {:.2?}", t.elapsed());
 
         // Apply view nullability inference using the pre-built cache
         if config.infer_view_nullability {
@@ -407,9 +389,7 @@ impl PgrpcBuilder {
             fn_index.apply_sql_function_nullability(&rel_index, &view_nullability_cache)?;
         }
 
-        let t = Instant::now();
         let schema_files = codegen_split(&fn_index, &ty_index, &rel_index, &config)?;
-        println!("cargo:warning=[pgrpc timing] codegen_split: {:.2?}", t.elapsed());
 
         // Create output directory if it doesn't exist
         fs::create_dir_all(output_path)?;
@@ -431,7 +411,6 @@ impl PgrpcBuilder {
         }
 
         // Generate task enum if task queue is configured
-        let t = Instant::now();
         let mut final_schema_files = schema_files.clone();
         if let Some(task_config) = &config.task_queue {
             match generate_task_code(&mut db.client, task_config, &ty_index, &config) {
@@ -474,10 +453,7 @@ impl PgrpcBuilder {
             }
         }
 
-        println!("cargo:warning=[pgrpc timing] task_code: {:.2?}", t.elapsed());
-
         // Generate queries if configured
-        let t = Instant::now();
         if let Some(query_index) = &query_index_opt {
             if !query_index.is_empty() {
                 match generate_query_code(query_index, &ty_index, &rel_index, &config) {
@@ -496,8 +472,6 @@ impl PgrpcBuilder {
                 }
             }
         }
-
-        println!("cargo:warning=[pgrpc timing] query_code: {:.2?}", t.elapsed());
 
         // Generate and write mod.rs
         let mod_content = generate_mod_file(&final_schema_files);
@@ -558,8 +532,7 @@ fn generate_task_code(
 
     let date_serde_module = generate_date_serde_module();
 
-    let task_code = prettyplease::unparse(
-        &syn::parse2::<syn::File>(quote::quote! {
+    let task_code = quote::quote! {
             #(#schema_imports)*
 
             use serde_json;
@@ -571,9 +544,7 @@ fn generate_task_code(
             #date_serde_module
 
             #task_enum_code
-        })
-        .expect("task enum code to parse"),
-    );
+        }.to_string();
 
     Ok(Some(warning_ignores.to_string() + &task_code))
 }
@@ -600,8 +571,7 @@ fn generate_error_code(
 
     let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
 
-    let error_code = prettyplease::unparse(
-        &syn::parse2::<syn::File>(quote::quote! {
+    let error_code = quote::quote! {
             use serde::{Deserialize, Serialize};
             use serde_json;
             use time;
@@ -612,9 +582,7 @@ fn generate_error_code(
             #payload_structs
 
             #error_enum
-        })
-        .expect("error type code to parse"),
-    );
+        }.to_string();
 
     Ok(Some(warning_ignores.to_string() + &error_code))
 }
@@ -786,8 +754,7 @@ fn generate_query_code(
     let query_code_tokens = codegen::codegen_queries(query_index, ty_index, rel_index, config);
     let date_serde_module = generate_date_serde_module();
 
-    let query_code = prettyplease::unparse(
-        &syn::parse2::<syn::File>(quote! {
+    let query_code = quote! {
             use postgres_types::private::BytesMut;
             use postgres_types::{IsNull, ToSql, Type};
             use rust_decimal::Decimal;
@@ -795,9 +762,7 @@ fn generate_query_code(
             #date_serde_module
 
             #query_code_tokens
-        })
-        .expect("query code to parse"),
-    );
+        }.to_string();
 
     Ok(warning_ignores.to_string() + &query_code)
 }
