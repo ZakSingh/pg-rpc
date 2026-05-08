@@ -288,10 +288,17 @@ impl<'a> QueryIntrospector<'a> {
                         );
                         let new_nullable = cn.is_nullable();
 
-                        // Try to get the actual column type from the table schema (preserves domains)
+                        // Try to get the actual column type from the table schema (preserves domains).
+                        // The map is keyed by the *output* name (which may be an alias from
+                        // `col as alias`), and its value carries the *source* column name to
+                        // look up in rel_index. Using col.name here would miss aliased columns
+                        // and silently fall back to the base type reported by prepared-statement
+                        // metadata, dropping the domain wrapper.
                         let refined_type_oid = column_type_map
                             .get(&col.name)
-                            .and_then(|(table, _)| self.rel_index.get_column_type(table, &col.name))
+                            .and_then(|(table, source_col)| {
+                                self.rel_index.get_column_type(table, source_col)
+                            })
                             .unwrap_or(col.type_oid);
 
                         log::info!("[REFINE] Column '{}': nullable={}, type_oid={} -> {}",
@@ -334,6 +341,20 @@ impl<'a> QueryIntrospector<'a> {
                 if let Some(pg_query::protobuf::node::Node::SelectStmt(select)) = &node.node {
                     for target in &select.target_list {
                         if let Some(pg_query::protobuf::node::Node::ResTarget(res_target)) = &target.node {
+                            // Handle star expressions (`*` and `t.*`) by expanding them through
+                            // the FROM-clause relation in rel_index. Without this, queries like
+                            // `select * from some_view` yield an empty type map and fall back to
+                            // tokio_postgres' result-column metadata, which always reports the
+                            // domain's base type — dropping the domain wrapper for view columns.
+                            if let Some(val) = &res_target.val {
+                                if let Some(expansions) = self.expand_star_target(val, &alias_map) {
+                                    for (output_name, table_name, col_name) in expansions {
+                                        result.insert(output_name, (table_name, col_name));
+                                    }
+                                    continue;
+                                }
+                            }
+
                             // Get the output column name
                             let output_name = if !res_target.name.is_empty() {
                                 res_target.name.clone()
@@ -374,6 +395,82 @@ impl<'a> QueryIntrospector<'a> {
             }
         }
         None
+    }
+
+    /// If `node` is a star expression (`*` or `t.*`), expand it into a list of
+    /// `(output_column_name, source_table_name, source_column_name)` tuples by
+    /// consulting `rel_index`. Returns `None` when the node is not a star
+    /// expression (so the caller can fall back to scalar handling).
+    fn expand_star_target(
+        &self,
+        node: &pg_query::protobuf::Node,
+        alias_map: &HashMap<String, String>,
+    ) -> Option<Vec<(String, String, String)>> {
+        let col_ref = match &node.node {
+            Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) => col_ref,
+            _ => return None,
+        };
+
+        // A star expression's last field is an A_Star node. Bail out otherwise.
+        let last = col_ref.fields.last()?;
+        match &last.node {
+            Some(pg_query::protobuf::node::Node::AStar(_)) => {}
+            _ => return None,
+        }
+
+        // Determine which table to expand from. For `*` with one or zero qualifying
+        // names, walk every relation referenced in the FROM clause. For `t.*`,
+        // resolve `t` through the alias map.
+        let qualifier: Option<String> = if col_ref.fields.len() >= 2 {
+            // `schema.t.*` is also possible; the qualifier we care about is the
+            // last String field before the A_Star.
+            col_ref
+                .fields
+                .iter()
+                .rev()
+                .skip(1)
+                .find_map(|f| match &f.node {
+                    Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+        } else {
+            None
+        };
+
+        let mut expansions = Vec::new();
+
+        let push_columns = |table_name: &str, out: &mut Vec<(String, String, String)>| {
+            if let Some(rel) = self.rel_index.values().find(|r| r.id.name() == table_name) {
+                for col in &rel.columns {
+                    let col_str = col.as_str().to_string();
+                    out.push((col_str.clone(), table_name.to_string(), col_str));
+                }
+            }
+        };
+
+        match qualifier {
+            Some(q) => {
+                let resolved = alias_map.get(&q).cloned().unwrap_or(q);
+                push_columns(&resolved, &mut expansions);
+            }
+            None => {
+                // Plain `*`: expand every distinct relation present in FROM. The alias
+                // map carries both alias->table and table->table entries; dedupe by
+                // resolved table name to avoid emitting columns twice for self-joins.
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for table in alias_map.values() {
+                    if seen.insert(table.clone()) {
+                        push_columns(table, &mut expansions);
+                    }
+                }
+            }
+        }
+
+        if expansions.is_empty() {
+            None
+        } else {
+            Some(expansions)
+        }
     }
 
     /// Extract (table_or_alias, column_name) from a column reference node

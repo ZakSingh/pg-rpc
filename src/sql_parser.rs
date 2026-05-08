@@ -245,8 +245,12 @@ impl SqlParser {
         let mut seen_params: std::collections::HashMap<String, (usize, bool)> =
             std::collections::HashMap::new();
 
-        // Temporarily replace :: (type cast operator) with a placeholder to avoid matching it
-        const TYPECAST_PLACEHOLDER: &str = "___PGRPC_TYPECAST___";
+        // Temporarily replace :: (type cast operator) with a placeholder to avoid matching it.
+        // The placeholder MUST contain a character that is not part of `[a-zA-Z0-9_]`, otherwise
+        // the named-parameter regex will greedily extend across it and swallow the cast type
+        // (e.g. `:xs::bigint[]` -> `:xs<placeholder>bigint[]` would match `:xs<placeholder>bigint`
+        // as a single param name when the placeholder contains only word characters).
+        const TYPECAST_PLACEHOLDER: &str = "\x01PGRPC_TYPECAST\x01";
         let sql_with_placeholder = sql.replace("::", TYPECAST_PLACEHOLDER);
 
         // Process named parameters (:param_name)
@@ -379,6 +383,40 @@ DELETE FROM authors WHERE id = :author_id;
                 assert_eq!(*nullable, false);
             }
             _ => panic!("Expected named parameter"),
+        }
+    }
+
+    #[test]
+    fn test_named_parameter_with_array_type_cast() {
+        let parser = SqlParser::new();
+
+        // Regression: `:name::type[]` used to lose the `::type` portion because the
+        // typecast placeholder was made of word characters and the param-name regex
+        // greedily extended across it.
+        let cases = [
+            (
+                "select unnest(:xs::bigint[]);",
+                "select unnest($1::bigint[]);",
+            ),
+            (
+                "select (:sales_taxes::currency[])[ord];",
+                "select ($1::currency[])[ord];",
+            ),
+            (
+                "select unnest((:xs)::bigint[]);",
+                "select unnest(($1)::bigint[]);",
+            ),
+            (
+                "select :a::int + :b::text;",
+                "select $1::int + $2::text;",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let (transformed, _) = parser
+                .transform_parameters(input, &HashSet::new())
+                .unwrap();
+            assert_eq!(transformed, expected, "input: {input}");
         }
     }
 
