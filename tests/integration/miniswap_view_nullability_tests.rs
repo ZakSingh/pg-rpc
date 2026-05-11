@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::HashMap;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 /// Tests view nullability inference based on real-world patterns from miniswap
 /// Verifies that the inference matches the manual @pgrpc_not_null annotations
@@ -24,8 +25,7 @@ fn test_miniswap_view_nullability_inference() {
             .expect("Should generate code");
 
         // Read the generated code
-        let content = std::fs::read_to_string(output_path.join("miniswap_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("miniswap_test.rs"));
 
         // Parse expected nullability based on miniswap's manual annotations
         let expected_nullability = get_expected_nullability();
@@ -324,8 +324,7 @@ fn test_composite_type_nullability() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("composite_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("composite_test.rs"));
 
         // Verify composite type fields
         // Note: Individual fields within composites are currently always Option<T>
@@ -404,8 +403,7 @@ fn test_inner_join_table_reference() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("join_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("join_test.rs"));
 
         // Verify nullability
         verify_view_nullability(
@@ -470,8 +468,7 @@ fn test_left_join_table_reference() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("left_join_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("left_join_test.rs"));
 
         // Verify nullability
         verify_view_nullability(
@@ -554,8 +551,7 @@ fn test_null_comparison_behavior() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("null_comparison_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("null_comparison_test.rs"));
 
         // Verify nullability
         verify_view_nullability(
@@ -670,8 +666,7 @@ fn test_star_expansion_nullability() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("star_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("star_test.rs"));
 
         // Test 1: Simple star expansion - all columns should maintain their original nullability
         verify_view_nullability(
@@ -822,8 +817,7 @@ fn test_view_referencing_other_views() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("view_ref_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("view_ref_test.rs"));
 
         // Verify nullability propagation
         verify_view_nullability(

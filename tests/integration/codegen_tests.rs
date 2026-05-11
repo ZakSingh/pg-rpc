@@ -2,6 +2,7 @@ use super::*;
 use pgrpc::*;
 use std::collections::HashMap;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 /// Helper to test code generation in memory without writing files
 fn test_code_generation(conn_string: &str, schemas: &[&str]) -> HashMap<String, String> {
@@ -28,7 +29,7 @@ fn test_code_generation(conn_string: &str, schemas: &[&str]) -> HashMap<String, 
 
         if path.extension().map_or(false, |ext| ext == "rs") {
             let filename = path.file_name().unwrap().to_string_lossy().to_string();
-            let content = std::fs::read_to_string(&path).expect("Should read generated file");
+            let content = read_pretty(&path);
             generated_files.insert(filename, content);
         }
     }

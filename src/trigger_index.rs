@@ -76,19 +76,17 @@ impl TriggerIndex {
                 continue;
             }
 
-            let table_oid: i32 = row.get("table_oid");
-            let table_oid = table_oid as OID;
-
-            let trigger_oid: i32 = row.get("trigger_oid");
-            let trigger_oid = trigger_oid as OID;
+            // Postgres `oid` columns deserialize as `u32`, not `i32` —
+            // postgres-rust rejects the i32 conversion for oid types.
+            let table_oid: OID = row.get("table_oid");
+            let trigger_oid: OID = row.get("trigger_oid");
 
             let trigger_name: String = row.get("trigger_name");
             let timing_str: String = row.get("timing");
             let events_array: Vec<String> = row.get("events");
             let level_str: String = row.get("level");
 
-            let function_oid: i32 = row.get("function_oid");
-            let function_oid = function_oid as OID;
+            let function_oid: OID = row.get("function_oid");
             let function_name: String = row.get("function_name");
             let function_schema: String = row.get("function_schema");
             let function_source: String = row.get("function_source");

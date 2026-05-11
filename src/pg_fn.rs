@@ -94,11 +94,16 @@ impl PgArg {
         sql_to_rs_ident(clean_name, CaseType::Snake)
     }
 
-    /// Returns the Rust name for this argument when used as an OUT parameter field
+    /// Returns the Rust name for this argument when used as an OUT parameter field.
+    ///
+    /// Strips both `o_` (OUT-only convention) and `p_` (INOUT-as-parameter convention)
+    /// prefixes so the struct field reads cleanly and matches the Rust function arg
+    /// name (which also strips `p_`).
     pub fn rs_out_name(&self) -> TokenStream {
-        // Strip 'o_' prefix if present for cleaner Rust field names
-        let clean_name = if self.name.starts_with("o_") {
-            &self.name[2..]
+        let clean_name = if let Some(rest) = self.name.strip_prefix("o_") {
+            rest
+        } else if let Some(rest) = self.name.strip_prefix("p_") {
+            rest
         } else {
             &self.name
         };
@@ -615,6 +620,17 @@ impl PgFn {
         oids
     }
 
+    /// True if any argument or return type is a pg pseudo-type (`anyelement`,
+    /// `internal`, etc.) that we can't generate a Rust signature for. Such
+    /// functions are intentionally skipped during codegen — they're typically
+    /// internal helpers (e.g. `core.raise_error(p_error anyelement)`) the user
+    /// doesn't expect to call from Rust.
+    pub fn has_pseudo_signature(&self, types: &BTreeMap<OID, PgType>) -> bool {
+        self.ty_oids()
+            .iter()
+            .any(|oid| matches!(types.get(oid), Some(crate::pg_type::PgType::Pseudo(_))))
+    }
+
     /// Retrieve the body (between the `$$`)
     fn body(&self) -> &str {
         let (tag, start_ind) = quote_ind(&self.definition).unwrap();
@@ -943,6 +959,13 @@ impl ToRust for PgArg {
 
 impl ToRust for PgFn {
     fn to_rust(&self, types: &BTreeMap<OID, PgType>, config: &Config) -> TokenStream {
+        // Skip functions whose signature involves a pg pseudo-type we can't represent
+        // in Rust (anyelement, internal, etc.). These are almost always internal helpers
+        // that the user doesn't intend to expose.
+        if self.has_pseudo_signature(types) {
+            return TokenStream::new();
+        }
+
         // Use function-specific error type
         let error_enum_name = self.error_enum_name();
         let err_type = quote! { #error_enum_name };
@@ -1312,13 +1335,12 @@ impl PgFn {
             .iter()
             .map(|arg| {
                 let field_name = arg.rs_out_name();
-                let clean_name = if arg.name.starts_with("o_") {
-                    &arg.name[2..]
-                } else {
-                    &arg.name
-                };
-                let rs_name_str = sql_to_rs_string(clean_name, CaseType::Snake);
-                let needs_rename = rs_name_str != clean_name;
+                // The Rust field name strips `o_`/`p_` prefixes (see `rs_out_name`).
+                // The serde rename target must match the SQL column name as Postgres
+                // returns it, so we use the raw `arg.name` here.
+                let sql_name: &str = &arg.name;
+                let rs_name_str = arg.rs_out_name().to_string();
+                let needs_rename = rs_name_str != sql_name;
 
                 let base_type = Self::arg_base_type(arg, types);
                 let field_type = if arg.nullable {
@@ -1328,8 +1350,8 @@ impl PgFn {
                 };
 
                 let serde_attr = match (needs_rename, arg.nullable) {
-                    (true, true) => quote! { #[serde(rename = #clean_name, default)] },
-                    (true, false) => quote! { #[serde(rename = #clean_name)] },
+                    (true, true) => quote! { #[serde(rename = #sql_name, default)] },
+                    (true, false) => quote! { #[serde(rename = #sql_name)] },
                     (false, true) => quote! { #[serde(default)] },
                     (false, false) => quote! {},
                 };
@@ -1405,10 +1427,12 @@ impl PgFn {
         for grouped_field in &grouped {
             match grouped_field {
                 GroupedField::Plain((idx, arg)) => {
-                    let field_name = sql_to_rs_ident(&arg.name, CaseType::Snake);
-                    let clean_name = &arg.name;
-                    let rs_name_str = sql_to_rs_string(clean_name, CaseType::Snake);
-                    let needs_rename = rs_name_str != *clean_name;
+                    // Match the prefix-stripping that flat OUT structs use in
+                    // `rs_out_name` so the two paths produce the same Rust field name.
+                    let field_name = arg.rs_out_name();
+                    let sql_name: &str = &arg.name;
+                    let rs_name_str = arg.rs_out_name().to_string();
+                    let needs_rename = rs_name_str != sql_name;
 
                     let base_type = Self::arg_base_type(arg, types);
                     let field_type = if arg.nullable {
@@ -1418,8 +1442,8 @@ impl PgFn {
                     };
 
                     let serde_attr = match (needs_rename, arg.nullable) {
-                        (true, true) => quote! { #[serde(rename = #clean_name, default)] },
-                        (true, false) => quote! { #[serde(rename = #clean_name)] },
+                        (true, true) => quote! { #[serde(rename = #sql_name, default)] },
+                        (true, false) => quote! { #[serde(rename = #sql_name)] },
                         (false, true) => quote! { #[serde(default)] },
                         (false, false) => quote! {},
                     };

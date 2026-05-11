@@ -1,6 +1,7 @@
 use super::*;
 use pgrpc::*;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 /// Test that demonstrates nullability discrepancy between view struct and query result struct
 ///
@@ -70,11 +71,11 @@ SELECT * FROM view_one;
 
         // Read generated public.rs (has view structs)
         let public_file = output_dir.join("public.rs");
-        let public_code = std::fs::read_to_string(&public_file).expect("Should read public.rs");
+        let public_code = read_pretty(&public_file);
 
         // Read generated queries.rs (has query result structs)
         let queries_file = output_dir.join("queries.rs");
-        let queries_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let queries_code = read_pretty(&queries_file);
 
         println!("=== VIEW STRUCT (public.rs) ===");
         // Find ViewOne struct
@@ -178,10 +179,8 @@ SELECT * FROM user_posts;
         builder.build().expect("Code generation should succeed");
 
         // Read generated files
-        let public_code = std::fs::read_to_string(output_dir.join("public.rs"))
-            .expect("Should read public.rs");
-        let queries_code = std::fs::read_to_string(output_dir.join("queries.rs"))
-            .expect("Should read queries.rs");
+        let public_code = read_pretty(output_dir.join("public.rs"));
+        let queries_code = read_pretty(output_dir.join("queries.rs"));
 
         println!("\n=== VIEW STRUCT (public.rs) ===");
         if let Some(start) = public_code.find("pub struct UserPosts") {
@@ -272,10 +271,8 @@ SELECT * FROM product_stats;
         builder.build().expect("Code generation should succeed");
 
         // Read generated files
-        let public_code = std::fs::read_to_string(output_dir.join("public.rs"))
-            .expect("Should read public.rs");
-        let queries_code = std::fs::read_to_string(output_dir.join("queries.rs"))
-            .expect("Should read queries.rs");
+        let public_code = read_pretty(output_dir.join("public.rs"));
+        let queries_code = read_pretty(output_dir.join("queries.rs"));
 
         println!("\n=== VIEW STRUCT (public.rs) ===");
         if let Some(start) = public_code.find("pub struct ProductStats") {

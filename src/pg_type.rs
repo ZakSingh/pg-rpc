@@ -79,6 +79,13 @@ pub enum PgType {
     Bytea,
     Json,
     Record,
+    Uuid,
+    Time,
+    /// Catch-all for pg pseudo-types we can't usefully codegen for (`anyelement`,
+    /// `anyarray`, `anynonarray`, `anyenum`, `internal`, etc.). Carrying the type
+    /// name lets us produce useful error messages when these flow into a function
+    /// signature, instead of panicking at codegen time.
+    Pseudo(String),
     Geography,
     Geometry,
     TsVector,
@@ -142,6 +149,9 @@ impl PgType {
             PgType::TsVector => "tsvector",
             PgType::TsQuery => "tsquery",
             PgType::Vector => "vector",
+            PgType::Uuid => "uuid",
+            PgType::Time => "time",
+            PgType::Pseudo(name) => name,
         }
     }
 
@@ -195,6 +205,8 @@ impl PgType {
             PgType::TsVector => quote! { tsvector::TsVector },
             PgType::TsQuery => quote! { tsvector::TsQuery },
             PgType::Vector => quote! { pgvector::Vector },
+            PgType::Uuid => quote! { uuid::Uuid },
+            PgType::Time => quote! { time::Time },
             x => unimplemented!("unknown type {:?}", x),
         }
     }
@@ -263,6 +275,8 @@ impl PgType {
             PgType::TsVector => quote! { tsvector::TsVector },
             PgType::TsQuery => quote! { tsvector::TsQuery },
             PgType::Vector => quote! { pgvector::Vector },
+            PgType::Uuid => quote! { uuid::Uuid },
+            PgType::Time => quote! { time::Time },
             x => unimplemented!("unknown type {:?}", x),
         };
 
@@ -752,9 +766,9 @@ impl TryFrom<Row> for PgType {
                 "bool" => PgType::Bool,
                 "timestamptz" => PgType::Timestamptz,
                 "timestamp" => PgType::Timestamptz, // timestamp without timezone also maps to timestamptz
-                "time" => PgType::Text,             // time types map to String
-                "timetz" => PgType::Text,
-                "uuid" => PgType::Text, // UUID as string for now
+                "time" => PgType::Time,
+                "timetz" => PgType::Time,
+                "uuid" => PgType::Uuid,
                 "float4" | "real" => PgType::Float32,
                 "float8" | "double precision" => PgType::Float64,
                 _ if t.get::<&str, u32>("array_element_type") != 0 => PgType::Array {
@@ -877,17 +891,10 @@ impl TryFrom<Row> for PgType {
                 "void" => PgType::Void,
                 "trigger" => PgType::Void, // Trigger functions return pseudo-type, treat as void
                 "record" => PgType::Record,
-                p => {
-                    eprintln!("ERROR: Unhandled pseudo type encountered:");
-                    eprintln!("  Type name: {}", name);
-                    eprintln!("  Schema: {}", schema);
-                    eprintln!("  Pseudo type: {}", p);
-                    eprintln!("  Type category: p (pseudo)");
-                    if let Ok(oid) = t.try_get::<_, u32>("oid") {
-                        eprintln!("  OID: {}", oid);
-                    }
-                    unimplemented!("pseudo type not implemented: {}", p)
-                }
+                // Other pg pseudo-types (anyelement, anyarray, internal, etc.) are common
+                // in helper procedures we don't intend to expose. Stash the name and let
+                // function codegen skip any signature that touches this.
+                _ => PgType::Pseudo(name.to_string()),
             },
             x => unimplemented!("ttype not implemented {}", x),
         };
@@ -1441,9 +1448,13 @@ impl ToRust for PgType {
             | PgType::Geometry
             | PgType::TsVector
             | PgType::TsQuery
-            | PgType::Vector => {
+            | PgType::Vector
+            | PgType::Uuid
+            | PgType::Time => {
                 quote! {}
             }
+            // Pseudo types like `anyelement` are placeholders — no Rust type to emit.
+            PgType::Pseudo(_) => quote! {},
             // No need to create type aliases for arrays. Instead they'll be used as Vec<Inner>
             PgType::Array { .. } => quote! {},
             x => unimplemented!("Unhandled PgType {:?}", x),

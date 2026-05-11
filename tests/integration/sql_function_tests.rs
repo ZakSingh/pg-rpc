@@ -1,5 +1,6 @@
 use super::*;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 #[test]
 fn test_sql_language_function_parsing() {
@@ -85,8 +86,7 @@ fn test_sql_language_function_parsing() {
             .expect("Should generate code");
 
         // Read the generated code
-        let generated = std::fs::read_to_string(output_path.join("test_sql.rs"))
-            .expect("Should read generated file");
+        let generated = read_pretty(output_path.join("test_sql.rs"));
 
         println!("Generated code:\n{}", generated);
 
@@ -208,8 +208,7 @@ fn test_sql_function_with_triggers() {
             .expect("Should generate code");
 
         // Read the generated code
-        let generated = std::fs::read_to_string(output_path.join("test_triggers.rs"))
-            .expect("Should read generated file");
+        let generated = read_pretty(output_path.join("test_triggers.rs"));
 
         println!(
             "Generated code for SQL function with triggers:\n{}",
@@ -321,8 +320,7 @@ fn test_sql_function_constraint_exceptions() {
             .expect("Should generate code");
 
         // Read the generated code
-        let generated = std::fs::read_to_string(output_path.join("test_constraints.rs"))
-            .expect("Should read generated file");
+        let generated = read_pretty(output_path.join("test_constraints.rs"));
 
         println!(
             "Generated code for SQL functions with constraints:\n{}",
@@ -351,7 +349,7 @@ fn test_sql_function_constraint_exceptions() {
 
         // Read the errors module to check constraint handling
         let errors_content =
-            std::fs::read_to_string(output_path.join("errors.rs")).expect("Should read errors.rs");
+            read_pretty(output_path.join("errors.rs"));
 
         // Verify constraint enums are generated
         assert!(
@@ -473,8 +471,7 @@ fn test_sql_function_nullability_inference() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("nullability_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("nullability_test.rs"));
 
         println!("Generated code for nullability inference:\n{}", content);
 

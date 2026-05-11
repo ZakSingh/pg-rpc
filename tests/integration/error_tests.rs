@@ -2,6 +2,7 @@ use super::*;
 use indoc::indoc;
 use pgrpc::*;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 /// Generate code and compile it in a temporary directory, returning the path
 fn setup_generated_code(conn_string: &str) -> TempDir {
@@ -83,8 +84,7 @@ fn test_error_enum_generation() {
         let generated_dir = _temp_dir.path();
 
         // Read the errors.rs file
-        let errors_content = std::fs::read_to_string(generated_dir.join("errors.rs"))
-            .expect("Should read errors.rs");
+        let errors_content = read_pretty(generated_dir.join("errors.rs"));
 
         // Verify PgRpcError enum exists
         assert!(errors_content.contains("pub enum PgRpcError"));
@@ -112,8 +112,7 @@ fn test_constraint_violation_mapping() {
         let _temp_dir = setup_generated_code(conn_string);
         let generated_dir = _temp_dir.path();
 
-        let errors_content = std::fs::read_to_string(generated_dir.join("errors.rs"))
-            .expect("Should read errors.rs");
+        let errors_content = read_pretty(generated_dir.join("errors.rs"));
 
         // Constraint violation handling moved to function-specific error enums
         // Let's check that constraint enums are still generated
@@ -134,7 +133,7 @@ fn test_function_specific_error_enums() {
 
         // Read the api schema file which contains our test function
         let api_content =
-            std::fs::read_to_string(generated_dir.join("api.rs")).expect("Should read api.rs");
+            read_pretty(generated_dir.join("api.rs"));
 
         // Functions should have their own error enums
         // Looking for GetAccountByEmailError since that's our test function
@@ -193,8 +192,7 @@ fn test_error_enum_has_proper_traits() {
         let _temp_dir = setup_generated_code(conn_string);
         let generated_dir = _temp_dir.path();
 
-        let errors_content = std::fs::read_to_string(generated_dir.join("errors.rs"))
-            .expect("Should read errors.rs");
+        let errors_content = read_pretty(generated_dir.join("errors.rs"));
 
         // PgRpcError should derive Debug and use thiserror::Error
         assert!(errors_content.contains("#[derive(Debug, thiserror::Error)]"));
@@ -244,8 +242,7 @@ fn test_constraint_enum_coverage() {
         let _temp_dir = setup_generated_code(conn_string);
         let generated_dir = _temp_dir.path();
 
-        let errors_content = std::fs::read_to_string(generated_dir.join("errors.rs"))
-            .expect("Should read errors.rs");
+        let errors_content = read_pretty(generated_dir.join("errors.rs"));
 
         // Check that constraint enums are generated for tables that actually have them in the errors.rs
         // Based on the current implementation, only tables with meaningful constraint names get enums
@@ -278,7 +275,7 @@ fn test_functions_use_specific_errors() {
 
         // Check that API functions use function-specific error types
         let api_content =
-            std::fs::read_to_string(generated_dir.join("api.rs")).expect("Should read api.rs");
+            read_pretty(generated_dir.join("api.rs"));
 
         // Functions should return Result with function-specific error
         assert!(api_content.contains("Result<"));
@@ -300,8 +297,7 @@ fn test_database_error_fallback() {
         let _temp_dir = setup_generated_code(conn_string);
         let generated_dir = _temp_dir.path();
 
-        let errors_content = std::fs::read_to_string(generated_dir.join("errors.rs"))
-            .expect("Should read errors.rs");
+        let errors_content = read_pretty(generated_dir.join("errors.rs"));
 
         // Should have a generic Database error variant for unmapped errors
         assert!(errors_content.contains("Database(tokio_postgres::Error)"));
@@ -329,8 +325,7 @@ fn test_custom_exception_ergonomics() {
             .build()
             .expect("Code generation should succeed");
 
-        let errors_content = std::fs::read_to_string(project_dir.join("src/generated/errors.rs"))
-            .expect("Should read errors.rs");
+        let errors_content = read_pretty(project_dir.join("src/generated/errors.rs"));
 
         // Check that custom exception variants are generated with DbError instead of String
         assert!(errors_content

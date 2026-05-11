@@ -1,5 +1,6 @@
 use super::*;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 #[test]
 fn test_custom_error_types() {
@@ -129,8 +130,7 @@ fn test_custom_error_types() {
             .expect("Should generate code");
 
         // Read the generated custom_errors.rs file
-        let custom_errors_content = std::fs::read_to_string(output_path.join("custom_errors.rs"))
-            .expect("Should read custom_errors.rs");
+        let custom_errors_content = read_pretty(output_path.join("custom_errors.rs"));
 
         println!("Generated custom_errors.rs:\n{}", custom_errors_content);
 
@@ -164,7 +164,7 @@ fn test_custom_error_types() {
 
         // Read the generated core.rs file
         let core_content =
-            std::fs::read_to_string(output_path.join("core.rs")).expect("Should read core.rs");
+            read_pretty(output_path.join("core.rs"));
 
         // Verify function error enums include custom error variants
         assert!(
@@ -255,8 +255,7 @@ fn test_custom_error_json_deserialization() {
             .expect("Should generate code");
 
         // Verify the generated error type
-        let custom_errors_content = std::fs::read_to_string(output_path.join("custom_errors.rs"))
-            .expect("Should read custom_errors.rs");
+        let custom_errors_content = read_pretty(output_path.join("custom_errors.rs"));
 
         assert!(
             custom_errors_content.contains("struct NewItemImageRequired"),
@@ -269,7 +268,7 @@ fn test_custom_error_json_deserialization() {
 
         // Read the generated core.rs to verify the function detected the custom error
         let core_content =
-            std::fs::read_to_string(output_path.join("core.rs")).expect("Should read core.rs");
+            read_pretty(output_path.join("core.rs"));
 
         // The validate_item_image function should have detected the custom error from CALL
         assert!(

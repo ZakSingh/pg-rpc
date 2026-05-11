@@ -1,5 +1,6 @@
 use super::*;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 /// Tests @pgrpc_not_null annotations for INOUT parameters in procedures
 #[test]
@@ -77,8 +78,7 @@ fn test_procedure_out_param_nullability() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("out_param_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("out_param_test.rs"));
             
         // Debug: Print the generated function for get_user_name
         if content.contains("get_user_name") {
@@ -221,8 +221,7 @@ fn test_returns_table_nullability() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("returns_table_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("returns_table_test.rs"));
 
         // Test RETURNS TABLE with annotations
         assert!(
@@ -338,8 +337,7 @@ fn test_out_param_annotation_edge_cases() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("edge_case_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("edge_case_test.rs"));
 
         // Test multiple annotations
         assert!(

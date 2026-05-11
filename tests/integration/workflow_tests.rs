@@ -2,6 +2,7 @@ use super::*;
 use indoc::indoc;
 use pgrpc::*;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 /// Test the complete workflow from schema to working generated code
 #[test]
@@ -40,21 +41,21 @@ fn test_complete_workflow() {
 
         // Step 4: Verify the content of each file has the expected structure
         let mod_content =
-            std::fs::read_to_string(output_path.join("mod.rs")).expect("Should read mod.rs");
+            read_pretty(output_path.join("mod.rs"));
         assert!(mod_content.contains("pub mod public;"));
         assert!(mod_content.contains("pub mod api;"));
 
         let public_content =
-            std::fs::read_to_string(output_path.join("public.rs")).expect("Should read public.rs");
+            read_pretty(output_path.join("public.rs"));
         assert!(public_content.contains("struct Account"));
         assert!(public_content.contains("enum Role"));
 
         let api_content =
-            std::fs::read_to_string(output_path.join("api.rs")).expect("Should read api.rs");
+            read_pretty(output_path.join("api.rs"));
         assert!(api_content.contains("get_account_by_email"));
 
         let errors_content =
-            std::fs::read_to_string(output_path.join("errors.rs")).expect("Should read errors.rs");
+            read_pretty(output_path.join("errors.rs"));
         assert!(errors_content.contains("enum PgRpcError"));
         assert!(errors_content.contains("AccountConstraint"));
     });
@@ -110,14 +111,13 @@ fn test_multiple_schema_workflow() {
         assert!(entries.contains(&"errors.rs".to_string()));
 
         // Check that test_schema content is correct
-        let test_schema_content = std::fs::read_to_string(output_path.join("test_schema.rs"))
-            .expect("Should read test_schema.rs");
+        let test_schema_content = read_pretty(output_path.join("test_schema.rs"));
         assert!(test_schema_content.contains("struct TestTable"));
         assert!(test_schema_content.contains("get_test_by_name"));
 
         // Check that errors include constraints from all schemas
         let errors_content =
-            std::fs::read_to_string(output_path.join("errors.rs")).expect("Should read errors.rs");
+            read_pretty(output_path.join("errors.rs"));
         assert!(errors_content.contains("TestTableConstraint"));
     });
 }
@@ -169,7 +169,7 @@ fn test_error_handling_workflow() {
 
         // Verify error handling structure
         let errors_content =
-            std::fs::read_to_string(output_path.join("errors.rs")).expect("Should read errors.rs");
+            read_pretty(output_path.join("errors.rs"));
 
         // Should have unified error enum
         assert!(errors_content.contains("pub enum PgRpcError"));
@@ -201,9 +201,9 @@ fn test_incremental_schema_changes() {
 
         // The current implementation may generate mod.rs instead of public.rs
         let _initial_public = if output_path.join("public.rs").exists() {
-            std::fs::read_to_string(output_path.join("public.rs")).expect("Should read public.rs")
+            read_pretty(output_path.join("public.rs"))
         } else {
-            std::fs::read_to_string(output_path.join("mod.rs")).expect("Should read mod.rs")
+            read_pretty(output_path.join("mod.rs"))
         };
 
         // Add a new table to the schema
@@ -228,9 +228,9 @@ fn test_incremental_schema_changes() {
             .expect("Updated code generation should succeed");
 
         let updated_content = if output_path.join("public.rs").exists() {
-            std::fs::read_to_string(output_path.join("public.rs")).expect("Should read public.rs")
+            read_pretty(output_path.join("public.rs"))
         } else {
-            std::fs::read_to_string(output_path.join("mod.rs")).expect("Should read mod.rs")
+            read_pretty(output_path.join("mod.rs"))
         };
 
         // Check that regeneration happened
@@ -279,7 +279,7 @@ fn test_view_and_function_workflow() {
 
         // Check that views are generated
         let public_content = if output_path.join("public.rs").exists() {
-            std::fs::read_to_string(output_path.join("public.rs")).expect("Should read public.rs")
+            read_pretty(output_path.join("public.rs"))
         } else {
             // Try mod.rs if public.rs doesn't exist
             std::fs::read_to_string(output_path.join("mod.rs")).unwrap_or_default()
@@ -296,7 +296,7 @@ fn test_view_and_function_workflow() {
 
         // Check that API functions are generated
         let api_content =
-            std::fs::read_to_string(output_path.join("api.rs")).expect("Should read api.rs");
+            read_pretty(output_path.join("api.rs"));
         assert!(api_content.contains("get_account_by_email"));
         assert!(api_content.contains("pub async fn"));
         assert!(api_content.contains("Result<"));

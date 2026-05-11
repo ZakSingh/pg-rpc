@@ -1,6 +1,7 @@
 use super::*;
 use indoc::indoc;
 use pgrpc::PgrpcBuilder;
+use crate::integration::compile_helpers::read_pretty;
 
 #[test]
 fn test_composite_type_fromsql_generation() {
@@ -51,7 +52,7 @@ fn test_composite_type_fromsql_generation() {
 
         // Read generated code to verify it has FromSql/ToSql derives
         let public_content =
-            std::fs::read_to_string(output_path.join("public.rs")).expect("Should read public.rs");
+            read_pretty(output_path.join("public.rs"));
 
         println!("Generated public.rs content (first 1000 chars):");
         println!("{}", &public_content.chars().take(1000).collect::<String>());
@@ -104,28 +105,31 @@ fn test_composite_type_fromsql_generation() {
                 
                 let client = pool.get().await.expect("Failed to get client");
                 
-                // Test calling function that returns composite type
-                let contact = get_test_contact(&client)
+                // Test calling function that returns composite type.
+                // Generated functions use the bon builder pattern: `f().exec(&client).await`.
+                let contact = get_test_contact()
+                    .exec(&client)
                     .await
                     .expect("Should get contact")
                     .expect("Contact should not be null");
-                
+
                 println!("Contact phone: {:?}", contact.phone);
                 println!("Contact email: {:?}", contact.email);
-                
+
                 // Test calling function that returns nested composite type
-                let person = get_test_person(&client)
+                let person = get_test_person()
+                    .exec(&client)
                     .await
                     .expect("Should get person")
                     .expect("Person should not be null");
-                
+
                 println!("Person name: {:?}", person.name);
                 println!("Person age: {:?}", person.age);
                 if let Some(contact) = &person.contact {
                     println!("Person contact phone: {:?}", contact.phone);
                     println!("Person contact email: {:?}", contact.email);
                 }
-                
+
                 println!("✅ FromSql/ToSql works for composite types!");
             }
         "#};
@@ -232,7 +236,8 @@ fn test_nested_composite_extraction() {
                 let client = pool.get().await.expect("Failed to get client");
                 
                 // Test calling function that returns deeply nested composite type
-                let employee = get_test_employee(&client)
+                let employee = get_test_employee()
+                    .exec(&client)
                     .await
                     .expect("Should get employee")
                     .expect("Employee should not be null");

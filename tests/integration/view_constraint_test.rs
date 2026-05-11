@@ -1,5 +1,6 @@
 use super::*;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 /// Test that constraint error enums are not generated for views
 #[test]
@@ -54,8 +55,7 @@ fn test_no_constraint_enums_for_views() {
             .expect("Should generate code");
 
         // Check the errors.rs file for constraint enums
-        let errors_content = std::fs::read_to_string(output_path.join("errors.rs"))
-            .expect("Should read errors.rs file");
+        let errors_content = read_pretty(output_path.join("errors.rs"));
 
         // Tables should have constraint enums
         assert!(

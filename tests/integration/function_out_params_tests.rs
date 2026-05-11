@@ -1,5 +1,6 @@
 use super::*;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 /// Tests functions with OUT parameters and proper query syntax
 #[test]
@@ -71,8 +72,7 @@ fn test_function_out_params_query_syntax() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("func_out_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("func_out_test.rs"));
             
         // Debug: Print part of the generated content
         if content.contains("get_server_info") {
@@ -206,8 +206,7 @@ fn test_mixed_out_param_scenarios() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("mixed_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("mixed_test.rs"));
 
         // Test procedure with INOUT params
         assert!(
@@ -279,8 +278,7 @@ fn test_out_param_prefix_stripping() {
             .build()
             .expect("Should generate code");
 
-        let content = std::fs::read_to_string(output_path.join("prefix_test.rs"))
-            .expect("Should read generated file");
+        let content = read_pretty(output_path.join("prefix_test.rs"));
 
         // Verify the struct is generated
         assert!(

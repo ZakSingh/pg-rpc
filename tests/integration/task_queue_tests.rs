@@ -3,6 +3,7 @@ use indoc::indoc;
 use pgrpc::*;
 use std::collections::HashMap;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 /// Helper to create a test database with task queue schema and composite types
 fn setup_task_queue_schema(client: &mut Client) -> Result<(), postgres::Error> {
@@ -179,7 +180,7 @@ fn test_task_queue_generation(conn_string: &str) -> HashMap<String, String> {
 
         if path.extension().map_or(false, |ext| ext == "rs") {
             let filename = path.file_name().unwrap().to_string_lossy().to_string();
-            let content = std::fs::read_to_string(&path).expect("Should read generated file");
+            let content = read_pretty(&path);
             generated_files.insert(filename, content);
         }
     }
@@ -343,7 +344,7 @@ fn test_generated_task_enum_compiles() {
             [dependencies]
             serde = { version = \"1.0\", features = [\"derive\"] }
             serde_json = \"1.0\"
-            uuid = { version = \"1.0\", features = [\"v4\"] }
+            uuid = { version = \"1.0\", features = [\"v4\", \"serde\"] }
             rust_decimal = \"1.0\"
             time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
         "};
@@ -601,7 +602,7 @@ fn test_custom_table_configuration() {
 
             if path.extension().map_or(false, |ext| ext == "rs") {
                 let filename = path.file_name().unwrap().to_string_lossy().to_string();
-                let content = std::fs::read_to_string(&path).expect("Should read generated file");
+                let content = read_pretty(&path);
                 generated_files.insert(filename, content);
             }
         }
@@ -686,7 +687,7 @@ fn test_custom_table_compilation() {
         // Read generated tasks file
         let tasks_file_path = output_path.join("tasks.rs");
         let tasks_content =
-            std::fs::read_to_string(&tasks_file_path).expect("Should read generated tasks.rs");
+            read_pretty(&tasks_file_path);
 
         // Create a temporary Rust project to test compilation
         let test_dir = TempDir::new().expect("Failed to create temp directory");
@@ -703,7 +704,7 @@ fn test_custom_table_compilation() {
             serde = { version = \"1.0\", features = [\"derive\"] }
             serde_json = \"1.0\"
             time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
-            uuid = \"1.0\"
+            uuid = { version = \"1.0\", features = [\"serde\"] }
             rust_decimal = \"1.0\"
         "};
 
@@ -875,7 +876,7 @@ fn test_timestamptz_serialization_deserialization() {
             serde = { version = \"1.0\", features = [\"derive\"] }
             serde_json = \"1.0\"
             time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
-            uuid = \"1.0\"
+            uuid = { version = \"1.0\", features = [\"serde\"] }
             rust_decimal = \"1.0\"
         "};
 
@@ -1024,7 +1025,7 @@ fn test_date_serialization_deserialization() {
             serde = { version = \"1.0\", features = [\"derive\"] }
             serde_json = \"1.0\"
             time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
-            uuid = \"1.0\"
+            uuid = { version = \"1.0\", features = [\"serde\"] }
             rust_decimal = \"1.0\"
         "};
 

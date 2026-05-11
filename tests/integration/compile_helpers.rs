@@ -15,6 +15,18 @@ pub fn prettify(source: &str) -> String {
     }
 }
 
+/// Read a generated source file and return it prettified.
+///
+/// Panics if the file is missing, matching the `.expect("Should read ...")` pattern
+/// the older tests use. Returns an empty string is *not* desired here; a missing
+/// generated file always indicates a real test failure.
+pub fn read_pretty(path: impl AsRef<Path>) -> String {
+    let path = path.as_ref();
+    let raw = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("Failed to read generated file {}: {}", path.display(), e));
+    prettify(&raw)
+}
+
 /// Create a minimal Cargo project for testing generated code
 pub fn create_test_cargo_project(conn_string: &str, schemas: Vec<&str>) -> TempDir {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -70,6 +82,9 @@ pub fn create_test_cargo_project(conn_string: &str, schemas: Vec<&str>) -> TempD
         deadpool-postgres = "0.12"
         tokio = { version = "1.0", features = ["full"] }
         postgis-butmaintained = "0.12"
+        rust_decimal = "1"
+        bon = "2"
+        uuid = { version = "1", features = ["serde", "v4"] }
         
     "#};
     std::fs::write(project_dir.join("Cargo.toml"), cargo_toml_content)

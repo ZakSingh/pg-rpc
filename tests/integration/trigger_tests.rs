@@ -2,6 +2,7 @@ use super::*;
 use indoc::indoc;
 use pgrpc::*;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 /// Create test triggers and trigger functions for testing
 fn setup_trigger_test_data(client: &mut Client) -> Result<(), postgres::Error> {
@@ -298,15 +299,14 @@ fn test_trigger_exception_integration() {
         builder.build().expect("Should build successfully");
 
         // Check that generated functions include trigger exceptions
-        let api_content = std::fs::read_to_string(output_path.join("trigger_api.rs"))
-            .expect("Should read trigger_api.rs");
+        let api_content = read_pretty(output_path.join("trigger_api.rs"));
 
         // Functions should still use unified error type
         assert!(api_content.contains("super::errors::PgRpcError"));
 
         // Check error types include trigger exceptions
         let errors_content =
-            std::fs::read_to_string(output_path.join("errors.rs")).expect("Should read errors.rs");
+            read_pretty(output_path.join("errors.rs"));
 
         // Should have error enum
         assert!(errors_content.contains("enum PgRpcError"));
@@ -604,7 +604,7 @@ fn test_trigger_exception_error_codes() {
 
         // Verify error handling includes the various SQL states
         let errors_content =
-            std::fs::read_to_string(output_path.join("errors.rs")).expect("Should read errors.rs");
+            read_pretty(output_path.join("errors.rs"));
 
         // Should have error enum with proper From implementation
         assert!(errors_content.contains("enum PgRpcError"));

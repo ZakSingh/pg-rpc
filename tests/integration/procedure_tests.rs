@@ -1,5 +1,6 @@
 use super::*;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 #[test]
 fn test_procedure_with_no_parameters() {
@@ -32,7 +33,7 @@ fn test_procedure_with_no_parameters() {
 
         // Read the generated code
         let public_content =
-            std::fs::read_to_string(output_path.join("public.rs")).expect("Should read public.rs");
+            read_pretty(output_path.join("public.rs"));
 
         // Verify the procedure is generated with CALL
         assert!(
@@ -90,7 +91,7 @@ fn test_procedure_with_in_parameters() {
 
         // Read the generated code
         let public_content =
-            std::fs::read_to_string(output_path.join("public.rs")).expect("Should read public.rs");
+            read_pretty(output_path.join("public.rs"));
 
         // Debug: print the full content since it seems short
         println!("Full public.rs content:\n{}", public_content);
@@ -163,7 +164,7 @@ fn test_procedure_with_single_inout_parameter() {
 
         // Read the generated code
         let public_content =
-            std::fs::read_to_string(output_path.join("public.rs")).expect("Should read public.rs");
+            read_pretty(output_path.join("public.rs"));
 
         // Verify the return type is the INOUT parameter type (nullable by default)
         assert!(
@@ -216,23 +217,25 @@ fn test_procedure_with_multiple_inout_parameters() {
 
         // Read the generated code
         let public_content =
-            std::fs::read_to_string(output_path.join("public.rs")).expect("Should read public.rs");
+            read_pretty(output_path.join("public.rs"));
 
-        // Verify struct is generated for multiple INOUT parameters
+        // Verify struct is generated for multiple INOUT parameters. INOUT params
+        // here have `DEFAULT NULL`, so codegen treats them as nullable (`Option<T>`).
+        // OUT-struct fields strip the `p_` prefix (matching the input arg names).
         assert!(
             public_content.contains("struct GetUserInfoOut"),
             "Should generate struct for multiple INOUT parameters"
         );
         assert!(
-            public_content.contains("p_username: String"),
+            public_content.contains("username: Option<String>"),
             "Should have username field in struct"
         );
         assert!(
-            public_content.contains("p_email: String"),
+            public_content.contains("email: Option<String>"),
             "Should have email field in struct"
         );
         assert!(
-            public_content.contains("p_active: bool"),
+            public_content.contains("active: Option<bool>"),
             "Should have active field in struct"
         );
         assert!(
@@ -276,15 +279,17 @@ fn test_procedure_with_inout_parameters() {
 
         // Read the generated code
         let public_content =
-            std::fs::read_to_string(output_path.join("public.rs")).expect("Should read public.rs");
+            read_pretty(output_path.join("public.rs"));
 
-        // Verify INOUT parameter is both input and output
+        // Verify INOUT parameter is both input and output. Codegen strips the `p_`
+        // prefix from arg names and returns `Option<T>` for procedures (since CALL
+        // can return zero rows in some shapes).
         assert!(
-            public_content.contains("p_value: i32"),
+            public_content.contains("value: i32"),
             "Should have value as input parameter"
         );
         assert!(
-            public_content.contains("Result<i32, DoubleValueError>"),
+            public_content.contains("Result<Option<i32>, DoubleValueError>"),
             "Should return the INOUT parameter"
         );
 
@@ -330,7 +335,7 @@ fn test_procedure_error_handling() {
 
         // Read the generated code
         let public_content =
-            std::fs::read_to_string(output_path.join("public.rs")).expect("Should read public.rs");
+            read_pretty(output_path.join("public.rs"));
 
         // Verify error enum is generated
         assert!(

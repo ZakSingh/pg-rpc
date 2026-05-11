@@ -1,6 +1,7 @@
 use super::*;
 use indoc::indoc;
 use tempfile::TempDir;
+use crate::integration::compile_helpers::read_pretty;
 
 /// Test that type-level @pgrpc_not_null annotations work for composite types
 #[test]
@@ -11,7 +12,7 @@ fn test_composite_type_bulk_not_null() {
             client,
             indoc! {"
                 CREATE SCHEMA test_bulk;
-                
+
                 CREATE TYPE test_bulk.user_info AS (
                     id bigint,
                     email text,
@@ -20,6 +21,11 @@ fn test_composite_type_bulk_not_null() {
                     avatar_url text
                 );
                 COMMENT ON TYPE test_bulk.user_info IS 'User information @pgrpc_not_null(id, email, name)';
+
+                -- pgrpc only emits types reachable from a function/view/query, so
+                -- expose a trivial wrapper to anchor the composite type for codegen.
+                CREATE FUNCTION test_bulk.get_user_info() RETURNS test_bulk.user_info
+                  LANGUAGE sql AS $$ SELECT NULL::test_bulk.user_info $$;
             "},
         )
         .expect("Should create schema and composite type");
@@ -36,8 +42,7 @@ fn test_composite_type_bulk_not_null() {
             .expect("Should generate code");
 
         // Check generated type
-        let schema_content = std::fs::read_to_string(output_path.join("test_bulk.rs"))
-            .expect("Should read test_bulk.rs");
+        let schema_content = read_pretty(output_path.join("test_bulk.rs"));
 
         // Debug: print the generated struct
         eprintln!("=== Generated test_bulk.rs content ===");
@@ -62,7 +67,7 @@ fn test_column_annotation_precedence() {
             client,
             indoc! {"
                 CREATE SCHEMA test_precedence;
-                
+
                 CREATE TYPE test_precedence.contact_info AS (
                     phone text,
                     email text,
@@ -72,6 +77,10 @@ fn test_column_annotation_precedence() {
                 -- Phone has column-level @pgrpc_not_null, should override type-level
                 COMMENT ON COLUMN test_precedence.contact_info.phone IS '@pgrpc_not_null';
                 -- Email should still use type-level annotation
+
+                -- Anchor the type so codegen actually emits a struct for it.
+                CREATE FUNCTION test_precedence.get_contact_info() RETURNS test_precedence.contact_info
+                  LANGUAGE sql AS $$ SELECT NULL::test_precedence.contact_info $$;
             "},
         )
         .expect("Should create schema and composite type");
@@ -88,8 +97,7 @@ fn test_column_annotation_precedence() {
             .expect("Should generate code");
 
         // Check generated type
-        let schema_content = std::fs::read_to_string(output_path.join("test_precedence.rs"))
-            .expect("Should read test_precedence.rs");
+        let schema_content = read_pretty(output_path.join("test_precedence.rs"));
 
         // Both should be not null - phone from column annotation, email from type annotation
         assert!(schema_content.contains("pub phone: String"), "phone should not be Option");
