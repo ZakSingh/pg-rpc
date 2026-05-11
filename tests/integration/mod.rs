@@ -51,7 +51,11 @@ pub struct PostgresTestContainer {
 
 impl PostgresTestContainer {
     fn new() -> Self {
+        // testcontainers-modules' default tag is `11-alpine` (long EOL). Pin to 16
+        // explicitly so the harness exercises a supported version that matches what
+        // pgrpc users are likely running in production.
         let container = postgres_module::Postgres::default()
+            .with_tag("16-alpine")
             .with_label("pgrpc-test-harness", "1")
             .start()
             .expect("Failed to start PostgreSQL container");
