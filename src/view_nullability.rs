@@ -93,6 +93,49 @@ enum JoinType {
     Full,
 }
 
+/// True iff `node` is a call to a SQL aggregate function with no GROUP BY
+/// implication. Used to recognize the "always returns one row" pattern in
+/// scalar subqueries like `(SELECT count(*) FROM t)` and `(SELECT max(x) FROM t)`.
+///
+/// We deliberately keep the allowlist small and well-known. Aggregates outside
+/// this list fall through to the conservative "could return zero rows" path.
+fn is_aggregate_call(node: &protobuf::Node) -> bool {
+    let func = match node.node.as_ref() {
+        Some(protobuf::node::Node::FuncCall(f)) => f,
+        // TypeCast wrapping an aggregate (`count(*)::int4`) still counts —
+        // the wrapper doesn't change cardinality.
+        Some(protobuf::node::Node::TypeCast(tc)) => {
+            return tc.arg.as_deref().map(is_aggregate_call).unwrap_or(false);
+        }
+        _ => return false,
+    };
+    let name = match func.funcname.last().and_then(|n| n.node.as_ref()) {
+        Some(protobuf::node::Node::String(s)) => s.sval.to_lowercase(),
+        _ => return false,
+    };
+    matches!(
+        name.as_str(),
+        "count"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "stddev"
+            | "stddev_samp"
+            | "stddev_pop"
+            | "variance"
+            | "var_samp"
+            | "var_pop"
+            | "array_agg"
+            | "string_agg"
+            | "json_agg"
+            | "jsonb_agg"
+            | "bool_and"
+            | "bool_or"
+            | "every"
+    )
+}
+
 /// Extract the function name from a node inside a `RangeFunction.functions`
 /// list. The pg_query AST wraps the call in a `List` with a `FuncCall` as the
 /// first item. Returns `(name, true)` if a FuncCall was found, otherwise
@@ -1780,40 +1823,56 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                 Ok(false)
             }
             SubLinkType::ExprSublink | SubLinkType::ArraySublink => {
-                // Scalar subquery or array subquery
-                // Need to analyze the subquery itself
-                if let Some(subselect) = &sub_link.subselect {
-                    if let Some(protobuf::node::Node::SelectStmt(select)) = &subselect.node {
-                        // Check if it's a COUNT(*) or COUNT(column) query
-                        if select.target_list.len() == 1 {
-                            if let Some(target) = select.target_list.first() {
-                                if let Some(protobuf::node::Node::ResTarget(res_target)) =
-                                    &target.node
-                                {
-                                    if let Some(val) = &res_target.val {
-                                        if let Some(protobuf::node::Node::FuncCall(func)) =
-                                            &val.node
-                                        {
-                                            // Check if it's COUNT
-                                            if let Some(name_node) = func.funcname.last() {
-                                                if let Some(protobuf::node::Node::String(s)) =
-                                                    &name_node.node
-                                                {
-                                                    if s.sval.to_lowercase() == "count" {
-                                                        // COUNT always returns a value
-                                                        return Ok(false);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                // Scalar subquery (`(SELECT expr)`) or array subquery
+                // (`ARRAY(SELECT …)`). Both can return NULL when the inner
+                // SELECT yields zero rows; otherwise their nullability is the
+                // projected expression's.
+                let select = match sub_link
+                    .subselect
+                    .as_ref()
+                    .and_then(|n| n.node.as_ref())
+                {
+                    Some(protobuf::node::Node::SelectStmt(s)) => s,
+                    _ => return Ok(true),
+                };
+
+                // Multi-column subqueries can't appear in scalar position; bail.
+                if select.target_list.len() != 1 {
+                    return Ok(true);
                 }
-                // For other cases, be conservative
-                Ok(true)
+                let res_target = match select.target_list.first().and_then(|t| t.node.as_ref()) {
+                    Some(protobuf::node::Node::ResTarget(rt)) => rt,
+                    _ => return Ok(true),
+                };
+                let val = match &res_target.val {
+                    Some(v) => v,
+                    None => return Ok(true),
+                };
+
+                // We can promise the subquery returns at least one row in two
+                // cases:
+                //   (a) No FROM clause at all — `(SELECT 1)`, `(SELECT NOW())`.
+                //       Always exactly one row.
+                //   (b) A single bare aggregate over the FROM rows with no
+                //       GROUP BY / HAVING — aggregates over zero rows still
+                //       produce one row (the aggregate's own NULL/non-NULL
+                //       contract takes over).
+                let from_empty = select.from_clause.is_empty();
+                let bare_aggregate = !from_empty
+                    && select.group_clause.is_empty()
+                    && select.having_clause.is_none()
+                    && is_aggregate_call(val);
+
+                if !(from_empty || bare_aggregate) {
+                    return Ok(true);
+                }
+
+                // Now defer to whatever rules already exist for the inner
+                // expression. count(*) hits is_function_nullable -> false,
+                // max/sum/avg -> true (correct, NULL on empty input),
+                // literals -> false, NOW() -> false, arithmetic -> recursive,
+                // etc.
+                self.is_expression_nullable(val)
             }
             _ => Ok(true),
         }

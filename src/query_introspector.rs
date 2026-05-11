@@ -169,7 +169,24 @@ impl<'a> QueryIntrospector<'a> {
         // Get return columns using statement metadata
         let return_columns = match final_query_type {
             QueryType::One | QueryType::Opt | QueryType::Many => {
-                Some(self.introspect_return_columns_from_stmt(&stmt, &parsed.postgres_sql)?)
+                let mut cols = self.introspect_return_columns_from_stmt(&stmt, &parsed.postgres_sql)?;
+                // `-- @pgrpc_not_null(col1, col2)` lets the user assert NOT NULL
+                // on columns whose nullability we couldn't (or won't) prove —
+                // unnest output, jsonb_to_recordset values, lateral subqueries,
+                // anywhere the user's invariants are stronger than the SQL.
+                if !parsed.not_null_annotations.is_empty() {
+                    for col in &mut cols {
+                        if parsed.not_null_annotations.contains(&col.name) {
+                            log::info!(
+                                "[ANNOTATION] Forcing column '{}' NOT NULL via @pgrpc_not_null",
+                                col.name
+                            );
+                            col.nullable = false;
+                            col.nullable_due_to_join = false;
+                        }
+                    }
+                }
+                Some(cols)
             }
             QueryType::Exec | QueryType::ExecRows => None,
         };

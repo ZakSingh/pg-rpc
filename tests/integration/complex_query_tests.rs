@@ -437,6 +437,106 @@ fn test_lateral_join_with_limit_one() {
     });
 }
 
+/// Arithmetic on NOT NULL operands stays NOT NULL.
+///
+/// `is_aexpr_nullable` already recurses into both sides for `+ - * / % ^`,
+/// so a query like `SELECT count(*) + 1 FROM t` should produce a NOT NULL
+/// result without any analyzer changes. This test pins that invariant.
+#[test]
+fn test_arithmetic_on_not_null_operands() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client
+            .execute("CREATE TABLE counters (n INT NOT NULL)", &[])
+            .unwrap();
+
+        let sql = indoc! {r#"
+            -- name: ArithmeticShapes :one
+            SELECT
+                count(*) + 1 AS plus_literal,
+                (count(*) * 2)::int4 AS times_literal,
+                count(*) + count(*) AS sum_of_aggs,
+                length('hello') + 1 AS literal_only
+            FROM counters;
+        "#};
+
+        let (_dir, code) = generate_queries(conn_string, sql);
+
+        // Every column is arithmetic on operands that are themselves NOT NULL
+        // (count(*) is in our NOT NULL allowlist, integer literals are NOT NULL,
+        // length() of a literal string is NOT NULL).
+        assert!(code.contains("pub plus_literal: i64"));
+        assert!(code.contains("pub times_literal: i32"));
+        assert!(code.contains("pub sum_of_aggs: i64"));
+        assert!(code.contains("pub literal_only: i32"));
+    });
+}
+
+/// `(SELECT <expr>)` scalar subqueries.
+///
+/// Without a FROM clause the subquery always returns exactly one row, so its
+/// output nullability matches the projected expression. With a FROM clause we
+/// can't know in general whether any rows match, so the result stays nullable —
+/// except for the special case of a single aggregate over no GROUP BY, which
+/// always produces one row.
+#[test]
+fn test_scalar_subquery_nullability() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client
+            .execute("CREATE TABLE items (id SERIAL PRIMARY KEY, label TEXT NOT NULL)", &[])
+            .unwrap();
+
+        let sql = indoc! {r#"
+            -- name: ScalarSubqueries :one
+            SELECT
+                (SELECT 1) AS literal,
+                (SELECT NOW()) AS literal_now,
+                (SELECT count(*) FROM items) AS item_count,
+                (SELECT max(id) FROM items) AS max_id,
+                (SELECT label FROM items WHERE id = 1) AS maybe_label
+            ;
+        "#};
+
+        let (_dir, code) = generate_queries(conn_string, sql);
+
+        // (SELECT <literal>) — no FROM, exactly one row, projected literal is NOT NULL.
+        assert!(code.contains("pub literal: i32"));
+        assert!(code.contains("pub literal_now: time::OffsetDateTime"));
+        // count() over no GROUP BY: always one row, count is NOT NULL.
+        assert!(code.contains("pub item_count: i64"));
+        // max() over no GROUP BY: always one row, but max's own nullability is
+        // nullable (returns NULL on empty input).
+        assert!(code.contains("pub max_id: Option<i32>"));
+        // Subquery with FROM + WHERE — could match zero rows, conservatively nullable.
+        assert!(code.contains("pub maybe_label: Option<String>"));
+    });
+}
+
+/// `-- @pgrpc_not_null(col1, col2)` lets the user assert columns are NOT NULL
+/// when pgrpc can't prove it. Useful for unnest/jsonb_to_recordset/lateral
+/// subquery output where the user's invariants are stronger than what the
+/// schema can express.
+#[test]
+fn test_not_null_annotation_overrides_inference() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        let _ = client;
+
+        let sql = indoc! {r#"
+            -- name: UnnestWithAnnotation :many
+            -- @pgrpc_not_null(name, age)
+            SELECT name, age
+            FROM unnest(:names::text[], :ages::int4[]) AS t(name, age);
+        "#};
+
+        let (_dir, code) = generate_queries(conn_string, sql);
+
+        // Without the annotation these would be `Option<String>` / `Option<i32>`
+        // (unnest output is conservatively nullable). The annotation flips them
+        // to bare `String` / `i32`.
+        assert!(code.contains("pub name: String"));
+        assert!(code.contains("pub age: i32"));
+    });
+}
+
 /// End-to-end compilation check. Ensures the union of advanced query shapes
 /// produces code that not only matches expected substrings but also passes
 /// `cargo check`. Catches regressions in derive macros, trait bounds, and
