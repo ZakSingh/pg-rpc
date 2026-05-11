@@ -90,6 +90,12 @@ fn extract_enum_variants(expr: &Node, expected_column: &str) -> Option<CheckEnum
             if a_expr.kind() == pg_query::protobuf::AExprKind::AexprIn {
                 return extract_in_variants(a_expr, expected_column);
             }
+            // Handle `col = ANY (ARRAY[...])`, the form pg_get_constraintdef emits for `col IN (...)`.
+            if a_expr.kind() == pg_query::protobuf::AExprKind::AexprOpAny
+                && is_equality_op(&a_expr.name)
+            {
+                return extract_any_array_variants(a_expr, expected_column);
+            }
             // Check if this is an equality: col = 'value'
             if a_expr.kind() == pg_query::protobuf::AExprKind::AexprOp {
                 if is_equality_op(&a_expr.name) {
@@ -141,6 +147,41 @@ fn extract_in_variants(
     let values = extract_string_list(rexpr)?;
 
     if values.is_empty() {
+        return None;
+    }
+
+    Some(CheckEnumInfo {
+        column: column_name,
+        variants: values,
+    })
+}
+
+/// Extract variants from `col = ANY (ARRAY['a', 'b', ...])`.
+///
+/// `pg_get_constraintdef` rewrites `col IN (literals)` into this form, so any
+/// CHECK constraint round-tripped through the catalog lands here rather than in
+/// [`extract_in_variants`].
+fn extract_any_array_variants(
+    a_expr: &pg_query::protobuf::AExpr,
+    expected_column: &str,
+) -> Option<CheckEnumInfo> {
+    let column_name = extract_column_name(a_expr.lexpr.as_ref()?)?;
+    if column_name != expected_column {
+        return None;
+    }
+
+    let rexpr = a_expr.rexpr.as_ref()?;
+    let elements = match &rexpr.node {
+        Some(NodeEnum::AArrayExpr(arr)) => &arr.elements,
+        _ => return None,
+    };
+
+    let values: Vec<String> = elements
+        .iter()
+        .filter_map(extract_string_value)
+        .collect();
+
+    if values.is_empty() || values.len() != elements.len() {
         return None;
     }
 
@@ -246,7 +287,10 @@ fn extract_string_list(node: &Node) -> Option<Vec<String>> {
     }
 }
 
-/// Extract a string value from a constant node
+/// Extract a string value from a constant node.
+///
+/// Handles `TypeCast` wrappers because `pg_get_constraintdef` emits explicit
+/// casts (e.g. `'pending'::text`) for every literal in a CHECK expression.
 fn extract_string_value(node: &Node) -> Option<String> {
     match &node.node {
         Some(NodeEnum::AConst(a_const)) => {
@@ -258,6 +302,7 @@ fn extract_string_value(node: &Node) -> Option<String> {
             None
         }
         Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+        Some(NodeEnum::TypeCast(cast)) => cast.arg.as_deref().and_then(extract_string_value),
         _ => None,
     }
 }
@@ -319,5 +364,27 @@ mod tests {
         let result = parse_check_as_enum(expr, &["status"]);
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_any_array_normalized_form() {
+        // The form that `pg_get_constraintdef` returns for `col IN (literals)`.
+        let expr = "CHECK ((status = ANY (ARRAY['pending'::text, 'shipped'::text, 'delivered'::text])))";
+        let result = parse_check_as_enum(expr, &["status"]);
+
+        let info = result.expect("Should parse normalized = ANY(ARRAY) form");
+        assert_eq!(info.column, "status");
+        assert_eq!(info.variants, vec!["pending", "shipped", "delivered"]);
+    }
+
+    #[test]
+    fn test_or_chain_with_text_casts() {
+        // The form `pg_get_constraintdef` returns for OR chains: literals get `::text` casts.
+        let expr = "CHECK (((s = 'low'::text) OR (s = 'medium'::text) OR (s = 'high'::text)))";
+        let result = parse_check_as_enum(expr, &["s"]);
+
+        let info = result.expect("Should parse OR chain with TypeCast literals");
+        assert_eq!(info.column, "s");
+        assert_eq!(info.variants, vec!["low", "medium", "high"]);
     }
 }

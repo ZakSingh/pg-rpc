@@ -1,4 +1,5 @@
 use super::*;
+use crate::integration::compile_helpers::prettify;
 use pgrpc::*;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -139,22 +140,16 @@ fn test_query_introspection() {
 
         // Now introspect it
         let rel_index = pgrpc::rel_index::RelIndex::new(client).unwrap();
-        let temp_type_index = pgrpc::ty_index::TypeIndex::new(
-            client,
-            &[],
-        ).unwrap();
 
         let view_cache = pgrpc::view_nullability::ViewNullabilityCache::new();
 
-        let mut introspector = pgrpc::query_introspector::QueryIntrospector::new(
-            client,
+        let introspector = pgrpc::query_introspector::QueryIntrospector::new(
             &rel_index,
-            &temp_type_index,
             &view_cache,
             None, // No trigger index for this test
         );
 
-        let introspected = introspector.introspect(parsed).unwrap();
+        let introspected = introspector.introspect(client, parsed).unwrap();
 
         // Verify parameter types
         assert_eq!(introspected.params.len(), 1);
@@ -221,23 +216,17 @@ WHERE u.id = :user_id;
         let parsed = &queries[0];
 
         let rel_index = pgrpc::rel_index::RelIndex::new(client).unwrap();
-        let temp_type_index = pgrpc::ty_index::TypeIndex::new(
-            client,
-            &[],
-        ).unwrap();
 
         // Build view nullability cache (empty in this case)
         let view_cache = pgrpc::view_nullability::ViewNullabilityCache::new();
 
-        let mut introspector = pgrpc::query_introspector::QueryIntrospector::new(
-            client,
+        let introspector = pgrpc::query_introspector::QueryIntrospector::new(
             &rel_index,
-            &temp_type_index,
             &view_cache,
             None, // No trigger index for this test
         );
 
-        let introspected = introspector.introspect(parsed).unwrap();
+        let introspected = introspector.introspect(client, parsed).unwrap();
 
         let return_cols = introspected.return_columns.as_ref().expect("Should have return columns");
         assert_eq!(return_cols.len(), 5);
@@ -313,7 +302,7 @@ DELETE FROM users WHERE id = :user_id;
         let queries_file = output_dir.join("queries.rs");
         assert!(queries_file.exists(), "queries.rs should be generated");
 
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         // Verify GetUser function - :one returns Result<T, Error> (not Option)
         assert!(generated_code.contains("pub async fn get_user"), "Should generate get_user function");
@@ -413,7 +402,7 @@ SELECT user_id, username, post_id, title FROM user_posts WHERE user_id = :user_i
 
         // Read generated code
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         // Verify that columns from the LEFT JOIN are nullable
         // user_id and username should be NOT NULL
@@ -465,7 +454,7 @@ SELECT id, username, COALESCE(bio, 'No bio') as bio FROM users WHERE id = :user_
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         // bio should be String (not Option<String>) because of COALESCE
         assert!(generated_code.contains("pub bio: String"), "bio should be String due to COALESCE");
@@ -513,7 +502,7 @@ fn test_multiple_query_files() {
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         // Both queries should be generated
         assert!(generated_code.contains("pub async fn get_user"));
@@ -592,7 +581,7 @@ WHERE p.id = $1;
         let queries_file = output_dir.join("queries.rs");
         assert!(queries_file.exists(), "queries.rs should be generated");
 
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE ===\n{}\n======================", generated_code);
 
@@ -678,7 +667,7 @@ RETURNING message_id, account_id, item_id, content, created_at, updated_at;
         let queries_file = output_dir.join("queries.rs");
         assert!(queries_file.exists(), "queries.rs should be generated");
 
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE ===\n{}\n======================", generated_code);
 
@@ -753,7 +742,7 @@ RETURNING item_id, name, description, price;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE ===\n{}\n======================", generated_code);
 
@@ -826,7 +815,7 @@ WHERE (email = :email OR :email IS NULL)
         let queries_file = output_dir.join("queries.rs");
         assert!(queries_file.exists(), "queries.rs should be generated");
 
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE ===\n{}\n======================", generated_code);
 
@@ -900,7 +889,7 @@ WHERE p.published = true;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE (CTE SELECT) ===\n{}\n======================", generated_code);
 
@@ -970,7 +959,7 @@ RETURNING account_id;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE (CTE INSERT) ===\n{}\n======================", generated_code);
 
@@ -1031,7 +1020,7 @@ SELECT id, name, parent_id, depth FROM category_tree;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE (RECURSIVE CTE) ===\n{}\n======================", generated_code);
 
@@ -1108,7 +1097,7 @@ LEFT JOIN items i ON i.item_nanoid = :item_nanoid;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).unwrap();
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).unwrap());
 
         println!(
             "=== GENERATED CODE (DATA-MODIFYING CTE) ===\n{}\n======================",
@@ -1195,7 +1184,7 @@ SELECT * FROM users WHERE status = $1;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE (INFERENCE) ===\n{}\n======================", generated_code);
 
@@ -1259,7 +1248,7 @@ SELECT * FROM users LIMIT 1;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         // Explicit :many should win over inferred :opt
         assert!(generated_code.contains("Result<Vec<GetUserLimitOneRow>, GetUserLimitOneError>"),
@@ -1313,7 +1302,7 @@ RETURNING *;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE (UPSERT) ===\n{}\n======================", generated_code);
 
@@ -1368,7 +1357,7 @@ SELECT * FROM users WHERE id = $1;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE (PK LOOKUP) ===\n{}\n======================", generated_code);
 
@@ -1418,7 +1407,7 @@ DELETE FROM users WHERE id = $1 RETURNING *;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         // DeleteUser - DELETE without RETURNING should infer :exec
         assert!(generated_code.contains("pub async fn delete_user"), "Should generate delete_user function");
@@ -1473,7 +1462,7 @@ RETURNING id;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         // param_2 (sort_order) should be impl Into<Option<i32>> because it's wrapped in COALESCE
         assert!(
@@ -1529,7 +1518,7 @@ SELECT * FROM users WHERE ($1::text IS NULL OR email = $1);
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         // param should be impl Into<Option<...>> because it's used in IS NULL check
         assert!(
@@ -1599,7 +1588,7 @@ RETURNING *;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE (INSERT PARAM NULLABILITY) ===\n{}\n======================", generated_code);
 
@@ -1684,7 +1673,7 @@ RETURNING *;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE (DEFAULT KEYWORD) ===\n{}\n======================", generated_code);
 
@@ -1765,7 +1754,7 @@ RETURNING *;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE (UPDATE DEFAULT KEYWORD) ===\n{}\n======================", generated_code);
 
@@ -1850,7 +1839,7 @@ SELECT * FROM inserted;
         builder.build().expect("Code generation should succeed");
 
         let queries_file = output_dir.join("queries.rs");
-        let generated_code = std::fs::read_to_string(&queries_file).expect("Should read queries.rs");
+        let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
         println!("=== GENERATED CODE (CTE INSERT DEFAULT) ===\n{}\n======================", generated_code);
 

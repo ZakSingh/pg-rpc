@@ -1,8 +1,19 @@
 use indoc::indoc;
 use postgres::{Client, NoTls};
+use std::process::Command;
 use std::sync::{Mutex, Once};
+use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::{postgres as postgres_module, testcontainers::runners::SyncRunner};
 use uuid::Uuid;
+
+/// Docker label applied to every container started by this harness.
+///
+/// Used for two cleanup paths:
+///   * Startup scrub — removes any containers left behind by a previous run that exited
+///     abnormally (panic in `main`, SIGINT, OOM kill, etc.).
+///   * `libc::atexit` hook — removes the container started by the current run, since
+///     storing it in a `static` means its `Drop` never fires.
+const HARNESS_LABEL: &str = "pgrpc-test-harness=1";
 
 pub mod check_enum_tests;
 pub mod codegen_tests;
@@ -41,6 +52,7 @@ pub struct PostgresTestContainer {
 impl PostgresTestContainer {
     fn new() -> Self {
         let container = postgres_module::Postgres::default()
+            .with_label("pgrpc-test-harness", "1")
             .start()
             .expect("Failed to start PostgreSQL container");
 
@@ -99,9 +111,52 @@ impl PostgresTestContainer {
     }
 }
 
-/// Get the shared test container instance
+/// Remove every container tagged with [`HARNESS_LABEL`].
+///
+/// Idempotent and best-effort: failures (Docker not running, no matches, etc.) are
+/// silently ignored. The caller never needs to care whether anything was actually removed.
+fn scrub_labeled_containers() {
+    // `docker ps -aq --filter label=...` prints one container ID per line, or nothing.
+    let list = match Command::new("docker")
+        .args(["ps", "-aq", "--filter", &format!("label={}", HARNESS_LABEL)])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return,
+    };
+    let ids: Vec<&str> = std::str::from_utf8(&list)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let _ = Command::new("docker").arg("rm").arg("-f").args(&ids).output();
+}
+
+/// `atexit` callback. Runs on normal process termination (`main` returns, `exit()` is
+/// called, all `#[test]`s finish). Will not run on SIGKILL or `std::process::abort` —
+/// the startup scrub catches those cases on the next run.
+extern "C" fn cleanup_on_exit() {
+    scrub_labeled_containers();
+}
+
+/// Get the shared test container instance.
+///
+/// On first call, registers an `atexit` cleanup hook (so the container is removed when
+/// the test binary exits normally — `static` storage means `Drop` never runs on its own)
+/// and scrubs any containers left over from a prior abnormal exit.
 pub fn get_test_container() -> &'static PostgresTestContainer {
     INIT.call_once(|| {
+        // Sweep up anything left over from a previous run that didn't shut down cleanly.
+        scrub_labeled_containers();
+
+        // SAFETY: `libc::atexit` only requires the callback to be a valid `extern "C" fn`,
+        // which it is. The callback runs without any Rust runtime invariants to preserve.
+        unsafe {
+            libc::atexit(cleanup_on_exit);
+        }
+
         let container = PostgresTestContainer::new();
         let mut guard = CONTAINER.lock().unwrap();
         *guard = Some(container);

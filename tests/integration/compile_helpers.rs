@@ -3,6 +3,18 @@ use std::path::Path;
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
+/// Prettify raw `quote!` output so substring assertions can match the
+/// human-readable form (e.g. `impl<'a>` instead of `impl < 'a >`).
+///
+/// Falls back to the original source on parse error, since some test inputs
+/// deliberately exercise partial fragments that aren't standalone files.
+pub fn prettify(source: &str) -> String {
+    match syn::parse_file(source) {
+        Ok(file) => prettyplease::unparse(&file),
+        Err(_) => source.to_string(),
+    }
+}
+
 /// Create a minimal Cargo project for testing generated code
 pub fn create_test_cargo_project(conn_string: &str, schemas: Vec<&str>) -> TempDir {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");

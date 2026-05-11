@@ -49,8 +49,12 @@ impl QueryIndex {
 
         let conn_str = connection_string.to_string();
 
+        // Cache one client per rayon worker, keyed by the connection string so that
+        // back-to-back QueryIndex::new calls with *different* targets (most commonly
+        // the integration test suite, where each test gets its own database) don't
+        // reuse a client pointed at the wrong database.
         thread_local! {
-            static THREAD_CLIENT: RefCell<Option<Client>> = const { RefCell::new(None) };
+            static THREAD_CLIENT: RefCell<Option<(String, Client)>> = const { RefCell::new(None) };
         }
 
         let results: Vec<Result<(QueryId, IntrospectedQuery)>> = parsed_queries
@@ -58,15 +62,16 @@ impl QueryIndex {
             .map(|parsed| {
                 THREAD_CLIENT.with(|cell| {
                     let mut borrow = cell.borrow_mut();
-                    let client = match borrow.as_mut() {
-                        Some(c) => c,
-                        None => {
-                            let mut c = Client::connect(&conn_str, NoTls)?;
-                            c.execute("SET jit = off", &[])?;
-                            *borrow = Some(c);
-                            borrow.as_mut().unwrap()
-                        }
+                    let needs_new = match borrow.as_ref() {
+                        Some((cached_conn, _)) => cached_conn != &conn_str,
+                        None => true,
                     };
+                    if needs_new {
+                        let mut c = Client::connect(&conn_str, NoTls)?;
+                        c.execute("SET jit = off", &[])?;
+                        *borrow = Some((conn_str.clone(), c));
+                    }
+                    let (_, client) = borrow.as_mut().unwrap();
 
                     let introspected = introspector.introspect(client, parsed)?;
                     let id = QueryId {

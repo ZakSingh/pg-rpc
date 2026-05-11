@@ -1582,6 +1582,7 @@ dependencies = [
  "indoc",
  "itertools 0.14.0",
  "jsonpath-rust",
+ "libc",
  "log",
  "once_cell",
  "petgraph",
