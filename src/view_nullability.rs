@@ -48,6 +48,10 @@ pub struct ViewNullabilityAnalyzer<'a> {
     nullable_columns: HashSet<String>,
     /// Cache of previously analyzed view nullability
     view_nullability_cache: &'a ViewNullabilityCache,
+    /// CTE name -> column nullability map, populated while walking `WITH` clauses.
+    /// Looked up when a CTE name appears in a FROM clause so we can resolve
+    /// `cte_alias.col` references against the CTE's inferred output shape.
+    cte_columns: HashMap<String, IndexMap<String, ColumnNullability>>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +73,16 @@ enum TableInfo {
         /// True if this view reference can produce NULL values due to outer joins
         is_nullable: bool,
     },
+    /// "Derived" table — a CTE reference, FROM-clause subquery, or set-returning
+    /// function. Behaves like [`TableInfo::View`] for column lookup, but isn't
+    /// backed by a real `pg_class` entry, so things like star-expansion via
+    /// `get_table_columns` should treat it as opaque.
+    Derived {
+        /// Column name -> nullability, in declaration order.
+        nullability: IndexMap<String, ColumnNullability>,
+        /// True if this reference can produce NULL values due to outer joins.
+        is_nullable: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -79,6 +93,83 @@ enum JoinType {
     Full,
 }
 
+/// Extract the function name from a node inside a `RangeFunction.functions`
+/// list. The pg_query AST wraps the call in a `List` with a `FuncCall` as the
+/// first item. Returns `(name, true)` if a FuncCall was found, otherwise
+/// `("", false)`.
+fn extract_range_function_name(node: &protobuf::Node) -> (String, bool) {
+    let inner = match node.node.as_ref() {
+        Some(protobuf::node::Node::List(list)) => list.items.first(),
+        _ => Some(node),
+    };
+    let func = match inner.and_then(|n| n.node.as_ref()) {
+        Some(protobuf::node::Node::FuncCall(f)) => f,
+        _ => return (String::new(), false),
+    };
+    // funcname may be schema-qualified (`pg_catalog.unnest`); take the last segment.
+    let last = func.funcname.last().and_then(|n| n.node.as_ref());
+    match last {
+        Some(protobuf::node::Node::String(s)) => (s.sval.clone(), true),
+        _ => (String::new(), true),
+    }
+}
+
+/// Collapse a positional column list (output of [`ViewNullabilityAnalyzer::analyze_select_stmt`])
+/// into an order-preserving map. Duplicate or empty names get a synthetic
+/// `column_N` placeholder so they survive the round-trip.
+fn vec_to_indexmap(cols: Vec<(String, ColumnNullability)>) -> IndexMap<String, ColumnNullability> {
+    let mut out = IndexMap::new();
+    for (i, (name, cn)) in cols.into_iter().enumerate() {
+        let key = if name.is_empty() {
+            format!("column_{}", i)
+        } else {
+            name
+        };
+        out.insert(key, cn);
+    }
+    out
+}
+
+/// Merge two set-operation arms (UNION / INTERSECT / EXCEPT).
+///
+/// PostgreSQL matches columns positionally. A column is NOT NULL iff *every*
+/// arm reports it NOT NULL. Mismatched lengths fall back to all-nullable for
+/// safety — we never claim NOT NULL on a column we couldn't verify on both
+/// arms. Output column names come from the left arm (matching pg's behaviour).
+fn merge_set_op_columns(
+    larg: &[(String, ColumnNullability)],
+    rarg: &[(String, ColumnNullability)],
+) -> Vec<(String, ColumnNullability)> {
+    if larg.len() != rarg.len() {
+        return larg
+            .iter()
+            .map(|(n, _)| {
+                (
+                    n.clone(),
+                    ColumnNullability {
+                        nullable_due_to_join: false,
+                        nullable_on_base: true,
+                    },
+                )
+            })
+            .collect();
+    }
+    larg.iter()
+        .zip(rarg.iter())
+        .map(|((name, l), (_, r))| {
+            (
+                name.clone(),
+                ColumnNullability {
+                    // Either side reaching the column through an outer join taints the union.
+                    nullable_due_to_join: l.nullable_due_to_join || r.nullable_due_to_join,
+                    // Base-nullable on either arm makes the merged column base-nullable.
+                    nullable_on_base: l.nullable_on_base || r.nullable_on_base,
+                },
+            )
+        })
+        .collect()
+}
+
 impl<'a> ViewNullabilityAnalyzer<'a> {
     pub fn new(rel_index: &'a RelIndex, view_nullability_cache: &'a ViewNullabilityCache) -> Self {
         Self {
@@ -86,6 +177,7 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
             alias_map: HashMap::new(),
             nullable_columns: HashSet::new(),
             view_nullability_cache,
+            cte_columns: HashMap::new(),
         }
     }
 
@@ -178,45 +270,30 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
         // Clear previous state
         self.alias_map.clear();
         self.nullable_columns.clear();
+        self.cte_columns.clear();
 
-        // Track column results: (is_not_null_overall, nullable_due_to_join)
-        let mut column_nullability = Vec::new();
-
-        // Find the main SELECT statement
-        if let Some(stmt) = parse_result.protobuf.stmts.first() {
+        // Walk the top-level SelectStmt with the shared helper. Anything else
+        // (INSERT/UPDATE/DELETE … RETURNING) is handled by
+        // `refine_nullability_from_dml_target` in the introspector, not here.
+        let column_nullability = if let Some(stmt) = parse_result.protobuf.stmts.first() {
             if let Some(node) = &stmt.stmt {
                 if let Some(protobuf::node::Node::SelectStmt(select)) = &node.node {
-                    // First analyze FROM clause
-                    for from_item in &select.from_clause {
-                        self.analyze_from_item(from_item)?;
-                    }
-
-                    // Then analyze each target column, expanding star expressions
-                    for target in &select.target_list {
-                        if let Some(protobuf::node::Node::ResTarget(res_target)) = &target.node {
-                            if let Some(val) = &res_target.val {
-                                // Check if this is a star expression
-                                if self.is_star_expression(val) {
-                                    // Expand star expression into individual columns
-                                    let expanded = self.expand_star_expression_detailed(val)?;
-                                    column_nullability.extend(expanded.into_iter().map(|(_, cn)| cn));
-                                } else {
-                                    // Regular column expression
-                                    let cn = self.expression_nullability_detailed(val)?;
-                                    column_nullability.push(cn);
-                                }
-                            }
-                        }
-                    }
+                    self.analyze_select_stmt(select)?
+                } else {
+                    Vec::new()
                 }
+            } else {
+                Vec::new()
             }
-        }
+        } else {
+            Vec::new()
+        };
 
         // Map view columns to their nullability
         // Use IndexMap to preserve column order
         let mut result = IndexMap::new();
         for (i, column_name) in view_columns.iter().enumerate() {
-            if let Some(cn) = column_nullability.get(i) {
+            if let Some((_, cn)) = column_nullability.get(i) {
                 result.insert(column_name.clone(), *cn);
             } else {
                 // Default to nullable if we couldn't analyze
@@ -231,6 +308,359 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
         }
 
         Ok(result)
+    }
+
+    /// Analyze a `SelectStmt` and return its output columns in declaration order,
+    /// each paired with its inferred nullability.
+    ///
+    /// Handles three top-level shapes:
+    ///   * `WITH` prefix — each CTE is analyzed and registered in `cte_columns`
+    ///     before the outer SELECT body, so later FROM references resolve.
+    ///   * Set operations (`UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`) — both
+    ///     arms are analyzed and merged column-wise. A column is NOT NULL only
+    ///     if it is NOT NULL on *every* arm; mismatched column counts produce
+    ///     all-nullable output (conservative).
+    ///   * Plain `SELECT … FROM …` — FROM items are walked into `alias_map`,
+    ///     then each target expression is analyzed.
+    ///
+    /// FROM-clause handling mutates `self.alias_map`. Callers that want to
+    /// analyze a *nested* SelectStmt without poisoning the outer alias state
+    /// should snapshot/restore (the CTE-walk does this).
+    fn analyze_select_stmt(
+        &mut self,
+        select: &protobuf::SelectStmt,
+    ) -> anyhow::Result<Vec<(String, ColumnNullability)>> {
+        // 1. Process the WITH clause first so the outer query's FROM items can
+        //    reference CTE aliases.
+        if let Some(with) = &select.with_clause {
+            self.analyze_with_clause(with)?;
+        }
+
+        // 2. UNION/INTERSECT/EXCEPT: analyze each arm and merge. The arms each
+        //    have their own FROM clause, so we snapshot alias state to keep
+        //    them independent.
+        use protobuf::SetOperation;
+        let op = SetOperation::try_from(select.op).unwrap_or(SetOperation::Undefined);
+        if op != SetOperation::SetopNone {
+            let larg_cols = if let Some(larg) = &select.larg {
+                self.analyze_subselect(larg)?
+            } else {
+                Vec::new()
+            };
+            let rarg_cols = if let Some(rarg) = &select.rarg {
+                self.analyze_subselect(rarg)?
+            } else {
+                Vec::new()
+            };
+            return Ok(merge_set_op_columns(&larg_cols, &rarg_cols));
+        }
+
+        // 3. Plain SELECT.
+        for from_item in &select.from_clause {
+            self.analyze_from_item(from_item)?;
+        }
+
+        let mut columns: Vec<(String, ColumnNullability)> = Vec::new();
+        for target in &select.target_list {
+            if let Some(protobuf::node::Node::ResTarget(res_target)) = &target.node {
+                if let Some(val) = &res_target.val {
+                    if self.is_star_expression(val) {
+                        let expanded = self.expand_star_expression_detailed(val)?;
+                        columns.extend(expanded);
+                    } else {
+                        let cn = self.expression_nullability_detailed(val)?;
+                        // Output column name is the `AS alias` if present, else
+                        // best-effort derived from the expression. Missing names
+                        // become empty strings — callers that care about names
+                        // (the CTE path) supply explicit `aliascolnames` overrides.
+                        let name = if !res_target.name.is_empty() {
+                            res_target.name.clone()
+                        } else {
+                            self.extract_column_name(val).unwrap_or_default()
+                        };
+                        columns.push((name, cn));
+                    }
+                }
+            }
+        }
+        Ok(columns)
+    }
+
+    /// Determine the column-nullability map produced by a `RangeFunction`
+    /// (set-returning function in FROM). Conservative by design: if we don't
+    /// recognize the function, return an empty map so callers fall back to
+    /// "all columns nullable".
+    ///
+    /// What we DO infer:
+    ///   * `unnest(arr)` — produces one column. Element type matches the array
+    ///     element, but pg's introspection over `unnest` can't see whether the
+    ///     producing array contained NULLs, so the column stays nullable.
+    ///   * `unnest(...) WITH ORDINALITY` — appends a NOT NULL `bigint`
+    ///     ordinality column at the end. We only assert NOT NULL on that one.
+    ///   * `generate_series(...)` — single NOT NULL column (`generate_series`).
+    ///     With ordinality, an additional NOT NULL `bigint`.
+    ///
+    /// Anything with a `coldeflist` (e.g. `jsonb_to_recordset(...) AS t(a int, b text)`)
+    /// has columns we can name but not prove non-null — JSON values can be
+    /// missing per row — so we list them all as nullable.
+    fn analyze_range_function(
+        &self,
+        range_fn: &protobuf::RangeFunction,
+    ) -> IndexMap<String, ColumnNullability> {
+        let mut columns: IndexMap<String, ColumnNullability> = IndexMap::new();
+
+        // `coldeflist` is the explicit `AS t(col1 type1, col2 type2, …)` form.
+        // Always nullable — we can't prove otherwise without per-row evidence.
+        for col in &range_fn.coldeflist {
+            if let Some(protobuf::node::Node::ColumnDef(col_def)) = &col.node {
+                columns.insert(
+                    col_def.colname.clone(),
+                    ColumnNullability {
+                        nullable_due_to_join: false,
+                        nullable_on_base: true,
+                    },
+                );
+            }
+        }
+
+        // Inspect each function call to learn its output shape and name.
+        // Without `coldeflist`, the alias's `colnames` (or the function name)
+        // determines the column name.
+        if columns.is_empty() {
+            for (i, fn_node) in range_fn.functions.iter().enumerate() {
+                let (fn_name, has_func_call) = extract_range_function_name(fn_node);
+                if !has_func_call {
+                    continue;
+                }
+                // Try to use the alias's per-position colnames first, falling
+                // back to the function name for the single-output case.
+                let column_name = range_fn
+                    .alias
+                    .as_ref()
+                    .and_then(|a| a.colnames.get(i))
+                    .and_then(|n| {
+                        if let Some(protobuf::node::Node::String(s)) = &n.node {
+                            Some(s.sval.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| fn_name.clone());
+                let cn = match fn_name.as_str() {
+                    // `generate_series` is the textbook NOT NULL set-returning
+                    // function — every element is by construction non-null.
+                    "generate_series" => ColumnNullability {
+                        nullable_due_to_join: false,
+                        nullable_on_base: false,
+                    },
+                    // `unnest` propagates whatever NULLs were in the array.
+                    // Without per-array-element evidence we assume nullable.
+                    _ => ColumnNullability {
+                        nullable_due_to_join: false,
+                        nullable_on_base: true,
+                    },
+                };
+                columns.insert(column_name, cn);
+            }
+        }
+
+        // `WITH ORDINALITY` appends one NOT NULL `bigint` column. The alias's
+        // colnames list (if any) gives its name; otherwise pg defaults to
+        // "ordinality".
+        if range_fn.ordinality {
+            let ord_name = range_fn
+                .alias
+                .as_ref()
+                .and_then(|a| a.colnames.last())
+                .and_then(|n| {
+                    if let Some(protobuf::node::Node::String(s)) = &n.node {
+                        Some(s.sval.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "ordinality".to_string());
+            columns.insert(
+                ord_name,
+                ColumnNullability {
+                    nullable_due_to_join: false,
+                    nullable_on_base: false,
+                },
+            );
+        }
+
+        columns
+    }
+
+    /// Analyze a boxed `SelectStmt` (from a UNION arm or subquery) with a
+    /// snapshot/restore of `alias_map` so the inner scope can't leak.
+    fn analyze_subselect(
+        &mut self,
+        select: &protobuf::SelectStmt,
+    ) -> anyhow::Result<Vec<(String, ColumnNullability)>> {
+        let saved = std::mem::take(&mut self.alias_map);
+        let result = self.analyze_select_stmt(select);
+        self.alias_map = saved;
+        result
+    }
+
+    /// Populate `self.cte_columns` from a `WITH` clause. Each CTE's body may
+    /// itself be a SELECT (possibly with another WITH) or a data-modifying
+    /// statement with `RETURNING`. Anything we can't analyze conservatively
+    /// produces no entry, so later references fall back to all-nullable.
+    fn analyze_with_clause(&mut self, with: &protobuf::WithClause) -> anyhow::Result<()> {
+        for cte_node in &with.ctes {
+            let cte = match &cte_node.node {
+                Some(protobuf::node::Node::CommonTableExpr(c)) => c,
+                _ => continue,
+            };
+            let columns = match self.analyze_cte_body(cte)? {
+                Some(cols) => cols,
+                None => continue,
+            };
+
+            // Apply `aliascolnames` (`WITH cte(a, b, c) AS …`) if present —
+            // these rename the CTE's output columns positionally.
+            let renamed = if cte.aliascolnames.is_empty() {
+                columns
+            } else {
+                let mut out = IndexMap::new();
+                for (i, alias_node) in cte.aliascolnames.iter().enumerate() {
+                    if let Some(protobuf::node::Node::String(s)) = &alias_node.node {
+                        if let Some((_, cn)) = columns.get_index(i) {
+                            out.insert(s.sval.clone(), *cn);
+                        }
+                    }
+                }
+                // Carry over any unrenamed trailing columns under their original names.
+                for (i, (k, v)) in columns.iter().enumerate() {
+                    if i >= cte.aliascolnames.len() {
+                        out.insert(k.clone(), *v);
+                    }
+                }
+                out
+            };
+
+            self.cte_columns.insert(cte.ctename.clone(), renamed);
+        }
+        Ok(())
+    }
+
+    /// Analyze a single CTE body. Returns `None` if the body shape isn't one
+    /// we know how to introspect (very deeply-nested or future Postgres
+    /// constructs) — callers should treat that as "all columns nullable".
+    fn analyze_cte_body(
+        &mut self,
+        cte: &protobuf::CommonTableExpr,
+    ) -> anyhow::Result<Option<IndexMap<String, ColumnNullability>>> {
+        let body = match cte.ctequery.as_ref().and_then(|n| n.node.as_ref()) {
+            Some(node) => node,
+            None => return Ok(None),
+        };
+
+        let cols = match body {
+            protobuf::node::Node::SelectStmt(select) => {
+                let cols = self.analyze_subselect(select)?;
+                vec_to_indexmap(cols)
+            }
+            protobuf::node::Node::InsertStmt(insert) => self
+                .returning_columns_from_target(&insert.relation, &insert.returning_list)?
+                .unwrap_or_default(),
+            protobuf::node::Node::UpdateStmt(update) => self
+                .returning_columns_from_target(&update.relation, &update.returning_list)?
+                .unwrap_or_default(),
+            protobuf::node::Node::DeleteStmt(delete) => self
+                .returning_columns_from_target(&delete.relation, &delete.returning_list)?
+                .unwrap_or_default(),
+            _ => return Ok(None),
+        };
+
+        if cols.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(cols))
+        }
+    }
+
+    /// Build the column-nullability map produced by a DML statement's
+    /// `RETURNING` list. Looks each plain column up in `rel_index` to see if
+    /// the target table has a NOT NULL constraint on it. Expressions, casts,
+    /// and anything else default to nullable.
+    fn returning_columns_from_target(
+        &self,
+        relation: &Option<protobuf::RangeVar>,
+        returning_list: &[protobuf::Node],
+    ) -> anyhow::Result<Option<IndexMap<String, ColumnNullability>>> {
+        if returning_list.is_empty() {
+            return Ok(None);
+        }
+        let range_var = match relation {
+            Some(rv) => rv,
+            None => return Ok(None),
+        };
+        let schema = if range_var.schemaname.is_empty() {
+            None
+        } else {
+            Some(range_var.schemaname.clone())
+        };
+        let rel = match self.find_relation(&schema, &range_var.relname) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let mut result: IndexMap<String, ColumnNullability> = IndexMap::new();
+        for target in returning_list {
+            if let Some(protobuf::node::Node::ResTarget(res_target)) = &target.node {
+                let val = match &res_target.val {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                // The output column name in RETURNING: explicit `AS alias`,
+                // otherwise the referenced column's name (single-field
+                // ColumnRef).
+                let alias = if !res_target.name.is_empty() {
+                    Some(res_target.name.clone())
+                } else {
+                    self.extract_column_name(val)
+                };
+
+                let cn = match &val.node {
+                    Some(protobuf::node::Node::ColumnRef(col_ref)) => {
+                        // `RETURNING table.col` or `RETURNING col` — both
+                        // resolve to a column on `rel`.
+                        let col_name = match col_ref.fields.last().and_then(|f| f.node.as_ref()) {
+                            Some(protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+                            _ => None,
+                        };
+                        match col_name {
+                            Some(name) => ColumnNullability {
+                                nullable_due_to_join: false,
+                                nullable_on_base: !self.is_column_not_null(rel, &name),
+                            },
+                            None => ColumnNullability {
+                                nullable_due_to_join: false,
+                                nullable_on_base: true,
+                            },
+                        }
+                    }
+                    _ => ColumnNullability {
+                        nullable_due_to_join: false,
+                        nullable_on_base: true,
+                    },
+                };
+
+                if let Some(name) = alias {
+                    result.insert(name, cn);
+                }
+            }
+        }
+
+        if result.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
     }
 
     fn analyze_from_item(&mut self, from: &protobuf::Node) -> anyhow::Result<()> {
@@ -261,6 +691,16 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                                 is_nullable: false, // Will be updated by join analysis
                             },
                         );
+                    } else if let Some(cte) = self.cte_columns.get(&table_name) {
+                        // The name resolves to a CTE in the enclosing scope —
+                        // use its inferred column-nullability map.
+                        self.alias_map.insert(
+                            alias,
+                            TableInfo::Derived {
+                                nullability: cte.clone(),
+                                is_nullable: false,
+                            },
+                        );
                     } else {
                         // Not a base table, check if it's a view in the cache
                         let cache_key = (schema.clone(), table_name.clone());
@@ -277,6 +717,50 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                             );
                         }
                         // If not found in either, it's ignored (conservative approach)
+                    }
+                }
+                protobuf::node::Node::RangeSubselect(range_sub) => {
+                    // `(SELECT …) AS alias` in FROM. We recursively analyze
+                    // the inner SELECT (with snapshot/restore via
+                    // `analyze_subselect`) and register the result as a Derived
+                    // alias. Lateral subqueries follow the same path; the
+                    // surrounding LEFT JOIN sets `is_nullable` later.
+                    let alias = range_sub
+                        .alias
+                        .as_ref()
+                        .map(|a| a.aliasname.clone())
+                        .unwrap_or_default();
+                    if let Some(sub) = &range_sub.subquery {
+                        if let Some(protobuf::node::Node::SelectStmt(inner)) = &sub.node {
+                            let cols = self.analyze_subselect(inner)?;
+                            self.alias_map.insert(
+                                alias,
+                                TableInfo::Derived {
+                                    nullability: vec_to_indexmap(cols),
+                                    is_nullable: false,
+                                },
+                            );
+                        }
+                    }
+                }
+                protobuf::node::Node::RangeFunction(range_fn) => {
+                    // Set-returning functions like `unnest`, `generate_series`,
+                    // `jsonb_to_recordset`. Inference is deliberately limited
+                    // to a small allowlist; anything else stays all-nullable.
+                    let columns = self.analyze_range_function(range_fn);
+                    let alias = range_fn
+                        .alias
+                        .as_ref()
+                        .map(|a| a.aliasname.clone())
+                        .unwrap_or_default();
+                    if !alias.is_empty() {
+                        self.alias_map.insert(
+                            alias,
+                            TableInfo::Derived {
+                                nullability: columns,
+                                is_nullable: false,
+                            },
+                        );
                     }
                 }
                 protobuf::node::Node::JoinExpr(join) => {
@@ -499,6 +983,15 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                     result.push((col_name.clone(), final_not_null));
                 }
             }
+            TableInfo::Derived {
+                nullability,
+                is_nullable,
+            } => {
+                for (col_name, cn) in nullability {
+                    let final_not_null = cn.is_not_null() && !is_nullable;
+                    result.push((col_name.clone(), final_not_null));
+                }
+            }
         }
 
         log::info!("[GET_COLUMNS] Returning {} columns", result.len());
@@ -536,6 +1029,10 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                 nullability,
                 is_nullable,
                 ..
+            }
+            | TableInfo::Derived {
+                nullability,
+                is_nullable,
             } => {
                 for (col_name, cn) in nullability {
                     result.push((
@@ -652,7 +1149,8 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                     if let Some(table_info) = self.alias_map.get(&name.sval) {
                         match table_info {
                             TableInfo::Table { is_nullable, .. }
-                            | TableInfo::View { is_nullable, .. } => {
+                            | TableInfo::View { is_nullable, .. }
+                            | TableInfo::Derived { is_nullable, .. } => {
                                 return Ok(ColumnNullability {
                                     nullable_due_to_join: *is_nullable,
                                     nullable_on_base: false,
@@ -684,6 +1182,10 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                                     nullability,
                                     is_nullable,
                                     ..
+                                }
+                                | TableInfo::Derived {
+                                    nullability,
+                                    is_nullable,
                                 } => {
                                     if let Some(cn) = nullability.get(&name.sval) {
                                         return Ok(ColumnNullability {
@@ -734,6 +1236,10 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                                     nullability,
                                     is_nullable,
                                     ..
+                                }
+                                | TableInfo::Derived {
+                                    nullability,
+                                    is_nullable,
                                 } => {
                                     if let Some(cn) = nullability.get(&col_name.sval) {
                                         return Ok(ColumnNullability {
@@ -755,7 +1261,8 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                         if let Some(table_info) = self.alias_map.get(&table_ref.sval) {
                             match table_info {
                                 TableInfo::Table { is_nullable, .. }
-                                | TableInfo::View { is_nullable, .. } => {
+                                | TableInfo::View { is_nullable, .. }
+                                | TableInfo::Derived { is_nullable, .. } => {
                                     return Ok(ColumnNullability {
                                         nullable_due_to_join: *is_nullable,
                                         nullable_on_base: false,
@@ -797,7 +1304,8 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                         // For whole-row references, nullability depends on join type
                         match table_info {
                             TableInfo::Table { is_nullable, .. }
-                            | TableInfo::View { is_nullable, .. } => {
+                            | TableInfo::View { is_nullable, .. }
+                            | TableInfo::Derived { is_nullable, .. } => {
                                 return Ok(*is_nullable);
                             }
                         }
@@ -818,7 +1326,8 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                                         return Ok(!not_null);
                                     }
                                 }
-                                TableInfo::View { nullability, .. } => {
+                                TableInfo::View { nullability, .. }
+                                | TableInfo::Derived { nullability, .. } => {
                                     if let Some(cn) = nullability.get(&name.sval) {
                                         return Ok(cn.is_nullable());
                                     }
@@ -863,6 +1372,10 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                                     nullability,
                                     is_nullable,
                                     ..
+                                }
+                                | TableInfo::Derived {
+                                    nullability,
+                                    is_nullable,
                                 } => {
                                     // If view is nullable due to outer join, column is nullable
                                     if *is_nullable {
@@ -887,7 +1400,8 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                         if let Some(table_info) = self.alias_map.get(&table_ref.sval) {
                             match table_info {
                                 TableInfo::Table { is_nullable, .. }
-                                | TableInfo::View { is_nullable, .. } => {
+                                | TableInfo::View { is_nullable, .. }
+                                | TableInfo::Derived { is_nullable, .. } => {
                                     return Ok(*is_nullable);
                                 }
                             }
@@ -925,6 +1439,24 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                 match s.sval.to_lowercase().as_str() {
                     // Aggregate functions that always return a value
                     "count" => Ok(false),
+
+                    // Window functions in the ranking/numbering family — these
+                    // are documented NOT NULL by Postgres regardless of the
+                    // PARTITION BY / ORDER BY contents.
+                    //   * `row_number()` — sequential 1, 2, 3, …
+                    //   * `rank()`, `dense_rank()` — integer ranks
+                    //   * `percent_rank()`, `cume_dist()` — `double precision`
+                    //   * `ntile(n)` — bucket index
+                    // (We don't list `lag`/`lead`/`first_value`/`last_value`/
+                    // `nth_value` here: those return whatever the underlying
+                    // expression yields, which can be NULL at the partition
+                    // edges or if the source value is NULL.)
+                    "row_number"
+                    | "rank"
+                    | "dense_rank"
+                    | "percent_rank"
+                    | "cume_dist"
+                    | "ntile" => Ok(false),
 
                     // Aggregate functions that can return NULL
                     "sum" | "avg" | "min" | "max" | "stddev" | "variance" => Ok(true),
@@ -1043,7 +1575,9 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
         for alias in nullable_tables {
             if let Some(table_info) = self.alias_map.get_mut(&alias) {
                 match table_info {
-                    TableInfo::Table { is_nullable, .. } | TableInfo::View { is_nullable, .. } => {
+                    TableInfo::Table { is_nullable, .. }
+                    | TableInfo::View { is_nullable, .. }
+                    | TableInfo::Derived { is_nullable, .. } => {
                         *is_nullable = true;
                     }
                 }
@@ -1067,6 +1601,16 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                         .map(|a| a.aliasname.clone())
                         .unwrap_or_else(|| range_var.relname.clone());
                     aliases.insert(alias);
+                }
+                protobuf::node::Node::RangeSubselect(range_sub) => {
+                    if let Some(alias) = &range_sub.alias {
+                        aliases.insert(alias.aliasname.clone());
+                    }
+                }
+                protobuf::node::Node::RangeFunction(range_fn) => {
+                    if let Some(alias) = &range_fn.alias {
+                        aliases.insert(alias.aliasname.clone());
+                    }
                 }
                 protobuf::node::Node::JoinExpr(join) => {
                     if let Some(larg) = &join.larg {

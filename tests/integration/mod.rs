@@ -18,6 +18,7 @@ const HARNESS_LABEL: &str = "pgrpc-test-harness=1";
 pub mod check_enum_tests;
 pub mod codegen_tests;
 pub mod compile_helpers;
+pub mod complex_query_tests;
 pub mod composite_fromsql_tests;
 pub mod custom_error_tests;
 pub mod error_tests;

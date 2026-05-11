@@ -50,20 +50,32 @@ pub fn create_test_cargo_project(conn_string: &str, schemas: Vec<&str>) -> TempD
 
     builder.build().expect("Code generation should succeed");
 
-    // Create a simple lib.rs that uses the generated code
-    let lib_rs_content = indoc! {"
-        pub mod generated;
-        
-        pub use generated::*;
-        
-        // Re-export commonly used types
-        pub use generated::errors::PgRpcError;
-        #[allow(unused_imports)]
-        pub use generated::public::*;
-        #[allow(unused_imports)]
-        pub use generated::api::*;
-    "};
-    std::fs::write(src_dir.join("lib.rs"), lib_rs_content).expect("Should write lib.rs");
+    // Re-export only the schemas that actually got a file written. Hardcoding
+    // `public` / `api` breaks tests whose schema list doesn't include both.
+    let mut lib_rs = String::from("pub mod generated;\npub use generated::*;\n");
+    if pgrpc_dir.join("errors.rs").exists() {
+        lib_rs.push_str("pub use generated::errors::PgRpcError;\n");
+    }
+    for entry in std::fs::read_dir(&pgrpc_dir).expect("read generated dir") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        // `mod.rs` is the umbrella; `errors` is already handled above.
+        if matches!(stem, "mod" | "errors") {
+            continue;
+        }
+        lib_rs.push_str(&format!(
+            "#[allow(unused_imports)] pub use generated::{}::*;\n",
+            stem
+        ));
+    }
+    std::fs::write(src_dir.join("lib.rs"), lib_rs).expect("Should write lib.rs");
 
     // Create Cargo.toml with all required dependencies
     let cargo_toml_content = indoc! {r#"
