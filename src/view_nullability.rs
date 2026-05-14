@@ -52,6 +52,19 @@ pub struct ViewNullabilityAnalyzer<'a> {
     /// Looked up when a CTE name appears in a FROM clause so we can resolve
     /// `cte_alias.col` references against the CTE's inferred output shape.
     cte_columns: HashMap<String, IndexMap<String, ColumnNullability>>,
+    /// Columns proved NOT NULL by the active WHERE predicate via CHECK-derived
+    /// facts. Populated on entry to a plain SELECT's body (after FROM is walked
+    /// and WHERE is parsed) and consulted by [`Self::is_column_not_null`] in
+    /// addition to declared NOT NULL constraints.
+    ///
+    /// Key: relation OID. Value: set of column names known NOT NULL **within
+    /// this SELECT scope**. Subselects snapshot and restore this map so an
+    /// inner WHERE never leaks into the outer scope (and vice versa).
+    refined_not_null: HashMap<OID, HashSet<String>>,
+    /// Lazily-populated cache of CHECK-derived nullability facts per relation.
+    /// Filled on first access during predicate refinement; reused across
+    /// subsequent SELECTs in the same analyzer instance.
+    relation_facts_cache: HashMap<OID, Vec<crate::parse_check_facts::NotNullFact>>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +104,40 @@ enum JoinType {
     Left,
     Right,
     Full,
+}
+
+/// True iff the active WHERE-derived predicate `active` is strong enough to
+/// satisfy the fact-antecedent `required`.
+///
+/// Direct structural matches (eq↔eq, is-not-null↔is-not-null) are the obvious
+/// case. We also accept `col = literal` as proof that `col IS NOT NULL`,
+/// since equality with a non-NULL literal rules out NULL — this lets a single
+/// discriminator WHERE refine columns whose constraints are NULL-keyed rather
+/// than literal-keyed.
+fn predicate_implies(
+    active: &crate::parse_check_facts::Predicate,
+    required: &crate::parse_check_facts::Predicate,
+) -> bool {
+    use crate::parse_check_facts::Predicate;
+    match (active, required) {
+        (
+            Predicate::Eq { column: c1, value: v1 },
+            Predicate::Eq { column: c2, value: v2 },
+        ) => c1 == c2 && v1 == v2,
+        (
+            Predicate::IsNotNull { column: c1 },
+            Predicate::IsNotNull { column: c2 },
+        ) => c1 == c2,
+        // `col = literal` implies `col IS NOT NULL` (the literal is non-NULL by
+        // construction in our model, which only carries text literals today).
+        (
+            Predicate::Eq { column: c1, .. },
+            Predicate::IsNotNull { column: c2 },
+        ) => c1 == c2,
+        // `col IS NOT NULL` does NOT imply `col = some_literal` — we can't
+        // infer the value side from a NULL test.
+        (Predicate::IsNotNull { .. }, Predicate::Eq { .. }) => false,
+    }
 }
 
 /// True iff `node` is a call to a SQL aggregate function with no GROUP BY
@@ -221,6 +268,8 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
             nullable_columns: HashSet::new(),
             view_nullability_cache,
             cte_columns: HashMap::new(),
+            refined_not_null: HashMap::new(),
+            relation_facts_cache: HashMap::new(),
         }
     }
 
@@ -314,6 +363,9 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
         self.alias_map.clear();
         self.nullable_columns.clear();
         self.cte_columns.clear();
+        self.refined_not_null.clear();
+        // relation_facts_cache intentionally NOT cleared — it's a pure derived
+        // cache keyed by relation OID and safe to keep across analyses.
 
         // Walk the top-level SelectStmt with the shared helper. Anything else
         // (INSERT/UPDATE/DELETE … RETURNING) is handled by
@@ -403,6 +455,14 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
             self.analyze_from_item(from_item)?;
         }
 
+        // 3a. Refine column nullability using WHERE-derived predicates against
+        //     CHECK-derived facts. Snapshot the existing refined_not_null map
+        //     so a nested subselect's refinements don't leak into outer scope.
+        let saved_refined = std::mem::take(&mut self.refined_not_null);
+        if let Some(where_clause) = &select.where_clause {
+            self.refine_from_where(where_clause);
+        }
+
         let mut columns: Vec<(String, ColumnNullability)> = Vec::new();
         for target in &select.target_list {
             if let Some(protobuf::node::Node::ResTarget(res_target)) = &target.node {
@@ -426,6 +486,8 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                 }
             }
         }
+        // Restore predicate refinements from the enclosing scope (if any).
+        self.refined_not_null = saved_refined;
         Ok(columns)
     }
 
@@ -1464,7 +1526,7 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
     }
 
     fn is_column_not_null(&self, rel: &PgRel, column_name: &str) -> bool {
-        // Check if column has a NOT NULL constraint
+        // Declared NOT NULL takes priority — cheapest check, most common case.
         for constraint in &rel.constraints {
             if let Constraint::NotNull(not_null) = constraint {
                 if not_null.column.as_str() == column_name {
@@ -1472,7 +1534,116 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                 }
             }
         }
+        // Then consult predicate-derived refinements (active WHERE clause
+        // combined with this relation's CHECK constraints).
+        if let Some(refined_cols) = self.refined_not_null.get(&rel.oid) {
+            if refined_cols.contains(column_name) {
+                return true;
+            }
+        }
         false
+    }
+
+    /// Walk the WHERE clause, extract predicates, and use them against each
+    /// FROM-table's CHECK-derived facts to populate `self.refined_not_null`.
+    ///
+    /// This is intentionally best-effort: any unrecognized WHERE shape just
+    /// produces no extra refinements, and unrecognized CHECK shapes likewise
+    /// contribute nothing. We never claim NOT NULL on a column we can't prove.
+    fn refine_from_where(&mut self, where_clause: &protobuf::Node) {
+        // First snapshot the alias_map state we need — collect (alias, oid, schema, name).
+        // We iterate immutably; the lazy fact-cache fill happens after.
+        let table_aliases: Vec<(String, OID, Option<String>, String)> = self
+            .alias_map
+            .iter()
+            .filter_map(|(alias, info)| match info {
+                TableInfo::Table {
+                    schema, name, oid, is_nullable,
+                    ..
+                } if !*is_nullable => {
+                    // Outer-joined tables: skip — their rows can be all-NULL
+                    // regardless of WHERE. Inner-joined tables qualify.
+                    Some((alias.clone(), *oid, schema.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Single-table SELECTs let us accept unqualified columns. With multiple
+        // tables in FROM we need the WHERE qualifier to match the alias.
+        let single_table_alias = if table_aliases.len() == 1 {
+            Some(table_aliases[0].0.as_str().to_string())
+        } else {
+            None
+        };
+
+        for (alias, oid, _schema, _name) in &table_aliases {
+            // Extract predicates attributed to this alias (qualified `alias.col`
+            // refs or unqualified refs in the single-table case).
+            let qualifier_filter = if single_table_alias.is_some() {
+                None // accept unqualified
+            } else {
+                Some(alias.as_str())
+            };
+            let predicates =
+                crate::where_predicates::extract_predicates(where_clause, qualifier_filter);
+            if predicates.is_empty() {
+                continue;
+            }
+
+            // Two independent sources of refinement:
+            //   (a) "WHERE col IS NOT NULL" directly proves `col` non-NULL.
+            //   (b) An active predicate matches a CHECK-derived fact's antecedent.
+            let entry = self.refined_not_null.entry(*oid).or_default();
+
+            // (a) Direct refinement from the WHERE itself: both
+            //     `IS NOT NULL` and `col = literal` (a non-NULL literal rules
+            //     out NULL on the column) prove the column non-NULL here.
+            for p in &predicates {
+                match p {
+                    crate::parse_check_facts::Predicate::IsNotNull { column }
+                    | crate::parse_check_facts::Predicate::Eq { column, .. } => {
+                        entry.insert(column.clone());
+                    }
+                }
+            }
+
+            // (b) Fact-driven refinement: pull the relation's CHECK facts and
+            //     test each one's antecedent against the active predicates.
+            self.ensure_relation_facts(*oid);
+            let facts: Vec<crate::parse_check_facts::NotNullFact> = self
+                .relation_facts_cache
+                .get(oid)
+                .cloned()
+                .unwrap_or_default();
+            // Re-borrow entry after the &mut self call above.
+            let entry = self.refined_not_null.entry(*oid).or_default();
+            for fact in &facts {
+                if predicates.iter().any(|p| predicate_implies(p, &fact.when)) {
+                    entry.insert(fact.column.clone());
+                }
+            }
+        }
+    }
+
+    /// Fill `relation_facts_cache` for `oid` if not already present. Looks at
+    /// every CHECK constraint on the relation and accumulates the facts.
+    fn ensure_relation_facts(&mut self, oid: OID) {
+        if self.relation_facts_cache.contains_key(&oid) {
+            return;
+        }
+        let mut facts = Vec::new();
+        if let Some(rel) = self.rel_index.get(&oid) {
+            for c in &rel.constraints {
+                if let Constraint::Check(check) = c {
+                    if let Some(expr) = &check.check_expression {
+                        let parsed = crate::parse_check_facts::parse_check_as_facts(expr);
+                        facts.extend(parsed);
+                    }
+                }
+            }
+        }
+        self.relation_facts_cache.insert(oid, facts);
     }
 
     fn is_function_nullable(&self, func: &protobuf::FuncCall) -> anyhow::Result<bool> {

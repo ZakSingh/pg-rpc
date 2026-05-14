@@ -16,6 +16,7 @@ use uuid::Uuid;
 const HARNESS_LABEL: &str = "pgrpc-test-harness=1";
 
 pub mod check_enum_tests;
+pub mod check_predicate_nullability_tests;
 pub mod codegen_tests;
 pub mod compile_helpers;
 pub mod complex_query_tests;
@@ -32,6 +33,7 @@ pub mod schema_tests;
 pub mod sql_function_tests;
 pub mod task_queue_tests;
 pub mod trigger_tests;
+pub mod array_of_composites_tests;
 pub mod bulk_nullability_minimal_tests;
 pub mod view_constraint_test;
 pub mod view_nullability_tests;
