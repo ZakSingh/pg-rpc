@@ -1521,6 +1521,9 @@ impl PgFn {
                     });
 
                     if *optional {
+                        // See codegen.rs for the rationale — `NullProbe`
+                        // accepts every Postgres type, so the probe never
+                        // trips tokio-postgres's type-compatibility check.
                         let first_idx = fields[0].0;
                         let group_type = quote! { Option<#nested_struct_name> };
 
@@ -1529,7 +1532,7 @@ impl PgFn {
                         });
 
                         parent_field_assignments.push(quote! {
-                            #group_field_name: if row.try_get::<usize, Option<serde_json::Value>>(#first_idx)?.is_none() {
+                            #group_field_name: if row.try_get::<usize, super::nullable::NullProbe>(#first_idx)?.is_null {
                                 None
                             } else {
                                 Some(#nested_struct_name {

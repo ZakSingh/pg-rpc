@@ -30,6 +30,7 @@ pub mod postgis_tests;
 pub mod procedure_tests;
 pub mod query_tests;
 pub mod schema_tests;
+pub mod single_field_group_tests;
 pub mod sql_function_tests;
 pub mod task_queue_tests;
 pub mod trigger_tests;

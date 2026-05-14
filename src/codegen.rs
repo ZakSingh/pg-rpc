@@ -469,7 +469,53 @@ pub fn codegen_split(
         warning_ignores.to_string() + &error_module_code,
     );
 
+    // Shared null-probe helper. Used by the optional-group row decoder to
+    // detect whether a LEFT JOIN'd group should be `None` without committing
+    // to a concrete `FromSql` type for the sentinel column. Emitted once here
+    // and referenced from row-struct codegen as `super::nullable::NullProbe`.
+    schema_code.insert(
+        "nullable".to_string(),
+        warning_ignores.to_string() + &generate_nullable_module().to_string(),
+    );
+
     Ok(schema_code)
+}
+
+/// Codegen for the shared `nullable` module.
+///
+/// `NullProbe` implements `FromSql` for any Postgres type — its only job is to
+/// answer "is this cell NULL?". `accepts` returns true unconditionally so
+/// `try_get::<_, NullProbe>(i)` never trips tokio-postgres's type-compatibility
+/// check, and the underlying `from_sql_nullable` machinery routes NULL cells to
+/// `from_sql_null` and non-NULL cells to `from_sql`, so we just record which
+/// branch fired.
+fn generate_nullable_module() -> TokenStream {
+    quote! {
+        use postgres_types::{FromSql, Type};
+        use std::error::Error;
+
+        /// Cheap null-check probe. `try_get::<_, NullProbe>(i)?.is_null` is
+        /// true iff the column at `i` is SQL NULL, regardless of its
+        /// Postgres type.
+        #[derive(Debug, Clone, Copy)]
+        pub struct NullProbe {
+            pub is_null: bool,
+        }
+
+        impl<'a> FromSql<'a> for NullProbe {
+            fn from_sql(_ty: &Type, _raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+                Ok(NullProbe { is_null: false })
+            }
+
+            fn from_sql_null(_ty: &Type) -> Result<Self, Box<dyn Error + Sync + Send>> {
+                Ok(NullProbe { is_null: true })
+            }
+
+            fn accepts(_ty: &Type) -> bool {
+                true
+            }
+        }
+    }
 }
 
 fn codegen_types(type_index: &TypeIndex, config: &Config) -> BTreeMap<SchemaName, TokenStream> {
@@ -1757,9 +1803,14 @@ fn generate_row_struct(
                 });
 
                 if *optional {
-                    // For optional groups: check if ALL grouped columns are NULL.
-                    // Use the first column as sentinel — if it's NULL, the whole
-                    // group is NULL (since they come from the same LEFT JOIN'd table).
+                    // For optional groups: probe the first column to see if
+                    // it's NULL. Since every member of an optional group is
+                    // `nullable_due_to_join` from the same LEFT JOIN'd table,
+                    // they're all NULL together — so one probe is enough.
+                    //
+                    // `NullProbe`'s `FromSql::accepts` returns true for every
+                    // Postgres type, sidestepping the type-compatibility check
+                    // that a typed sentinel would trip.
                     let first_idx = fields[0].0;
 
                     let group_type = quote! { Option<#nested_struct_name> };
@@ -1769,7 +1820,7 @@ fn generate_row_struct(
                     });
 
                     parent_field_assignments.push(quote! {
-                        #group_field_name: if row.try_get::<usize, Option<serde_json::Value>>(#first_idx)?.is_none() {
+                        #group_field_name: if row.try_get::<usize, super::nullable::NullProbe>(#first_idx)?.is_null {
                             None
                         } else {
                             Some(#nested_struct_name {
