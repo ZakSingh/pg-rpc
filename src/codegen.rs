@@ -117,12 +117,17 @@ pub fn codegen_split(
         all_schema_refs.entry(schema).or_default().extend(refs);
     }
 
-    // Add error types to a common module
+    // Add error types to a common module.
+    // Concatenate via `TokenStream::extend` rather than `quote! { #acc #ts }`,
+    // which would re-tokenize the accumulator on every step (O(n²) in tokens).
     let mut schema_code: BTreeMap<SchemaName, String> = type_def_code
         .into_iter()
         .chain(fn_code)
         .into_grouping_map()
-        .fold(TokenStream::new(), |acc, _, ts| quote! { #acc #ts })
+        .fold(TokenStream::new(), |mut acc, _, ts| {
+            acc.extend(ts);
+            acc
+        })
         .iter()
         .map(|(schema, tokens)| {
             // Get referenced schemas for this schema
