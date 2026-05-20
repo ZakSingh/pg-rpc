@@ -40,6 +40,7 @@ pub mod view_constraint_test;
 pub mod view_nullability_tests;
 pub mod view_query_nullability_test;
 pub mod workflow_tests;
+pub mod prepared_cache_bench;
 
 /// Global container instance that's shared across all tests
 static INIT: Once = Once::new();

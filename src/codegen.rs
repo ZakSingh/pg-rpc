@@ -890,6 +890,31 @@ fn rewrite_sql_for_defaults(
     .to_string()
 }
 
+/// Build the `&[postgres_types::Type]` slice expression for `prepare_typed_cached`,
+/// or `None` if any parameter has a user-defined OID that postgres-types can't resolve.
+///
+/// We use `Type::from_oid` at runtime so we don't have to hard-code the OID→const mapping
+/// here — postgres-types already maintains that mapping for every builtin. If `from_oid`
+/// returns `None` for any param (i.e. user-defined composite/domain/enum/array-of-those),
+/// we bail out and the caller falls back to untyped `prepare_cached`.
+fn build_prepared_types_slice(
+    params: &[crate::query_introspector::QueryParam],
+) -> Option<TokenStream> {
+    // Use the resolved postgres type oid, not the domain-preserving inferred oid.
+    // postgres-types' Type::from_oid only knows builtin OIDs, and the prepared statement
+    // itself was created with the resolved types anyway.
+    let oids: Vec<OID> = params.iter().map(|p| p.postgres_type_oid).collect();
+    for &oid in &oids {
+        if postgres_types::Type::from_oid(oid).is_none() {
+            return None;
+        }
+    }
+    let lits: Vec<TokenStream> = oids.iter().map(|oid| quote! { #oid }).collect();
+    Some(quote! {
+        &[#(postgres_types::Type::from_oid(#lits).unwrap()),*]
+    })
+}
+
 /// Generate code for SQL query files
 pub fn codegen_queries(
     query_index: &crate::query_index::QueryIndex,
@@ -950,7 +975,7 @@ fn generate_query_code(
                     let scalar_type = get_column_type(&columns[0], type_index);
                     let return_type = quote! { Result<#scalar_type, #error_enum_name> };
                     let execution = quote! {
-                        client.query_opt(query, &params).await
+                        client.query_opt(&stmt, &params).await
                             .and_then(|opt_row| {
                                 let row = opt_row.expect("query returned no rows");
                                 row.try_get(0)
@@ -965,7 +990,7 @@ fn generate_query_code(
 
                     let return_type = quote! { Result<#struct_name, #error_enum_name> };
                     let execution = quote! {
-                        client.query_opt(query, &params).await
+                        client.query_opt(&stmt, &params).await
                             .and_then(|opt_row| {
                                 let row = opt_row.expect("query returned no rows");
                                 row.try_into()
@@ -979,7 +1004,7 @@ fn generate_query_code(
                 // Should not happen for :one queries
                 let return_type = quote! { Result<(), #error_enum_name> };
                 let execution = quote! {
-                    client.execute(query, &params).await?;
+                    client.execute(&stmt, &params).await?;
                     Ok(())
                 };
                 (return_type, execution, quote! {})
@@ -992,7 +1017,7 @@ fn generate_query_code(
                     let scalar_type = get_column_type(&columns[0], type_index);
                     let return_type = quote! { Result<Option<#scalar_type>, #error_enum_name> };
                     let execution = quote! {
-                        client.query_opt(query, &params).await
+                        client.query_opt(&stmt, &params).await
                             .and_then(|row| match row {
                                 Some(row) => Ok(Some(row.try_get(0)?)),
                                 None => Ok(None),
@@ -1007,7 +1032,7 @@ fn generate_query_code(
 
                     let return_type = quote! { Result<Option<#struct_name>, #error_enum_name> };
                     let execution = quote! {
-                        client.query_opt(query, &params).await
+                        client.query_opt(&stmt, &params).await
                             .and_then(|row| match row {
                                 Some(row) => Ok(Some(row.try_into()?)),
                                 None => Ok(None),
@@ -1020,7 +1045,7 @@ fn generate_query_code(
             } else {
                 let return_type = quote! { Result<Option<()>, #error_enum_name> };
                 let execution = quote! {
-                    client.execute(query, &params).await?;
+                    client.execute(&stmt, &params).await?;
                     Ok(Some(()))
                 };
                 (return_type, execution, quote! {})
@@ -1033,7 +1058,7 @@ fn generate_query_code(
                     let scalar_type = get_column_type(&columns[0], type_index);
                     let return_type = quote! { Result<Vec<#scalar_type>, #error_enum_name> };
                     let execution = quote! {
-                        client.query(query, &params).await
+                        client.query(&stmt, &params).await
                             .and_then(|rows| rows.into_iter().map(|row| row.try_get(0)).collect())
                             .map_err(#error_enum_name::from)
                     };
@@ -1045,7 +1070,7 @@ fn generate_query_code(
 
                     let return_type = quote! { Result<Vec<#struct_name>, #error_enum_name> };
                     let execution = quote! {
-                        client.query(query, &params).await
+                        client.query(&stmt, &params).await
                             .and_then(|rows| rows.into_iter().map(|row| row.try_into()).collect())
                             .map_err(#error_enum_name::from)
                     };
@@ -1056,7 +1081,7 @@ fn generate_query_code(
                 // Should not happen for :many queries
                 let return_type = quote! { Result<Vec<()>, #error_enum_name> };
                 let execution = quote! {
-                    let rows = client.query(query, &params).await?;
+                    let rows = client.query(&stmt, &params).await?;
                     Ok(vec![(); rows.len()])
                 };
                 (return_type, execution, quote! {})
@@ -1065,7 +1090,7 @@ fn generate_query_code(
         crate::sql_parser::QueryType::Exec => {
             let return_type = quote! { Result<(), #error_enum_name> };
             let execution = quote! {
-                client.execute(query, &params).await?;
+                client.execute(&stmt, &params).await?;
                 Ok(())
             };
             (return_type, execution, quote! {})
@@ -1073,7 +1098,7 @@ fn generate_query_code(
         crate::sql_parser::QueryType::ExecRows => {
             let return_type = quote! { Result<u64, #error_enum_name> };
             let execution = quote! {
-                let rows_affected = client.execute(query, &params).await?;
+                let rows_affected = client.execute(&stmt, &params).await?;
                 Ok(rows_affected)
             };
             (return_type, execution, quote! {})
@@ -1139,6 +1164,25 @@ fn generate_query_code(
         generate_default_match_arms(query, &default_eligible_params, sql, type_index)
     };
 
+    // Prepare the statement using the per-connection cache.
+    //
+    // When the SQL is static (no default-eligible params) AND all params are builtin
+    // postgres types, pass the type slice so prepare_typed_cached can skip an extra
+    // describe round-trip on first prepare. Otherwise fall back to untyped
+    // prepare_cached — the cache key includes the (rewritten) SQL string, so each
+    // default-match-arm SQL variant still gets cached on its own.
+    let has_default_arms = !default_eligible_params.is_empty();
+    let prepare_step = match (has_default_arms, build_prepared_types_slice(&query.params)) {
+        (false, Some(types_slice)) => quote! {
+            let stmt = client.prepare_typed_cached(query, #types_slice).await
+                .map_err(#error_enum_name::from)?;
+        },
+        _ => quote! {
+            let stmt = client.prepare_cached(query).await
+                .map_err(#error_enum_name::from)?;
+        },
+    };
+
     quote! {
         #row_struct
 
@@ -1152,6 +1196,7 @@ fn generate_query_code(
         ) -> #return_type {
             #(#param_conversions)*
             #query_and_params_setup
+            #prepare_step
 
             #query_execution
         }

@@ -340,6 +340,37 @@ DELETE FROM users WHERE id = :user_id;
         assert!(generated_code.contains("pub id: i32"), "Should have i32 id field");
         assert!(generated_code.contains("pub username: String"), "Should have String username field");
         assert!(generated_code.contains("pub email: String"), "Should have String email field");
+
+        // Verify prepared-statement caching: every generated query must funnel
+        // through deadpool's per-connection StatementCache. Without this the hot
+        // path re-prepares on every call (parse/bind/describe round-trip).
+        assert!(
+            generated_code.contains("prepare_typed_cached"),
+            "Generated code should use prepare_typed_cached for builtin-typed params"
+        );
+        // Each of the six fn bodies must hand a &Statement to the query/execute call
+        // rather than the raw SQL string.
+        let stmt_uses = generated_code.matches("(&stmt,").count();
+        assert!(
+            stmt_uses >= 6,
+            "Expected ≥6 uses of &stmt in query/execute calls, got {}",
+            stmt_uses
+        );
+        // No call site should still be passing the raw `query` &str to the client.
+        // (`prepare_typed_cached(query, ...)` is the only legitimate use of the bare
+        // `query` identifier — check the patterns that would indicate a regression.)
+        assert!(
+            !generated_code.contains("query_opt(query,"),
+            "Found query_opt(query, ...) — should be prepared and use &stmt"
+        );
+        assert!(
+            !generated_code.contains(".query(query,"),
+            "Found .query(query, ...) — should be prepared and use &stmt"
+        );
+        assert!(
+            !generated_code.contains("execute(query,"),
+            "Found execute(query, ...) — should be prepared and use &stmt"
+        );
     });
 }
 
