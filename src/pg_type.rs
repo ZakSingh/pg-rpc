@@ -502,6 +502,13 @@ impl PgType {
             "Inner{}",
             sql_to_rs_string(pg_name, CaseType::Pascal)
         );
+        // Borrowed twin of `InnerXxx`, used only as a zero-clone destination for
+        // `ToSql`. Its fields are `&'a T` (or `Option<&'a T>`) instead of owned,
+        // so building one in the generated `impl ToSql for Rs` costs nothing.
+        let inner_ref_struct_name = format_ident!(
+            "Inner{}Ref",
+            sql_to_rs_string(pg_name, CaseType::Pascal)
+        );
 
         // Determine which fields belong to optional groups so we can make
         // ALL their inner struct fields Option (needed for FromSql/ToSql roundtrip
@@ -545,11 +552,38 @@ impl PgType {
             })
             .collect();
 
+        // Mirror of `inner_field_tokens` for the borrowed Ref struct.
+        // Nullable fields become `Option<&'a T>` rather than `&'a Option<T>` so
+        // the optional-group projections (`as_ref().and_then(|g| g.f.as_ref())`)
+        // can hand a value in directly without an intermediate owned `Option`.
+        // Wire output is identical: `ToSql for Option<T>` matches `T` either way.
+        let inner_ref_field_tokens: Vec<TokenStream> = fields
+            .iter()
+            .map(|f| {
+                let ident = types.get(&f.type_oid).unwrap().to_rust_ident(types);
+                let field_name = sql_to_rs_ident(&f.name, CaseType::Snake);
+                let pg_name = &f.name;
+                let is_nullable = f.nullable || optional_group_fields.contains(&f.name);
+                let field_type = if is_nullable {
+                    quote! { Option<&'a #ident> }
+                } else {
+                    quote! { &'a #ident }
+                };
+                quote! {
+                    #[postgres(name = #pg_name)]
+                    #field_name: #field_type
+                }
+            })
+            .collect();
+
         // Generate conversion from inner flat struct to grouped struct.
         // For each grouped field, we read from the inner struct's flat fields.
         let mut from_inner_assignments: Vec<TokenStream> = Vec::new();
         // Generate conversion from grouped struct to inner flat struct.
         let mut to_inner_assignments: Vec<TokenStream> = Vec::new();
+        // Borrowed variant: assignments that feed `InnerXxxRef`, with `&self.*`
+        // instead of `self.*.clone()` — used by `impl ToSql for Rs`.
+        let mut to_inner_ref_assignments: Vec<TokenStream> = Vec::new();
 
         for grouped_field in &grouped {
             match grouped_field {
@@ -557,6 +591,7 @@ impl PgType {
                     let rs_field = sql_to_rs_ident(&field.name, CaseType::Snake);
                     from_inner_assignments.push(quote! { #rs_field: inner.#rs_field });
                     to_inner_assignments.push(quote! { #rs_field: self.#rs_field.clone() });
+                    to_inner_ref_assignments.push(quote! { #rs_field: &self.#rs_field });
                 }
                 GroupedField::Group {
                     group_name,
@@ -649,6 +684,32 @@ impl PgType {
                             .collect();
 
                         to_inner_assignments.extend(to_inner_field_conversions);
+
+                        // Borrowed variant of the above. Inner field is `Option<&T>`.
+                        // When the nested field itself is `Option<T>`, we flatten with
+                        // `as_ref().and_then(|g| g.f.as_ref())`. When the nested field
+                        // is `T`, we project with `as_ref().map(|g| &g.f)`.
+                        let to_inner_ref_field_conversions: Vec<TokenStream> = group_fields
+                            .iter()
+                            .zip(inner_field_rs_names.iter())
+                            .zip(nested_field_rs_names.iter())
+                            .map(|((f, inner_rs), nested_rs)| {
+                                let nested_is_option = f.nullable || f.nullable_due_to_join;
+                                if nested_is_option {
+                                    quote! {
+                                        #inner_rs: self.#group_field_name
+                                            .as_ref()
+                                            .and_then(|g| g.#nested_rs.as_ref())
+                                    }
+                                } else {
+                                    quote! {
+                                        #inner_rs: self.#group_field_name.as_ref().map(|g| &g.#nested_rs)
+                                    }
+                                }
+                            })
+                            .collect();
+
+                        to_inner_ref_assignments.extend(to_inner_ref_field_conversions);
                     } else {
                         // Non-optional group: direct field access
                         let nested_field_conversions: Vec<TokenStream> = inner_field_rs_names
@@ -674,6 +735,16 @@ impl PgType {
                             .collect();
 
                         to_inner_assignments.extend(to_inner_field_conversions);
+
+                        let to_inner_ref_field_conversions: Vec<TokenStream> = inner_field_rs_names
+                            .iter()
+                            .zip(nested_field_rs_names.iter())
+                            .map(|(inner_rs, nested_rs)| {
+                                quote! { #inner_rs: &self.#group_field_name.#nested_rs }
+                            })
+                            .collect();
+
+                        to_inner_ref_assignments.extend(to_inner_ref_field_conversions);
                     }
                 }
             }
@@ -688,11 +759,22 @@ impl PgType {
                 #(#parent_fields),*
             }
 
-            /// Internal flat struct matching the Postgres wire format
-            #[derive(Debug, Clone, postgres_types::FromSql, postgres_types::ToSql)]
+            /// Internal flat struct matching the Postgres wire format.
+            /// Used only as a `FromSql` destination — `ToSql` is implemented via
+            /// the borrowed `Ref` twin below to avoid per-field clones.
+            #[derive(Debug, Clone, postgres_types::FromSql)]
             #[postgres(name = #pg_name)]
             struct #inner_struct_name {
                 #(#inner_field_tokens),*
+            }
+
+            /// Borrowed twin of `#inner_struct_name`, used as a zero-clone
+            /// destination for `ToSql`. Built directly from `&self` in
+            /// `impl ToSql for #rs_name` without copying any field.
+            #[derive(postgres_types::ToSql)]
+            #[postgres(name = #pg_name)]
+            struct #inner_ref_struct_name<'a> {
+                #(#inner_ref_field_tokens),*
             }
 
             impl<'a> postgres_types::FromSql<'a> for #rs_name {
@@ -717,8 +799,8 @@ impl PgType {
                     ty: &postgres_types::Type,
                     out: &mut postgres_types::private::BytesMut,
                 ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
-                    let inner = #inner_struct_name {
-                        #(#to_inner_assignments),*
+                    let inner = #inner_ref_struct_name {
+                        #(#to_inner_ref_assignments),*
                     };
                     inner.to_sql(ty, out)
                 }
@@ -1083,6 +1165,8 @@ impl ToRust for PgType {
                             format_ident!("Dom{}", sql_to_rs_string(name, CaseType::Pascal));
                         let rs_dom_inner_name =
                             format_ident!("Inner{}", sql_to_rs_string(name, CaseType::Pascal));
+                        let rs_dom_inner_ref_name =
+                            format_ident!("Inner{}Ref", sql_to_rs_string(name, CaseType::Pascal));
 
                         // If the domain wraps a composite type, we want to create a new composite type
                         // with the non-null constraints enforced by the domain rather than creating a new wrapper type.
@@ -1105,6 +1189,42 @@ impl ToRust for PgType {
                                     type_oid: f.type_oid,
                                 }
                                 .to_rust_inner(types, false)
+                            })
+                            .collect();
+
+                        // Field declarations and value expressions for the
+                        // borrowed `InnerXxxRef<'a>` twin. Each field is
+                        // `&'a T` or `Option<&'a T>` and the value is
+                        // `&self.field` / `self.field.as_ref()`.
+                        let ref_field_tokens: Vec<TokenStream> = fields
+                            .iter()
+                            .map(|f| {
+                                let ident = types.get(&f.type_oid).unwrap().to_rust_ident(types);
+                                let field_name = sql_to_rs_ident(&f.name, CaseType::Snake);
+                                let pg_name = &f.name;
+                                let nullable = f.nullable && !non_null_cols.contains(&f.name);
+                                let field_type = if nullable {
+                                    quote! { Option<&'a #ident> }
+                                } else {
+                                    quote! { &'a #ident }
+                                };
+                                quote! {
+                                    #[postgres(name = #pg_name)]
+                                    #field_name: #field_type
+                                }
+                            })
+                            .collect();
+
+                        let ref_assignments: Vec<TokenStream> = fields
+                            .iter()
+                            .map(|f| {
+                                let field_name = sql_to_rs_ident(&f.name, CaseType::Snake);
+                                let nullable = f.nullable && !non_null_cols.contains(&f.name);
+                                if nullable {
+                                    quote! { #field_name: self.#field_name.as_ref() }
+                                } else {
+                                    quote! { #field_name: &self.#field_name }
+                                }
                             })
                             .collect();
 
@@ -1157,11 +1277,21 @@ impl ToRust for PgType {
                                 #(#field_tokens),*
                             }
 
-                            /// Internal; used for serialization/deserialization only
-                            #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql, serde::Deserialize, serde::Serialize)]
+                            /// Internal; used as the `FromSql` destination for the
+                            /// domain-wrapped composite. `ToSql` lives on the
+                            /// borrowed `Ref` twin to avoid cloning every field.
+                            #[derive(Debug, postgres_types::FromSql, serde::Deserialize, serde::Serialize)]
                             #[postgres(name = #pg_inner_name)]
                             struct #rs_dom_inner_name {
                                 #(#field_tokens),*
+                            }
+
+                            /// Borrowed twin of `#rs_dom_inner_name`. Built in-place from
+                            /// `&self` inside `impl ToSql for #rs_name` — zero clones.
+                            #[derive(postgres_types::ToSql)]
+                            #[postgres(name = #pg_inner_name)]
+                            struct #rs_dom_inner_ref_name<'a> {
+                                #(#ref_field_tokens),*
                             }
 
                             /// Internal; used for serialization/deserialization only
@@ -1183,24 +1313,6 @@ impl ToRust for PgType {
                                 fn accepts(ty: &postgres_types::Type) -> bool {
                                     ty.name() == #name || ty.name() == #pg_inner_name
                                 }
-                            }
-
-                            /// Manual ToSql implementation for domain wrapper
-                            impl postgres_types::ToSql for #rs_dom_name {
-                                fn to_sql(&self, ty: &postgres_types::Type, out: &mut postgres_types::private::BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
-                                    // For domains, we need to get the inner type
-                                    let inner_ty = match ty.kind() {
-                                        postgres_types::Kind::Domain(inner) => inner,
-                                        _ => return Err("Expected domain type".into()),
-                                    };
-                                    self.0.to_sql(inner_ty, out)
-                                }
-
-                                fn accepts(ty: &postgres_types::Type) -> bool {
-                                    ty.name() == #name || ty.name() == #pg_inner_name
-                                }
-
-                                postgres_types::to_sql_checked!();
                             }
 
                             /// Dispatch FromSql implementation to internal domain wrapper struct
@@ -1232,14 +1344,15 @@ impl ToRust for PgType {
                                     ty: &postgres_types::Type,
                                     out: &mut postgres_types::private::BytesMut,
                                 ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
-                                    let inner = unsafe { std::mem::transmute::<#rs_name, #rs_dom_inner_name>(self.clone()) };
-
                                     let inner_ty = match ty.kind() {
                                         postgres_types::Kind::Domain(inner) => inner,
                                         _ => return Err("Expected domain type".into()),
                                     };
 
-                                    inner.to_sql(inner_ty, out)
+                                    let inner_ref = #rs_dom_inner_ref_name {
+                                        #(#ref_assignments),*
+                                    };
+                                    inner_ref.to_sql(inner_ty, out)
                                 }
 
                                 fn accepts(ty: &postgres_types::Type) -> bool {
