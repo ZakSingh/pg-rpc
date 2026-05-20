@@ -228,3 +228,202 @@ fn prepared_statement_cache_speeds_up_repeated_queries() {
         );
     });
 }
+
+/// Same shape as `prepared_statement_cache_speeds_up_repeated_queries` but for
+/// the pg_fn (postgres-function-call) codepath. The generated function builds
+/// its SQL string with `format!` at runtime, so we route every call through
+/// `prepare_cached(&query)` rather than `prepare_typed_cached`. This test
+/// proves that path is meaningfully faster than the prior &str behaviour.
+#[test]
+fn prepared_statement_cache_speeds_up_repeated_function_calls() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Same shape as the query bench so the two results are directly
+        // comparable. The function does the same SELECT the query bench does.
+        client
+            .execute(
+                "CREATE TABLE bench_users (
+                    id SERIAL PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    bio TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )",
+                &[],
+            )
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO bench_users (username, email, bio) \
+                 SELECT 'user_' || g, 'user_' || g || '@example.com', \
+                        repeat('x', 80) \
+                 FROM generate_series(1, 500) g",
+                &[],
+            )
+            .unwrap();
+        // RETURNS TABLE so pg_fn generates a row struct + Vec<Row> return,
+        // exercising the most common shape (set-returning, multi-column).
+        client
+            .batch_execute(
+                "CREATE SCHEMA IF NOT EXISTS api;
+                 CREATE OR REPLACE FUNCTION api.bench_get_user(p_id integer)
+                 RETURNS TABLE (
+                     id integer,
+                     username text,
+                     email text,
+                     bio text,
+                     created_at timestamptz
+                 )
+                 LANGUAGE sql STABLE AS $$
+                     SELECT id, username, email, bio, created_at
+                     FROM bench_users WHERE id = p_id
+                 $$;",
+            )
+            .unwrap();
+
+        let project_dir = create_test_cargo_project(conn_string, vec!["public", "api"]);
+
+        // Re-export the api module so the bench binary can call api::bench_get_user.
+        let lib_rs = project_dir.path().join("src/lib.rs");
+        let mut lib_src = std::fs::read_to_string(&lib_rs).unwrap();
+        if !lib_src.contains("pub use generated::api") {
+            lib_src.push_str("\n#[allow(unused_imports)] pub use generated::api;\n");
+            std::fs::write(&lib_rs, lib_src).unwrap();
+        }
+
+        // The bench binary. Mirrors the query-bench setup (max_size=1, hold the
+        // client, warm-up then measure). The "uncached" baseline issues the
+        // *exact same SQL* the generated function would have issued before this
+        // PR — `select * from api.bench_get_user($1)` against a raw &str —
+        // so the only difference is whether prepare goes through the cache.
+        let bench_code = indoc! {r#"
+            use deadpool_postgres::{Config, Runtime};
+            use std::time::Instant;
+            use test_project::*;
+
+            #[tokio::main]
+            async fn main() {
+                let conn_string = std::env::args().nth(1).expect("conn string required");
+                let iters: usize = std::env::var("PGRPC_BENCH_ITERS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2000);
+
+                let mut config = Config::new();
+                config.url = Some(conn_string);
+                let mut pool_config = deadpool_postgres::PoolConfig::default();
+                pool_config.max_size = 1;
+                config.pool = Some(pool_config);
+
+                let pool = config
+                    .create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
+                    .expect("create pool");
+                let client = pool.get().await.expect("get client");
+
+                // Exact SQL the generated wrapper builds (set-returning fn -> `select *`).
+                let raw_sql = "select * from api.bench_get_user($1)";
+
+                // Warm-up. The cached path's first call pays the prepare; the
+                // uncached path pays a fresh parse/bind/describe every iteration.
+                for i in 0..50i32 {
+                    let id = (i % 500) + 1;
+                    let _ = api::bench_get_user()
+                        .id(id)
+                        .exec(&client)
+                        .await
+                        .expect("warmup cached");
+                    let _ = client
+                        .query(raw_sql, &[&id])
+                        .await
+                        .expect("warmup uncached");
+                }
+
+                // ---- cached path: pgrpc-generated function call ----
+                let t0 = Instant::now();
+                for i in 0..iters as i32 {
+                    let id = (i % 500) + 1;
+                    let _ = api::bench_get_user()
+                        .id(id)
+                        .exec(&client)
+                        .await
+                        .expect("cached call");
+                }
+                let cached = t0.elapsed();
+
+                // ---- uncached: raw &str — what we used to generate ----
+                let t0 = Instant::now();
+                for i in 0..iters as i32 {
+                    let id = (i % 500) + 1;
+                    let rows = client
+                        .query(raw_sql, &[&id])
+                        .await
+                        .expect("uncached call");
+                    // Touch the first column so the row payload isn't elided.
+                    if let Some(row) = rows.first() {
+                        let _: i32 = row.try_get(0).unwrap();
+                    }
+                }
+                let uncached = t0.elapsed();
+
+                let cached_us = cached.as_secs_f64() * 1_000_000.0 / iters as f64;
+                let uncached_us = uncached.as_secs_f64() * 1_000_000.0 / iters as f64;
+                let speedup = uncached_us / cached_us;
+
+                println!(
+                    "BENCH iters={} cached_us={:.2} uncached_us={:.2} speedup={:.2}x",
+                    iters, cached_us, uncached_us, speedup
+                );
+            }
+        "#};
+
+        add_test_binary(project_dir.path(), "bench_pg_fn_cache", bench_code);
+
+        let build = std::process::Command::new("cargo")
+            .args(["build", "--release", "--bin", "bench_pg_fn_cache"])
+            .current_dir(project_dir.path())
+            .output()
+            .expect("cargo build");
+        if !build.status.success() {
+            print_output(&build);
+            panic!("bench binary failed to compile");
+        }
+        let run = std::process::Command::new("cargo")
+            .args(["run", "--release", "--bin", "bench_pg_fn_cache", "--", conn_string])
+            .current_dir(project_dir.path())
+            .output()
+            .expect("cargo run");
+
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        if !run.status.success() {
+            eprintln!("STDOUT:\n{}", stdout);
+            eprintln!("STDERR:\n{}", stderr);
+            panic!("bench binary failed at runtime");
+        }
+
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with("BENCH "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "bench did not emit BENCH line. STDOUT:\n{}\nSTDERR:\n{}",
+                    stdout, stderr
+                )
+            });
+        eprintln!("{}", line);
+
+        let speedup: f64 = line
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("speedup="))
+            .and_then(|s| s.strip_suffix('x'))
+            .and_then(|s| s.parse().ok())
+            .expect("parse speedup from BENCH line");
+
+        // Same threshold rationale as the query bench above.
+        assert!(
+            speedup >= 1.10,
+            "Expected cached pg_fn path to be ≥1.10× faster than uncached, got {}× — \
+             prepared-statement caching may have regressed",
+            speedup
+        );
+    });
+}

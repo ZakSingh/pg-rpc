@@ -1014,7 +1014,7 @@ impl ToRust for PgFn {
                     // No OUT parameters - just execute
                     quote! {
                         client
-                            .execute(&query, &params)
+                            .execute(&stmt, &params)
                             .await
                             .map(|_| ())
                             .map_err(#err_type::from)
@@ -1023,7 +1023,7 @@ impl ToRust for PgFn {
                     // Single OUT parameter - return it directly
                     quote! {
                         client
-                            .query_one(&query, &params)
+                            .query_one(&stmt, &params)
                             .await
                             .and_then(|row| row.try_get(0))
                             .map_err(#err_type::from)
@@ -1033,7 +1033,7 @@ impl ToRust for PgFn {
                     // For now, return as a Row that can be converted
                     quote! {
                         client
-                            .query_one(&query, &params)
+                            .query_one(&stmt, &params)
                             .await
                             .and_then(|row| row.try_into())
                             .map_err(#err_type::from)
@@ -1042,7 +1042,7 @@ impl ToRust for PgFn {
             } else if return_opt {
                 quote! {
                     client
-                        .query_opt(&query, &params)
+                        .query_opt(&stmt, &params)
                         .await
                         .and_then(|opt_row| match opt_row {
                             None => Ok(None),
@@ -1055,7 +1055,7 @@ impl ToRust for PgFn {
                     // Void set-returning function - just return vec of units
                     quote! {
                         client
-                            .query(&query, &params)
+                            .query(&stmt, &params)
                             .await
                             .map(|rows| vec![(); rows.len()])
                             .map_err(#err_type::from)
@@ -1064,7 +1064,7 @@ impl ToRust for PgFn {
                     // RETURN TABLE functions need row conversion
                     quote! {
                         client
-                            .query(&query, &params)
+                            .query(&stmt, &params)
                             .await
                             .and_then(|rows| {
                                 rows.into_iter().map(TryInto::try_into).collect()
@@ -1078,7 +1078,7 @@ impl ToRust for PgFn {
                             // Composite types use TryInto
                             quote! {
                                 client
-                                    .query(&query, &params)
+                                    .query(&stmt, &params)
                                     .await
                                     .and_then(|rows| {
                                         rows.into_iter().map(TryInto::try_into).collect()
@@ -1089,7 +1089,7 @@ impl ToRust for PgFn {
                             // Primitive types use try_get(0)
                             quote! {
                                 client
-                                    .query(&query, &params)
+                                    .query(&stmt, &params)
                                     .await
                                     .and_then(|rows| {
                                         rows.into_iter().map(|row| row.try_get(0)).collect()
@@ -1102,7 +1102,7 @@ impl ToRust for PgFn {
                 // Functions with multiple OUT parameters return a struct via TryFrom<Row>
                 quote! {
                     client
-                        .query_one(&query, &params)
+                        .query_one(&stmt, &params)
                         .await
                         .and_then(|r| r.try_into())
                         .map_err(#err_type::from)
@@ -1111,7 +1111,7 @@ impl ToRust for PgFn {
                 // Void returning function
                 quote! {
                     client
-                        .execute(&query, &params)
+                        .execute(&stmt, &params)
                         .await
                         .map_err(#err_type::from)?;
 
@@ -1121,7 +1121,7 @@ impl ToRust for PgFn {
                 // Non-set RETURN TABLE function (single row)
                 quote! {
                     client
-                        .query_one(&query, &params)
+                        .query_one(&stmt, &params)
                         .await
                         .and_then(|r| r.try_into())
                         .map_err(#err_type::from)
@@ -1130,11 +1130,24 @@ impl ToRust for PgFn {
                 // Use try_get for single return value
                 quote! {
                     client
-                        .query_one(&query, &params)
+                        .query_one(&stmt, &params)
                         .await
                         .and_then(|r| r.try_get(0))
                         .map_err(#err_type::from)
                 }
+            };
+
+            // Cache the prepared statement on the per-connection StatementCache.
+            // The SQL string is built at runtime (varies with which optional params
+            // were passed), but each distinct SQL still gets its own cache entry,
+            // so callers see prepare-once behaviour per arg-shape per connection.
+            //
+            // We use prepare_cached (untyped) rather than prepare_typed_cached:
+            // function args frequently involve user-defined composites/domains/
+            // enums whose OIDs aren't builtins, and the describe round-trip saved
+            // by prepare_typed_cached is one-time per cache miss anyway.
+            let prepare_step = quote! {
+                let stmt = client.prepare_cached(&query).await.map_err(#err_type::from)?;
             };
 
             if !opt_args.is_empty() {
@@ -1180,6 +1193,8 @@ impl ToRust for PgFn {
                         }
                     };
 
+                    #prepare_step
+
                     #query
                 }
             } else {
@@ -1187,6 +1202,8 @@ impl ToRust for PgFn {
                 quote! {
                     let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#req_arg_refs),*];
                     let query = format!("{}({})", #query_string, #required_query_params);
+
+                    #prepare_step
 
                     #query
                 }
