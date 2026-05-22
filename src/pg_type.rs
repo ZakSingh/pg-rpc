@@ -591,7 +591,16 @@ impl PgType {
                     let rs_field = sql_to_rs_ident(&field.name, CaseType::Snake);
                     from_inner_assignments.push(quote! { #rs_field: inner.#rs_field });
                     to_inner_assignments.push(quote! { #rs_field: self.#rs_field.clone() });
-                    to_inner_ref_assignments.push(quote! { #rs_field: &self.#rs_field });
+                    // Ref field type for a nullable plain field is `Option<&T>`,
+                    // so project with `.as_ref()` instead of `&self.field`
+                    // (which would yield `&Option<T>`).
+                    let is_nullable = field.nullable || optional_group_fields.contains(&field.name);
+                    if is_nullable {
+                        to_inner_ref_assignments
+                            .push(quote! { #rs_field: self.#rs_field.as_ref() });
+                    } else {
+                        to_inner_ref_assignments.push(quote! { #rs_field: &self.#rs_field });
+                    }
                 }
                 GroupedField::Group {
                     group_name,
@@ -736,11 +745,23 @@ impl PgType {
 
                         to_inner_assignments.extend(to_inner_field_conversions);
 
-                        let to_inner_ref_field_conversions: Vec<TokenStream> = inner_field_rs_names
+                        // Inner Ref field is `Option<&T>` when the base column
+                        // is nullable, `&T` otherwise. Project with `.as_ref()`
+                        // for the nullable case to avoid `&Option<T>`.
+                        let to_inner_ref_field_conversions: Vec<TokenStream> = group_fields
                             .iter()
+                            .zip(inner_field_rs_names.iter())
                             .zip(nested_field_rs_names.iter())
-                            .map(|(inner_rs, nested_rs)| {
-                                quote! { #inner_rs: &self.#group_field_name.#nested_rs }
+                            .map(|((f, inner_rs), nested_rs)| {
+                                if f.nullable {
+                                    quote! {
+                                        #inner_rs: self.#group_field_name.#nested_rs.as_ref()
+                                    }
+                                } else {
+                                    quote! {
+                                        #inner_rs: &self.#group_field_name.#nested_rs
+                                    }
+                                }
                             })
                             .collect();
 
@@ -771,7 +792,7 @@ impl PgType {
             /// Borrowed twin of `#inner_struct_name`, used as a zero-clone
             /// destination for `ToSql`. Built directly from `&self` in
             /// `impl ToSql for #rs_name` without copying any field.
-            #[derive(postgres_types::ToSql)]
+            #[derive(Debug, postgres_types::ToSql)]
             #[postgres(name = #pg_name)]
             struct #inner_ref_struct_name<'a> {
                 #(#inner_ref_field_tokens),*
@@ -1288,7 +1309,7 @@ impl ToRust for PgType {
 
                             /// Borrowed twin of `#rs_dom_inner_name`. Built in-place from
                             /// `&self` inside `impl ToSql for #rs_name` — zero clones.
-                            #[derive(postgres_types::ToSql)]
+                            #[derive(Debug, postgres_types::ToSql)]
                             #[postgres(name = #pg_inner_name)]
                             struct #rs_dom_inner_ref_name<'a> {
                                 #(#ref_field_tokens),*
