@@ -1352,12 +1352,16 @@ impl PgFn {
             .iter()
             .map(|arg| {
                 let field_name = arg.rs_out_name();
-                // The Rust field name strips `o_`/`p_` prefixes (see `rs_out_name`).
-                // The serde rename target must match the SQL column name as Postgres
-                // returns it, so we use the raw `arg.name` here.
-                let sql_name: &str = &arg.name;
+                // Strip `o_`/`p_` prefixes from the serde rename target too — the
+                // generated struct is the public-facing shape, so JSON field names
+                // should not leak the SQL-side OUT/INOUT naming convention.
+                let clean_name: &str = arg
+                    .name
+                    .strip_prefix("o_")
+                    .or_else(|| arg.name.strip_prefix("p_"))
+                    .unwrap_or(&arg.name);
                 let rs_name_str = arg.rs_out_name().to_string();
-                let needs_rename = rs_name_str != sql_name;
+                let needs_rename = rs_name_str != clean_name;
 
                 let base_type = Self::arg_base_type(arg, types);
                 let field_type = if arg.nullable {
@@ -1367,8 +1371,8 @@ impl PgFn {
                 };
 
                 let serde_attr = match (needs_rename, arg.nullable) {
-                    (true, true) => quote! { #[serde(rename = #sql_name, default)] },
-                    (true, false) => quote! { #[serde(rename = #sql_name)] },
+                    (true, true) => quote! { #[serde(rename = #clean_name, default)] },
+                    (true, false) => quote! { #[serde(rename = #clean_name)] },
                     (false, true) => quote! { #[serde(default)] },
                     (false, false) => quote! {},
                 };
@@ -1415,16 +1419,19 @@ impl PgFn {
     ) -> TokenStream {
         use crate::column_grouping::{group_by_double_underscore, GroupedField};
 
-        // Build indexed args with clean names (strip o_ prefix)
+        // Build indexed args with clean names (strip o_/p_ prefix). These prefixes
+        // are SQL-side conventions for OUT/INOUT parameters and shouldn't leak into
+        // either the Rust field names or the serde JSON names.
         let indexed_args: Vec<(usize, PgArg)> = self
             .out_args
             .iter()
             .enumerate()
             .map(|(i, a)| {
                 let mut arg = a.clone();
-                // Strip o_ prefix for clean naming
-                if arg.name.starts_with("o_") {
-                    arg.name = arg.name[2..].to_string();
+                if let Some(rest) = arg.name.strip_prefix("o_") {
+                    arg.name = rest.to_string();
+                } else if let Some(rest) = arg.name.strip_prefix("p_") {
+                    arg.name = rest.to_string();
                 }
                 (i, arg)
             })
