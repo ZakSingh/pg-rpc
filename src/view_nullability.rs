@@ -1675,48 +1675,208 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                     // Aggregate functions that can return NULL
                     "sum" | "avg" | "min" | "max" | "stddev" | "variance" => Ok(true),
 
-                    // String functions that preserve nullability
-                    "lower" | "upper" | "trim" | "ltrim" | "rtrim" | "substring" | "substr" => {
-                        // These return NULL if input is NULL
-                        self.check_function_args_nullable(&func.args)
+                    // Strict string functions: NULL in any arg → NULL out.
+                    "lower"
+                    | "upper"
+                    | "initcap"
+                    | "trim"
+                    | "ltrim"
+                    | "rtrim"
+                    | "btrim"
+                    | "substring"
+                    | "substr"
+                    | "replace"
+                    | "translate"
+                    | "repeat"
+                    | "reverse"
+                    | "lpad"
+                    | "rpad"
+                    | "left"
+                    | "right"
+                    | "split_part"
+                    | "position"
+                    | "strpos"
+                    | "ascii"
+                    | "chr"
+                    | "md5"
+                    | "encode"
+                    | "decode"
+                    | "to_hex"
+                    | "quote_ident"
+                    | "quote_literal"
+                    | "quote_nullable"
+                    | "regexp_replace"
+                    | "regexp_match"
+                    | "regexp_matches"
+                    | "regexp_split_to_array"
+                    | "starts_with" => self.check_function_args_nullable(&func.args),
+
+                    // Strict length/size functions.
+                    "length" | "char_length" | "character_length" | "bit_length"
+                    | "octet_length" => self.check_function_args_nullable(&func.args),
+
+                    // `concat` and `concat_ws` are NOT strict: they skip NULL
+                    // arguments and always return a non-NULL string (the empty
+                    // string when every arg is NULL). They are syntactically
+                    // required to have at least one argument.
+                    "concat" | "concat_ws" => Ok(false),
+
+                    // `format(fmt, args...)` is strict in `fmt` only — other
+                    // args may be NULL and render as the string "NULL".
+                    "format" => {
+                        if let Some(first) = func.args.first() {
+                            self.is_expression_nullable(first)
+                        } else {
+                            Ok(true)
+                        }
                     }
 
-                    // String functions that always return a value
-                    "length" | "char_length" | "bit_length" | "octet_length" => {
-                        // These might return NULL if input is NULL in PostgreSQL
-                        self.check_function_args_nullable(&func.args)
-                    }
-
-                    // COALESCE returns the first non-null argument
-                    "coalesce" => {
-                        // COALESCE is non-null if at least one argument is non-null
-                        // For now, conservatively assume nullable
+                    // COALESCE / GREATEST / LEAST: result is non-null iff at
+                    // least one argument is known non-null. GREATEST/LEAST
+                    // ignore NULL inputs entirely (only NULL when *all* args
+                    // are NULL).
+                    "coalesce" | "greatest" | "least" => {
+                        for arg in &func.args {
+                            if !self.is_expression_nullable(arg)? {
+                                return Ok(false);
+                            }
+                        }
                         Ok(true)
                     }
 
-                    // Mathematical functions
-                    "abs" | "ceil" | "floor" | "round" | "trunc" => {
-                        self.check_function_args_nullable(&func.args)
+                    // NULLIF(a, b) returns NULL when a == b, otherwise a.
+                    // Always potentially nullable.
+                    "nullif" => Ok(true),
+
+                    // Strict mathematical functions.
+                    "abs"
+                    | "ceil"
+                    | "ceiling"
+                    | "floor"
+                    | "round"
+                    | "trunc"
+                    | "sign"
+                    | "mod"
+                    | "power"
+                    | "sqrt"
+                    | "cbrt"
+                    | "exp"
+                    | "ln"
+                    | "log"
+                    | "log10"
+                    | "div"
+                    | "gcd"
+                    | "lcm"
+                    | "sin"
+                    | "cos"
+                    | "tan"
+                    | "asin"
+                    | "acos"
+                    | "atan"
+                    | "atan2"
+                    | "sinh"
+                    | "cosh"
+                    | "tanh"
+                    | "degrees"
+                    | "radians" => self.check_function_args_nullable(&func.args),
+
+                    // Math constants / non-deterministic but never-NULL.
+                    "pi" | "random" => Ok(false),
+
+                    // CAST preserves nullability of its input.
+                    "cast" => self.check_function_args_nullable(&func.args),
+
+                    // Date/time: current/transaction/clock/statement timestamps
+                    // and local{time,timestamp} are documented never-NULL.
+                    "now"
+                    | "current_date"
+                    | "current_time"
+                    | "current_timestamp"
+                    | "localtime"
+                    | "localtimestamp"
+                    | "clock_timestamp"
+                    | "statement_timestamp"
+                    | "transaction_timestamp"
+                    | "timeofday" => Ok(false),
+
+                    // Strict date/time functions.
+                    "date_part"
+                    | "extract"
+                    | "date_trunc"
+                    | "age"
+                    | "to_char"
+                    | "to_date"
+                    | "to_timestamp"
+                    | "to_number"
+                    | "make_date"
+                    | "make_time"
+                    | "make_timestamp"
+                    | "make_timestamptz"
+                    | "make_interval"
+                    | "justify_days"
+                    | "justify_hours"
+                    | "justify_interval"
+                    | "isfinite" => self.check_function_args_nullable(&func.args),
+
+                    // Array aggregates: can return NULL over empty input sets.
+                    "array_agg" | "string_agg" | "json_agg" | "jsonb_agg"
+                    | "json_object_agg" | "jsonb_object_agg" => Ok(true),
+
+                    // Array introspection functions return NULL for empty or
+                    // out-of-bounds dimensions, so always treat as nullable.
+                    "array_length" | "array_upper" | "array_lower" | "array_ndims"
+                    | "array_position" => Ok(true),
+
+                    // Strict array functions: NULL array → NULL result.
+                    "cardinality"
+                    | "array_dims"
+                    | "array_positions"
+                    | "array_remove"
+                    | "array_replace"
+                    | "array_append"
+                    | "array_prepend"
+                    | "array_cat" => self.check_function_args_nullable(&func.args),
+
+                    // `array_to_string(array, delimiter [, null_string])` is
+                    // strict in its first argument only: NULL array → NULL,
+                    // non-NULL array → always a string (empty when the array
+                    // is empty). The delimiter/null_string args being NULL
+                    // does not make the result NULL.
+                    "array_to_string" => {
+                        if let Some(first) = func.args.first() {
+                            self.is_expression_nullable(first)
+                        } else {
+                            Ok(true)
+                        }
                     }
 
-                    // Type conversion functions
-                    "cast" => {
-                        // CAST preserves nullability
-                        self.check_function_args_nullable(&func.args)
-                    }
+                    // JSON constructors: variadic builders that never return
+                    // NULL — NULL values are encoded as JSON `null` inside.
+                    "json_build_object"
+                    | "jsonb_build_object"
+                    | "json_build_array"
+                    | "jsonb_build_array"
+                    | "json_object"
+                    | "jsonb_object" => Ok(false),
 
-                    // Date/time functions
-                    "now" | "current_date" | "current_time" | "current_timestamp" => Ok(false),
-                    "date_part" | "extract" => self.check_function_args_nullable(&func.args),
+                    // Strict JSON functions.
+                    "row_to_json"
+                    | "to_json"
+                    | "to_jsonb"
+                    | "array_to_json"
+                    | "jsonb_set"
+                    | "jsonb_insert"
+                    | "jsonb_strip_nulls"
+                    | "json_strip_nulls"
+                    | "jsonb_typeof"
+                    | "json_typeof"
+                    | "jsonb_array_length"
+                    | "json_array_length"
+                    | "jsonb_pretty" => self.check_function_args_nullable(&func.args),
 
-                    // Array functions
-                    "array_agg" | "string_agg" => Ok(true), // Can return NULL on empty sets
-                    "array_length" | "array_upper" | "array_lower" => Ok(true),
-
-                    // JSON functions
-                    "row_to_json" | "to_json" | "to_jsonb" => {
-                        self.check_function_args_nullable(&func.args)
-                    }
+                    // UUID generation: never NULL.
+                    "gen_random_uuid" | "uuid_generate_v1" | "uuid_generate_v1mc"
+                    | "uuid_generate_v4" => Ok(false),
 
                     _ => Ok(true), // Unknown functions default to nullable
                 }
