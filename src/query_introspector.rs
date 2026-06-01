@@ -56,6 +56,7 @@ pub struct QueryIntrospector<'a> {
     rel_index: &'a RelIndex,
     view_nullability_cache: &'a crate::view_nullability::ViewNullabilityCache,
     trigger_index: Option<&'a TriggerIndex>,
+    domain_index: &'a crate::domain_index::DomainIndex,
 }
 
 impl<'a> QueryIntrospector<'a> {
@@ -63,11 +64,13 @@ impl<'a> QueryIntrospector<'a> {
         rel_index: &'a RelIndex,
         view_nullability_cache: &'a crate::view_nullability::ViewNullabilityCache,
         trigger_index: Option<&'a TriggerIndex>,
+        domain_index: &'a crate::domain_index::DomainIndex,
     ) -> Self {
         Self {
             rel_index,
             view_nullability_cache,
             trigger_index,
+            domain_index,
         }
     }
 
@@ -291,8 +294,24 @@ impl<'a> QueryIntrospector<'a> {
                         name, cn.is_not_null(), cn.is_nullable(), cn.nullable_due_to_join);
                 }
 
+                // Parse once and share the AST across the column-type and
+                // cast-domain walks below (avoids re-parsing the same SQL).
+                let parsed_ast = pg_query::parse(sql).ok();
+
                 // Build a map of column name -> (table_name, inferred_type_oid) from the query
                 let column_type_map = self.infer_column_types_from_query(sql);
+
+                // Build a map of output column name -> domain OID for `expr::domain`
+                // casts. Prepared-statement metadata reports the domain's *base*
+                // type for a cast expression, so without this a `least(...)::currency`
+                // column would generate the base composite (`_currency`) instead of
+                // the `currency` domain that `pg_typeof` reports. Only domain casts
+                // are recorded — for non-domain casts (`::int4`, `::text`) the
+                // prepared-statement type is already authoritative.
+                let cast_domain_map = parsed_ast
+                    .as_ref()
+                    .map(|ast| self.infer_cast_domain_types(&ast.protobuf))
+                    .unwrap_or_default();
 
                 let refined_columns = columns
                     .iter()
@@ -311,10 +330,18 @@ impl<'a> QueryIntrospector<'a> {
                         // look up in rel_index. Using col.name here would miss aliased columns
                         // and silently fall back to the base type reported by prepared-statement
                         // metadata, dropping the domain wrapper.
-                        let refined_type_oid = column_type_map
+                        // A cast to a domain wins: it names the result type
+                        // directly, overriding the base type the prepared
+                        // statement reported. Otherwise fall back to the
+                        // source column's type (preserves domains on plain
+                        // refs), then to the prepared-statement type.
+                        let refined_type_oid = cast_domain_map
                             .get(&col.name)
-                            .and_then(|(table, source_col)| {
-                                self.rel_index.get_column_type(table, source_col)
+                            .copied()
+                            .or_else(|| {
+                                column_type_map.get(&col.name).and_then(|(table, source_col)| {
+                                    self.rel_index.get_column_type(table, source_col)
+                                })
                             })
                             .unwrap_or(col.type_oid);
 
@@ -396,6 +423,97 @@ impl<'a> QueryIntrospector<'a> {
                     }
                 }
             }
+        }
+
+        result
+    }
+
+    /// Find SELECT columns that are casts to a domain type (`expr::domain`) and
+    /// map their output name to the domain's OID.
+    ///
+    /// Prepared-statement metadata resolves a cast result to the domain's base
+    /// type, so a `least(...)::currency` column would otherwise be generated as
+    /// the base type (e.g. the composite `_currency`) rather than the `currency`
+    /// domain that `pg_typeof` reports. Only casts whose target is a domain are
+    /// recorded — for casts to ordinary types the prepared-statement type is
+    /// already correct.
+    ///
+    /// Cost: walks the already-parsed AST (no re-parse) and resolves cast
+    /// type-names against the pre-loaded in-memory `DomainIndex` — no DB query.
+    fn infer_cast_domain_types(
+        &self,
+        parse_result: &pg_query::protobuf::ParseResult,
+    ) -> HashMap<String, OID> {
+        let mut result = HashMap::new();
+
+        let select = match parse_result
+            .stmts
+            .first()
+            .and_then(|s| s.stmt.as_ref())
+            .and_then(|n| n.node.as_ref())
+        {
+            Some(pg_query::protobuf::node::Node::SelectStmt(select)) => select,
+            _ => return result,
+        };
+
+        for target in &select.target_list {
+            let res_target = match &target.node {
+                Some(pg_query::protobuf::node::Node::ResTarget(rt)) => rt,
+                _ => continue,
+            };
+            let val = match &res_target.val {
+                Some(v) => v,
+                None => continue,
+            };
+            let type_cast = match &val.node {
+                Some(pg_query::protobuf::node::Node::TypeCast(tc)) => tc,
+                _ => continue,
+            };
+
+            // Reassemble the (possibly schema-qualified) target type name and
+            // resolve it against the domain index. Bail early on non-domains so
+            // we don't even compute the output name for ordinary casts.
+            let type_name = match &type_cast.type_name {
+                Some(tn) => tn,
+                None => continue,
+            };
+            let name_parts: Vec<String> = type_name
+                .names
+                .iter()
+                .filter_map(|n| match &n.node {
+                    Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect();
+            if name_parts.is_empty() {
+                continue;
+            }
+            // Try the fully-qualified name, then the bare type name. The
+            // DomainIndex stores both forms (bare omitted only when ambiguous
+            // across schemas).
+            let qualified_name = name_parts.join(".");
+            let domain_oid = self
+                .domain_index
+                .get(&qualified_name)
+                .or_else(|| self.domain_index.get(name_parts.last().unwrap()));
+            let domain_oid = match domain_oid {
+                Some(oid) => oid,
+                None => continue,
+            };
+
+            // Output name: explicit alias, else the cast argument's column name.
+            let output_name = if !res_target.name.is_empty() {
+                res_target.name.clone()
+            } else if let Some(arg) = &type_cast.arg {
+                match self.extract_column_name_from_node(arg) {
+                    Some(name) => name,
+                    None => continue,
+                }
+            } else {
+                continue;
+            };
+
+            result.insert(output_name, domain_oid);
         }
 
         result

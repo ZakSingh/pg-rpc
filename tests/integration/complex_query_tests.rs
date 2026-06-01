@@ -678,3 +678,66 @@ fn test_greatest_least_nullability() {
         );
     });
 }
+
+/// A cast to a domain type (`expr::currency`, where `currency` is a domain over
+/// the composite `_currency`) should generate the *domain* type, matching
+/// `pg_typeof` and matching a plain column reference of the same domain.
+///
+/// Prepared-statement metadata reports the domain's base type for a cast
+/// expression, so the analyzer must recover the domain from the cast's target
+/// type name. Regression test: the cast column previously generated the bare
+/// base composite (`_Currency`) while a plain domain column generated
+/// `Currency`.
+#[test]
+fn test_cast_to_domain_preserves_domain_type() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client
+            .execute(
+                "CREATE TYPE _currency AS (amount BIGINT, code TEXT)",
+                &[],
+            )
+            .unwrap();
+        client
+            .execute("CREATE DOMAIN currency AS _currency", &[])
+            .unwrap();
+        client
+            .execute(
+                r#"CREATE TABLE "order" (
+                    id INT PRIMARY KEY,
+                    application_fee currency NOT NULL,
+                    item_subtotal currency NOT NULL
+                )"#,
+                &[],
+            )
+            .unwrap();
+
+        let sql = indoc! {r#"
+            -- name: CaptureBreakdown :many
+            SELECT
+                o.id,
+                LEAST(o.application_fee, o.item_subtotal)::currency AS fee_capped,
+                o.item_subtotal AS plain_domain
+            FROM "order" o;
+        "#};
+
+        let (_dir, code) = generate_queries(conn_string, sql);
+
+        assert!(code.contains("pub async fn capture_breakdown"));
+
+        // Plain domain column → domain type (this already worked).
+        assert!(
+            code.contains("pub plain_domain: super::public::Currency"),
+            "plain domain column should be the domain type"
+        );
+
+        // Cast to the domain → the domain type, NOT the base composite.
+        assert!(
+            code.contains("pub fee_capped: super::public::Currency"),
+            "cast to domain `currency` should generate the domain type, not the base composite"
+        );
+        assert!(
+            !code.contains("pub fee_capped: super::public::_Currency"),
+            "cast to domain must not unwrap to the base composite type"
+        );
+    });
+}

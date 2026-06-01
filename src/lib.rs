@@ -22,6 +22,7 @@ mod column_grouping;
 mod config;
 pub mod constraint_analysis;
 mod db;
+pub mod domain_index;
 mod error_type_index;
 mod exceptions;
 mod fn_index;
@@ -356,6 +357,12 @@ impl PgrpcBuilder {
         // If queries are configured, parse and introspect to collect type OIDs
         // We need a temporary TypeIndex for introspection, then rebuild with all OIDs
         let query_index_opt = if let Some(queries_config) = &config.queries {
+            // Map of domain name -> OID so cast-to-domain columns
+            // (`expr::currency`) keep the domain instead of the base type that
+            // prepared-statement metadata reports. One cheap query, resolved
+            // in-memory during introspection.
+            let domain_index = domain_index::DomainIndex::new(&mut db.client, &config.schemas)?;
+
             // Build query index using the shared view nullability cache and trigger index
             let query_index = query_index::QueryIndex::new(
                 &connection_string,
@@ -363,6 +370,7 @@ impl PgrpcBuilder {
                 &view_nullability_cache,
                 queries_config,
                 Some(&trigger_index),
+                &domain_index,
             )?;
 
             // Collect query type OIDs

@@ -143,10 +143,12 @@ fn test_query_introspection() {
 
         let view_cache = pgrpc::view_nullability::ViewNullabilityCache::new();
 
+        let domain_index = pgrpc::domain_index::DomainIndex::empty();
         let introspector = pgrpc::query_introspector::QueryIntrospector::new(
             &rel_index,
             &view_cache,
             None, // No trigger index for this test
+            &domain_index,
         );
 
         let introspected = introspector.introspect(client, parsed).unwrap();
@@ -220,10 +222,12 @@ WHERE u.id = :user_id;
         // Build view nullability cache (empty in this case)
         let view_cache = pgrpc::view_nullability::ViewNullabilityCache::new();
 
+        let domain_index = pgrpc::domain_index::DomainIndex::empty();
         let introspector = pgrpc::query_introspector::QueryIntrospector::new(
             &rel_index,
             &view_cache,
             None, // No trigger index for this test
+            &domain_index,
         );
 
         let introspected = introspector.introspect(client, parsed).unwrap();
