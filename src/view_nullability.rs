@@ -923,6 +923,13 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                     // COALESCE is non-null if at least one argument is guaranteed non-null
                     self.is_coalesce_nullable(&coalesce.args)
                 }
+                protobuf::node::Node::MinMaxExpr(min_max) => {
+                    // GREATEST/LEAST skip NULL inputs and return NULL only when
+                    // *all* arguments are NULL, so the result is non-null as
+                    // soon as a single argument is non-null — the same rule as
+                    // COALESCE.
+                    self.is_coalesce_nullable(&min_max.args)
+                }
                 protobuf::node::Node::TypeCast(type_cast) => {
                     // Type casts preserve nullability of the argument
                     if let Some(arg) = &type_cast.arg {

@@ -621,3 +621,60 @@ fn test_complex_queries_generated_code_compiles() {
         assert_compilation_success(output);
     });
 }
+
+/// `GREATEST`/`LEAST` parse into a `MinMaxExpr` AST node (not a `FuncCall`).
+/// They ignore NULL inputs and return NULL *only* when every argument is NULL,
+/// so the result is NOT NULL as soon as a single argument is NOT NULL — the
+/// same rule as `COALESCE`. Regression test for the analyzer previously
+/// defaulting `MinMaxExpr` to nullable.
+#[test]
+fn test_greatest_least_nullability() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client
+            .execute(
+                "CREATE TABLE timestamps (
+                    id INT PRIMARY KEY,
+                    a TIMESTAMPTZ NOT NULL,
+                    b TIMESTAMPTZ NOT NULL,
+                    c TIMESTAMPTZ
+                )",
+                &[],
+            )
+            .unwrap();
+
+        let sql = indoc! {r#"
+            -- name: MinMaxNullability :many
+            SELECT
+                GREATEST(a, b) AS greatest_both_not_null,
+                LEAST(a, b) AS least_both_not_null,
+                GREATEST(a, c) AS greatest_one_nullable,
+                LEAST(c) AS least_all_nullable
+            FROM timestamps;
+        "#};
+
+        let (_dir, code) = generate_queries(conn_string, sql);
+
+        assert!(code.contains("pub async fn min_max_nullability"));
+
+        // At least one NOT NULL argument ⇒ the result is NOT NULL, because
+        // GREATEST/LEAST skip NULL inputs.
+        assert!(
+            code.contains("pub greatest_both_not_null: time::OffsetDateTime"),
+            "GREATEST(not_null, not_null) should be NOT NULL"
+        );
+        assert!(
+            code.contains("pub least_both_not_null: time::OffsetDateTime"),
+            "LEAST(not_null, not_null) should be NOT NULL"
+        );
+        assert!(
+            code.contains("pub greatest_one_nullable: time::OffsetDateTime"),
+            "GREATEST(not_null, nullable) should be NOT NULL — one NOT NULL arg is enough"
+        );
+
+        // Every argument nullable ⇒ the result is nullable.
+        assert!(
+            code.contains("pub least_all_nullable: Option<time::OffsetDateTime>"),
+            "LEAST(nullable) with no NOT NULL arg should stay nullable"
+        );
+    });
+}
