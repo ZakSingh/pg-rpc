@@ -741,3 +741,66 @@ fn test_cast_to_domain_preserves_domain_type() {
         );
     });
 }
+
+/// A cast can target a domain in a schema we are *not* generating code for
+/// (e.g. `expr::finance.currency` while only `public` is generated). The
+/// DomainIndex must therefore cover all non-system schemas, independent of the
+/// codegen schema list, and resolve the schema-qualified cast type name.
+#[test]
+fn test_cast_to_domain_in_other_schema() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client.execute("CREATE SCHEMA finance", &[]).unwrap();
+        client
+            .execute("CREATE TYPE finance._currency AS (amount BIGINT, code TEXT)", &[])
+            .unwrap();
+        client
+            .execute("CREATE DOMAIN finance.currency AS finance._currency", &[])
+            .unwrap();
+        client
+            .execute(
+                r#"CREATE TABLE public."order" (
+                    id INT PRIMARY KEY,
+                    application_fee finance.currency NOT NULL,
+                    item_subtotal finance.currency NOT NULL
+                )"#,
+                &[],
+            )
+            .unwrap();
+
+        let sql = indoc! {r#"
+            -- name: CaptureBreakdownXschema :many
+            SELECT
+                o.id,
+                LEAST(o.application_fee, o.item_subtotal)::finance.currency AS fee_capped
+            FROM public."order" o;
+        "#};
+
+        // Only generate `public` — the cast targets a domain in `finance`,
+        // which is deliberately not in the codegen schema list.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let sql_file = temp_dir.path().join("test.sql");
+        std::fs::write(&sql_file, sql).expect("write sql");
+        let output_dir = temp_dir.path().join("generated");
+        PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("public")
+            .output_path(&output_dir)
+            .queries_config(pgrpc::QueriesConfig {
+                paths: vec![sql_file.to_string_lossy().to_string()],
+            })
+            .build()
+            .expect("codegen should succeed");
+        let code = read_pretty(&output_dir.join("queries.rs"));
+
+        // Resolved to the `finance` domain, not its base composite.
+        assert!(
+            code.contains("pub fee_capped: super::finance::Currency"),
+            "qualified cast to a domain in a non-codegen schema should resolve to that domain. Got:\n{}",
+            code
+        );
+        assert!(
+            !code.contains("_Currency"),
+            "must not unwrap the cross-schema domain to its base composite"
+        );
+    });
+}

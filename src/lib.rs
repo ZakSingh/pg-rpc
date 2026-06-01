@@ -359,9 +359,10 @@ impl PgrpcBuilder {
         let query_index_opt = if let Some(queries_config) = &config.queries {
             // Map of domain name -> OID so cast-to-domain columns
             // (`expr::currency`) keep the domain instead of the base type that
-            // prepared-statement metadata reports. One cheap query, resolved
-            // in-memory during introspection.
-            let domain_index = domain_index::DomainIndex::new(&mut db.client, &config.schemas)?;
+            // prepared-statement metadata reports. Covers all non-system
+            // schemas (a cast may target a domain outside the codegen schema
+            // list); resolved in-memory during introspection.
+            let domain_index = domain_index::DomainIndex::new(&mut db.client)?;
 
             // Build query index using the shared view nullability cache and trigger index
             let query_index = query_index::QueryIndex::new(
