@@ -537,6 +537,89 @@ fn test_not_null_annotation_overrides_inference() {
     });
 }
 
+/// Unqualified columns from the preserved (left) side of a LEFT JOIN that uses
+/// a `USING (...)` clause must stay NOT NULL. Only the right-side table is made
+/// nullable by a LEFT JOIN; columns selected without a table qualifier still
+/// resolve to their owning relation and keep its base nullability.
+///
+/// Regression: previously every unqualified column in a `USING`-join query was
+/// emitted as `Option<_>` because the analyzer couldn't attribute the bare
+/// column reference to the preserved relation.
+#[test]
+fn test_left_join_using_preserves_left_side_not_null() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // `seller` is a right-side table joined to the pre-existing `account`
+        // table via a USING (account_id) LEFT JOIN.
+        client
+            .execute(
+                "CREATE TABLE seller (
+                    account_id INT PRIMARY KEY REFERENCES account(account_id),
+                    can_sell BOOLEAN NOT NULL
+                )",
+                &[],
+            )
+            .unwrap();
+
+        let sql = indoc! {r#"
+            -- name: SearchAccounts :many
+            SELECT account_id,
+                   name,
+                   email,
+                   s.can_sell
+            FROM account
+                 LEFT JOIN seller s USING (account_id);
+        "#};
+
+        let (_dir, code) = generate_queries(conn_string, sql);
+
+        // Preserved-side columns (unqualified, owned by `account`) stay NOT NULL.
+        // `account_id` is the USING join key: it is COALESCE(account.account_id,
+        // s.account_id), and the left input is NOT NULL, so it is NOT NULL too.
+        assert!(code.contains("pub account_id: i32"), "account_id should be NOT NULL");
+        assert!(code.contains("pub name: String"), "name should be NOT NULL");
+        // Right side of the LEFT JOIN is nullable.
+        assert!(code.contains("pub can_sell: Option<bool>"), "can_sell should be nullable");
+    });
+}
+
+/// `array_agg(...)` under a `GROUP BY` never returns NULL: every group has at
+/// least one row by construction, so the aggregate always produces a non-empty
+/// array. (A bare `array_agg` over a possibly-empty set with no GROUP BY *can*
+/// return NULL — that case stays nullable.)
+///
+/// Regression: `array_agg` was unconditionally treated as nullable, so grouped
+/// aggregates came out `Option<Vec<_>>` when they can never be NULL.
+#[test]
+fn test_array_agg_under_group_by_is_not_null() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client
+            .execute(
+                "CREATE TABLE orders (
+                    order_id INT NOT NULL,
+                    sku TEXT NOT NULL
+                )",
+                &[],
+            )
+            .unwrap();
+
+        let sql = indoc! {r#"
+            -- name: OrderSkus :many
+            SELECT order_id, array_agg(sku) AS skus
+            FROM orders
+            GROUP BY order_id;
+        "#};
+
+        let (_dir, code) = generate_queries(conn_string, sql);
+
+        assert!(code.contains("pub order_id: i32"));
+        // array_agg under GROUP BY: each group has >=1 row, never NULL.
+        assert!(
+            code.contains("pub skus: Vec<String>"),
+            "array_agg under GROUP BY should be NOT NULL Vec, got nullable"
+        );
+    });
+}
+
 /// End-to-end compilation check. Ensures the union of advanced query shapes
 /// produces code that not only matches expected substrings but also passes
 /// `cargo check`. Catches regressions in derive macros, trait bounds, and

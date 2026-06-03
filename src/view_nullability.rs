@@ -65,6 +65,14 @@ pub struct ViewNullabilityAnalyzer<'a> {
     /// Filled on first access during predicate refinement; reused across
     /// subsequent SELECTs in the same analyzer instance.
     relation_facts_cache: HashMap<OID, Vec<crate::parse_check_facts::NotNullFact>>,
+    /// Nullability of columns that a `USING (...)` / `NATURAL` join merged into
+    /// a single output column. A merged join key is `COALESCE(left, right)`, so
+    /// its nullability follows the *preserved* side of the join (the left side
+    /// of a LEFT JOIN, the right side of a RIGHT JOIN, neither for INNER, both
+    /// for FULL). Consulted for unqualified column references before the
+    /// ambiguous-owner fallback, since the column legitimately lives in both
+    /// joined relations. Populated during FROM/join analysis.
+    merged_using_columns: HashMap<String, ColumnNullability>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +191,47 @@ fn is_aggregate_call(node: &protobuf::Node) -> bool {
     )
 }
 
+/// True iff `node` is a bare call to an aggregate that returns NULL *only* when
+/// its input set is empty (the array/string/json aggregates). Under a GROUP BY
+/// every group has at least one row by construction, so these aggregates always
+/// produce a non-NULL value in that context.
+///
+/// This is deliberately narrower than [`is_aggregate_call`]: it excludes
+/// `sum`/`avg`/`min`/`max`/`bool_or`/… which can return NULL even over a
+/// non-empty group (e.g. `sum` of all-NULL inputs, `max` over an empty FILTER).
+fn is_empty_input_only_aggregate(node: &protobuf::Node) -> bool {
+    let func = match node.node.as_ref() {
+        Some(protobuf::node::Node::FuncCall(f)) => f,
+        // A surrounding cast (`array_agg(x)::text[]`) doesn't change the value.
+        Some(protobuf::node::Node::TypeCast(tc)) => {
+            return tc
+                .arg
+                .as_deref()
+                .map(is_empty_input_only_aggregate)
+                .unwrap_or(false);
+        }
+        _ => return false,
+    };
+    // A FILTER clause can shrink the input to empty even inside a non-empty
+    // group, reintroducing NULL — so only the unfiltered form is safe.
+    if func.agg_filter.is_some() {
+        return false;
+    }
+    let name = match func.funcname.last().and_then(|n| n.node.as_ref()) {
+        Some(protobuf::node::Node::String(s)) => s.sval.to_lowercase(),
+        _ => return false,
+    };
+    matches!(
+        name.as_str(),
+        "array_agg"
+            | "string_agg"
+            | "json_agg"
+            | "jsonb_agg"
+            | "json_object_agg"
+            | "jsonb_object_agg"
+    )
+}
+
 /// Extract the function name from a node inside a `RangeFunction.functions`
 /// list. The pg_query AST wraps the call in a `List` with a `FuncCall` as the
 /// first item. Returns `(name, true)` if a FuncCall was found, otherwise
@@ -270,6 +319,7 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
             cte_columns: HashMap::new(),
             refined_not_null: HashMap::new(),
             relation_facts_cache: HashMap::new(),
+            merged_using_columns: HashMap::new(),
         }
     }
 
@@ -364,6 +414,7 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
         self.nullable_columns.clear();
         self.cte_columns.clear();
         self.refined_not_null.clear();
+        self.merged_using_columns.clear();
         // relation_facts_cache intentionally NOT cleared — it's a pure derived
         // cache keyed by relation OID and safe to keep across analyses.
 
@@ -471,7 +522,15 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                         let expanded = self.expand_star_expression_detailed(val)?;
                         columns.extend(expanded);
                     } else {
-                        let cn = self.expression_nullability_detailed(val)?;
+                        let mut cn = self.expression_nullability_detailed(val)?;
+                        // array_agg/string_agg/json_agg/… return NULL only over
+                        // an empty input set. Under a GROUP BY every group has
+                        // at least one row, so the aggregate is never NULL.
+                        if !select.group_clause.is_empty()
+                            && is_empty_input_only_aggregate(val)
+                        {
+                            cn.nullable_on_base = false;
+                        }
                         // Output column name is the `AS alias` if present, else
                         // best-effort derived from the expression. Missing names
                         // become empty strings — callers that care about names
@@ -604,8 +663,10 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
         select: &protobuf::SelectStmt,
     ) -> anyhow::Result<Vec<(String, ColumnNullability)>> {
         let saved = std::mem::take(&mut self.alias_map);
+        let saved_using = std::mem::take(&mut self.merged_using_columns);
         let result = self.analyze_select_stmt(select);
         self.alias_map = saved;
+        self.merged_using_columns = saved_using;
         result
     }
 
@@ -880,6 +941,11 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                     // Determine join type and mark appropriate columns as nullable
                     let join_type = self.get_join_type(join);
                     self.apply_join_nullability(join, join_type)?;
+
+                    // Record nullability for any `USING (...)` merged columns,
+                    // which collapse to a single output column sourced from the
+                    // join's preserved side.
+                    self.record_using_columns(join, join_type)?;
                 }
                 _ => {
                     // Handle other from item types as needed
@@ -1271,47 +1337,74 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                         }
                     }
 
-                    // Single column name, try single-table case
-                    if self.alias_map.len() == 1 {
-                        if let Some((_, table_info)) = self.alias_map.iter().next() {
-                            match table_info {
-                                TableInfo::Table {
-                                    schema,
-                                    name: table_name,
-                                    is_nullable,
-                                    ..
-                                } => {
-                                    if let Some(rel) = self.find_relation(schema, table_name) {
-                                        let base_not_null =
-                                            self.is_column_not_null(rel, &name.sval);
-                                        return Ok(ColumnNullability {
-                                            nullable_due_to_join: *is_nullable,
-                                            nullable_on_base: !base_not_null,
-                                        });
-                                    }
+                    // A `USING`/`NATURAL` join merges same-named columns into a
+                    // single output column whose nullability follows the
+                    // preserved side. That column exists in both relations, so
+                    // the owner-count logic below would call it ambiguous —
+                    // resolve it from the merged map first.
+                    if let Some(cn) = self.merged_using_columns.get(&name.sval) {
+                        return Ok(*cn);
+                    }
+
+                    // Unqualified column name. Resolve it to its owning relation
+                    // the way Postgres does: find the relation(s) in scope that
+                    // actually expose a column with this name. With a single
+                    // table that's trivial; with a join we must avoid the old
+                    // bug of defaulting every unqualified column to nullable.
+                    // We only trust the result when exactly one relation owns the
+                    // column — if two do, the reference would be ambiguous (a
+                    // query error) and we stay conservative.
+                    let mut resolved: Option<ColumnNullability> = None;
+                    let mut owner_count = 0usize;
+                    for table_info in self.alias_map.values() {
+                        let cn = match table_info {
+                            TableInfo::Table {
+                                schema,
+                                name: table_name,
+                                is_nullable,
+                                ..
+                            } => {
+                                let rel = match self.find_relation(schema, table_name) {
+                                    Some(rel) => rel,
+                                    None => continue,
+                                };
+                                if !rel.columns.iter().any(|c| c.as_str() == name.sval) {
+                                    continue;
                                 }
-                                TableInfo::View {
-                                    nullability,
-                                    is_nullable,
-                                    ..
-                                }
-                                | TableInfo::Derived {
-                                    nullability,
-                                    is_nullable,
-                                } => {
-                                    if let Some(cn) = nullability.get(&name.sval) {
-                                        return Ok(ColumnNullability {
-                                            nullable_due_to_join: *is_nullable
-                                                || cn.nullable_due_to_join,
-                                            nullable_on_base: cn.nullable_on_base,
-                                        });
-                                    }
+                                let base_not_null = self.is_column_not_null(rel, &name.sval);
+                                ColumnNullability {
+                                    nullable_due_to_join: *is_nullable,
+                                    nullable_on_base: !base_not_null,
                                 }
                             }
+                            TableInfo::View {
+                                nullability,
+                                is_nullable,
+                                ..
+                            }
+                            | TableInfo::Derived {
+                                nullability,
+                                is_nullable,
+                            } => match nullability.get(&name.sval) {
+                                Some(cn) => ColumnNullability {
+                                    nullable_due_to_join: *is_nullable || cn.nullable_due_to_join,
+                                    nullable_on_base: cn.nullable_on_base,
+                                },
+                                None => continue,
+                            },
+                        };
+                        owner_count += 1;
+                        resolved = Some(cn);
+                    }
+
+                    if owner_count == 1 {
+                        if let Some(cn) = resolved {
+                            return Ok(cn);
                         }
                     }
 
-                    // Conservative default
+                    // Conservative default: column not found in any in-scope
+                    // relation, or ambiguously owned by more than one.
                     Ok(ColumnNullability {
                         nullable_due_to_join: false,
                         nullable_on_base: true,
@@ -1962,6 +2055,118 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
                         *is_nullable = true;
                     }
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// For a join with a `USING (col, …)` clause, record each merged column's
+    /// nullability. A `USING` column produces ONE output column equal to
+    /// `COALESCE(left.col, right.col)`, so it is NOT NULL exactly when the
+    /// preserved side's column is NOT NULL:
+    ///   * INNER — both sides present; either source works, prefer non-nullable.
+    ///   * LEFT  — left preserved; follow the left side.
+    ///   * RIGHT — right preserved; follow the right side.
+    ///   * FULL  — neither preserved; the merged column is nullable.
+    ///
+    /// We resolve the column against the preserved side's table aliases (already
+    /// registered in `alias_map` by the time this runs). If we can't attribute
+    /// it, we record nothing and the conservative fallback applies.
+    fn record_using_columns(
+        &mut self,
+        join: &protobuf::JoinExpr,
+        join_type: JoinType,
+    ) -> anyhow::Result<()> {
+        if join.using_clause.is_empty() {
+            return Ok(());
+        }
+
+        // Collect the aliases of the preserved side(s).
+        let mut preserved = HashSet::new();
+        match join_type {
+            JoinType::Inner => {
+                if let Some(larg) = &join.larg {
+                    self.collect_table_aliases(larg, &mut preserved)?;
+                }
+                if let Some(rarg) = &join.rarg {
+                    self.collect_table_aliases(rarg, &mut preserved)?;
+                }
+            }
+            JoinType::Left => {
+                if let Some(larg) = &join.larg {
+                    self.collect_table_aliases(larg, &mut preserved)?;
+                }
+            }
+            JoinType::Right => {
+                if let Some(rarg) = &join.rarg {
+                    self.collect_table_aliases(rarg, &mut preserved)?;
+                }
+            }
+            JoinType::Full => {
+                // Merged column is nullable on both sides; nothing to assert.
+                return Ok(());
+            }
+        }
+
+        for using_col in &join.using_clause {
+            let col_name = match &using_col.node {
+                Some(protobuf::node::Node::String(s)) => s.sval.clone(),
+                _ => continue,
+            };
+
+            // Find the preserved-side relation that owns this column and take
+            // its nullability. Prefer a NOT NULL source if more than one exists
+            // (INNER join with the column on both sides).
+            let mut best: Option<ColumnNullability> = None;
+            for alias in &preserved {
+                let table_info = match self.alias_map.get(alias) {
+                    Some(ti) => ti,
+                    None => continue,
+                };
+                let cn = match table_info {
+                    TableInfo::Table {
+                        schema,
+                        name,
+                        is_nullable,
+                        ..
+                    } => {
+                        let rel = match self.find_relation(schema, name) {
+                            Some(rel) => rel,
+                            None => continue,
+                        };
+                        if !rel.columns.iter().any(|c| c.as_str() == col_name) {
+                            continue;
+                        }
+                        ColumnNullability {
+                            nullable_due_to_join: *is_nullable,
+                            nullable_on_base: !self.is_column_not_null(rel, &col_name),
+                        }
+                    }
+                    TableInfo::View {
+                        nullability,
+                        is_nullable,
+                        ..
+                    }
+                    | TableInfo::Derived {
+                        nullability,
+                        is_nullable,
+                    } => match nullability.get(&col_name) {
+                        Some(cn) => ColumnNullability {
+                            nullable_due_to_join: *is_nullable || cn.nullable_due_to_join,
+                            nullable_on_base: cn.nullable_on_base,
+                        },
+                        None => continue,
+                    },
+                };
+                best = Some(match best {
+                    Some(prev) if prev.is_not_null() => prev,
+                    _ => cn,
+                });
+            }
+
+            if let Some(cn) = best {
+                self.merged_using_columns.insert(col_name, cn);
             }
         }
 

@@ -155,7 +155,10 @@ fn get_expected_nullability() -> HashMap<&'static str, Vec<(&'static str, bool)>
             ("total_amount", false), // Math expression with field selection - conservatively nullable
             ("total_currency", false), // Field selection - conservatively nullable
             ("shipping_status", true), // CASE with ELSE 'pending'
-            ("product_names", false), // ARRAY_AGG - conservatively nullable
+            ("product_names", true), // ARRAY_AGG under GROUP BY: each group has >=1
+            // row, so array_agg never returns NULL (an all-NULL group still yields
+            // a non-NULL `{NULL}` array). The LEFT JOIN on product only makes the
+            // array *elements* nullable, not the array itself.
             ("created_at", true),    // NOT NULL from base table
             ("updated_at", true),    // NOT NULL from base table
         ],
