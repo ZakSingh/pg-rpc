@@ -543,3 +543,70 @@ Domains aren't so simple; we have to parse their check constraints to determine 
 Means that `a` and `b` will be `Option`.
 
 If the `is not null` has an ancestor `or`, the column is `Option`. Otherwise it is non-null.
+
+## Strict domain types
+
+Domains normally generate transparent newtypes:
+
+```rust
+#[derive(Debug, Clone, /* ... */, serde::Deserialize)]
+pub struct Zip(pub String);
+```
+
+Nothing stops Rust code from constructing or deserializing a value that violates
+the domain's CHECK constraint — `Zip("not a zip".into())` compiles fine. Mark a
+domain "strict" to opt into validation:
+
+```sql
+COMMENT ON DOMAIN zip IS '@pgrpc_strict';
+```
+
+or equivalently in `pgrpc.toml` (or via `PgrpcBuilder::strict_domain`):
+
+```toml
+strict_domains = ["public.zip"]
+```
+
+This changes the generated type to:
+
+```rust
+#[serde(try_from = "String")]
+pub struct Zip(String);          // field is private
+
+impl Zip {
+    pub fn new_unchecked(value: String) -> Self;  // bypasses validation
+    pub fn into_inner(self) -> String;
+    pub fn as_inner(&self) -> &String;            // read access (also via Deref)
+}
+```
+
+You provide the validation by implementing `TryFrom` — the generated code is
+`include!`-d into your crate, so coherence allows this:
+
+```rust
+impl TryFrom<String> for db::public::Zip {
+    type Error = ZipError;  // must implement Display
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        if s.len() == 9 && s.bytes().all(|b| b.is_ascii_digit()) {
+            Ok(Self::new_unchecked(s))
+        } else {
+            Err(ZipError)
+        }
+    }
+}
+```
+
+Notes:
+
+- All serde deserialization (JSON APIs, task-queue payloads) now runs your
+  validator, and `Zip::try_from(s)` / `s.try_into()` is the validated constructor.
+- Values read from Postgres skip validation — the database already enforces the
+  CHECK constraint.
+- Forgetting the impl fails compilation with
+  ``the trait bound `Zip: TryFrom<String>` is not satisfied``.
+- Strict mode is not supported for domains over composite types (a warning is
+  logged and the annotation is ignored).
+- If the domain is also listed in `disable_deserialize`, no `Deserialize` impl is
+  generated at all; the field still becomes private and `new_unchecked` /
+  `into_inner` are still generated.

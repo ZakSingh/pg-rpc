@@ -97,6 +97,7 @@ pub fn create_test_cargo_project(conn_string: &str, schemas: Vec<&str>) -> TempD
         rust_decimal = "1"
         bon = "2"
         uuid = { version = "1", features = ["serde", "v4"] }
+        derive_more = { version = "1", features = ["full"] }
         
     "#};
     std::fs::write(project_dir.join("Cargo.toml"), cargo_toml_content)

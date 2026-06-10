@@ -13,6 +13,7 @@ pub struct Config {
     pub errors: Option<ErrorsConfig>,
     pub infer_view_nullability: bool,
     pub disable_deserialize: Vec<String>,
+    pub strict_domains: Vec<String>,
     pub queries: Option<QueriesConfig>,
     pub tracing: Option<TracingConfig>,
 }
@@ -56,6 +57,7 @@ impl Default for Config {
             errors: None,
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
+            strict_domains: Vec::new(),
             queries: None,
             tracing: None,
         }
@@ -67,6 +69,12 @@ impl Config {
     pub fn should_disable_deserialize(&self, schema: &str, type_name: &str) -> bool {
         let full_name = format!("{}.{}", schema, type_name);
         self.disable_deserialize.contains(&full_name)
+    }
+
+    /// Check if a domain should be generated in strict (validated) mode
+    pub fn is_strict_domain(&self, schema: &str, type_name: &str) -> bool {
+        let full_name = format!("{}.{}", schema, type_name);
+        self.strict_domains.contains(&full_name)
     }
 }
 

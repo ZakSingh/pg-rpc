@@ -1203,6 +1203,14 @@ fn generate_query_code(
     }
 }
 
+/// Chain of `.as_inner()` calls that peels `depth` domain layers.
+/// Used instead of direct `.0` field access because strict domains have a
+/// private inner field that is not visible from the `queries` module, and
+/// method calls auto-deref through reference layers just like field access.
+fn domain_unwrap_chain(depth: usize) -> TokenStream {
+    (0..depth).map(|_| quote! { .as_inner() }).collect()
+}
+
 /// Generate a parameter reference for query execution
 fn generate_param_ref(
     param: &crate::query_introspector::QueryParam,
@@ -1228,13 +1236,11 @@ fn generate_param_ref(
             let unwrapped_name_str = format!("{}_unwrapped", param.name.to_snake_case());
             let unwrapped_name = sql_to_rs_ident(&unwrapped_name_str, CaseType::Snake);
 
-            // Generate chained .0 accesses for nested domains
-            let unwrap_chain: TokenStream = (0..unwrap_depth)
-                .map(|_| quote! { .0 })
-                .collect();
+            // Generate chained .as_inner() calls for nested domains
+            let unwrap_chain = domain_unwrap_chain(unwrap_depth);
 
             nullable_domain_bindings.push(
-                quote! { let #unwrapped_name = #param_name.as_ref().map(|v| &v #unwrap_chain); }
+                quote! { let #unwrapped_name = #param_name.as_ref().map(|v| v #unwrap_chain); }
             );
             quote! { &#unwrapped_name }
         } else {
@@ -1243,11 +1249,9 @@ fn generate_param_ref(
         }
     } else {
         if unwrap_depth > 0 {
-            // For non-nullable domain: pass &param.0.0... (depth times)
-            let unwrap_chain: TokenStream = (0..unwrap_depth)
-                .map(|_| quote! { .0 })
-                .collect();
-            quote! { &#param_name #unwrap_chain }
+            // For non-nullable domain: pass param.as_inner().as_inner()... (depth times)
+            let unwrap_chain = domain_unwrap_chain(unwrap_depth);
+            quote! { #param_name #unwrap_chain }
         } else if param_needs_reference(param.type_oid, type_index) {
             quote! { &#param_name }
         } else {
@@ -1320,10 +1324,8 @@ fn generate_default_match_arms(
                     );
 
                     if unwrap_depth > 0 {
-                        let unwrap_chain: TokenStream = (0..unwrap_depth)
-                            .map(|_| quote! { .0 })
-                            .collect();
-                        param_refs.push(quote! { &#val_name #unwrap_chain as &(dyn postgres_types::ToSql + Sync) });
+                        let unwrap_chain = domain_unwrap_chain(unwrap_depth);
+                        param_refs.push(quote! { #val_name #unwrap_chain as &(dyn postgres_types::ToSql + Sync) });
                     } else {
                         param_refs.push(quote! { #val_name as &(dyn postgres_types::ToSql + Sync) });
                     }
@@ -1388,12 +1390,10 @@ fn generate_param_ref_for_match(
             let unwrapped_name_str = format!("{}_unwrapped", param.name.to_snake_case());
             let unwrapped_name = sql_to_rs_ident(&unwrapped_name_str, CaseType::Snake);
 
-            let unwrap_chain: TokenStream = (0..unwrap_depth)
-                .map(|_| quote! { .0 })
-                .collect();
+            let unwrap_chain = domain_unwrap_chain(unwrap_depth);
 
             nullable_domain_bindings.push(
-                quote! { let #unwrapped_name = #param_name.as_ref().map(|v| &v #unwrap_chain); }
+                quote! { let #unwrapped_name = #param_name.as_ref().map(|v| v #unwrap_chain); }
             );
             quote! { &#unwrapped_name as &(dyn postgres_types::ToSql + Sync) }
         } else {
@@ -1401,10 +1401,8 @@ fn generate_param_ref_for_match(
         }
     } else {
         if unwrap_depth > 0 {
-            let unwrap_chain: TokenStream = (0..unwrap_depth)
-                .map(|_| quote! { .0 })
-                .collect();
-            quote! { &#param_name #unwrap_chain as &(dyn postgres_types::ToSql + Sync) }
+            let unwrap_chain = domain_unwrap_chain(unwrap_depth);
+            quote! { #param_name #unwrap_chain as &(dyn postgres_types::ToSql + Sync) }
         } else if param_needs_reference(param.type_oid, type_index) {
             quote! { &#param_name as &(dyn postgres_types::ToSql + Sync) }
         } else {
@@ -2024,7 +2022,7 @@ fn get_param_type(type_oid: OID, type_index: &TypeIndex, nullable: bool) -> Toke
 }
 
 /// Compute how many domain layers to unwrap to reach the target type.
-/// Returns 0 if no unwrapping needed, or the number of `.0` accesses required.
+/// Returns 0 if no unwrapping needed, or the number of `.as_inner()` calls required.
 ///
 /// PostgreSQL's parameter type inference varies by context:
 /// - Comparisons (WHERE slug = $1): PostgreSQL expects the base type (citext)
@@ -2032,8 +2030,8 @@ fn get_param_type(type_oid: OID, type_index: &TypeIndex, nullable: bool) -> Toke
 ///
 /// For nested domains like `level3` → `level2` → `level1` → `citext`:
 /// - PostgreSQL may expect `citext` (the ultimate base)
-/// - Single `.0` unwrap only removes one layer
-/// - This function computes how many `.0` unwraps are needed
+/// - A single `.as_inner()` call only removes one layer
+/// - This function computes how many `.as_inner()` calls are needed
 fn compute_domain_unwrap_depth(
     from_oid: OID,
     to_oid: OID,

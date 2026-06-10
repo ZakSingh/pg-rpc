@@ -32,6 +32,7 @@ pub mod query_tests;
 pub mod schema_tests;
 pub mod single_field_group_tests;
 pub mod sql_function_tests;
+pub mod strict_domain_tests;
 pub mod task_queue_tests;
 pub mod trigger_tests;
 pub mod array_of_composites_tests;

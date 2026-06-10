@@ -70,6 +70,11 @@ pub fn has_builder(comment: &str) -> bool {
     comment.contains("@pgrpc_builder")
 }
 
+/// Check if comment contains @pgrpc_strict
+pub fn has_strict(comment: &str) -> bool {
+    comment.contains("@pgrpc_strict")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +154,12 @@ mod tests {
         assert!(has_builder("@pgrpc_builder Filter for listing items"));
         assert!(has_builder("some text @pgrpc_builder more"));
         assert!(!has_builder("no annotation here"));
+    }
+
+    #[test]
+    fn test_has_strict() {
+        assert!(has_strict("@pgrpc_strict"));
+        assert!(has_strict("US zip code. @pgrpc_strict"));
+        assert!(!has_strict("no annotation here"));
     }
 }

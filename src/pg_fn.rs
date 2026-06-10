@@ -1839,6 +1839,7 @@ mod test {
             errors: None,
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
+            strict_domains: Vec::new(),
             queries: None,
             tracing: None,
         };
@@ -1919,6 +1920,7 @@ mod test {
             errors: None,
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
+            strict_domains: Vec::new(),
             queries: None,
             tracing: None,
         };
@@ -1973,6 +1975,7 @@ mod test {
             errors: None,
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
+            strict_domains: Vec::new(),
             queries: None,
             tracing: Some(TracingConfig {
                 enabled: true,
@@ -2039,6 +2042,7 @@ mod test {
             errors: None,
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
+            strict_domains: Vec::new(),
             queries: None,
             tracing: None,
         };

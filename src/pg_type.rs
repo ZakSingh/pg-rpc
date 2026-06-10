@@ -1189,6 +1189,15 @@ impl ToRust for PgType {
                         let rs_dom_inner_ref_name =
                             format_ident!("Inner{}Ref", sql_to_rs_string(name, CaseType::Pascal));
 
+                        if comment.as_ref().is_some_and(|c| annotations::has_strict(c))
+                            || config.is_strict_domain(schema, name)
+                        {
+                            log::warn!(
+                                "@pgrpc_strict on domain {}.{} ignored: strict mode is not supported for domains over composite types",
+                                schema, name
+                            );
+                        }
+
                         // If the domain wraps a composite type, we want to create a new composite type
                         // with the non-null constraints enforced by the domain rather than creating a new wrapper type.
                         // TODO: Refactor for DRY
@@ -1390,10 +1399,48 @@ impl ToRust for PgType {
                         let (additional_derives, custom_impls) =
                             determine_domain_traits(pg_type, &rs_name);
 
-                        let deserialize_derive = if config.should_disable_deserialize(schema, name) {
+                        let is_strict = comment.as_ref().is_some_and(|c| annotations::has_strict(c))
+                            || config.is_strict_domain(schema, name);
+                        let deserialize_disabled = config.should_disable_deserialize(schema, name);
+
+                        let deserialize_derive = if deserialize_disabled {
                             quote! {}
                         } else {
                             quote! { serde::Deserialize, }
+                        };
+
+                        // Strict domains route Deserialize through the user's `TryFrom<#inner>` impl.
+                        let serde_try_from_attr = if is_strict && !deserialize_disabled {
+                            let inner_ty_str = inner.to_string().replace(' ', "");
+                            quote! { #[serde(try_from = #inner_ty_str)] }
+                        } else {
+                            quote! {}
+                        };
+
+                        // Strict domains hide the inner field so values can only be
+                        // built through the user's validating TryFrom impl (or the
+                        // explicit unchecked escape hatch below).
+                        let field_vis = if is_strict { quote! {} } else { quote! { pub } };
+
+                        let strict_impls = if is_strict {
+                            quote! {
+                                impl #rs_name {
+                                    /// Constructs the value WITHOUT running domain validation.
+                                    /// Intended for trusted inputs and for use inside your
+                                    /// `TryFrom` impl. The database still enforces the CHECK
+                                    /// constraint on write.
+                                    pub fn new_unchecked(value: #inner) -> Self {
+                                        Self(value)
+                                    }
+
+                                    /// Consumes the wrapper, returning the inner value.
+                                    pub fn into_inner(self) -> #inner {
+                                        self.0
+                                    }
+                                }
+                            }
+                        } else {
+                            quote! {}
                         };
 
                         let base_derives = quote! { Debug, Clone, derive_more::Deref, serde::Serialize, #deserialize_derive postgres_types::ToSql, postgres_types::FromSql };
@@ -1406,7 +1453,17 @@ impl ToRust for PgType {
                         quote! {
                             #[derive(#all_derives)]
                             #[postgres(name = #name)]
-                            pub struct #rs_name(pub #inner);
+                            #serde_try_from_attr
+                            pub struct #rs_name(#field_vis #inner);
+
+                            impl #rs_name {
+                                /// Returns a reference to the inner (base-type) value.
+                                pub fn as_inner(&self) -> &#inner {
+                                    &self.0
+                                }
+                            }
+
+                            #strict_impls
 
                             #(#custom_impls)*
                         }
@@ -1725,6 +1782,11 @@ mod tests {
         assert!(code_str.contains("PartialOrd"));
         assert!(code_str.contains("Ord"));
 
+        // Non-strict domains keep a public inner field and still get as_inner()
+        assert!(code_str.contains("pub struct UserId (pub i32)"));
+        assert!(code_str.contains("fn as_inner"));
+        assert!(!code_str.contains("fn new_unchecked"));
+
         // Test text domain (should get Display impl + ordering traits)
         types.insert(2, PgType::Text);
         let text_domain = PgType::Domain {
@@ -1772,5 +1834,87 @@ mod tests {
         assert!(code_str.contains("Hash"));
         assert!(code_str.contains("PartialOrd"));
         assert!(code_str.contains("Ord"));
+    }
+
+    fn strict_text_domain(comment: Option<&str>) -> (BTreeMap<OID, PgType>, PgType) {
+        let mut types = BTreeMap::new();
+        types.insert(1, PgType::Text);
+        let domain = PgType::Domain {
+            schema: "public".to_string(),
+            name: "zip".to_string(),
+            type_oid: 1,
+            constraints: vec![],
+            comment: comment.map(String::from),
+        };
+        (types, domain)
+    }
+
+    #[test]
+    fn test_strict_domain_via_annotation() {
+        let (types, domain) = strict_text_domain(Some("US zip code. @pgrpc_strict"));
+        let code_str = domain.to_rust(&types, &Config::default()).to_string();
+
+        // Inner field is private
+        assert!(code_str.contains("pub struct Zip (String)"));
+        assert!(!code_str.contains("pub String"));
+        // Deserialize routed through the user's TryFrom impl
+        assert!(code_str.contains("serde :: Deserialize"));
+        assert!(code_str.contains(r#"try_from = "String""#));
+        // Constructor surface
+        assert!(code_str.contains("fn new_unchecked"));
+        assert!(code_str.contains("fn into_inner"));
+        assert!(code_str.contains("fn as_inner"));
+    }
+
+    #[test]
+    fn test_strict_domain_via_config() {
+        let (types, domain) = strict_text_domain(None);
+        let config = Config {
+            strict_domains: vec!["public.zip".to_string()],
+            ..Default::default()
+        };
+        let code_str = domain.to_rust(&types, &config).to_string();
+
+        assert!(code_str.contains("pub struct Zip (String)"));
+        assert!(!code_str.contains("pub String"));
+        assert!(code_str.contains(r#"try_from = "String""#));
+        assert!(code_str.contains("fn new_unchecked"));
+    }
+
+    #[test]
+    fn test_strict_domain_with_deserialize_disabled() {
+        let (types, domain) = strict_text_domain(Some("@pgrpc_strict"));
+        let config = Config {
+            strict_domains: vec!["public.zip".to_string()],
+            disable_deserialize: vec!["public.zip".to_string()],
+            ..Default::default()
+        };
+        let code_str = domain.to_rust(&types, &config).to_string();
+
+        // No Deserialize at all, so no try_from routing either
+        assert!(!code_str.contains("Deserialize"));
+        assert!(!code_str.contains("try_from"));
+        // Field still private with explicit constructor surface
+        assert!(code_str.contains("pub struct Zip (String)"));
+        assert!(code_str.contains("fn new_unchecked"));
+        assert!(code_str.contains("fn into_inner"));
+    }
+
+    #[test]
+    fn test_strict_domain_qualified_inner() {
+        let mut types = BTreeMap::new();
+        types.insert(1, PgType::Numeric);
+        let domain = PgType::Domain {
+            schema: "public".to_string(),
+            name: "price".to_string(),
+            type_oid: 1,
+            constraints: vec![],
+            comment: Some("@pgrpc_strict".to_string()),
+        };
+        let code_str = domain.to_rust(&types, &Config::default()).to_string();
+
+        // Path-qualified inner types must render without spaces in the serde attr
+        assert!(code_str.contains(r#"try_from = "rust_decimal::Decimal""#));
+        assert!(code_str.contains("pub struct Price (rust_decimal :: Decimal)"));
     }
 }

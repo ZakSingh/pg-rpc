@@ -62,6 +62,7 @@ pub struct PgrpcBuilder {
     errors: Option<config::ErrorsConfig>,
     infer_view_nullability: bool,
     disable_deserialize: Vec<String>,
+    strict_domains: Vec<String>,
     queries: Option<config::QueriesConfig>,
     tracing: Option<config::TracingConfig>,
 }
@@ -85,6 +86,7 @@ impl PgrpcBuilder {
             errors: None,
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
+            strict_domains: Vec::new(),
             queries: None,
             tracing: None,
         }
@@ -216,6 +218,20 @@ impl PgrpcBuilder {
         self
     }
 
+    /// Mark a domain (as "schema.name") as strict: the generated newtype gets a
+    /// private inner field and deserialization is routed through a user-provided
+    /// `TryFrom<Inner>` impl. Equivalent to `COMMENT ON DOMAIN ... IS '@pgrpc_strict'`.
+    pub fn strict_domain(mut self, type_name: impl Into<String>) -> Self {
+        self.strict_domains.push(type_name.into());
+        self
+    }
+
+    /// Mark multiple domains (as "schema.name") as strict
+    pub fn strict_domains(mut self, types: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.strict_domains.extend(types.into_iter().map(Into::into));
+        self
+    }
+
     /// Configure SQL query files for code generation
     pub fn queries_config(mut self, config: config::QueriesConfig) -> Self {
         self.queries = Some(config);
@@ -275,6 +291,7 @@ impl PgrpcBuilder {
             errors: config.errors,
             infer_view_nullability: config.infer_view_nullability,
             disable_deserialize: config.disable_deserialize,
+            strict_domains: config.strict_domains,
             queries: config.queries,
             tracing: config.tracing,
         })
@@ -315,6 +332,7 @@ impl PgrpcBuilder {
             errors: self.errors.clone(),
             infer_view_nullability: self.infer_view_nullability,
             disable_deserialize: self.disable_deserialize.clone(),
+            strict_domains: self.strict_domains.clone(),
             queries: self.queries.clone(),
             tracing: self.tracing.clone(),
         };
