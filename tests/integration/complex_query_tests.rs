@@ -887,3 +887,165 @@ fn test_cast_to_domain_in_other_schema() {
         );
     });
 }
+
+/// Regression: a scalar `text` column that sits *before* an array-typed column
+/// in the result set must not pick up an erroneous `Vec<…>` wrapper.
+///
+/// See PGRPC_BUG_REPORT.md: when a `:many` query selects a scalar `text` column
+/// adjacent to a `text[]` column, the scalar was generated as `Vec<String>`
+/// (the array-ness of the later column bled onto the earlier one), and a query
+/// selecting a single scalar `text` column was generated as `Vec<Vec<String>>`.
+#[test]
+fn test_scalar_column_before_array_not_wrapped() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client
+            .execute(
+                "CREATE TABLE t (
+                    id   INT,
+                    name TEXT,
+                    tags TEXT[]
+                )",
+                &[],
+            )
+            .unwrap();
+
+        let sql = indoc! {r#"
+            -- name: SelectIdNameTags :many
+            SELECT id, name, tags FROM t;
+        "#};
+
+        let (_dir, code) = generate_queries(conn_string, sql);
+
+        assert!(
+            code.contains("pub struct SelectIdNameTagsRow"),
+            "should generate Row struct. Got:\n{}",
+            code
+        );
+        // `id` is a scalar int.
+        assert!(
+            code.contains("pub id: Option<i32>") || code.contains("pub id: i32"),
+            "id should be i32. Got:\n{}",
+            code
+        );
+        // `name` is a scalar `text` — must be String, NOT Vec<String>.
+        assert!(
+            !code.contains("name: Vec<String>") && !code.contains("name: Option<Vec<String>>"),
+            "scalar `name` must not be wrapped in Vec. Got:\n{}",
+            code
+        );
+        assert!(
+            code.contains("pub name: Option<String>") || code.contains("pub name: String"),
+            "name should be String. Got:\n{}",
+            code
+        );
+        // `tags` is the real array column — Vec<String>.
+        assert!(
+            code.contains("tags: Vec<String>") || code.contains("tags: Option<Vec<String>>"),
+            "tags should be Vec<String>. Got:\n{}",
+            code
+        );
+    });
+}
+
+/// Regression: a `:many` query selecting a single scalar `text` column must be
+/// generated as `Vec<String>`, not `Vec<Vec<String>>`.
+#[test]
+fn test_single_scalar_column_not_double_wrapped() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        client
+            .execute(
+                "CREATE TABLE t2 (
+                    id   INT,
+                    name TEXT,
+                    tags TEXT[]
+                )",
+                &[],
+            )
+            .unwrap();
+
+        let sql = indoc! {r#"
+            -- name: SelectName :many
+            SELECT name FROM t2;
+        "#};
+
+        let (_dir, code) = generate_queries(conn_string, sql);
+
+        // A single scalar column produces a scalar :many query returning Vec<String>.
+        assert!(
+            !code.contains("Vec<Vec<String>>") && !code.contains("Vec<Option<Vec<String>>>"),
+            "single scalar `text` column must not be double-wrapped. Got:\n{}",
+            code
+        );
+        assert!(
+            code.contains("Vec<String>") || code.contains("Vec<Option<String>>"),
+            "single scalar `text` :many should return Vec<String>. Got:\n{}",
+            code
+        );
+    });
+}
+
+/// Regression for the array-bleed bug in PGRPC_BUG_REPORT.md.
+///
+/// `RelIndex::get_column_type` matched relations by *unqualified* name only, so
+/// when two tables in different schemas share a name, the wrong table's columns
+/// could be used to look up a column's type. If the wrong table's same-named
+/// column is `text[]`, a scalar `text` result column gets mis-typed as
+/// `Vec<String>`. Which table wins depends on catalog OID ordering, which is
+/// why the bug was DB-state-dependent (fresh apply vs. incremental migration).
+#[test]
+fn test_cross_schema_name_collision_preserves_scalar_type() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Two tables named `widget` in two schemas, with the *same* column name
+        // `label` at the *same* ordinal position but different types: a scalar
+        // `text` in `core`, an array `text[]` in `other`. A by-name-only lookup
+        // can resolve `core.widget.label` against `other.widget.label`.
+        client.execute("CREATE SCHEMA core", &[]).unwrap();
+        client.execute("CREATE SCHEMA other", &[]).unwrap();
+        client
+            .execute(
+                "CREATE TABLE other.widget (id INT, label TEXT[])",
+                &[],
+            )
+            .unwrap();
+        client
+            .execute(
+                "CREATE TABLE core.widget (id INT, label TEXT)",
+                &[],
+            )
+            .unwrap();
+
+        let sql = indoc! {r#"
+            -- name: SelectWidgetLabel :many
+            SELECT id, label FROM core.widget;
+        "#};
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let sql_file = temp_dir.path().join("test.sql");
+        std::fs::write(&sql_file, sql).expect("write sql");
+        let output_dir = temp_dir.path().join("generated");
+        PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("core")
+            .schema("other")
+            .output_path(&output_dir)
+            .queries_config(pgrpc::QueriesConfig {
+                paths: vec![sql_file.to_string_lossy().to_string()],
+            })
+            .build()
+            .expect("codegen should succeed");
+        let code = read_pretty(&output_dir.join("queries.rs"));
+
+        // `core.widget.label` is scalar `text` — must be String, never Vec<String>.
+        assert!(
+            !code.contains("label: Vec<String>")
+                && !code.contains("label: Option<Vec<String>>"),
+            "scalar `label` from core.widget must not pick up other.widget's array type. Got:\n{}",
+            code
+        );
+        assert!(
+            code.contains("pub label: Option<String>") || code.contains("pub label: String"),
+            "label should resolve to String. Got:\n{}",
+            code
+        );
+    });
+}
