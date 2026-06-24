@@ -339,8 +339,12 @@ impl<'a> QueryIntrospector<'a> {
                             .get(&col.name)
                             .copied()
                             .or_else(|| {
-                                column_type_map.get(&col.name).and_then(|(table, source_col)| {
-                                    self.rel_index.get_column_type(table, source_col)
+                                column_type_map.get(&col.name).and_then(|(schema, table, source_col)| {
+                                    self.rel_index.get_column_type_in_schema(
+                                        schema.as_deref(),
+                                        table,
+                                        source_col,
+                                    )
                                 })
                             })
                             .unwrap_or(col.type_oid);
@@ -367,8 +371,14 @@ impl<'a> QueryIntrospector<'a> {
     }
 
     /// Infer which table each selected column comes from by parsing the query.
-    /// Returns a map of column_name -> (table_name, column_name).
-    fn infer_column_types_from_query(&self, sql: &str) -> HashMap<String, (String, String)> {
+    /// Returns a map of output column name -> (schema, source table, source column),
+    /// where `schema` is `Some` only when the FROM clause qualifies the table
+    /// (e.g. `core.widget`) — letting the type lookup disambiguate same-named
+    /// tables across schemas instead of guessing by catalog OID order.
+    fn infer_column_types_from_query(
+        &self,
+        sql: &str,
+    ) -> HashMap<String, (Option<String>, String, String)> {
         let mut result = HashMap::new();
 
         let parse_result = match pg_query::parse(sql) {
@@ -378,6 +388,8 @@ impl<'a> QueryIntrospector<'a> {
 
         // Build alias map first
         let alias_map = self.build_alias_map(sql);
+        // Map of resolved table name -> its schema (when the FROM clause names one).
+        let schema_map = self.build_table_schema_map(sql);
 
         // Extract the SELECT statement
         if let Some(stmt) = parse_result.protobuf.stmts.first() {
@@ -393,7 +405,8 @@ impl<'a> QueryIntrospector<'a> {
                             if let Some(val) = &res_target.val {
                                 if let Some(expansions) = self.expand_star_target(val, &alias_map) {
                                     for (output_name, table_name, col_name) in expansions {
-                                        result.insert(output_name, (table_name, col_name));
+                                        let schema = schema_map.get(&table_name).cloned().flatten();
+                                        result.insert(output_name, (schema, table_name, col_name));
                                     }
                                     continue;
                                 }
@@ -416,7 +429,8 @@ impl<'a> QueryIntrospector<'a> {
                                         .get(&table_or_alias)
                                         .cloned()
                                         .unwrap_or(table_or_alias);
-                                    result.insert(output_name, (table_name, col_name));
+                                    let schema = schema_map.get(&table_name).cloned().flatten();
+                                    result.insert(output_name, (schema, table_name, col_name));
                                 }
                             }
                         }
@@ -426,6 +440,62 @@ impl<'a> QueryIntrospector<'a> {
         }
 
         result
+    }
+
+    /// Build a map of (resolved) table name -> its schema, for every relation in
+    /// the FROM clause that is written schema-qualified (`schema.table`). Tables
+    /// without an explicit schema are absent (value resolved as `None`). Used to
+    /// disambiguate same-named tables in different schemas during type lookup.
+    fn build_table_schema_map(&self, sql: &str) -> HashMap<String, Option<String>> {
+        let mut map = HashMap::new();
+        if let Ok(parse_result) = pg_query::parse(sql) {
+            if let Some(stmt) = parse_result.protobuf.stmts.first() {
+                if let Some(node) = &stmt.stmt {
+                    self.collect_table_schemas_from_node(node, &mut map);
+                }
+            }
+        }
+        map
+    }
+
+    /// Recursively collect `relname -> Some(schemaname)` for schema-qualified
+    /// range vars in a statement's table references.
+    fn collect_table_schemas_from_node(
+        &self,
+        node: &pg_query::protobuf::Node,
+        map: &mut HashMap<String, Option<String>>,
+    ) {
+        use pg_query::protobuf::node::Node;
+
+        match &node.node {
+            Some(Node::SelectStmt(select)) => {
+                for from_item in &select.from_clause {
+                    self.collect_table_schemas_from_node(from_item, map);
+                }
+            }
+            Some(Node::RangeVar(range_var)) => {
+                let schema = (!range_var.schemaname.is_empty())
+                    .then(|| range_var.schemaname.clone());
+                // Only record a qualifying schema; never overwrite a known
+                // schema with `None` from a later unqualified reference.
+                map.entry(range_var.relname.clone())
+                    .and_modify(|e| {
+                        if e.is_none() {
+                            *e = schema.clone();
+                        }
+                    })
+                    .or_insert(schema);
+            }
+            Some(Node::JoinExpr(join)) => {
+                if let Some(larg) = &join.larg {
+                    self.collect_table_schemas_from_node(larg, map);
+                }
+                if let Some(rarg) = &join.rarg {
+                    self.collect_table_schemas_from_node(rarg, map);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Find SELECT columns that are casts to a domain type (`expr::domain`) and
