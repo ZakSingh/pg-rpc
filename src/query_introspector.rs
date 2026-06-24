@@ -390,6 +390,12 @@ impl<'a> QueryIntrospector<'a> {
         let alias_map = self.build_alias_map(sql);
         // Map of resolved table name -> its schema (when the FROM clause names one).
         let schema_map = self.build_table_schema_map(sql);
+        // The set of tables actually referenced in the FROM clause. Unqualified
+        // result columns may only bind to one of these — never to an arbitrary
+        // catalog relation that happens to share a column name. The alias map's
+        // values are exactly the resolved FROM-clause table names.
+        let from_tables: std::collections::HashSet<String> =
+            alias_map.values().cloned().collect();
 
         // Extract the SELECT statement
         if let Some(stmt) = parse_result.protobuf.stmts.first() {
@@ -423,7 +429,7 @@ impl<'a> QueryIntrospector<'a> {
 
                             // Try to extract table.column from the expression
                             if let Some(val) = &res_target.val {
-                                if let Some((table_or_alias, col_name)) = self.extract_table_column_from_node(val) {
+                                if let Some((table_or_alias, col_name)) = self.extract_table_column_from_node(val, &from_tables) {
                                     // Resolve alias to actual table name
                                     let table_name = alias_map
                                         .get(&table_or_alias)
@@ -678,8 +684,22 @@ impl<'a> QueryIntrospector<'a> {
         }
     }
 
-    /// Extract (table_or_alias, column_name) from a column reference node
-    fn extract_table_column_from_node(&self, node: &pg_query::protobuf::Node) -> Option<(String, String)> {
+    /// Extract (table_or_alias, column_name) from a column reference node.
+    ///
+    /// `from_tables` is the set of relation names actually referenced in the
+    /// query's FROM clause (resolved through the alias map). An **unqualified**
+    /// column must bind only to one of those tables — never to an arbitrary
+    /// catalog relation that merely happens to have a column of the same name.
+    /// Otherwise a bare `name` could resolve to e.g. pgTAP's `tap_funky` view
+    /// (whose `name` column is the built-in `name` type), overriding the
+    /// authoritative prepared-statement OID with the wrong type. When no
+    /// FROM-clause table has the column, return `None` so the prepared-statement
+    /// type (which Postgres reports correctly) stands.
+    fn extract_table_column_from_node(
+        &self,
+        node: &pg_query::protobuf::Node,
+        from_tables: &std::collections::HashSet<String>,
+    ) -> Option<(String, String)> {
         if let Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) = &node.node {
             let fields: Vec<_> = col_ref.fields.iter()
                 .filter_map(|f| {
@@ -693,12 +713,12 @@ impl<'a> QueryIntrospector<'a> {
 
             match fields.len() {
                 1 => {
-                    // Unqualified column - try to find which table it belongs to
+                    // Unqualified column: bind only to a FROM-clause table that
+                    // actually has this column. Never scan the whole catalog.
                     let col_name = &fields[0];
-                    for rel in self.rel_index.values() {
-                        let table_name = rel.id.name();
+                    for table_name in from_tables {
                         if self.rel_index.get_column_type(table_name, col_name).is_some() {
-                            return Some((table_name.to_string(), col_name.clone()));
+                            return Some((table_name.clone(), col_name.clone()));
                         }
                     }
                     None

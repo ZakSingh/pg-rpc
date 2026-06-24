@@ -5,6 +5,7 @@ with recursive type_tree as (
            t.typtype,
            n.nspname                                                                                              as schema_name,
            t.typelem                                                                                              as array_element_type,
+           t.typcategory                                                                                          as type_category,
            t.typbasetype                                                                                          as domain_base_type,
            case when t.typtype = 'd' then ( select array_agg(pg_get_constraintdef(c.oid))
                                             from pg_constraint c
@@ -87,6 +88,7 @@ with recursive type_tree as (
            t.typtype,
            n.nspname                                                                                              as schema_name,
            t.typelem                                                                                              as array_element_type,
+           t.typcategory                                                                                          as type_category,
            t.typbasetype                                                                                          as domain_base_type,
            case when t.typtype = 'd' then ( select array_agg(pg_get_constraintdef(c.oid))
                                             from pg_constraint c
@@ -179,6 +181,7 @@ select distinct on (oid) oid,
                          typtype,
                          schema_name,
                          array_element_type,
+                         type_category,
                          domain_base_type,
                          domain_composite_constraints,
                          domain_constraint_names,

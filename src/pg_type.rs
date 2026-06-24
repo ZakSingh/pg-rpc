@@ -874,7 +874,21 @@ impl TryFrom<Row> for PgType {
                 "uuid" => PgType::Uuid,
                 "float4" | "real" => PgType::Float32,
                 "float8" | "double precision" => PgType::Float64,
-                _ if t.get::<&str, u32>("array_element_type") != 0 => PgType::Array {
+                // `name` is a built-in string type. It must be matched
+                // explicitly *before* the array guard below: PostgreSQL stores
+                // `name` internally as an array of `char`, so its `typelem` is
+                // non-zero (OID 18) even though it is a scalar string. Keying
+                // array-ness off `typelem` alone would mis-classify it as
+                // `Vec<char>`/`Vec<String>`. (The same is true of `oidvector`
+                // and `int2vector`; the `typcategory = 'A'` test below is the
+                // authoritative array discriminant and excludes all of them.)
+                "name" => PgType::Text,
+                // Only PostgreSQL's array *category* ('A') is a true array type.
+                // `typelem != 0` is NOT sufficient: several scalar types
+                // (`name`, `oidvector`, `int2vector`, …) also carry a non-zero
+                // `typelem`. Using typcategory avoids wrapping those scalars in
+                // a spurious `Vec<…>`.
+                _ if t.get::<_, i8>("type_category") as u8 as char == 'A' => PgType::Array {
                     schema,
                     element_type_oid: t.get("array_element_type"),
                 },
