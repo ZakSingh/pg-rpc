@@ -1049,3 +1049,91 @@ fn test_cross_schema_name_collision_preserves_scalar_type() {
         );
     });
 }
+
+/// Regression: PostgreSQL's built-in `name` type (OID 19) is a scalar string,
+/// but internally it is an array of `char`, so its `typelem` is non-zero. The
+/// type mapper keyed array-ness off `typelem != 0`, mis-classifying `name` as
+/// an array and rendering it `Vec<String>`. Array-ness must be keyed off
+/// `typcategory = 'A'` instead. (This is the secondary defect from the
+/// PGRPC_BUG_REPORT follow-up.)
+#[test]
+fn test_name_type_is_scalar_not_array() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        let sql = indoc! {r#"
+            -- name: NameTypedColumn :many
+            SELECT 'x'::name AS label;
+        "#};
+        let (_dir, code) = generate_queries(conn_string, sql);
+
+        assert!(
+            !code.contains("Vec<Vec<String>>") && !code.contains("Vec<Option<Vec<String>>>"),
+            "a `name`-typed scalar column must not be double-wrapped. Got:\n{}",
+            code
+        );
+        // It's a scalar `:many`, so the function returns Vec<String> of the
+        // single column — never Vec<Vec<String>>.
+        assert!(
+            code.contains("Vec<String>") || code.contains("Vec<Option<String>>"),
+            "`name`-typed scalar :many should map to String. Got:\n{}",
+            code
+        );
+    });
+}
+
+/// Regression for the *primary* array-bleed cause (PGRPC_BUG_REPORT follow-up):
+/// an unqualified result column (`name`) must bind only to a table in the
+/// query's FROM clause, never to an arbitrary catalog relation that happens to
+/// have a same-named column.
+///
+/// pgTAP installs a view `public.tap_funky` whose `name` column is the built-in
+/// `name` type (OID 19). When present, `select name from category` was binding
+/// the bare `name` to `tap_funky` and overriding the authoritative
+/// prepared-statement OID (25 = text) with 19. The trigger is purely "some
+/// relation in the DB has a column named `name`", which is why it surfaced only
+/// after a fresh apply that installs pgTAP.
+#[test]
+fn test_unqualified_column_binds_only_to_from_clause_table() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        // Decoy relation (stands in for pgTAP's `tap_funky`) that owns a column
+        // named `funky` of an array type. The query selects an output column
+        // also named `funky` that comes from an *expression* over `category`,
+        // NOT from any FROM-clause table column. The bare output name `funky`
+        // must NOT be bound to the decoy relation just because it shares the
+        // name — its prepared-statement type (text) must stand.
+        // Created first so it has the lowest OID among relations owning a
+        // `widget_label` column — the old catalog scan returned the first such
+        // relation in OID order, so the decoy must sort first to win. Its
+        // `widget_label` is `text[]`, a type distinct from the real table's.
+        client
+            .execute(
+                "CREATE VIEW tap_funky AS SELECT ARRAY['x']::text[] AS widget_label",
+                &[],
+            )
+            .unwrap();
+        client
+            .execute("CREATE TABLE category (id INT, widget_label TEXT)", &[])
+            .unwrap();
+
+        let multi = indoc! {r#"
+            -- name: CategoryRows :many
+            SELECT id, widget_label FROM category;
+        "#};
+        let (_d2, code2) = generate_queries(conn_string, multi);
+
+        // `category.widget_label` is text — the bare reference must not pick up
+        // the decoy relation's text[] column (which it isn't even FROM).
+        assert!(
+            !code2.contains("widget_label: Vec<String>")
+                && !code2.contains("widget_label: Option<Vec<String>>"),
+            "bare `widget_label` from category must resolve to its own text type, \
+             not the decoy relation's same-named array column. Got:\n{}",
+            code2
+        );
+        assert!(
+            code2.contains("pub widget_label: Option<String>")
+                || code2.contains("pub widget_label: String"),
+            "widget_label should resolve to String. Got:\n{}",
+            code2
+        );
+    });
+}
