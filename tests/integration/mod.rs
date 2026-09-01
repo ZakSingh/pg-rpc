@@ -6,7 +6,8 @@ use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::{postgres as postgres_module, testcontainers::runners::SyncRunner};
 use uuid::Uuid;
 
-/// Docker label applied to every container started by this harness.
+/// Docker label applied to every container started by this harness (which are also named
+/// `pgrpc-test-<pid>` so they are recognisable in `docker ps`).
 ///
 /// Used for two cleanup paths:
 ///   * Startup scrub — removes any containers left behind by a previous run that exited
@@ -63,6 +64,7 @@ impl PostgresTestContainer {
         let container = postgres_module::Postgres::default()
             .with_tag("16-alpine")
             .with_label("pgrpc-test-harness", "1")
+            .with_container_name(format!("pgrpc-test-{}", std::process::id()))
             .start()
             .expect("Failed to start PostgreSQL container");
 
@@ -121,7 +123,8 @@ impl PostgresTestContainer {
     }
 }
 
-/// Remove every container tagged with [`HARNESS_LABEL`].
+/// Remove every container tagged with [`HARNESS_LABEL`], together with its anonymous
+/// data volume (`-v`); without that flag each removed container strands a volume.
 ///
 /// Idempotent and best-effort: failures (Docker not running, no matches, etc.) are
 /// silently ignored. The caller never needs to care whether anything was actually removed.
@@ -141,7 +144,7 @@ fn scrub_labeled_containers() {
     if ids.is_empty() {
         return;
     }
-    let _ = Command::new("docker").arg("rm").arg("-f").args(&ids).output();
+    let _ = Command::new("docker").args(["rm", "-f", "-v"]).args(&ids).output();
 }
 
 /// `atexit` callback. Runs on normal process termination (`main` returns, `exit()` is
