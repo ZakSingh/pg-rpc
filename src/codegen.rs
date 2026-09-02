@@ -1125,7 +1125,7 @@ fn generate_query_code(
         // Use "queries.<query_name>" as the span name for SQL queries
         let span_name = format!("queries.{}", query.name);
         quote! {
-            #[tracing::instrument(name = #span_name, skip(client))]
+            #[tracing::instrument(name = #span_name, skip_all)]
         }
     } else {
         quote! {}
@@ -2015,7 +2015,7 @@ fn get_param_type(type_oid: OID, type_index: &TypeIndex, nullable: bool) -> Toke
     };
 
     if nullable {
-        quote! { impl Into<Option<#base_type>> + std::fmt::Debug }
+        quote! { impl Into<Option<#base_type>> }
     } else {
         base_type
     }

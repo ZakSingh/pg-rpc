@@ -1318,7 +1318,7 @@ impl ToRust for PgFn {
             // Build the span name as "schema.function_name"
             let span_name = format!("{}.{}", schema_str, fn_name_str);
             quote! {
-                #[tracing::instrument(name = #span_name, skip(client))]
+                #[tracing::instrument(name = #span_name, skip_all)]
             }
         } else {
             quote! {}
@@ -1996,8 +1996,8 @@ mod test {
             "Span name should be schema.function_name"
         );
         assert!(
-            generated_str.contains("skip (client)"),
-            "Should skip client parameter"
+            generated_str.contains("skip_all"),
+            "Span must not record any argument: parameters can carry secrets"
         );
         assert!(
             !generated_str.contains("err (Debug)"),

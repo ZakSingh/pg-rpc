@@ -269,6 +269,10 @@ impl PgrpcBuilder {
     /// that include the function name and schema. This makes it easier to
     /// identify which function caused an error when using tracing.
     ///
+    /// Spans record only the span name (`schema.function` or `queries.name`).
+    /// Arguments are never captured, so secrets passed to generated functions
+    /// stay out of logs and traces.
+    ///
     /// Users must add `tracing = "0.1"` to their Cargo.toml when this is enabled.
     pub fn enable_tracing(mut self, enabled: bool) -> Self {
         let tracing_config = self.tracing.get_or_insert(config::TracingConfig::default());
