@@ -672,8 +672,9 @@ fn build_view_nullability_cache(
 
     let rows = db.query(view_query, &[])?;
 
-    // Collect all views
-    let mut views: HashMap<(Option<String>, String), (String, Vec<String>)> = HashMap::new();
+    // Collect all views. Ordered so that graph construction — and therefore
+    // the topological sort's tie-breaking — is the same on every run.
+    let mut views: BTreeMap<(Option<String>, String), (String, Vec<String>)> = BTreeMap::new();
 
     for row in rows {
         let schema: String = row.get(0);
@@ -739,8 +740,10 @@ fn build_view_nullability_cache(
     let sorted_nodes = match toposort(&graph, None) {
         Ok(nodes) => nodes,
         Err(_) => {
-            log::warn!("Circular dependency detected in views, falling back to unordered analysis");
-            node_to_view.keys().cloned().collect()
+            log::warn!("Circular dependency detected in views, falling back to name-ordered analysis");
+            let mut nodes: Vec<NodeIndex> = node_to_view.keys().cloned().collect();
+            nodes.sort_by(|a, b| node_to_view[a].cmp(&node_to_view[b]));
+            nodes
         }
     };
 
