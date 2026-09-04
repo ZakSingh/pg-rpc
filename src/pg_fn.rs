@@ -645,6 +645,7 @@ impl PgFn {
         &mut self,
         rel_index: &RelIndex,
         view_nullability_cache: &crate::view_nullability::ViewNullabilityCache,
+        composite_index: &crate::composite_index::CompositeIndex,
     ) -> anyhow::Result<()> {
         // Only apply to SQL language functions with OUT parameters
         if !self.definition.contains("LANGUAGE sql")
@@ -680,7 +681,8 @@ impl PgFn {
         let mut analyzer = crate::view_nullability::ViewNullabilityAnalyzer::new(
             rel_index,
             view_nullability_cache,
-        );
+        )
+        .with_composite_index(composite_index);
 
         // Collect column names from OUT parameters
         let column_names: Vec<String> = self.out_args.iter().map(|arg| arg.name.clone()).collect();

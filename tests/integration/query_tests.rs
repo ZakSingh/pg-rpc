@@ -144,11 +144,13 @@ fn test_query_introspection() {
         let view_cache = pgrpc::view_nullability::ViewNullabilityCache::new();
 
         let domain_index = pgrpc::domain_index::DomainIndex::empty();
+        let composite_index = pgrpc::composite_index::CompositeIndex::empty();
         let introspector = pgrpc::query_introspector::QueryIntrospector::new(
             &rel_index,
             &view_cache,
             None, // No trigger index for this test
             &domain_index,
+            &composite_index,
         );
 
         let introspected = introspector.introspect(client, parsed).unwrap();
@@ -223,11 +225,13 @@ WHERE u.id = :user_id;
         let view_cache = pgrpc::view_nullability::ViewNullabilityCache::new();
 
         let domain_index = pgrpc::domain_index::DomainIndex::empty();
+        let composite_index = pgrpc::composite_index::CompositeIndex::empty();
         let introspector = pgrpc::query_introspector::QueryIntrospector::new(
             &rel_index,
             &view_cache,
             None, // No trigger index for this test
             &domain_index,
+            &composite_index,
         );
 
         let introspected = introspector.introspect(client, parsed).unwrap();

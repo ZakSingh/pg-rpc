@@ -1,4 +1,5 @@
 use crate::codegen::OID;
+use crate::composite_index::{CompositeIndex, ResolvedAttr};
 use crate::pg_constraint::Constraint;
 use crate::pg_rel::PgRel;
 use crate::rel_index::RelIndex;
@@ -73,6 +74,11 @@ pub struct ViewNullabilityAnalyzer<'a> {
     /// ambiguous-owner fallback, since the column legitimately lives in both
     /// joined relations. Populated during FROM/join analysis.
     merged_using_columns: HashMap<String, ColumnNullability>,
+    /// Composite-type attribute metadata, used to decide whether a projection
+    /// like `(p.length).amount` can be NULL once `p.length` itself is known
+    /// NOT NULL. Without it every attribute projection stays conservatively
+    /// nullable. Attached with [`Self::with_composite_index`].
+    composite_index: Option<&'a CompositeIndex>,
 }
 
 #[derive(Debug, Clone)]
@@ -320,7 +326,16 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
             refined_not_null: HashMap::new(),
             relation_facts_cache: HashMap::new(),
             merged_using_columns: HashMap::new(),
+            composite_index: None,
         }
+    }
+
+    /// Attach composite-type metadata so attribute projections
+    /// (`(p.length).amount`) can be proven NOT NULL from the composite's
+    /// annotations or a wrapping domain's CHECKs.
+    pub fn with_composite_index(mut self, composite_index: &'a CompositeIndex) -> Self {
+        self.composite_index = Some(composite_index);
+        self
     }
 
     /// Extract potential view dependencies from a view definition
@@ -1283,6 +1298,38 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
             match node {
                 protobuf::node::Node::ColumnRef(col_ref) => {
                     self.column_ref_nullability_detailed(col_ref)
+                }
+                protobuf::node::Node::AIndirection(ind) => {
+                    // `(expr).attr` inherits its base's two-level nullability
+                    // (a LEFT JOIN'd composite column projects a join-nullable
+                    // attribute); whether the attribute itself can be NULL is
+                    // a base-level property.
+                    let Some(arg) = &ind.arg else {
+                        return Ok(ColumnNullability {
+                            nullable_due_to_join: false,
+                            nullable_on_base: true,
+                        });
+                    };
+                    let base = self.expression_nullability_detailed(arg)?;
+                    Ok(ColumnNullability {
+                        nullable_due_to_join: base.nullable_due_to_join,
+                        nullable_on_base: base.nullable_on_base
+                            || !self.attribute_chain_not_null(arg, &ind.indirection),
+                    })
+                }
+                protobuf::node::Node::FieldSelect(fs) => {
+                    let Some(arg) = &fs.arg else {
+                        return Ok(ColumnNullability {
+                            nullable_due_to_join: false,
+                            nullable_on_base: true,
+                        });
+                    };
+                    let base = self.expression_nullability_detailed(arg)?;
+                    Ok(ColumnNullability {
+                        nullable_due_to_join: base.nullable_due_to_join,
+                        nullable_on_base: base.nullable_on_base
+                            || !self.field_select_not_null(arg, fs.fieldnum),
+                    })
                 }
                 protobuf::node::Node::TypeCast(type_cast) => {
                     // Type casts preserve the nullability of the argument
@@ -2421,51 +2468,166 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
         }
     }
 
+    /// `FieldSelect` is the post-analysis form of attribute projection
+    /// (raw parsing yields `AIndirection`); it addresses the attribute by
+    /// `attnum` rather than by name.
+    ///
+    /// Nullable if the composite value can be NULL, or if nothing proves the
+    /// selected attribute NOT NULL.
     fn is_field_select_nullable(
         &self,
         field_select: &protobuf::FieldSelect,
     ) -> anyhow::Result<bool> {
-        // Field selection from composite type
-        // The nullability depends on:
-        // 1. Whether the composite value itself is nullable
-        // 2. Whether the field within the composite is nullable
-
-        if let Some(arg) = &field_select.arg {
-            // First check if the composite value is nullable
-            if self.is_expression_nullable(arg)? {
-                // If the composite is nullable, the field selection is nullable
-                return Ok(true);
-            }
-
-            // The composite value is not null
-            // However, we don't have access to the composite type definition
-            // to check if the specific field is nullable
-            // For now, conservatively assume the field can be null
-            Ok(true)
-        } else {
-            Ok(true)
+        let Some(arg) = &field_select.arg else {
+            return Ok(true);
+        };
+        if self.is_expression_nullable(arg)? {
+            return Ok(true);
         }
+        Ok(!self.field_select_not_null(arg, field_select.fieldnum))
     }
 
+    /// `(expr).a.b` — attribute projection as the raw parser produces it. All
+    /// hops of one node share the node; nested parentheses produce nested
+    /// nodes, which recurse through [`Self::is_expression_nullable`].
+    ///
+    /// Nullable if the base expression can be NULL, or if any hop's attribute
+    /// isn't provably NOT NULL. Subscripts (`(expr).arr[1]`) and `.*` stay
+    /// conservatively nullable.
     fn is_aindirection_nullable(
         &self,
         indirection: &protobuf::AIndirection,
     ) -> anyhow::Result<bool> {
-        // AIndirection represents field access like (expr).field
-        // First check if the base expression is nullable
-        if let Some(arg) = &indirection.arg {
-            if self.is_expression_nullable(arg)? {
-                // If the base expression is nullable, the field access is nullable
-                return Ok(true);
-            }
-
-            // The base expression is not null
-            // For field access, we conservatively assume the field can be null
-            // unless we have specific knowledge about the composite type
-            Ok(true)
-        } else {
-            Ok(true)
+        let Some(arg) = &indirection.arg else {
+            return Ok(true);
+        };
+        if self.is_expression_nullable(arg)? {
+            return Ok(true);
         }
+        Ok(!self.attribute_chain_not_null(arg, &indirection.indirection))
+    }
+
+    /// Whether the attribute chain `hops`, projected out of `arg`, is
+    /// provably NOT NULL *given that `arg` itself is*. `false` without
+    /// evidence.
+    fn attribute_chain_not_null(&self, arg: &protobuf::Node, hops: &[protobuf::Node]) -> bool {
+        self.resolve_expression_type(arg)
+            .and_then(|base| self.walk_attribute_chain(base, hops))
+            .is_some_and(|a| a.not_null)
+    }
+
+    /// [`Self::attribute_chain_not_null`] for a `FieldSelect`, which names the
+    /// attribute by `attnum`.
+    fn field_select_not_null(&self, arg: &protobuf::Node, fieldnum: i32) -> bool {
+        self.composite_index
+            .zip(self.resolve_expression_type(arg))
+            .and_then(|(index, base)| index.attribute_by_num(base, fieldnum))
+            .is_some_and(|a| a.not_null)
+    }
+
+    /// Follow a chain of attribute names from a composite (or domain over
+    /// composite) type. The result is NOT NULL only if every hop is.
+    /// `None` if any hop isn't a plain attribute name or can't be resolved.
+    fn walk_attribute_chain(&self, base_type: OID, hops: &[protobuf::Node]) -> Option<ResolvedAttr> {
+        let index = self.composite_index?;
+        let mut current = ResolvedAttr {
+            type_oid: base_type,
+            not_null: true,
+        };
+        for hop in hops {
+            let name = match hop.node.as_ref()? {
+                protobuf::node::Node::String(s) => &s.sval,
+                _ => return None,
+            };
+            let attr = index.attribute(current.type_oid, name)?;
+            current = ResolvedAttr {
+                type_oid: attr.type_oid,
+                not_null: current.not_null && attr.not_null,
+            };
+        }
+        Some(current)
+    }
+
+    /// Best-effort static type of an expression, for the shapes that can sit
+    /// under an attribute projection: a column reference (resolved through the
+    /// FROM-clause aliases to the relation's declared column type) or a nested
+    /// projection. Anything else — casts, function calls, row constructors,
+    /// subqueries — yields `None`, keeping the projection conservatively
+    /// nullable.
+    fn resolve_expression_type(&self, expr: &protobuf::Node) -> Option<OID> {
+        match expr.node.as_ref()? {
+            protobuf::node::Node::ColumnRef(col_ref) => self.resolve_column_ref_type(col_ref),
+            protobuf::node::Node::AIndirection(ind) => {
+                let base = self.resolve_expression_type(ind.arg.as_deref()?)?;
+                self.walk_attribute_chain(base, &ind.indirection)
+                    .map(|a| a.type_oid)
+            }
+            protobuf::node::Node::FieldSelect(fs) => {
+                let base = self.resolve_expression_type(fs.arg.as_deref()?)?;
+                self.composite_index?
+                    .attribute_by_num(base, fs.fieldnum)
+                    .map(|a| a.type_oid)
+            }
+            _ => None,
+        }
+    }
+
+    /// Declared type of the column a `ColumnRef` names, following the same
+    /// alias-resolution rules as [`Self::is_column_ref_nullable`]: a qualified
+    /// `alias.col` goes through the alias map; a bare `col` is only resolved
+    /// when a single relation is in scope. Derived tables (CTEs, subqueries,
+    /// set-returning functions) have no catalog entry and yield `None`.
+    fn resolve_column_ref_type(&self, col_ref: &protobuf::ColumnRef) -> Option<OID> {
+        let fields = &col_ref.fields;
+        let (table_info, column) = match fields.len() {
+            1 => {
+                let column = string_field(&fields[0])?;
+                // A bare name that is itself an alias is a whole-row reference,
+                // whose row type we don't track.
+                if self.alias_map.contains_key(column) {
+                    return None;
+                }
+                if self.alias_map.len() != 1 {
+                    return None;
+                }
+                (self.alias_map.values().next()?, column)
+            }
+            2 => {
+                let alias = string_field(&fields[0])?;
+                let column = string_field(&fields[1])?;
+                (self.alias_map.get(alias)?, column)
+            }
+            _ => return None,
+        };
+
+        let rel = match table_info {
+            TableInfo::Table { oid, .. } => self.rel_index.get(oid)?,
+            TableInfo::View { schema, name, .. } => self.find_relation_any_kind(schema, name)?,
+            TableInfo::Derived { .. } => return None,
+        };
+        let idx = rel.columns.iter().position(|c| c.as_str() == column)?;
+        rel.column_types.get(idx).copied()
+    }
+
+    /// Like [`Self::find_relation`] but also matches views, whose declared
+    /// column types are needed to resolve attribute projections.
+    fn find_relation_any_kind(&self, schema: &Option<String>, table_name: &str) -> Option<&PgRel> {
+        self.rel_index.values().find(|rel| {
+            rel.id.name() == table_name
+                && match (rel.id.schema(), schema.as_deref()) {
+                    (rel_schema, Some(search_schema)) => rel_schema == search_schema,
+                    ("public", None) => true,
+                    _ => false,
+                }
+        })
+    }
+}
+
+/// The string payload of a `ColumnRef` field node, if it is one.
+fn string_field(node: &protobuf::Node) -> Option<&str> {
+    match node.node.as_ref()? {
+        protobuf::node::Node::String(s) => Some(&s.sval),
+        _ => None,
     }
 }
 
@@ -2643,5 +2805,229 @@ mod tests {
         assert_not_null(&result, "one");
         assert_not_null(&result, "greeting");
         assert_not_null(&result, "id");
+    }
+
+    // ------------------------------------------------------------------
+    // Attribute projections: `(col).attr`
+    // ------------------------------------------------------------------
+
+    const INT8_OID: OID = 20;
+    const NUMERIC_OID: OID = 1700;
+    const TEXT_OID: OID = 25;
+    const TEXT_ARRAY_OID: OID = 1009;
+    const DISTANCE_COMPOSITE_OID: OID = 50_001;
+    const DISTANCE_DOMAIN_OID: OID = 50_002;
+    const SPAN_COMPOSITE_OID: OID = 50_003;
+
+    fn not_null(name: &str, column: &str) -> Constraint {
+        Constraint::NotNull(NotNullConstraint {
+            name: name.into(),
+            column: column.into(),
+        })
+    }
+
+    /// `package(package_id bigint NOT NULL, length distance NOT NULL,
+    ///          optional_length distance, span _span NOT NULL)`
+    /// and a view `package_dims(package_id, length)` over it.
+    fn create_composite_rel_index() -> RelIndex {
+        let mut rel_index = RelIndex::default();
+        rel_index.insert(
+            2001,
+            PgRel {
+                oid: 2001,
+                id: PgId::new(Some("public".into()), "package".into()),
+                kind: PgRelKind::Table,
+                constraints: vec![
+                    not_null("package_id_not_null", "package_id"),
+                    not_null("length_not_null", "length"),
+                    not_null("span_not_null", "span"),
+                ],
+                columns: vec![
+                    "package_id".into(),
+                    "length".into(),
+                    "optional_length".into(),
+                    "span".into(),
+                ],
+                column_types: vec![
+                    INT8_OID,
+                    DISTANCE_DOMAIN_OID,
+                    DISTANCE_DOMAIN_OID,
+                    SPAN_COMPOSITE_OID,
+                ],
+            },
+        );
+        rel_index.insert(
+            2002,
+            PgRel {
+                oid: 2002,
+                id: PgId::new(Some("public".into()), "package_dims".into()),
+                kind: PgRelKind::View {
+                    definition: "SELECT package_id, length FROM package".into(),
+                },
+                constraints: vec![],
+                columns: vec!["package_id".into(), "length".into()],
+                column_types: vec![INT8_OID, DISTANCE_DOMAIN_OID],
+            },
+        );
+        rel_index
+    }
+
+    /// `_distance(amount numeric @pgrpc_not_null, unit text)`; domain
+    /// `distance` over it whose CHECK proves `unit`; and
+    /// `_span(length distance @pgrpc_not_null, label text, tags text[] @pgrpc_not_null)`.
+    fn create_composite_index() -> CompositeIndex {
+        use crate::composite_index::RawAttr;
+        let mut index = CompositeIndex::empty();
+        index.insert_composite(
+            DISTANCE_COMPOSITE_OID,
+            None,
+            vec![
+                RawAttr::new("amount", 1, NUMERIC_OID, Some("@pgrpc_not_null")),
+                RawAttr::new("unit", 2, TEXT_OID, None),
+            ],
+        );
+        index.insert_domain(
+            DISTANCE_DOMAIN_OID,
+            DISTANCE_COMPOSITE_OID,
+            &["CHECK ((VALUE).unit IS NOT NULL)"],
+        );
+        index.insert_composite(
+            SPAN_COMPOSITE_OID,
+            None,
+            vec![
+                RawAttr::new("length", 1, DISTANCE_DOMAIN_OID, Some("@pgrpc_not_null")),
+                RawAttr::new("label", 2, TEXT_OID, None),
+                RawAttr::new("tags", 3, TEXT_ARRAY_OID, Some("@pgrpc_not_null")),
+            ],
+        );
+        index
+    }
+
+    fn analyze_with_composites(
+        view_def: &str,
+        columns: &[&str],
+    ) -> IndexMap<String, ColumnNullability> {
+        let rel_index = create_composite_rel_index();
+        let composite_index = create_composite_index();
+        let mut cache = ViewNullabilityCache::new();
+        let not_null = ColumnNullability {
+            nullable_due_to_join: false,
+            nullable_on_base: false,
+        };
+        cache.insert(
+            (None, "package_dims".to_string()),
+            vec_to_indexmap(vec![
+                ("package_id".to_string(), not_null),
+                ("length".to_string(), not_null),
+            ]),
+        );
+        let mut analyzer = ViewNullabilityAnalyzer::new(&rel_index, &cache)
+            .with_composite_index(&composite_index);
+        let columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+        analyzer.analyze_view(view_def, &columns).unwrap()
+    }
+
+    #[test]
+    fn test_attribute_projection_from_not_null_column() {
+        let result = analyze_with_composites(
+            "SELECT (p.length).amount AS amount, (p.length).unit AS unit FROM package p",
+            &["amount", "unit"],
+        );
+        // `amount` via @pgrpc_not_null on the attribute; `unit` via the domain CHECK.
+        assert_not_null(&result, "amount");
+        assert_not_null(&result, "unit");
+    }
+
+    #[test]
+    fn test_attribute_projection_from_nullable_column_stays_nullable() {
+        let result = analyze_with_composites(
+            "SELECT (p.optional_length).amount AS amount FROM package p",
+            &["amount"],
+        );
+        assert_nullable(&result, "amount");
+    }
+
+    #[test]
+    fn test_attribute_projection_unproven_attribute_stays_nullable() {
+        let result = analyze_with_composites(
+            "SELECT (p.span).label AS label, (p.span).length AS length FROM package p",
+            &["label", "length"],
+        );
+        assert_nullable(&result, "label");
+        assert_not_null(&result, "length");
+    }
+
+    #[test]
+    fn test_nested_attribute_projection() {
+        // Both spellings: one node with two hops, and two nested nodes.
+        let result = analyze_with_composites(
+            "SELECT (p.span).length.amount AS a, \
+                    ((p.span).length).unit AS u, \
+                    ((p.span).label).x AS bogus \
+             FROM package p",
+            &["a", "u", "bogus"],
+        );
+        assert_not_null(&result, "a");
+        assert_not_null(&result, "u");
+        // `label` is text, so `.x` resolves to nothing.
+        assert_nullable(&result, "bogus");
+    }
+
+    #[test]
+    fn test_attribute_projection_with_subscript_stays_nullable() {
+        let result = analyze_with_composites(
+            "SELECT (p.span).tags[1] AS first_tag, \
+                    ((p.span).tags)[1] AS first_tag_nested, \
+                    (p.span).tags AS tags \
+             FROM package p",
+            &["first_tag", "first_tag_nested", "tags"],
+        );
+        // Out-of-range subscripts yield NULL.
+        assert_nullable(&result, "first_tag");
+        assert_nullable(&result, "first_tag_nested");
+        assert_not_null(&result, "tags");
+    }
+
+    #[test]
+    fn test_attribute_projection_unqualified_single_table() {
+        let result =
+            analyze_with_composites("SELECT (length).amount AS amount FROM package", &["amount"]);
+        assert_not_null(&result, "amount");
+    }
+
+    #[test]
+    fn test_attribute_projection_through_view_column() {
+        let result = analyze_with_composites(
+            "SELECT (v.length).amount AS amount FROM package_dims v",
+            &["amount"],
+        );
+        assert_not_null(&result, "amount");
+    }
+
+    #[test]
+    fn test_attribute_projection_through_left_join_is_join_nullable() {
+        let result = analyze_with_composites(
+            "SELECT (p.length).amount AS amount \
+             FROM package_dims v \
+             LEFT JOIN package p ON p.package_id = v.package_id",
+            &["amount"],
+        );
+        let amount = result.get("amount").unwrap();
+        assert!(amount.nullable_due_to_join, "got {:?}", amount);
+        assert!(!amount.nullable_on_base, "got {:?}", amount);
+    }
+
+    #[test]
+    fn test_attribute_projection_without_composite_index_stays_nullable() {
+        let rel_index = create_composite_rel_index();
+        let cache = ViewNullabilityCache::new();
+        let mut analyzer = ViewNullabilityAnalyzer::new(&rel_index, &cache);
+        let result = analyzer
+            .analyze_view(
+                "SELECT (p.length).amount AS amount FROM package p",
+                &["amount".to_string()],
+            )
+            .unwrap();
+        assert_nullable(&result, "amount");
     }
 }

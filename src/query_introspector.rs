@@ -57,6 +57,7 @@ pub struct QueryIntrospector<'a> {
     view_nullability_cache: &'a crate::view_nullability::ViewNullabilityCache,
     trigger_index: Option<&'a TriggerIndex>,
     domain_index: &'a crate::domain_index::DomainIndex,
+    composite_index: &'a crate::composite_index::CompositeIndex,
 }
 
 impl<'a> QueryIntrospector<'a> {
@@ -65,12 +66,14 @@ impl<'a> QueryIntrospector<'a> {
         view_nullability_cache: &'a crate::view_nullability::ViewNullabilityCache,
         trigger_index: Option<&'a TriggerIndex>,
         domain_index: &'a crate::domain_index::DomainIndex,
+        composite_index: &'a crate::composite_index::CompositeIndex,
     ) -> Self {
         Self {
             rel_index,
             view_nullability_cache,
             trigger_index,
             domain_index,
+            composite_index,
         }
     }
 
@@ -284,7 +287,8 @@ impl<'a> QueryIntrospector<'a> {
         // Fall back to view nullability analysis (for SELECT queries)
         let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
-        let mut analyzer = ViewNullabilityAnalyzer::new(self.rel_index, self.view_nullability_cache);
+        let mut analyzer = ViewNullabilityAnalyzer::new(self.rel_index, self.view_nullability_cache)
+            .with_composite_index(self.composite_index);
 
         match analyzer.analyze_view(sql, &column_names) {
             Ok(nullability_map) => {
