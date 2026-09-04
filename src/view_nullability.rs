@@ -338,77 +338,53 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
         self
     }
 
-    /// Extract potential view dependencies from a view definition
-    /// Returns a set of (schema, view_name) tuples that might be views this view depends on
-    /// Note: This returns all non-base-table references, which may include views
+    /// Relations a view definition reads that are not base tables — i.e. the
+    /// views (or CTE-like unknowns) it must be analyzed *after*.
+    ///
+    /// Every reference counts, wherever it sits: CTE bodies, subqueries in
+    /// FROM, set-operation branches, scalar subqueries in the target list or
+    /// WHERE. Missing one silently breaks the topological ordering of view
+    /// analysis, and a view analyzed before its dependency sees that
+    /// dependency as unknown and infers every column nullable — with the
+    /// outcome depending on hash-map iteration order, i.e. varying between
+    /// runs.
     pub fn extract_view_dependencies(
         &self,
         view_definition: &str,
     ) -> anyhow::Result<HashSet<(Option<String>, String)>> {
-        let mut dependencies = HashSet::new();
-
-        // Parse the view definition
         let parse_result = pg_query::parse(view_definition)?;
 
-        // Find the main SELECT statement
-        if let Some(stmt) = parse_result.protobuf.stmts.first() {
-            if let Some(node) = &stmt.stmt {
-                if let Some(protobuf::node::Node::SelectStmt(select)) = &node.node {
-                    // Analyze FROM clause
-                    for from_item in &select.from_clause {
-                        self.extract_dependencies_from_node(from_item, &mut dependencies)?;
-                    }
-                }
+        // pg_query collects every RangeVar in the tree and drops CTE names it
+        // has already seen; re-filter here so traversal order can't leak a
+        // CTE reference through.
+        let cte_names: HashSet<&str> = parse_result
+            .cte_names
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        let mut dependencies = HashSet::new();
+        for table in parse_result.tables() {
+            let (schema, name) = match table.split_once('.') {
+                Some((schema, name)) => (Some(schema.to_string()), name.to_string()),
+                None => (None, table.clone()),
+            };
+            if schema.is_none() && cte_names.contains(name.as_str()) {
+                continue;
             }
+            if self.find_relation(&schema, &name).is_some() {
+                log::debug!("Found base table: schema={:?}, table={}", schema, name);
+                continue;
+            }
+            log::debug!(
+                "Found potential view dependency: schema={:?}, table={}",
+                schema,
+                name
+            );
+            dependencies.insert((schema, name));
         }
 
         Ok(dependencies)
-    }
-
-    fn extract_dependencies_from_node(
-        &self,
-        node: &protobuf::Node,
-        dependencies: &mut HashSet<(Option<String>, String)>,
-    ) -> anyhow::Result<()> {
-        if let Some(node) = &node.node {
-            match node {
-                protobuf::node::Node::RangeVar(range_var) => {
-                    let table_name = range_var.relname.clone();
-                    let schema = if range_var.schemaname.is_empty() {
-                        None
-                    } else {
-                        Some(range_var.schemaname.clone())
-                    };
-
-                    // If this is not a base table, it might be a view
-                    if self.find_relation(&schema, &table_name).is_none() {
-                        log::debug!(
-                            "Found potential view dependency: schema={:?}, table={}",
-                            schema,
-                            table_name
-                        );
-                        dependencies.insert((schema, table_name));
-                    } else {
-                        log::debug!(
-                            "Found base table: schema={:?}, table={}",
-                            schema,
-                            table_name
-                        );
-                    }
-                }
-                protobuf::node::Node::JoinExpr(join) => {
-                    // Recursively check join arguments
-                    if let Some(larg) = &join.larg {
-                        self.extract_dependencies_from_node(larg, dependencies)?;
-                    }
-                    if let Some(rarg) = &join.rarg {
-                        self.extract_dependencies_from_node(rarg, dependencies)?;
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(())
     }
 
     /// Analyze a view definition and return a map of column names to their nullability.
@@ -3015,6 +2991,38 @@ mod tests {
         let amount = result.get("amount").unwrap();
         assert!(amount.nullable_due_to_join, "got {:?}", amount);
         assert!(!amount.nullable_on_base, "got {:?}", amount);
+    }
+
+    /// View dependencies must be found wherever a relation is read — CTE
+    /// bodies, FROM subqueries, UNION branches, scalar subqueries — with CTE
+    /// names and base tables excluded. A dependency missed here lets the view
+    /// be analyzed before the view it reads from, which infers every column
+    /// nullable, and which views that affects then varies from run to run.
+    #[test]
+    fn test_extract_view_dependencies_sees_through_ctes_subqueries_and_unions() {
+        let rel_index = create_test_rel_index();
+        let cache = ViewNullabilityCache::new();
+        let analyzer = ViewNullabilityAnalyzer::new(&rel_index, &cache);
+
+        let view_def = "WITH recent AS (SELECT * FROM user_stats), \
+                             twice AS (SELECT * FROM recent) \
+                        SELECT r.id \
+                        FROM twice r \
+                        JOIN (SELECT * FROM other.post_view) p ON p.id = r.id \
+                        WHERE r.id IN (SELECT id FROM flagged) \
+                        UNION ALL \
+                        SELECT id FROM users";
+
+        let deps = analyzer.extract_view_dependencies(view_def).unwrap();
+
+        let expected: HashSet<(Option<String>, String)> = [
+            (None, "user_stats".to_string()),
+            (Some("other".to_string()), "post_view".to_string()),
+            (None, "flagged".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(deps, expected);
     }
 
     #[test]

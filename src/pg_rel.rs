@@ -24,7 +24,11 @@ impl TryFrom<Row> for PgRel {
     type Error = postgres::Error;
 
     fn try_from(row: Row) -> Result<Self, Self::Error> {
-        let constraints = row.try_get::<_, Vec<Constraint>>("constraints")?;
+        // The introspection query aggregates constraints without an ORDER BY,
+        // so their order is whatever the executor produced that session. Sort
+        // so generated match arms don't reorder between runs.
+        let mut constraints = row.try_get::<_, Vec<Constraint>>("constraints")?;
+        constraints.sort_by(|a, b| a.name().as_str().cmp(b.name().as_str()));
 
         Ok(Self {
             oid: row.try_get::<_, u32>("oid")?,
