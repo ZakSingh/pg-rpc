@@ -22,6 +22,7 @@ mod column_grouping;
 mod config;
 pub mod constraint_analysis;
 mod db;
+pub mod composite_index;
 pub mod domain_index;
 mod error_type_index;
 mod exceptions;
@@ -343,6 +344,10 @@ impl PgrpcBuilder {
 
         let mut db = Db::new(&connection_string)?;
         let rel_index = RelIndex::new(&mut db.client)?;
+        // Composite attribute metadata (annotations, domain CHECKs) so view,
+        // query, and SQL-function nullability inference can see through
+        // `(col).attr` projections.
+        let composite_index = composite_index::CompositeIndex::new(&mut db.client)?;
         let trigger_index =
             trigger_index::TriggerIndex::new(&mut db.client, &rel_index, &config.schemas)?;
         let mut fn_index =
@@ -371,7 +376,7 @@ impl PgrpcBuilder {
         // Build view nullability cache if enabled
         // This will be shared between TypeIndex (for view types) and QueryIndex (for query analysis)
         let view_nullability_cache = if config.infer_view_nullability {
-            build_view_nullability_cache(&mut db.client, &rel_index)?
+            build_view_nullability_cache(&mut db.client, &rel_index, &composite_index)?
         } else {
             view_nullability::ViewNullabilityCache::new()
         };
@@ -394,6 +399,7 @@ impl PgrpcBuilder {
                 queries_config,
                 Some(&trigger_index),
                 &domain_index,
+                &composite_index,
             )?;
 
             // Collect query type OIDs
@@ -419,7 +425,11 @@ impl PgrpcBuilder {
 
         // Apply nullability inference to SQL language functions with OUT parameters
         if config.infer_view_nullability {
-            fn_index.apply_sql_function_nullability(&rel_index, &view_nullability_cache)?;
+            fn_index.apply_sql_function_nullability(
+                &rel_index,
+                &view_nullability_cache,
+                &composite_index,
+            )?;
         }
 
         let schema_files = codegen_split(&fn_index, &ty_index, &rel_index, &config)?;
@@ -638,6 +648,7 @@ fn generate_mod_file(schema_files: &BTreeMap<String, String>) -> String {
 fn build_view_nullability_cache(
     db: &mut postgres::Client,
     rel_index: &RelIndex,
+    composite_index: &composite_index::CompositeIndex,
 ) -> anyhow::Result<view_nullability::ViewNullabilityCache> {
     use petgraph::algo::toposort;
     use petgraph::graph::{DiGraph, NodeIndex};
@@ -742,7 +753,8 @@ fn build_view_nullability_cache(
                 log::info!("Analyzing view {:?} in topological order", view_key);
 
                 let mut analyzer =
-                    view_nullability::ViewNullabilityAnalyzer::new(rel_index, &nullability_cache);
+                    view_nullability::ViewNullabilityAnalyzer::new(rel_index, &nullability_cache)
+                        .with_composite_index(composite_index);
 
                 match analyzer.analyze_view(view_def, column_names) {
                     Ok(nullability_map) => {

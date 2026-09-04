@@ -394,6 +394,9 @@ Parameter names will be inferred from context or use `param_1`, `param_2` as fal
 - **JOIN Analysis:** LEFT/RIGHT/FULL JOINs make columns nullable
 - **View Analysis:** Queries referencing views inherit their nullability
 - **Expression Analysis:** COALESCE, CASE, aggregate functions, etc.
+- **Composite Attribute Projections:** `(p.col).attr` is non-null when `col` is NOT NULL
+  and the composite's attribute is proven non-null (see
+  [Nullability and CHECK constraints](#nullability-and-check-constraints))
 
 **Example:**
 
@@ -536,13 +539,34 @@ API responses. However, it comes with numerous downsides:
 
 ## Nullability and CHECK constraints
 
-Columns marked non-null in tables are non-null in the generated Rust code.
-Domains aren't so simple; we have to parse their check constraints to determine nullability.
+Columns marked NOT NULL in tables are non-null in the generated Rust code.
 
-`(value).a is not null or (value).b is not null`
-Means that `a` and `b` will be `Option`.
+Composite types aren't so simple: Postgres doesn't allow NOT NULL on the attributes of
+a composite type. An attribute is treated as non-null when either
 
-If the `is not null` has an ancestor `or`, the column is `Option`. Otherwise it is non-null.
+- its comment carries `@pgrpc_not_null` (or the type's comment carries
+  `@pgrpc_not_null(a, b, ...)`), or
+- a domain over the composite has a CHECK constraint proving `(value).attr is not null`
+  for every non-null value.
+
+For the CHECK route, a conjunction proves each of its parts and a disjunction proves only
+what *every* branch proves. A `value is null` branch is ignored, since it only covers a
+NULL composite, which the column's own nullability already handles:
+
+| CHECK constraint                                                   | Non-null attributes |
+|--------------------------------------------------------------------|---------------------|
+| `(value).a is not null and (value).b is not null`                  | `a`, `b`            |
+| `value is null or (value).a is not null`                           | `a`                 |
+| `value is null or ((value).a is not null and (value).b is not null)` | `a`, `b`          |
+| `(value).a is not null or (value).b is not null`                   | none                |
+
+The same evidence applies when a view or query projects a single attribute out of a
+composite-typed column. Given `length distance not null`, where `distance` is a domain
+over a composite whose `amount` is annotated or CHECK-proven, `(p.length).amount as
+length_amount` generates `length_amount: Decimal` rather than `Option<Decimal>`. The
+projection stays `Option` when the base column is nullable or on the outer side of a
+join, when there is no evidence for the attribute, or when it is subscripted
+(`(p.x).tags[1]`).
 
 ## Strict domain types
 

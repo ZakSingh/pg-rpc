@@ -37,14 +37,20 @@ impl QueryIndex {
         config: &QueriesConfig,
         trigger_index: Option<&TriggerIndex>,
         domain_index: &crate::domain_index::DomainIndex,
+        composite_index: &crate::composite_index::CompositeIndex,
     ) -> Result<Self> {
         let parser = SqlParser::new();
 
         // Parse all SQL files
         let parsed_queries = parser.parse_files(&config.paths)?;
 
-        let introspector =
-            QueryIntrospector::new(rel_index, view_nullability_cache, trigger_index, domain_index);
+        let introspector = QueryIntrospector::new(
+            rel_index,
+            view_nullability_cache,
+            trigger_index,
+            domain_index,
+            composite_index,
+        );
 
         // Introspect queries in parallel using rayon with thread-local DB connections
         use rayon::prelude::*;

@@ -67,6 +67,7 @@ impl FunctionIndex {
         &mut self,
         rel_index: &RelIndex,
         view_nullability_cache: &crate::view_nullability::ViewNullabilityCache,
+        composite_index: &crate::composite_index::CompositeIndex,
     ) -> anyhow::Result<()> {
         log::info!("Applying nullability inference to SQL functions...");
 
@@ -89,7 +90,11 @@ impl FunctionIndex {
 
             analyzed_count += 1;
 
-            match pg_fn.infer_out_param_nullability(rel_index, view_nullability_cache) {
+            match pg_fn.infer_out_param_nullability(
+                rel_index,
+                view_nullability_cache,
+                composite_index,
+            ) {
                 Ok(()) => {
                     log::debug!("Successfully analyzed SQL function: {}", pg_fn.name);
                 }

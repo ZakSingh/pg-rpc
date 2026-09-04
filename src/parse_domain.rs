@@ -59,46 +59,24 @@ fn collect_from_node(node: &Node, columns: &mut HashSet<String>) {
                     collect_from_node(arg, columns);
                 }
             } else if bool_expr.boolop() == BoolExprType::OrExpr {
-                // For OR, we can only infer not-null constraints in specific cases
-
-                // Check if any branch is testing if value is null
-                let null_branches: Vec<_> = bool_expr
-                    .args
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, arg)| is_value_null_test(arg))
-                    .map(|(idx, _)| idx)
-                    .collect();
-
-                // If exactly one branch tests value is null, we can analyze other branches
-                if null_branches.len() == 1 {
-                    let null_branch_idx = null_branches[0];
-
-                    // For all other branches, collect ONLY direct not-null tests
-                    // We cannot infer anything about fields in complex expressions
-                    let mut direct_not_nulls = HashSet::new();
-
-                    for (idx, arg) in bool_expr.args.iter().enumerate() {
-                        if idx != null_branch_idx {
-                            // Only collect fields that are directly tested with is not null
-                            collect_direct_not_nulls(arg, &mut direct_not_nulls);
-                        }
-                    }
-
-                    // Only add these fields if every non-null branch has a direct not-null test
-                    // If there are other conditions, we can't make the inference
-                    if direct_not_nulls.len() > 0
-                        && bool_expr.args.len() - 1
-                            == bool_expr
-                                .args
-                                .iter()
-                                .enumerate()
-                                .filter(|(idx, _)| *idx != null_branch_idx)
-                                .filter(|(_, arg)| is_direct_not_null_test(arg))
-                                .count()
-                    {
-                        columns.extend(direct_not_nulls);
-                    }
+                // A disjunction proves only what *every* branch proves. A
+                // `VALUE IS NULL` branch is vacuous here: attribute nullability
+                // only matters for non-NULL values, and for those the remaining
+                // branches must hold. So `VALUE IS NULL OR (a IS NOT NULL AND
+                // b IS NOT NULL)` proves both `a` and `b`, while
+                // `VALUE IS NULL OR a IS NOT NULL OR b IS NOT NULL` proves
+                // neither on its own.
+                let mut proven: Option<HashSet<String>> = None;
+                for arg in bool_expr.args.iter().filter(|arg| !is_value_null_test(arg)) {
+                    let mut branch = HashSet::new();
+                    collect_from_node(arg, &mut branch);
+                    proven = Some(match proven {
+                        None => branch,
+                        Some(acc) => acc.intersection(&branch).cloned().collect(),
+                    });
+                }
+                if let Some(proven) = proven {
+                    columns.extend(proven);
                 }
             }
         }
@@ -145,67 +123,7 @@ fn is_value_null_test(node: &Node) -> bool {
     false
 }
 
-// Check if this is a direct "(value).field is not null" test
-fn is_direct_not_null_test(node: &Node) -> bool {
-    if let Some(NodeEnum::NullTest(null_test)) = &node.node {
-        if null_test.nulltesttype() == NullTestType::IsNotNull {
-            if let Some(arg) = &null_test.arg {
-                if let Some(NodeEnum::AIndirection(a_ind)) = &arg.node {
-                    if let Some(inner_arg) = &a_ind.arg {
-                        if let Some(NodeEnum::ColumnRef(col_ref)) = &inner_arg.node {
-                            if col_ref.fields.len() == 1 {
-                                if let Some(NodeEnum::String(value)) = &col_ref.fields[0].node {
-                                    return value.sval.to_lowercase() == "value";
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-// Collect only fields that are directly tested with "(value).field is not null"
-fn collect_direct_not_nulls(node: &Node, columns: &mut HashSet<String>) {
-    match &node.node {
-        Some(NodeEnum::NullTest(null_test)) => {
-            if null_test.nulltesttype() == NullTestType::IsNotNull {
-                if let Some(arg) = &null_test.arg {
-                    if let Some(NodeEnum::AIndirection(a_ind)) = &arg.node {
-                        if let Some(inner_arg) = &a_ind.arg {
-                            if let Some(NodeEnum::ColumnRef(col_ref)) = &inner_arg.node {
-                                if col_ref.fields.len() == 1 {
-                                    if let Some(NodeEnum::String(value)) = &col_ref.fields[0].node {
-                                        if value.sval.to_lowercase() == "value" {
-                                            if let Some(NodeEnum::String(field)) =
-                                                &a_ind.indirection[0].node
-                                            {
-                                                columns.insert(field.sval.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Some(NodeEnum::BoolExpr(bool_expr)) => {
-            if bool_expr.boolop() == BoolExprType::AndExpr {
-                // For AND expressions within an OR, we can still collect direct not-nulls
-                for arg in &bool_expr.args {
-                    collect_direct_not_nulls(arg, columns);
-                }
-            }
-            // Ignore nested OR expressions
-        }
-        _ => {}
-    }
-}
-
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
@@ -274,5 +192,53 @@ mod tests {
 
         let set = HashSet::new();
         assert_eq!(non_null_cols, set);
+    }
+
+    fn names(cols: &[&str]) -> HashSet<String> {
+        cols.iter().map(|c| c.to_string()).collect()
+    }
+
+    /// `VALUE IS NULL OR (a IS NOT NULL AND b IS NOT NULL)`, as
+    /// `pg_get_constraintdef` renders it: for a non-NULL value the conjunction
+    /// must hold, so both attributes are proven.
+    #[test]
+    fn nullable_value_with_conjunction_proves_every_conjunct() {
+        let check_strs = vec![
+            "CHECK (((VALUE IS NULL) OR (((VALUE).amount IS NOT NULL) AND ((VALUE).unit IS NOT NULL))))",
+        ];
+
+        let constraint_nodes = get_constraints(&check_strs).unwrap();
+        let non_null_cols = collect_non_null_columns(&constraint_nodes);
+
+        assert_eq!(non_null_cols, names(&["amount", "unit"]));
+    }
+
+    /// `VALUE IS NULL OR a IS NOT NULL OR b IS NOT NULL` only proves
+    /// "a or b", never either one alone.
+    #[test]
+    fn disjunction_of_tests_proves_nothing_individually() {
+        let check_strs = vec![
+            "check (value is null or (value).author is not null or (value).editor is not null)",
+        ];
+
+        let constraint_nodes = get_constraints(&check_strs).unwrap();
+        let non_null_cols = collect_non_null_columns(&constraint_nodes);
+
+        assert_eq!(non_null_cols, HashSet::new());
+    }
+
+    /// A disjunction proves what every branch proves:
+    /// `(a AND b) OR (a AND c)` proves `a`.
+    #[test]
+    fn disjunction_proves_common_attributes() {
+        let check_strs = vec![
+            "check (((value).a is not null and (value).b is not null) \
+                 or ((value).a is not null and (value).c is not null))",
+        ];
+
+        let constraint_nodes = get_constraints(&check_strs).unwrap();
+        let non_null_cols = collect_non_null_columns(&constraint_nodes);
+
+        assert_eq!(non_null_cols, names(&["a"]));
     }
 }
