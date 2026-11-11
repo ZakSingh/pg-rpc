@@ -26,6 +26,9 @@ pub enum OnDelete {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct CheckConstraint {
     pub(crate) name: Ustr,
+    /// `comment on constraint ...`, carrying `@pgrpc_message` / `@pgrpc_field`.
+    #[serde(default)]
+    pub(crate) comment: Option<String>,
     pub(crate) columns: SmallVec<Ustr, 2>,
     #[serde(default)]
     pub(crate) check_expression: Option<String>,
@@ -34,6 +37,9 @@ pub struct CheckConstraint {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct ForeignKeyConstraint {
     pub(crate) name: Ustr,
+    /// `comment on constraint ...`, carrying `@pgrpc_message` / `@pgrpc_field`.
+    #[serde(default)]
+    pub(crate) comment: Option<String>,
     pub(crate) columns: SmallVec<Ustr, 2>,
     pub(crate) on_delete: OnDelete,
     /// The referenced table name (schema-qualified if not in search_path)
@@ -47,12 +53,18 @@ pub struct ForeignKeyConstraint {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct PrimaryKeyConstraint {
     pub(crate) name: Ustr,
+    /// `comment on constraint ...`, carrying `@pgrpc_message` / `@pgrpc_field`.
+    #[serde(default)]
+    pub(crate) comment: Option<String>,
     pub(crate) columns: SmallVec<Ustr, 2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct UniqueConstraint {
     pub(crate) name: Ustr,
+    /// `comment on constraint ...`, carrying `@pgrpc_message` / `@pgrpc_field`.
+    #[serde(default)]
+    pub(crate) comment: Option<String>,
     pub columns: SmallVec<Ustr, 2>,
 }
 
@@ -72,11 +84,19 @@ pub struct DefaultConstraint {
 pub struct DomainConstraint {
     pub(crate) name: Ustr,
     pub column: Ustr,
+    /// Name of the domain the CHECK belongs to (what `DbError::datatype()` reports).
+    #[serde(default)]
+    pub(crate) domain: Option<String>,
+    #[serde(default)]
+    pub(crate) comment: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct ExclusionConstraint {
     pub(crate) name: Ustr,
+    /// `comment on constraint ...`, carrying `@pgrpc_message` / `@pgrpc_field`.
+    #[serde(default)]
+    pub(crate) comment: Option<String>,
     pub(crate) columns: SmallVec<Ustr, 2>,
 }
 
@@ -128,6 +148,51 @@ impl Constraint {
             Constraint::Default(default) => default.name,
             Constraint::Domain(domain) => domain.name,
             Constraint::Exclusion(exclusion) => exclusion.name,
+        }
+    }
+
+    /// The columns the constraint spans (one for column-level constraints).
+    pub fn columns(&self) -> &[Ustr] {
+        match self {
+            Constraint::Check(c) => &c.columns,
+            Constraint::ForeignKey(f) => &f.columns,
+            Constraint::PrimaryKey(p) => &p.columns,
+            Constraint::Unique(u) => &u.columns,
+            Constraint::Exclusion(x) => &x.columns,
+            Constraint::NotNull(n) => std::slice::from_ref(&n.column),
+            Constraint::Default(d) => std::slice::from_ref(&d.column),
+            Constraint::Domain(d) => std::slice::from_ref(&d.column),
+        }
+    }
+
+    /// The constraint's Postgres comment, if any.
+    pub fn comment(&self) -> Option<&str> {
+        match self {
+            Constraint::Check(c) => c.comment.as_deref(),
+            Constraint::ForeignKey(f) => f.comment.as_deref(),
+            Constraint::PrimaryKey(p) => p.comment.as_deref(),
+            Constraint::Unique(u) => u.comment.as_deref(),
+            Constraint::Exclusion(x) => x.comment.as_deref(),
+            Constraint::Domain(d) => d.comment.as_deref(),
+            Constraint::NotNull(_) | Constraint::Default(_) => None,
+        }
+    }
+
+    /// The user-facing `@pgrpc_message` from the constraint's comment.
+    pub fn message(&self) -> Option<String> {
+        self.comment().and_then(crate::annotations::parse_message)
+    }
+
+    /// The form field a violation belongs to: the `@pgrpc_field` override if
+    /// present (`@pgrpc_field()` meaning none), otherwise the single
+    /// constrained column, otherwise none.
+    pub fn field(&self) -> Option<String> {
+        match self.comment().and_then(crate::annotations::parse_field) {
+            Some(explicit) => explicit,
+            None => match self.columns() {
+                [single] => Some(single.to_string()),
+                _ => None,
+            },
         }
     }
 

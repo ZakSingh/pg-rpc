@@ -9,6 +9,7 @@ use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
 use crate::rel_index::RelIndex;
 use crate::trigger_index::{TriggerEvent, TriggerIndex};
+use itertools::Itertools;
 use jsonpath_rust::JsonPath;
 use log::warn;
 use pg_query::protobuf::node::Node;
@@ -77,8 +78,10 @@ pub struct RelDep {
     pub trigger_exceptions: Vec<PgException>,
 }
 
-/// Extract and parse all SQL queries inside a PlPgSQL function
-pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
+/// Extract and parse all SQL queries inside a PlPgSQL function.
+///
+/// `scope` names the function (or query) being analyzed, for diagnostics.
+pub fn extract_queries(fn_json: &Value, scope: &str) -> Vec<ParseResult> {
     let query_path = JsonPath::try_from("$..PLpgSQL_expr.query").unwrap();
 
     query_path
@@ -89,7 +92,7 @@ pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
             match data.as_str() {
                 Some(query_str) => Some(pg_query::parse(query_str)),
                 None => {
-                    warn!("Failed to extract query string from JSON value: {:?}", data);
+                    warn!("{scope}: failed to extract query string from JSON value: {:?}", data);
                     None
                 }
             }
@@ -99,10 +102,10 @@ pub fn extract_queries(fn_json: &Value) -> Vec<ParseResult> {
 }
 
 /// Get the relations the given queries depend upon.
-pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex) -> Vec<RelDep> {
+pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex, scope: &str) -> Vec<RelDep> {
     queries
         .iter()
-        .flat_map(|q| get_query_deps(q, rel_index))
+        .flat_map(|q| get_query_deps(q, rel_index, scope))
         .collect()
 }
 
@@ -131,27 +134,45 @@ pub fn analyze_sql_for_constraints(
     sql: &str,
     rel_index: &RelIndex,
     trigger_index: Option<&TriggerIndex>,
+    scope: &str,
 ) -> (Vec<PgException>, BTreeMap<PgId, Vec<Constraint>>) {
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,
         Err(e) => {
-            warn!("Failed to parse SQL for constraint analysis: {}", e);
+            warn!("{scope}: failed to parse SQL for constraint analysis: {}", e);
             return (Vec::new(), BTreeMap::new());
         }
     };
+    let rel_deps = sql_rel_deps(&parsed, rel_index, trigger_index, scope);
+    constraints_from_deps(&rel_deps, rel_index)
+}
 
-    let queries = vec![parsed];
-    let mut rel_deps = get_rel_deps(&queries, rel_index);
-
-    // Populate trigger exceptions if available
+/// Relation dependencies of one parsed statement, with trigger exceptions
+/// populated when a trigger index is given.
+pub fn sql_rel_deps(
+    parsed: &ParseResult,
+    rel_index: &RelIndex,
+    trigger_index: Option<&TriggerIndex>,
+    scope: &str,
+) -> Vec<RelDep> {
+    let mut rel_deps = get_query_deps(parsed, rel_index, scope);
     if let Some(trigger_idx) = trigger_index {
         populate_trigger_exceptions(&mut rel_deps, trigger_idx);
     }
+    rel_deps
+}
 
+/// The constraints that the given relation dependencies can violate, as both
+/// a flat exception list (constraints plus trigger exceptions) and a
+/// per-table map used to build `XxxConstraint` error variants.
+pub fn constraints_from_deps(
+    rel_deps: &[RelDep],
+    rel_index: &RelIndex,
+) -> (Vec<PgException>, BTreeMap<PgId, Vec<Constraint>>) {
     let mut exceptions = Vec::new();
     let mut table_constraints: BTreeMap<PgId, Vec<Constraint>> = BTreeMap::new();
 
-    for dep in &rel_deps {
+    for dep in rel_deps {
         // Find the PgId for this OID
         let pg_id = rel_index
             .iter()
@@ -222,7 +243,14 @@ pub fn analyze_sql_for_constraints(
                     for constraint in &relevant_constraints {
                         exceptions.push(PgException::Constraint(constraint.clone()));
                     }
-                    table_constraints.insert(id.clone(), relevant_constraints);
+                    // Merge: the same table may be written by several
+                    // statements, or by the query and a function it calls.
+                    let entry = table_constraints.entry(id.clone()).or_default();
+                    entry.extend(relevant_constraints);
+                    *entry = std::mem::take(entry)
+                        .into_iter()
+                        .unique_by(|c| c.name())
+                        .collect();
                 }
             }
         }
@@ -234,16 +262,16 @@ pub fn analyze_sql_for_constraints(
     (exceptions, table_constraints)
 }
 
-fn get_query_deps(query: &ParseResult, rel_index: &RelIndex) -> Vec<RelDep> {
+fn get_query_deps(query: &ParseResult, rel_index: &RelIndex, scope: &str) -> Vec<RelDep> {
     query
         .protobuf
         .nodes()
         .iter()
         .filter_map(|(node, _, _, _)| match node.to_enum() {
             Node::SelectStmt(stmt) => get_select_deps(stmt.as_ref(), rel_index),
-            Node::InsertStmt(stmt) => get_insert_deps(stmt.as_ref(), rel_index),
-            Node::UpdateStmt(stmt) => get_update_deps(stmt.as_ref(), rel_index),
-            Node::DeleteStmt(stmt) => get_delete_deps(stmt.as_ref(), rel_index),
+            Node::InsertStmt(stmt) => get_insert_deps(stmt.as_ref(), rel_index, scope),
+            Node::UpdateStmt(stmt) => get_update_deps(stmt.as_ref(), rel_index, scope),
+            Node::DeleteStmt(stmt) => get_delete_deps(stmt.as_ref(), rel_index, scope),
             Node::CallStmt(_stmt) => None, // We'll handle CallStmt separately for custom errors
             _ => None,
         })
@@ -256,7 +284,7 @@ fn get_select_deps(_stmt: &SelectStmt, _rel_index: &RelIndex) -> Option<RelDep> 
 }
 
 /// Collect all dependencies from an `insert`.
-fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
+fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex, scope: &str) -> Option<RelDep> {
     let Some(rel_oid) = stmt
         .relation
         .as_ref()
@@ -265,7 +293,7 @@ fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
     else {
         // Could not determine what relation was being inserted into
         // This can happen with CTEs, temp tables, or relations not in our index
-        warn!("Skipping INSERT statement dependency analysis: {stmt:?}");
+        warn!("{scope}: skipping INSERT statement dependency analysis (no plain target table): {stmt:?}");
         return None;
     };
 
@@ -354,14 +382,14 @@ fn get_insert_deps(stmt: &InsertStmt, rel_index: &RelIndex) -> Option<RelDep> {
     })
 }
 
-fn get_delete_deps(stmt: &DeleteStmt, rel_index: &RelIndex) -> Option<RelDep> {
+fn get_delete_deps(stmt: &DeleteStmt, rel_index: &RelIndex, scope: &str) -> Option<RelDep> {
     let Some(rel_oid) = stmt
         .relation
         .as_ref()
         .map(|r| rel_index.id_to_oid(&PgId::from(r)))
         .flatten()
     else {
-        warn!("Skipping DELETE statement dependency analysis: {stmt:?}");
+        warn!("{scope}: skipping DELETE statement dependency analysis (no plain target table): {stmt:?}");
         return None;
     };
 
@@ -372,14 +400,14 @@ fn get_delete_deps(stmt: &DeleteStmt, rel_index: &RelIndex) -> Option<RelDep> {
     })
 }
 
-fn get_update_deps(stmt: &UpdateStmt, rel_index: &RelIndex) -> Option<RelDep> {
+fn get_update_deps(stmt: &UpdateStmt, rel_index: &RelIndex, scope: &str) -> Option<RelDep> {
     let Some(rel_oid) = stmt
         .relation
         .as_ref()
         .map(|r| rel_index.id_to_oid(&PgId::from(r)))
         .flatten()
     else {
-        warn!("Skipping UPDATE statement dependency analysis: {stmt:?}");
+        warn!("{scope}: skipping UPDATE statement dependency analysis (no plain target table): {stmt:?}");
         return None;
     };
 
@@ -446,8 +474,8 @@ mod tests {
             },
         );
 
-        let queries = extract_queries(&f);
-        let rels = get_rel_deps(&queries, &rel_index);
+        let queries = extract_queries(&f, "test");
+        let rels = get_rel_deps(&queries, &rel_index, "test");
         // Only INSERT is detected, SELECT deps are not implemented (TODO in get_select_deps)
         assert_eq!(rels.len(), 1);
 
@@ -469,6 +497,7 @@ mod tests {
                 id: PgId::new(None, ustr("users")),
                 constraints: vec![
                     Constraint::Unique(UniqueConstraint {
+                        comment: None,
                         name: ustr("users_email_key"),
                         columns: SmallVec::from_slice(&[ustr("email")]),
                     }),
@@ -483,7 +512,7 @@ mod tests {
         );
 
         let sql = "INSERT INTO users (email, name) VALUES ($1, $2)";
-        let (exceptions, constraints) = analyze_sql_for_constraints(sql, &rel_index, None);
+        let (exceptions, constraints) = analyze_sql_for_constraints(sql, &rel_index, None, "test");
 
         // Should find unique constraint on email
         assert!(!exceptions.is_empty());

@@ -2,7 +2,9 @@ use crate::annotations;
 use crate::codegen::ToRust;
 use crate::codegen::{FunctionName, SchemaName, OID};
 use crate::config;
-use crate::exceptions::{get_comment_exceptions, get_exceptions_with_triggers, PgException};
+use crate::call_graph::{self, CallTarget};
+use crate::constraint_analysis::RelDep;
+use crate::exceptions::{get_comment_exceptions, get_exceptions_from_deps, PgException};
 use crate::fn_index::FunctionId;
 use crate::ident::{
     sql_to_rs_ident,
@@ -47,7 +49,16 @@ pub struct PgFn {
     pub has_table_params: bool,
     pub definition: String,
     pub comment: Option<String>,
+    /// Everything this function can raise: its own `RAISE`s, constraint
+    /// violations from its DML, trigger exceptions, `@pgrpc_throws`, and (after
+    /// `FunctionIndex::follow_calls`) the same for every function it calls.
     pub exceptions: Vec<PgException>,
+    /// Relations this function writes, including those written by the
+    /// functions it calls (after `FunctionIndex::follow_calls`). Drives the
+    /// `XxxConstraint` variants of the error enum.
+    pub rel_deps: Vec<RelDep>,
+    /// Functions called from the body, by name as written, before resolution.
+    pub callees: BTreeSet<CallTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,7 +281,7 @@ impl PgFn {
                         Some(quote! {
                             Some(#error_name_str) => {
                                 if let Ok(payload) = serde_json::from_value(json.clone()) {
-                                    #error_enum_name::#variant_name(payload)
+                                    #error_enum_name::#variant_name(payload, db_error.to_owned())
                                 } else {
                                     #error_enum_name::Other(super::errors::PgRpcError::Database(e))
                                 }
@@ -282,8 +293,10 @@ impl PgFn {
                 })
                 .collect();
 
-            // Check for JSON hint instead of specific SQLSTATE
-            custom_arms.push(quote! {
+            // Typed errors are identified by the JSON hint, not the SQLSTATE,
+            // so this arm must come before every code-based arm: a typed
+            // error raised with a mapped SQLSTATE is still the typed error.
+            custom_arms.insert(0, quote! {
                 _code if db_error.hint() == Some("application/json") => {
                     // Parse JSON message for custom error
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(db_error.message()) {
@@ -298,8 +311,12 @@ impl PgFn {
             });
         }
 
-        // Build the complete match expression
+        // Build the complete match expression. The JSON-hint arm (if any)
+        // leads, then constraint classes, then SQLSTATE codes.
         let mut all_arms = Vec::new();
+        if has_custom_errors {
+            all_arms.push(custom_arms.remove(0));
+        }
 
         if !unique_arms.is_empty() {
             all_arms.push(quote! {
@@ -362,38 +379,11 @@ impl PgFn {
         let mut error_variants = Vec::new();
         let mut used_constraints: BTreeMap<PgId, Vec<Constraint>> = BTreeMap::new();
 
-        // Analyze both PL/pgSQL and SQL functions
-        let rel_deps = if self.definition.contains("LANGUAGE plpgsql")
-            || self.definition.contains("language plpgsql")
-        {
-            let parsed = parse_plpgsql(&self.definition).unwrap_or_default();
-            let queries = extract_queries(&parsed);
-            get_rel_deps(&queries, rel_index)
-        } else if self.definition.contains("LANGUAGE sql")
-            || self.definition.contains("language sql")
-            || self.definition.contains("LANGUAGE SQL")
-        {
-            // For SQL functions, extract the body and parse it
-            let body = self.body();
-            match pg_query::parse(body) {
-                Ok(parsed) => {
-                    let queries = vec![parsed];
-                    get_rel_deps(&queries, rel_index)
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to parse SQL function body for error analysis: {}",
-                        e
-                    );
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
+        // Relations written by this function and by everything it calls.
+        let rel_deps = &self.rel_deps;
 
         // Collect constraints from tables this function touches
-        for dep in &rel_deps {
+        for dep in rel_deps {
             // Find the PgId for this OID
             let pg_id = rel_index
                 .iter()
@@ -419,7 +409,14 @@ impl PgFn {
                         .collect();
 
                     if !relevant_constraints.is_empty() {
-                        used_constraints.insert(id.clone(), relevant_constraints);
+                        // Merge: the same table may be written more than once
+                        // (several statements, or caller + callee).
+                        let entry = used_constraints.entry(id.clone()).or_default();
+                        entry.extend(relevant_constraints);
+                        *entry = std::mem::take(entry)
+                            .into_iter()
+                            .unique_by(|c| c.name())
+                            .collect();
                     }
                 }
             }
@@ -467,8 +464,8 @@ impl PgFn {
                     if handled_exceptions.insert(variant_name.to_string()) {
                         let struct_name = variant_name.clone();
                         error_variants.push(quote! {
-                            #[error("Custom error: {}", stringify!(#error_name))]
-                            #variant_name(super::errors::#struct_name)
+                            #[error("{}", #error_name)]
+                            #variant_name(super::custom_errors::#struct_name, #[source] tokio_postgres::error::DbError)
                         });
                     }
                 }
@@ -519,8 +516,11 @@ impl PgFn {
                 PgException::CustomError(error_name) => {
                     let variant_name = sql_to_rs_ident(error_name, Pascal);
                     to_pgrpc_arms.push(quote! {
-                        #error_enum_name::#variant_name(payload) => {
-                            super::errors::PgRpcError::CustomError(super::errors::CustomError::#variant_name(payload))
+                        #error_enum_name::#variant_name(payload, db_error) => {
+                            super::errors::PgRpcError::CustomError(
+                                super::custom_errors::CustomError::#variant_name(payload),
+                                db_error,
+                            )
                         }
                     });
                 }
@@ -560,7 +560,7 @@ impl PgFn {
                 PgException::CustomError(error_name) => {
                     let variant_name = sql_to_rs_ident(error_name, Pascal);
                     as_db_error_arms.push(quote! {
-                        #error_enum_name::#variant_name(_) => None
+                        #error_enum_name::#variant_name(_, db_error) => Some(db_error)
                     });
                 }
                 _ => {}
@@ -631,12 +631,9 @@ impl PgFn {
             .any(|oid| matches!(types.get(oid), Some(crate::pg_type::PgType::Pseudo(_))))
     }
 
-    /// Retrieve the body (between the `$$`)
+    /// Retrieve the body (between the `$$`); empty if no dollar quoting was found.
     fn body(&self) -> &str {
-        let (tag, start_ind) = quote_ind(&self.definition).unwrap();
-        let end_ind = self.definition[start_ind..].find(tag).unwrap() + start_ind;
-
-        &self.definition[start_ind..end_ind]
+        fn_body(&self.definition).unwrap_or("")
     }
 
     /// Infer nullability of OUT parameters for SQL language functions
@@ -740,6 +737,7 @@ impl PgFn {
         row: Row,
         rel_index: &RelIndex,
         trigger_index: Option<&TriggerIndex>,
+        errors_config: Option<&crate::config::ErrorsConfig>,
     ) -> Result<Self, anyhow::Error> {
         let arg_type_oids: Vec<OID> = row.try_get("arg_oids")?;
         let arg_names: Vec<String> = row.try_get("arg_names")?;
@@ -807,50 +805,53 @@ impl PgFn {
         }
 
         let definition = row.try_get::<_, String>("function_definition")?;
+        let name: String = row.try_get("function_name")?;
+        let schema: String = row.try_get("schema_name")?;
+        let scope = format!("{schema}.{name}");
 
-        // Parse and analyze both PL/pgSQL and SQL functions
-        let exceptions = match language.as_str() {
-            "plpgsql" => {
-                let parsed = parse_plpgsql(&definition)?;
-                get_exceptions_with_triggers(
-                    &parsed,
-                    comment.as_ref(),
-                    rel_index,
-                    trigger_index,
-                    None,
-                )?
-            }
-            "sql" => {
-                // Extract the function body and parse as SQL
-                let fn_obj = Self {
-                    oid: row.try_get("oid")?,
-                    name: row.try_get("function_name")?,
-                    schema: row.try_get("schema_name")?,
-                    definition: definition.clone(),
-                    returns_set: row.try_get("returns_set")?,
-                    is_procedure: prokind == b'p' as i8,
-                    has_table_params,
-                    comment: comment.clone(),
-                    args: args.clone(),
-                    out_args: out_args.clone(),
-                    return_type_oid: row.try_get("return_type")?,
-                    exceptions: Vec::new(),
-                };
-
-                let body = fn_obj.body();
-                // Parse SQL body to get queries
-                match pg_query::parse(body) {
+        // Analyze the body: what it can raise, which relations it writes, and
+        // which functions it calls. A body that libpg_query cannot parse is a
+        // warning, not a failure: the function still gets a binding, its error
+        // enum just has no specific variants.
+        let (exceptions, rel_deps, callees): (Vec<PgException>, Vec<RelDep>, BTreeSet<CallTarget>) =
+            match language.as_str() {
+                "plpgsql" => match parse_plpgsql(&definition) {
                     Ok(parsed) => {
-                        // Convert parsed SQL to queries vector
+                        let queries = extract_queries(&parsed, &scope);
+                        let mut rel_deps = get_rel_deps(&queries, rel_index, &scope);
+                        if let Some(trigger_idx) = trigger_index {
+                            populate_trigger_exceptions(&mut rel_deps, trigger_idx);
+                        }
+                        let exceptions = get_exceptions_from_deps(
+                            &parsed,
+                            &rel_deps,
+                            comment.as_ref(),
+                            rel_index,
+                            errors_config,
+                            &scope,
+                        )?;
+                        let callees = call_graph::plpgsql_callees(&parsed);
+                        (exceptions, rel_deps, callees)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse PL/pgSQL function {}.{}: {}. Its error enum will only have the `Other` variant.",
+                            schema, name, e
+                        );
+                        Default::default()
+                    }
+                },
+                "sql" => match fn_body(&definition).map(pg_query::parse) {
+                    Some(Ok(parsed)) => {
+                        let callees = call_graph::sql_callees(&parsed);
                         let queries = vec![parsed];
-                        let mut rel_deps = get_rel_deps(&queries, rel_index);
+                        let mut rel_deps = get_rel_deps(&queries, rel_index, &scope);
 
                         // Populate trigger exceptions if available
                         if let Some(trigger_idx) = trigger_index {
                             populate_trigger_exceptions(&mut rel_deps, trigger_idx);
                         }
 
-                        // Get exceptions from table dependencies
                         let mut exceptions: Vec<PgException> = Vec::new();
 
                         // Collect constraint-based exceptions
@@ -879,7 +880,7 @@ impl PgFn {
                         }
 
                         // Add trigger-based exceptions if available
-                        if let Some(trigger_idx) = trigger_index {
+                        if trigger_index.is_some() {
                             for dep in &rel_deps {
                                 exceptions.extend(dep.trigger_exceptions.iter().cloned());
                             }
@@ -890,24 +891,42 @@ impl PgFn {
                             exceptions.extend(get_comment_exceptions(comment_str));
                         }
 
-                        exceptions
+                        // Typed errors raised through the configured raise function
+                        if let Some(cfg) = errors_config {
+                            exceptions.extend(
+                                extract_custom_errors_from_queries(&queries, cfg)
+                                    .into_iter()
+                                    .map(PgException::CustomError),
+                            );
+                        }
+
+                        (exceptions, rel_deps, callees)
                     }
-                    Err(e) => {
-                        warn!("Failed to parse SQL function body: {}", e);
-                        Vec::new()
+                    Some(Err(e)) => {
+                        warn!(
+                            "Failed to parse SQL function body of {}.{}: {}",
+                            schema, name, e
+                        );
+                        Default::default()
                     }
+                    None => {
+                        warn!(
+                            "Could not find the dollar-quoted body of SQL function {}.{}",
+                            schema, name
+                        );
+                        Default::default()
+                    }
+                },
+                _ => {
+                    // Other languages not supported yet
+                    Default::default()
                 }
-            }
-            _ => {
-                // Other languages not supported yet
-                Vec::new()
-            }
-        };
+            };
 
         Ok(Self {
             oid: row.try_get("oid")?,
-            name: row.try_get("function_name")?,
-            schema: row.try_get("schema_name")?,
+            name,
+            schema,
             definition,
             returns_set: row.try_get("returns_set")?,
             is_procedure: prokind == b'p' as i8, // 'p' for procedure, 'f' for function
@@ -917,8 +936,17 @@ impl PgFn {
             out_args,
             return_type_oid: row.try_get("return_type")?,
             exceptions,
+            rel_deps,
+            callees,
         })
     }
+}
+
+/// The dollar-quoted body of a `CREATE FUNCTION` definition.
+fn fn_body(definition: &str) -> Option<&str> {
+    let (tag, start) = quote_ind(definition)?;
+    let end = definition[start..].find(tag)? + start;
+    Some(&definition[start..end])
 }
 
 impl ToRust for PgArg {
@@ -1795,8 +1823,8 @@ mod test {
             },
         );
 
-        let queries = extract_queries(&f);
-        let rels = get_rel_deps(&queries, &rel_index);
+        let queries = extract_queries(&f, "test");
+        let rels = get_rel_deps(&queries, &rel_index, "test");
         // Only INSERT is detected, SELECT deps are not implemented (TODO in get_select_deps)
         assert_eq!(rels.len(), 1);
 
@@ -1824,6 +1852,8 @@ mod test {
             comment: None,
             definition: "".to_string(),
             exceptions: vec![],
+            rel_deps: vec![],
+            callees: Default::default(),
         };
 
         // Create type index with Text type
@@ -1878,6 +1908,8 @@ mod test {
             comment: None,
             definition: "".to_string(),
             exceptions: vec![],
+            rel_deps: vec![],
+            callees: Default::default(),
         };
 
         // Create type index with a composite type
@@ -1961,6 +1993,8 @@ mod test {
             comment: None,
             definition: "".to_string(),
             exceptions: vec![],
+            rel_deps: vec![],
+            callees: Default::default(),
         };
 
         let mut types = BTreeMap::new();
@@ -2028,6 +2062,8 @@ mod test {
             comment: None,
             definition: "".to_string(),
             exceptions: vec![],
+            rel_deps: vec![],
+            callees: Default::default(),
         };
 
         let mut types = BTreeMap::new();

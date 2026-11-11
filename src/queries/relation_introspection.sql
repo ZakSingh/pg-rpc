@@ -67,8 +67,10 @@ with recursive user_relations as (
                                   'name', dc.conname::text,
                                   'type', 'domain',
                                   'column', cth.root_column_name,
+                                  'domain', t.typname::text,
                                   'is_array', cth.is_array,
-                                  'check_clause', pg_get_constraintdef(dc.oid)
+                                  'check_clause', pg_get_constraintdef(dc.oid),
+                                  'comment', obj_description(dc.oid, 'pg_constraint')
                           )::json as constraint_info
                    from composite_type_hierarchy cth
                             join pg_type t on t.oid = cth.element_type_oid
@@ -80,6 +82,7 @@ with recursive user_relations as (
                           json_build_object(
                                   'name', c.relname::text,
                                   'type', 'u',
+                                  'comment', obj_description(c.oid, 'pg_class'),
                                   'columns', (
                                       select array_agg(a.attname order by array_position(i.indkey::int[], a.attnum::int))
                                       from pg_attribute a
@@ -109,7 +112,8 @@ with recursive user_relations as (
                                             (select array_agg(a.attname order by a.attnum)
                                              from unnest(con.conkey) k
                                                       join pg_attribute a on a.attrelid = ur.oid and a.attnum = k),
-                                            'check_expression', case when con.contype = 'c' then pg_get_constraintdef(con.oid) end)::json as constraint_info
+                                            'check_expression', case when con.contype = 'c' then pg_get_constraintdef(con.oid) end,
+                                            'comment', obj_description(con.oid, 'pg_constraint'))::json as constraint_info
                    from user_relations ur
                             join pg_constraint con on con.conrelid = ur.oid
                    where con.contype not in ('f', 't')
@@ -123,6 +127,7 @@ with recursive user_relations as (
                                              from unnest(con.conkey) k
                                                       join pg_attribute a on a.attrelid = ur.oid and a.attnum = k),
                                             'on_delete', con.confdeltype,
+                                            'comment', obj_description(con.oid, 'pg_constraint'),
                                             'ref_table', ref_class.relname::text,
                                             'ref_columns', (select array_agg(a.attname order by array_position(con.confkey::int[], a.attnum::int))
                                                             from unnest(con.confkey) k

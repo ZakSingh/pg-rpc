@@ -1,18 +1,17 @@
 use crate::annotations;
 use crate::config::Config;
-use crate::constraint_analysis::{extract_queries, get_rel_deps, Cmd, ConflictTarget};
+use crate::constraint_analysis::{extract_queries, get_rel_deps, Cmd, ConflictTarget, RelDep};
 use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
 use crate::pg_constraint::Constraint;
 use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
 use crate::trigger_index::TriggerIndex;
-use anyhow::anyhow;
 use itertools::Itertools;
 use jsonpath_rust::{JsonPath, JsonPathValue};
 use proc_macro2::TokenStream;
 use quote::ToTokens;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::ops::Deref;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -47,8 +46,9 @@ pub fn get_exceptions(
     parsed: &Value,
     comment: Option<&String>,
     rel_index: &crate::rel_index::RelIndex,
+    scope: &str,
 ) -> anyhow::Result<Vec<PgException>> {
-    get_exceptions_with_triggers(parsed, comment, rel_index, None, None)
+    get_exceptions_with_triggers(parsed, comment, rel_index, None, None, scope)
 }
 
 /// Get exceptions from a function body JSON parse with optional trigger analysis
@@ -58,16 +58,31 @@ pub fn get_exceptions_with_triggers(
     rel_index: &crate::rel_index::RelIndex,
     trigger_index: Option<&TriggerIndex>,
     errors_config: Option<&crate::config::ErrorsConfig>,
+    scope: &str,
 ) -> anyhow::Result<Vec<PgException>> {
-    let queries = extract_queries(&parsed);
+    let queries = extract_queries(parsed, scope);
 
-    let mut rel_deps = get_rel_deps(&queries, rel_index);
+    let mut rel_deps = get_rel_deps(&queries, rel_index, scope);
 
     // Populate trigger exceptions if trigger index is available
     if let Some(trigger_idx) = trigger_index {
         crate::pg_fn::populate_trigger_exceptions(&mut rel_deps, trigger_idx);
     }
 
+    get_exceptions_from_deps(parsed, &rel_deps, comment, rel_index, errors_config, scope)
+}
+
+/// Get exceptions from a function body JSON parse, given the relation
+/// dependencies already extracted from it (with trigger exceptions populated
+/// if the caller wants them).
+pub fn get_exceptions_from_deps(
+    parsed: &Value,
+    rel_deps: &[RelDep],
+    comment: Option<&String>,
+    rel_index: &crate::rel_index::RelIndex,
+    errors_config: Option<&crate::config::ErrorsConfig>,
+    scope: &str,
+) -> anyhow::Result<Vec<PgException>> {
     let constraints: Vec<&Constraint> = rel_deps
         .iter()
         .flat_map(|dep| {
@@ -142,7 +157,7 @@ pub fn get_exceptions_with_triggers(
         .collect();
 
     let (raised_sql_states, custom_errors) =
-        get_raised_sql_states_and_custom_errors(&parsed, errors_config)?;
+        get_raised_sql_states_and_custom_errors(parsed, errors_config, scope)?;
 
     let raised_exceptions = raised_sql_states
         .into_iter()
@@ -169,7 +184,7 @@ pub fn get_exceptions_with_triggers(
         .map(PgException::Constraint)
         .chain(raised_exceptions)
         .chain(custom_error_exceptions)
-        .chain(get_strict_exceptions(&parsed).into_iter())
+        .chain(get_strict_exceptions(parsed).into_iter())
         .chain(comment_exceptions.into_iter())
         .chain(trigger_exceptions.into_iter())
         .collect();
@@ -181,52 +196,15 @@ pub fn get_exceptions_with_triggers(
 fn get_raised_sql_states_and_custom_errors(
     fn_json: &Value,
     errors_config: Option<&crate::config::ErrorsConfig>,
+    scope: &str,
 ) -> anyhow::Result<(BTreeSet<SqlState>, BTreeSet<String>)> {
-    let err_raises = JsonPath::try_from("$..PLpgSQL_stmt_raise[?(@.elog_level == 21)].condname")?;
-
-    let code_as_option =
-    JsonPath::try_from("$..PLpgSQL_stmt_raise[?(@.elog_level == 21)]..PLpgSQL_raise_option[?(@.opt_type == 0)].expr.PLpgSQL_expr.query")?;
-
-    let binding = JsonPath::try_from("$..PLpgSQL_stmt_raise[?(@.elog_level == 21)]")?;
-    let errs = binding.find_slice(fn_json);
-
-    let err_count = if errs
-        .first()
-        .is_some_and(|e| matches!(e, JsonPathValue::NoValue))
-    {
-        0
-    } else {
-        errs.len()
-    };
-
-    let mut sql_states: BTreeSet<SqlState> = code_as_option
-        .find_slice(fn_json)
-        .into_iter()
-        .chain(err_raises.find_slice(fn_json).into_iter())
-        .filter(|x| x.has_value())
-        .map(|x| {
-            x.to_data()
-                .as_str()
-                .map(|s| match s.trim_matches('\'') {
-                    s => SYM_SQL_STATE_TO_CODE
-                        .get(s)
-                        .cloned()
-                        .unwrap_or_else(|| SqlState::from_code(s)),
-                })
-                .ok_or_else(|| anyhow!("Failed to parse sql state"))
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
-
-    // add P0001 code if errors exist w/o code
-    if err_count > sql_states.len() {
-        sql_states.insert(SqlState::default());
-    }
+    let sql_states = raised_sql_states(fn_json)?;
 
     // Detect custom errors if errors_config is provided using AST parsing
     let mut custom_errors = BTreeSet::new();
     if let Some(config) = errors_config {
         // Extract queries from the function JSON and parse them
-        let queries = crate::pg_fn::extract_queries(fn_json);
+        let queries = crate::pg_fn::extract_queries(fn_json, scope);
 
         // Use AST-based detection to find custom errors (and their optional SQLSTATEs)
         let found_errors = crate::pg_fn::extract_custom_errors_from_queries(&queries, config);
@@ -241,23 +219,125 @@ fn get_raised_sql_states_and_custom_errors(
             // The SQLSTATE will be determined by the raise_error call or RAISE statement
         }
 
-        // Also look for RAISE statements with HINT = 'application/json'
-        // These indicate JSON-formatted errors regardless of SQLSTATE
-        let hint_path = JsonPath::try_from("$..PLpgSQL_stmt_raise[?(@.elog_level == 21)]..PLpgSQL_raise_option[?(@.opt_type == 3)].expr.PLpgSQL_expr.query")?;
-        for hint_value in hint_path.find_slice(fn_json) {
-            if let Some(hint_str) = hint_value.to_data().as_str() {
-                if hint_str.trim_matches('\'') == "application/json" {
-                    // Found a RAISE with HINT = 'application/json'
-                    // The actual error type will be determined at runtime from the JSON message
-                    // But we know this function can raise custom errors
-                    #[cfg(test)]
-                    eprintln!("Found RAISE with HINT = 'application/json'");
+        // A hand-written `RAISE ... USING HINT = 'application/json', MESSAGE =
+        // jsonb_build_object('type', 'some_error', ...)` is the same contract
+        // as the raise helper; pick the type out of the literal.
+        custom_errors.extend(json_hint_raise_types(fn_json)?);
+    }
+
+    Ok((sql_states, custom_errors))
+}
+
+/// SQLSTATEs statically raised by `RAISE EXCEPTION` statements in a function.
+///
+/// Per statement: `RAISE condition_name` and `USING ERRCODE = 'XXXXX'` (or a
+/// quoted condition name) contribute that code; a `RAISE` with no `ERRCODE`
+/// contributes the default `P0001`. An `ERRCODE` that is an expression rather
+/// than a string literal (`USING ERRCODE = p_sqlstate`, as in a generic
+/// raise helper) is dynamic and contributes nothing, since any value is
+/// possible at runtime.
+fn raised_sql_states(fn_json: &Value) -> anyhow::Result<BTreeSet<SqlState>> {
+    let raise_path = JsonPath::try_from("$..PLpgSQL_stmt_raise")?;
+    let mut sql_states = BTreeSet::new();
+
+    for slice in raise_path.find_slice(fn_json) {
+        let JsonPathValue::Slice(stmt, _) = slice else { continue };
+        // 21 is ERROR; lower levels (NOTICE, WARNING, …) don't abort the call.
+        if stmt.get("elog_level").and_then(Value::as_i64) != Some(21) {
+            continue;
+        }
+
+        if let Some(condname) = stmt.get("condname").and_then(Value::as_str) {
+            sql_states.insert(sql_state_from_literal(condname));
+            continue;
+        }
+
+        // `USING ERRCODE = <expr>` is raise option type 0.
+        let errcode_expr = stmt
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o.get("PLpgSQL_raise_option"))
+            .find(|o| o.get("opt_type").and_then(Value::as_i64) == Some(0))
+            .and_then(|o| o.pointer("/expr/PLpgSQL_expr/query"))
+            .and_then(Value::as_str)
+            .map(str::trim);
+
+        match errcode_expr {
+            None => {
+                sql_states.insert(SqlState::default());
+            }
+            Some(expr) => {
+                let literal = expr
+                    .strip_prefix('\'')
+                    .and_then(|e| e.strip_suffix('\''));
+                match literal {
+                    Some(code) => {
+                        sql_states.insert(sql_state_from_literal(code));
+                    }
+                    None => log::debug!(
+                        "RAISE with dynamic ERRCODE `{}` contributes no static SQLSTATE",
+                        expr
+                    ),
                 }
             }
         }
     }
 
-    Ok((sql_states, custom_errors))
+    Ok(sql_states)
+}
+
+/// Error type names from `RAISE` statements that set `HINT = 'application/json'`
+/// and build their message with a literal `'type', '<name>'` pair.
+fn json_hint_raise_types(fn_json: &Value) -> anyhow::Result<BTreeSet<String>> {
+    static TYPE_LITERAL: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r#"'type'\s*,\s*'([A-Za-z_][A-Za-z0-9_]*)'"#).unwrap()
+    });
+
+    let raise_path = JsonPath::try_from("$..PLpgSQL_stmt_raise")?;
+    let mut names = BTreeSet::new();
+    for slice in raise_path.find_slice(fn_json) {
+        let JsonPathValue::Slice(stmt, _) = slice else { continue };
+        if stmt.get("elog_level").and_then(Value::as_i64) != Some(21) {
+            continue;
+        }
+        let options: Vec<&Value> = stmt
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o.get("PLpgSQL_raise_option"))
+            .collect();
+        let option_query = |opt_type: i64| {
+            options
+                .iter()
+                .find(|o| o.get("opt_type").and_then(Value::as_i64) == Some(opt_type))
+                .and_then(|o| o.pointer("/expr/PLpgSQL_expr/query"))
+                .and_then(Value::as_str)
+        };
+        // opt_type 3 is HINT, 1 is MESSAGE.
+        let is_json = option_query(3)
+            .map(|h| h.trim().trim_matches('\'') == "application/json")
+            .unwrap_or(false);
+        if !is_json {
+            continue;
+        }
+        if let Some(message) = option_query(1) {
+            for cap in TYPE_LITERAL.captures_iter(message) {
+                names.insert(cap[1].to_string());
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// `unique_violation` -> `23505`; anything else is taken as a literal code.
+fn sql_state_from_literal(s: &str) -> SqlState {
+    SYM_SQL_STATE_TO_CODE
+        .get(s)
+        .cloned()
+        .unwrap_or_else(|| SqlState::from_code(s))
 }
 
 fn get_strict_exceptions(parsed: &Value) -> Option<PgException> {
@@ -286,6 +366,57 @@ pub fn get_comment_exceptions(comment: &str) -> Vec<PgException> {
 mod test {
     use super::*;
     use pg_query::parse_plpgsql;
+
+    fn states_of(body: &str) -> BTreeSet<String> {
+        let def = format!(
+            "create function f() returns void language plpgsql as $$ begin {} end $$;",
+            body
+        );
+        raised_sql_states(&parse_plpgsql(&def).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|s| s.code().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn literal_errcode_does_not_also_add_p0001() {
+        assert_eq!(
+            states_of("raise exception 'nope' using errcode = 'P0002';"),
+            BTreeSet::from(["P0002".to_string()])
+        );
+    }
+
+    #[test]
+    fn bare_raise_is_p0001() {
+        assert_eq!(
+            states_of("raise exception 'nope';"),
+            BTreeSet::from(["P0001".to_string()])
+        );
+    }
+
+    #[test]
+    fn condition_names_map_to_codes() {
+        assert_eq!(
+            states_of("raise unique_violation; raise exception 'x' using errcode = 'check_violation';"),
+            BTreeSet::from(["23505".to_string(), "23514".to_string()])
+        );
+    }
+
+    #[test]
+    fn dynamic_errcode_contributes_nothing() {
+        // A generic raise helper: `using errcode = p_sqlstate`. Any code is
+        // possible at runtime, so no static variant must be invented.
+        let def = "create function f(p_sqlstate text) returns void language plpgsql as $$ \
+                   begin raise exception 'x' using errcode = p_sqlstate; end $$;";
+        let states = raised_sql_states(&parse_plpgsql(def).unwrap()).unwrap();
+        assert!(states.is_empty(), "{states:?}");
+    }
+
+    #[test]
+    fn notices_are_not_exceptions() {
+        assert!(states_of("raise notice 'just saying';").is_empty());
+    }
 
     #[test]
     fn test_strict_exception() {
@@ -341,7 +472,7 @@ mod test {
         "#;
 
         let (exceptions, _) =
-            get_raised_sql_states_and_custom_errors(&parse_plpgsql(fn_def)?, None)?;
+            get_raised_sql_states_and_custom_errors(&parse_plpgsql(fn_def)?, None, "test")?;
 
         assert_eq!(exceptions.len(), 5);
 
@@ -374,7 +505,7 @@ mod test {
         };
 
         let (_sql_states, custom_errors) =
-            get_raised_sql_states_and_custom_errors(&parsed, Some(&errors_config))?;
+            get_raised_sql_states_and_custom_errors(&parsed, Some(&errors_config), "test")?;
 
         // Should detect both custom error types
         assert!(
@@ -411,7 +542,7 @@ mod test {
         };
 
         let (sql_states, _custom_errors) =
-            get_raised_sql_states_and_custom_errors(&parsed, Some(&errors_config))?;
+            get_raised_sql_states_and_custom_errors(&parsed, Some(&errors_config), "test")?;
 
         // Should detect the SQLSTATE 23505 (unique violation)
         assert!(
@@ -443,7 +574,7 @@ mod test {
         };
 
         let (_sql_states, custom_errors) =
-            get_raised_sql_states_and_custom_errors(&parsed, Some(&errors_config))?;
+            get_raised_sql_states_and_custom_errors(&parsed, Some(&errors_config), "test")?;
 
         // Should detect the validation_error type
         assert!(
@@ -474,7 +605,7 @@ mod test {
         };
 
         let (_sql_states, custom_errors) =
-            get_raised_sql_states_and_custom_errors(&parsed, Some(&errors_config))?;
+            get_raised_sql_states_and_custom_errors(&parsed, Some(&errors_config), "test")?;
 
         // Should detect custom error with different function name
         assert!(
