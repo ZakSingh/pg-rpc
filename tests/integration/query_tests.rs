@@ -151,6 +151,8 @@ fn test_query_introspection() {
             None, // No trigger index for this test
             &domain_index,
             &composite_index,
+            None, // No function index: calls are not followed in this test
+            None, // No errors config
         );
 
         let introspected = introspector.introspect(client, parsed).unwrap();
@@ -232,6 +234,8 @@ WHERE u.id = :user_id;
             None, // No trigger index for this test
             &domain_index,
             &composite_index,
+            None, // No function index: calls are not followed in this test
+            None, // No errors config
         );
 
         let introspected = introspector.introspect(client, parsed).unwrap();

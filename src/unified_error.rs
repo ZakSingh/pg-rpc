@@ -110,7 +110,9 @@ pub fn collect_table_constraints(rel_index: &RelIndex) -> BTreeMap<PgId, Vec<Con
     table_constraints
 }
 
-/// Generates constraint enums for each table
+/// Generates constraint enums for each table, each with `name()`,
+/// `message()` and `field()` accessors and a `Display` that prints the
+/// Postgres constraint name.
 pub fn generate_constraint_enums(
     table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
 ) -> Vec<TokenStream> {
@@ -121,7 +123,7 @@ pub fn generate_constraint_enums(
         let table_name_pascal = table_name_str.to_pascal_case();
         let enum_name = quote::format_ident!("{}Constraint", table_name_pascal);
 
-        let mut variants = Vec::new();
+        let mut variants: Vec<(proc_macro2::Ident, &Constraint)> = Vec::new();
         let mut seen_names = BTreeSet::new();
 
         for constraint in constraints {
@@ -156,31 +158,165 @@ pub fn generate_constraint_enums(
 
             // Avoid duplicate variant names
             if seen_names.insert(variant_name.to_string()) {
-                variants.push(variant_name);
+                variants.push((variant_name, constraint));
             }
         }
 
-        if !variants.is_empty() {
-            let enum_def = quote! {
-                #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-                pub enum #enum_name {
-                    #(#variants),*
-                }
+        if variants.is_empty() {
+            continue;
+        }
 
-                impl std::fmt::Display for #enum_name {
-                    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        match self {
-                            #(#enum_name::#variants => write!(f, "{}", stringify!(#variants))),*
-                        }
+        let variant_idents: Vec<&proc_macro2::Ident> = variants.iter().map(|(v, _)| v).collect();
+        let name_arms = variants.iter().map(|(v, c)| {
+            let name = c.name();
+            let name = name.as_str();
+            quote! { #enum_name::#v => #name }
+        });
+        let message_arms = variants.iter().map(|(v, c)| match c.message() {
+            Some(m) => quote! { #enum_name::#v => Some(#m) },
+            None => quote! { #enum_name::#v => None },
+        });
+        let field_arms = variants.iter().map(|(v, c)| match c.field() {
+            Some(f) => quote! { #enum_name::#v => Some(#f) },
+            None => quote! { #enum_name::#v => None },
+        });
+
+        enums.push(quote! {
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            pub enum #enum_name {
+                #(#variant_idents),*
+            }
+
+            impl #enum_name {
+                /// The Postgres constraint name, as reported by
+                /// `DbError::constraint()`. Not-null variants, which have no
+                /// constraint object, use `<column>_not_null`.
+                pub fn name(&self) -> &'static str {
+                    match self {
+                        #(#name_arms),*
                     }
                 }
-            };
 
-            enums.push(enum_def);
-        }
+                /// The `@pgrpc_message` from the constraint's comment, if it has one.
+                pub fn message(&self) -> Option<&'static str> {
+                    match self {
+                        #(#message_arms),*
+                    }
+                }
+
+                /// The field the message belongs to: the single constrained
+                /// column, or the `@pgrpc_field` override. `None` for
+                /// multi-column constraints without an override and for
+                /// `@pgrpc_field()`.
+                pub fn field(&self) -> Option<&'static str> {
+                    match self {
+                        #(#field_arms),*
+                    }
+                }
+
+                /// `message()` and `field()` together, when the constraint is tagged.
+                pub fn user_message(&self) -> Option<ConstraintMessage> {
+                    Some(ConstraintMessage {
+                        message: self.message()?,
+                        field: self.field(),
+                    })
+                }
+            }
+
+            impl std::fmt::Display for #enum_name {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str(self.name())
+                }
+            }
+        });
     }
 
     enums
+}
+
+/// Generates `ConstraintMessage` and the name-keyed lookups
+/// `constraint_message(table, constraint)` and
+/// `domain_constraint_message(domain, constraint)` over every tagged
+/// constraint, for errors that did not get a typed variant.
+pub fn generate_constraint_message_lookup(
+    table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
+) -> TokenStream {
+    // (table, constraint) -> (message, field); first schema wins on a clash.
+    let mut table_entries: BTreeMap<(String, String), (String, Option<String>)> = BTreeMap::new();
+    // (domain, constraint) -> message
+    let mut domain_entries: BTreeMap<(String, String), String> = BTreeMap::new();
+
+    for (table_id, constraints) in table_constraints {
+        for constraint in constraints {
+            let Some(message) = constraint.message() else { continue };
+            match constraint {
+                Constraint::Domain(d) => {
+                    let Some(domain) = &d.domain else { continue };
+                    domain_entries
+                        .entry((domain.clone(), d.name.to_string()))
+                        .or_insert(message);
+                }
+                _ => {
+                    let key = (table_id.name().to_string(), constraint.name().to_string());
+                    let value = (message, constraint.field());
+                    if let Some(existing) = table_entries.get(&key) {
+                        if *existing != value {
+                            log::warn!(
+                                "Constraint {}.{} is tagged with different messages in two schemas; using the first",
+                                key.0, key.1
+                            );
+                        }
+                        continue;
+                    }
+                    table_entries.insert(key, value);
+                }
+            }
+        }
+    }
+
+    let table_arms = table_entries.iter().map(|((table, constraint), (message, field))| {
+        let field = match field {
+            Some(f) => quote! { Some(#f) },
+            None => quote! { None },
+        };
+        quote! {
+            (#table, #constraint) => Some(ConstraintMessage { message: #message, field: #field })
+        }
+    });
+    let domain_arms = domain_entries.iter().map(|((domain, constraint), message)| {
+        quote! {
+            (#domain, #constraint) => Some(ConstraintMessage { message: #message, field: None })
+        }
+    });
+
+    quote! {
+        /// A user-facing message attached to a constraint with `@pgrpc_message`,
+        /// and the form field it belongs to (see `@pgrpc_field`).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct ConstraintMessage {
+            pub message: &'static str,
+            /// `None` means the message is form-level rather than tied to a field.
+            pub field: Option<&'static str>,
+        }
+
+        /// `(table, constraint)` -> message, for every tagged table constraint.
+        /// Keyed by the bare names `DbError::table()` and `DbError::constraint()` report.
+        pub fn constraint_message(table: &str, constraint: &str) -> Option<ConstraintMessage> {
+            match (table, constraint) {
+                #(#table_arms,)*
+                _ => None,
+            }
+        }
+
+        /// `(domain, constraint)` -> message, for every tagged domain CHECK.
+        /// Keyed by `DbError::datatype()` and `DbError::constraint()`.
+        pub fn domain_constraint_message(domain: &str, constraint: &str) -> Option<ConstraintMessage> {
+            match (domain, constraint) {
+                #(#domain_arms,)*
+                _ => None,
+            }
+        }
+    }
 }
 
 /// Generates the unified PgRpcError enum (without wrapper)
@@ -237,8 +373,8 @@ pub fn generate_unified_error(
     // Add custom error variant if errors config is present
     if config.errors.is_some() {
         error_variants.push(quote! {
-            #[error("Custom error")]
-            CustomError(super::custom_errors::CustomError)
+            #[error("{0:?}")]
+            CustomError(super::custom_errors::CustomError, #[source] tokio_postgres::error::DbError)
         });
     }
 
@@ -519,12 +655,15 @@ pub fn generate_as_db_error_impl(
         }
     }
 
-    let custom_arms: Vec<TokenStream> = custom_variant_names
+    let mut custom_arms: Vec<TokenStream> = custom_variant_names
         .iter()
         .map(|variant_name| {
             quote! { PgRpcError::#variant_name(db_error) => Some(db_error) }
         })
         .collect();
+    if config.errors.is_some() {
+        custom_arms.push(quote! { PgRpcError::CustomError(_, db_error) => Some(db_error) });
+    }
 
     quote! {
         impl AsDbError for PgRpcError {
@@ -556,10 +695,12 @@ mod tests {
 
         let users_constraints = vec![
             Constraint::Unique(UniqueConstraint {
+                comment: None,
                 name: ustr("users_email_key"),
                 columns: SmallVec::from_slice(&[ustr("email")]),
             }),
             Constraint::Check(CheckConstraint {
+                comment: None,
                 name: ustr("users_age_check"),
                 columns: SmallVec::from_slice(&[ustr("age")]),
                 check_expression: None,
@@ -588,6 +729,7 @@ mod tests {
         let mut table_constraints = BTreeMap::new();
 
         let users_constraints = vec![Constraint::Unique(UniqueConstraint {
+            comment: None,
             name: ustr("users_email_key"),
             columns: SmallVec::from_slice(&[ustr("email")]),
         })];
@@ -636,6 +778,7 @@ mod tests {
             id: PgId::new(Some(ustr("public")), ustr("users")),
             kind: PgRelKind::Table,
             constraints: vec![Constraint::Unique(UniqueConstraint {
+                comment: None,
                 name: ustr("users_email_key"),
                 columns: SmallVec::from_slice(&[ustr("email")]),
             })],

@@ -652,12 +652,13 @@ fn generate_unified_errors(
 
     // Collect all custom exceptions from functions
     let mut all_exceptions = BTreeSet::new();
-    for pg_fn in fn_index.deref().values() {
+    for pg_fn in fn_index.codegen_fns() {
         all_exceptions.extend(pg_fn.exceptions.iter().cloned());
     }
 
-    // Generate constraint enums
+    // Generate constraint enums and the name-keyed message lookup
     let constraint_enums = unified_error::generate_constraint_enums(&table_constraints);
+    let constraint_lookup = unified_error::generate_constraint_message_lookup(&table_constraints);
 
     // Generate the unified error type
     let error_enum =
@@ -731,10 +732,31 @@ fn generate_unified_errors(
             fn routine(&self) -> Option<&str> {
                 self.as_db_error().and_then(|e| e.routine())
             }
+
+            /// The `@pgrpc_message` of the violated constraint, if the
+            /// constraint carries one, looked up by the table (or domain) and
+            /// constraint names on the underlying `DbError`. Works for every
+            /// generated error enum, including violations that surfaced as
+            /// `Other(PgRpcError)` without a typed variant.
+            fn user_message(&self) -> Option<ConstraintMessage> {
+                let db = self.as_db_error()?;
+                let constraint = db.constraint()?;
+                if let Some(table) = db.table() {
+                    if let Some(found) = constraint_message(table, constraint) {
+                        return Some(found);
+                    }
+                }
+                if let Some(datatype) = db.datatype() {
+                    return domain_constraint_message(datatype, constraint);
+                }
+                None
+            }
         }
 
         /// Blanket implementation of PgRpcErrorExt for all types that implement AsDbError
         impl<T: AsDbError> PgRpcErrorExt for T {}
+
+        #constraint_lookup
 
         #(#constraint_enums)*
 
@@ -752,8 +774,7 @@ fn codegen_fns(
     _all_exceptions: &BTreeSet<PgException>,
 ) -> BTreeMap<SchemaName, TokenStream> {
     let schemas: BTreeMap<&str, Vec<&PgFn>> = fns
-        .deref()
-        .values()
+        .codegen_fns()
         .into_group_map_by(|f| f.schema.as_str())
         .into_iter()
         .collect();
@@ -783,8 +804,7 @@ fn codegen_fns_with_refs(
     let mut schema_refs: BTreeMap<SchemaName, BTreeSet<SchemaName>> = BTreeMap::new();
 
     let schemas: BTreeMap<&str, Vec<&PgFn>> = fns
-        .deref()
-        .values()
+        .codegen_fns()
         .into_group_map_by(|f| f.schema.as_str())
         .into_iter()
         .collect();
@@ -1561,14 +1581,67 @@ fn generate_query_error_enum(
         }
     }
 
+    // Typed errors (errors-schema payloads) raised by functions this query calls.
+    let mut custom_error_arms = Vec::new();
+    for exception in &query.exceptions {
+        let PgException::CustomError(error_name) = exception else { continue };
+        let variant_name = sql_to_rs_ident(error_name, CaseType::Pascal);
+        if !handled_exceptions.insert(variant_name.to_string()) {
+            continue;
+        }
+        let struct_name = variant_name.clone();
+        let error_name_str = error_name.as_str();
+
+        error_variants.push(quote! {
+            #[error("{}", #error_name_str)]
+            #variant_name(super::custom_errors::#struct_name, #[source] tokio_postgres::error::DbError)
+        });
+        to_pgrpc_arms.push(quote! {
+            #error_enum_name::#variant_name(payload, db_error) => {
+                super::errors::PgRpcError::CustomError(
+                    super::custom_errors::CustomError::#variant_name(payload),
+                    db_error,
+                )
+            }
+        });
+        as_db_error_arms.push(quote! {
+            #error_enum_name::#variant_name(_, db_error) => Some(db_error)
+        });
+        custom_error_arms.push(quote! {
+            Some(#error_name_str) => {
+                if let Ok(payload) = serde_json::from_value(json.clone()) {
+                    #error_enum_name::#variant_name(payload, db_error.to_owned())
+                } else {
+                    #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                }
+            }
+        });
+    }
+
     // Add catch-all Other variant
     error_variants.push(quote! {
         #[error(transparent)]
         Other(super::errors::PgRpcError)
     });
 
-    // Build match arms for From<tokio_postgres::Error>
+    // Build match arms for From<tokio_postgres::Error>. The JSON-hint arm
+    // leads: a typed error is identified by its hint regardless of SQLSTATE.
     let mut all_from_arms = Vec::new();
+
+    if !custom_error_arms.is_empty() {
+        all_from_arms.push(quote! {
+            _code if db_error.hint() == Some("application/json") => {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(db_error.message()) {
+                    match json.get("type").and_then(|t| t.as_str()) {
+                        #(#custom_error_arms,)*
+                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                    }
+                } else {
+                    #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                }
+            },
+        });
+    }
 
     if !unique_arms.is_empty() {
         all_from_arms.push(quote! {

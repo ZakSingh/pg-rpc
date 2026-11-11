@@ -24,7 +24,10 @@ from pg_proc p
          left join pg_description d on d.objoid = p.oid
 where p.prokind in ('f', 'p')  -- Include both functions and procedures
   and l.lanname in ('plpgsql', 'sql')
-  and n.nspname  = any($1)  --not in ('pg_catalog', 'information_schema')
+  -- Every user schema is indexed so that calls from a generated function into a
+  -- helper elsewhere (e.g. `core.*`) can be followed. Which schemas get Rust
+  -- output is decided later by `FunctionIndex::codegen_fns`.
+  and n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
   and not exists ( select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e' )
   and not exists (select 1 from pg_trigger where tgfoid = p.oid)  -- No triggers
 order by n.nspname, p.proname;

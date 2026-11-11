@@ -1,5 +1,5 @@
 use crate::codegen::OID;
-use crate::exceptions::{get_exceptions, PgException};
+use crate::exceptions::{get_exceptions_with_triggers, PgException};
 use crate::rel_index::RelIndex;
 use pg_query::parse_plpgsql;
 use postgres::Client;
@@ -61,7 +61,15 @@ pub struct TriggerIndex {
 
 impl TriggerIndex {
     /// Create a new trigger index by querying the database
-    pub fn new(db: &mut Client, rel_index: &RelIndex, schemas: &[String]) -> anyhow::Result<Self> {
+    ///
+    /// Covers tables in every user schema: a generated function may write to a
+    /// table outside the codegen schemas (directly or via a helper), and the
+    /// triggers on that table can still fail the call.
+    pub fn new(
+        db: &mut Client,
+        rel_index: &RelIndex,
+        errors_config: Option<&crate::config::ErrorsConfig>,
+    ) -> anyhow::Result<Self> {
         let trigger_sql = include_str!("./queries/trigger_introspection.sql");
 
         let mut triggers_by_table: HashMap<OID, Vec<Trigger>> = HashMap::new();
@@ -69,13 +77,6 @@ impl TriggerIndex {
         let rows = db.query(trigger_sql, &[])?;
 
         for row in rows {
-            let schema_name: String = row.get("schema_name");
-
-            // Only include triggers on tables in the requested schemas
-            if !schemas.contains(&schema_name) {
-                continue;
-            }
-
             // Postgres `oid` columns deserialize as `u32`, not `i32` —
             // postgres-rust rejects the i32 conversion for oid types.
             let table_oid: OID = row.get("table_oid");
@@ -123,6 +124,8 @@ impl TriggerIndex {
                 &function_source,
                 function_comment.as_ref(),
                 rel_index,
+                errors_config,
+                &format!("trigger function {function_schema}.{function_name}"),
             )
             .unwrap_or_else(|_| Vec::new());
 
@@ -188,6 +191,8 @@ impl TriggerIndex {
         source: &str,
         comment: Option<&String>,
         rel_index: &RelIndex,
+        errors_config: Option<&crate::config::ErrorsConfig>,
+        scope: &str,
     ) -> anyhow::Result<Vec<PgException>> {
         // Create a mock function definition for parsing
         let function_def = format!(
@@ -199,7 +204,7 @@ impl TriggerIndex {
         match parse_plpgsql(&function_def) {
             Ok(parsed) => {
                 // Use existing exception analysis logic
-                get_exceptions(&parsed, comment, rel_index)
+                get_exceptions_with_triggers(&parsed, comment, rel_index, None, errors_config, scope)
             }
             Err(_) => {
                 // If parsing fails, try to extract basic RAISE statements with regex

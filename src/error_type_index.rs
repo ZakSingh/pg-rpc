@@ -1,4 +1,4 @@
-use crate::codegen::{ToRust, OID};
+use crate::codegen::OID;
 use crate::config::ErrorsConfig;
 use crate::ident::{sql_to_rs_ident, CaseType};
 use crate::ty_index::TypeIndex;
@@ -8,7 +8,7 @@ use postgres::Client;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 const ERROR_TYPE_INTROSPECTION_QUERY: &str = include_str!("./queries/error_type_introspection.sql");
@@ -140,13 +140,17 @@ pub fn collect_error_type_oids(
     Ok(type_oids.into_iter().collect())
 }
 
-/// Generate error payload struct definitions
+/// Generate error payload struct definitions.
+///
+/// Returns the structs and the set of schema modules their field types live
+/// in, so the caller can emit `use super::<schema>;` for them.
 pub fn generate_error_payload_structs(
     error_index: &ErrorTypeIndex,
     ty_index: &TypeIndex,
     config: &crate::config::Config,
-) -> TokenStream {
+) -> (TokenStream, BTreeSet<String>) {
     let mut structs = Vec::new();
+    let mut referenced_schemas = BTreeSet::new();
 
     for error_type in error_index.values() {
         let struct_name = format_ident!("{}", error_type.error_name.to_pascal_case());
@@ -157,11 +161,16 @@ pub fn generate_error_payload_structs(
             .map(|field| {
                 let field_name = sql_to_rs_ident(&field.name, CaseType::Snake);
                 let pg_name = &field.name;
-                let base_field_type = ty_index
-                    .deref()
-                    .get(&field.type_oid)
-                    .map(|pg_type| pg_type.to_rust(ty_index.deref(), config))
-                    .unwrap_or_else(|| quote! { serde_json::Value });
+                // A *reference* to the field's Rust type (`i32`, `String`,
+                // `super::api::Thing`), not its definition.
+                let base_field_type = match ty_index.deref().get(&field.type_oid) {
+                    Some(pg_type) => {
+                        let (tokens, schemas) = pg_type.to_rust_ident_with_schemas(ty_index.deref());
+                        referenced_schemas.extend(schemas);
+                        tokens
+                    }
+                    None => quote! { serde_json::Value },
+                };
 
                 let (field_type, is_nullable) = if field.not_null {
                     (base_field_type, false)
@@ -211,9 +220,12 @@ pub fn generate_error_payload_structs(
         });
     }
 
-    quote! {
-        #(#structs)*
-    }
+    (
+        quote! {
+            #(#structs)*
+        },
+        referenced_schemas,
+    )
 }
 
 /// Generate an enum of all error types for pattern matching

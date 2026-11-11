@@ -1282,6 +1282,7 @@ mod tests {
             id: PgId::new(Some(ustr("public")), ustr("help_center_article")),
             kind: PgRelKind::Table,
             constraints: vec![Constraint::Unique(UniqueConstraint {
+                comment: None,
                 name: ustr("help_center_article_section_slug_idx"),
                 columns: smallvec![ustr("section"), ustr("slug")],
             })],
@@ -1516,6 +1517,7 @@ mod tests {
             id: PgId::new(Some(ustr("public")), ustr("orders")),
             kind: PgRelKind::Table,
             constraints: vec![Constraint::PrimaryKey(PrimaryKeyConstraint {
+                comment: None,
                 name: ustr("orders_pkey"),
                 columns: smallvec![ustr("order_id")],
             })],
@@ -1530,6 +1532,7 @@ mod tests {
             id: PgId::new(Some(ustr("public")), ustr("customers")),
             kind: PgRelKind::Table,
             constraints: vec![Constraint::PrimaryKey(PrimaryKeyConstraint {
+                comment: None,
                 name: ustr("customers_pkey"),
                 columns: smallvec![ustr("customer_id")],
             })],
@@ -1600,6 +1603,7 @@ mod tests {
             id: PgId::new(Some(ustr("public")), ustr("users")),
             kind: PgRelKind::Table,
             constraints: vec![Constraint::PrimaryKey(PrimaryKeyConstraint {
+                comment: None,
                 name: ustr("users_pkey"),
                 columns: smallvec![ustr("user_id")],
             })],
@@ -1703,10 +1707,12 @@ mod tests {
             kind: PgRelKind::Table,
             constraints: vec![
                 Constraint::PrimaryKey(PrimaryKeyConstraint {
+                    comment: None,
                     name: ustr("orders_pkey"),
                     columns: smallvec![ustr("order_id")],
                 }),
                 Constraint::ForeignKey(ForeignKeyConstraint {
+                    comment: None,
                     name: ustr("orders_customer_id_fkey"),
                     columns: smallvec![ustr("customer_id")],
                     on_delete: OnDelete::NoAction,
@@ -1738,6 +1744,7 @@ mod tests {
             id: PgId::new(Some(ustr("public")), ustr("products")),
             kind: PgRelKind::Table,
             constraints: vec![Constraint::PrimaryKey(PrimaryKeyConstraint {
+                comment: None,
                 name: ustr("products_pkey"),
                 columns: smallvec![ustr("product_id")],
             })],
@@ -1753,10 +1760,12 @@ mod tests {
             kind: PgRelKind::Table,
             constraints: vec![
                 Constraint::PrimaryKey(PrimaryKeyConstraint {
+                    comment: None,
                     name: ustr("order_items_pkey"),
                     columns: smallvec![ustr("item_id")],
                 }),
                 Constraint::ForeignKey(ForeignKeyConstraint {
+                    comment: None,
                     name: ustr("order_items_order_id_fkey"),
                     columns: smallvec![ustr("order_id")],
                     on_delete: OnDelete::Cascade,
@@ -1764,6 +1773,7 @@ mod tests {
                     ref_columns: Some(smallvec![ustr("order_id")]),
                 }),
                 Constraint::ForeignKey(ForeignKeyConstraint {
+                    comment: None,
                     name: ustr("order_items_product_id_fkey"),
                     columns: smallvec![ustr("product_id")],
                     on_delete: OnDelete::Restrict,

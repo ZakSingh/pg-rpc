@@ -16,6 +16,7 @@ use std::time::Instant;
 pub use crate::config::{ErrorsConfig, QueriesConfig, TaskQueueConfig, TracingConfig};
 
 pub mod annotations;
+pub mod call_graph;
 pub mod cardinality_inference;
 mod codegen;
 mod column_grouping;
@@ -349,9 +350,16 @@ impl PgrpcBuilder {
         // `(col).attr` projections.
         let composite_index = composite_index::CompositeIndex::new(&mut db.client)?;
         let trigger_index =
-            trigger_index::TriggerIndex::new(&mut db.client, &rel_index, &config.schemas)?;
-        let mut fn_index =
-            FunctionIndex::new(&mut db.client, &rel_index, &trigger_index, &config.schemas)?;
+            trigger_index::TriggerIndex::new(&mut db.client, &rel_index, config.errors.as_ref())?;
+        // Indexes every user schema (so calls into helpers elsewhere can be
+        // followed); only `config.schemas` get Rust output.
+        let mut fn_index = FunctionIndex::new(
+            &mut db.client,
+            &rel_index,
+            &trigger_index,
+            &config.schemas,
+            config.errors.as_ref(),
+        )?;
 
         // Collect type OIDs from functions, task types, and error types
         let mut type_oids = fn_index.get_type_oids();
@@ -400,6 +408,8 @@ impl PgrpcBuilder {
                 Some(&trigger_index),
                 &domain_index,
                 &composite_index,
+                Some(&fn_index),
+                config.errors.as_ref(),
             )?;
 
             // Collect query type OIDs
@@ -608,9 +618,17 @@ fn generate_error_code(
         errors: Some(errors_config.clone()),
         ..Default::default()
     };
-    let payload_structs =
+    let (payload_structs, referenced_schemas) =
         error_type_index::generate_error_payload_structs(&error_index, ty_index, &config);
     let error_enum = error_type_index::generate_error_type_enum(&error_index);
+    let schema_imports: Vec<TokenStream> = referenced_schemas
+        .iter()
+        .filter(|s: &&String| s.as_str() != "custom_errors")
+        .map(|s| {
+            let ident = quote::format_ident!("{}", crate::ident::sql_to_rs_ident(s, crate::ident::CaseType::Snake).to_string());
+            quote::quote! { use super::#ident; }
+        })
+        .collect();
 
     let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
 
@@ -621,6 +639,7 @@ fn generate_error_code(
             use uuid;
             use rust_decimal;
             use std::net::IpAddr;
+            #(#schema_imports)*
 
             #payload_structs
 

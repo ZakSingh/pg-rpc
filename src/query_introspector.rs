@@ -1,6 +1,9 @@
 use crate::cardinality_inference::CardinalityAnalyzer;
 use crate::codegen::OID;
-use crate::constraint_analysis::analyze_sql_for_constraints;
+use crate::call_graph;
+use crate::constraint_analysis::{constraints_from_deps, sql_rel_deps};
+use crate::fn_index::FunctionIndex;
+use itertools::Itertools;
 use crate::exceptions::PgException;
 use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
@@ -58,6 +61,12 @@ pub struct QueryIntrospector<'a> {
     trigger_index: Option<&'a TriggerIndex>,
     domain_index: &'a crate::domain_index::DomainIndex,
     composite_index: &'a crate::composite_index::CompositeIndex,
+    /// When given, functions the query calls contribute their exceptions and
+    /// DML targets to the query's error enum (see `FunctionIndex::follow_calls`).
+    fn_index: Option<&'a FunctionIndex>,
+    /// Typed-error configuration, so direct calls to the raise helper in a
+    /// query are detected.
+    errors_config: Option<&'a crate::config::ErrorsConfig>,
 }
 
 impl<'a> QueryIntrospector<'a> {
@@ -67,6 +76,8 @@ impl<'a> QueryIntrospector<'a> {
         trigger_index: Option<&'a TriggerIndex>,
         domain_index: &'a crate::domain_index::DomainIndex,
         composite_index: &'a crate::composite_index::CompositeIndex,
+        fn_index: Option<&'a FunctionIndex>,
+        errors_config: Option<&'a crate::config::ErrorsConfig>,
     ) -> Self {
         Self {
             rel_index,
@@ -74,7 +85,62 @@ impl<'a> QueryIntrospector<'a> {
             trigger_index,
             domain_index,
             composite_index,
+            fn_index,
+            errors_config,
         }
+    }
+
+    /// Exceptions and per-table constraints for a query: its own DML plus
+    /// everything reachable through the functions it calls.
+    fn analyze_errors(
+        &self,
+        query_name: &str,
+        sql: &str,
+    ) -> (Vec<PgException>, BTreeMap<PgId, Vec<Constraint>>) {
+        let parsed = match pg_query::parse(sql) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!(
+                    "Query {}: failed to parse SQL for error analysis: {}",
+                    query_name,
+                    e
+                );
+                return (Vec::new(), BTreeMap::new());
+            }
+        };
+
+        let mut rel_deps = sql_rel_deps(&parsed, self.rel_index, self.trigger_index, query_name);
+        let mut exceptions = Vec::new();
+
+        if let Some(cfg) = self.errors_config {
+            exceptions.extend(
+                crate::pg_fn::extract_custom_errors_from_queries(std::slice::from_ref(&parsed), cfg)
+                    .into_iter()
+                    .map(PgException::CustomError),
+            );
+        }
+
+        if let Some(fn_index) = self.fn_index {
+            for target in call_graph::sql_callees(&parsed) {
+                // Query files have no schema of their own; unqualified names
+                // resolve in `public`.
+                let Some(callee) = fn_index.resolve(&target, None) else { continue };
+                log::debug!(
+                    "Query {} calls {}.{}; folding its errors in",
+                    query_name,
+                    callee.schema,
+                    callee.name
+                );
+                // Callee data is already transitive after `follow_calls`.
+                exceptions.extend(callee.exceptions.iter().cloned());
+                rel_deps.extend(callee.rel_deps.iter().cloned());
+            }
+        }
+
+        let (own_exceptions, table_dependencies) = constraints_from_deps(&rel_deps, self.rel_index);
+        exceptions.extend(own_exceptions);
+        let exceptions = exceptions.into_iter().unique().collect();
+        (exceptions, table_dependencies)
     }
 
     /// Introspect a parsed query to determine parameter and return types
@@ -175,7 +241,7 @@ impl<'a> QueryIntrospector<'a> {
         // Get return columns using statement metadata
         let return_columns = match final_query_type {
             QueryType::One | QueryType::Opt | QueryType::Many => {
-                let mut cols = self.introspect_return_columns_from_stmt(&stmt, &parsed.postgres_sql)?;
+                let mut cols = self.introspect_return_columns_from_stmt(&parsed.name, &stmt, &parsed.postgres_sql)?;
                 // `-- @pgrpc_not_null(col1, col2)` lets the user assert NOT NULL
                 // on columns whose nullability we couldn't (or won't) prove —
                 // unnest output, jsonb_to_recordset values, lateral subqueries,
@@ -197,12 +263,9 @@ impl<'a> QueryIntrospector<'a> {
             QueryType::Exec | QueryType::ExecRows => None,
         };
 
-        // Analyze exceptions and table dependencies
-        let (exceptions, table_dependencies) = analyze_sql_for_constraints(
-            &parsed.postgres_sql,
-            self.rel_index,
-            self.trigger_index,
-        );
+        // Analyze exceptions and table dependencies, following function calls
+        let (exceptions, table_dependencies) =
+            self.analyze_errors(&parsed.name, &parsed.postgres_sql);
 
         // No need to DEALLOCATE - Statement is dropped automatically
 
@@ -222,6 +285,7 @@ impl<'a> QueryIntrospector<'a> {
     /// Introspect return columns using the prepared statement metadata
     fn introspect_return_columns_from_stmt(
         &self,
+        query_name: &str,
         stmt: &postgres::Statement,
         sql: &str,
     ) -> Result<Vec<QueryColumn>> {
@@ -254,7 +318,7 @@ impl<'a> QueryIntrospector<'a> {
         }
 
         // Apply nullability analysis
-        if let Some(refined_columns) = self.refine_nullability(sql, &columns)? {
+        if let Some(refined_columns) = self.refine_nullability(query_name, sql, &columns)? {
             log::debug!(
                 "[INTROSPECT] After refine_nullability: {} columns",
                 refined_columns.len()
@@ -271,7 +335,7 @@ impl<'a> QueryIntrospector<'a> {
 
     /// Refine column nullability and types using ViewNullabilityAnalyzer or DML table analysis.
     /// Also looks up actual column types from the table schema to preserve domain types.
-    fn refine_nullability(&self, sql: &str, columns: &[QueryColumn]) -> Result<Option<Vec<QueryColumn>>> {
+    fn refine_nullability(&self, query_name: &str, sql: &str, columns: &[QueryColumn]) -> Result<Option<Vec<QueryColumn>>> {
         log::info!("[REFINE] Starting nullability refinement for query: {}", sql);
         log::info!("[REFINE] Input columns:");
         for col in columns {
@@ -279,7 +343,7 @@ impl<'a> QueryIntrospector<'a> {
         }
 
         // First, try to refine using DML target table (for INSERT/UPDATE/DELETE with RETURNING)
-        if let Some(refined) = self.refine_nullability_from_dml_target(sql, columns)? {
+        if let Some(refined) = self.refine_nullability_from_dml_target(query_name, sql, columns)? {
             log::info!("[REFINE] DML target analysis succeeded");
             return Ok(Some(refined));
         }
@@ -368,7 +432,7 @@ impl<'a> QueryIntrospector<'a> {
                 Ok(Some(refined_columns))
             }
             Err(e) => {
-                log::warn!("[REFINE] Could not apply nullability analysis: {}", e);
+                log::warn!("Query {query_name}: could not apply nullability analysis, columns stay nullable: {}", e);
                 Ok(None)
             }
         }
@@ -741,6 +805,7 @@ impl<'a> QueryIntrospector<'a> {
     /// Refine nullability and types for INSERT/UPDATE/DELETE RETURNING by looking at the target table
     fn refine_nullability_from_dml_target(
         &self,
+        query_name: &str,
         sql: &str,
         columns: &[QueryColumn],
     ) -> Result<Option<Vec<QueryColumn>>> {
@@ -760,7 +825,7 @@ impl<'a> QueryIntrospector<'a> {
         let table_rel = match table_rel {
             Some(rel) => rel,
             None => {
-                log::warn!("[REFINE-DML] Could not find table '{}' in rel_index", target_table);
+                log::warn!("Query {query_name}: DML target table '{}' not found in relation index", target_table);
                 return Ok(None);
             }
         };

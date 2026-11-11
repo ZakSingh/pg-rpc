@@ -15,6 +15,35 @@ static NULLABLE_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"@pgrpc_nullable\(([^)]+)\)").unwrap()
 });
 
+static MESSAGE_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"@pgrpc_message[ \t]+([^\r\n]*)").unwrap());
+
+static FIELD_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"@pgrpc_field\(([^)]*)\)").unwrap());
+
+/// Parse `@pgrpc_message <text to end of line>` from a constraint comment.
+pub fn parse_message(comment: &str) -> Option<String> {
+    MESSAGE_REGEX
+        .captures(comment)
+        .and_then(|cap| cap.get(1))
+        .map(|m| m.as_str().trim().to_string())
+        .filter(|m| !m.is_empty())
+}
+
+/// Parse `@pgrpc_field(name)` / `@pgrpc_field()` from a constraint comment.
+///
+/// `None`: no tag. `Some(None)`: `@pgrpc_field()`, i.e. explicitly no field
+/// (form-level). `Some(Some(name))`: the field to attribute the message to.
+pub fn parse_field(comment: &str) -> Option<Option<String>> {
+    FIELD_REGEX.captures(comment).map(|cap| {
+        let name = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    })
+}
+
 /// Parse @pgrpc_not_null(col1, col2, ...) from a comment string
 pub fn parse_not_null(comment: &str) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
@@ -78,6 +107,21 @@ pub fn has_strict(comment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_runs_to_end_of_line_and_is_optional() {
+        let c = "Printed on the certificate, where there is room.\n\n  @pgrpc_message Title must be 60 characters or fewer  \n@pgrpc_field(title)";
+        assert_eq!(parse_message(c).as_deref(), Some("Title must be 60 characters or fewer"));
+        assert_eq!(parse_message("just prose, no tag"), None);
+        assert_eq!(parse_message("@pgrpc_message   "), None);
+    }
+
+    #[test]
+    fn field_tag_three_states() {
+        assert_eq!(parse_field("no tag here"), None);
+        assert_eq!(parse_field("@pgrpc_field()"), Some(None));
+        assert_eq!(parse_field("@pgrpc_field( promo_code )"), Some(Some("promo_code".to_string())));
+    }
 
     #[test]
     fn test_parse_not_null_single() {

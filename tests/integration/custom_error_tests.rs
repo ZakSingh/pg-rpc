@@ -1,6 +1,17 @@
 use super::*;
 use tempfile::TempDir;
-use crate::integration::compile_helpers::read_pretty;
+use crate::integration::compile_helpers::{
+    assert_compilation_success, compile_project, create_test_cargo_project_with, read_pretty,
+};
+
+/// Strip whitespace (and the trailing comma prettyplease adds before a
+/// closing paren when it wraps) so substring checks survive formatting.
+fn compact(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .replace(",)", ")")
+}
 
 #[test]
 fn test_custom_error_types() {
@@ -166,15 +177,30 @@ fn test_custom_error_types() {
         let core_content =
             read_pretty(output_path.join("core.rs"));
 
-        // Verify function error enums include custom error variants
+        // Hand-written `RAISE ... USING HINT = 'application/json', MESSAGE =
+        // jsonb_build_object('type', '<name>', …)` is detected from the literal.
+        let core_compact = compact(&core_content);
         assert!(
-            core_content.contains("ValidateUserError")
-                || core_content.contains("validate_user_error"),
-            "Should generate error enum for validate_user function"
+            core_compact.contains(&compact(
+                "ValidationError(super::custom_errors::ValidationError, #[source] tokio_postgres::error::DbError)"
+            )),
+            "validate_user should carry the typed payload and the DbError:\n{core_content}"
         );
-
-        // The function should detect the custom error usage even without explicit type casting
-        // due to the SQLSTATE 'M0000' detection
+        assert!(
+            core_compact.contains("AuthorizationError(super::custom_errors::AuthorizationError"),
+            "check_authorization should carry its typed payload:\n{core_content}"
+        );
+        // The JSON-hint arm leads the From<tokio_postgres::Error> match.
+        let validate_from = core_content
+            .find("impl From<tokio_postgres::Error> for ValidateUserError")
+            .expect("From impl");
+        let hint_pos = core_content[validate_from..]
+            .find("db_error.hint() == Some(\"application/json\")")
+            .expect("hint arm");
+        let code_pos = core_content[validate_from..]
+            .find("SqlState::from_code(")
+            .unwrap_or(usize::MAX);
+        assert!(hint_pos < code_pos, "typed arm must precede SQLSTATE arms");
 
         println!("Custom error types test completed successfully!");
     });
@@ -224,7 +250,8 @@ fn test_custom_error_json_deserialization() {
         )
         .expect("Should create raise_error procedure");
 
-        // Create a function that uses the raise_error procedure
+        // Create a function that uses the raise_error procedure, a caller of
+        // it in another schema, and a trigger that raises the same way.
         execute_sql(
             client,
             r#"
@@ -238,21 +265,58 @@ fn test_custom_error_json_deserialization() {
                 RETURN TRUE;
             END;
             $$;
+
+            CREATE SCHEMA IF NOT EXISTS api;
+            CREATE OR REPLACE FUNCTION api.publish_item(p_item_id INTEGER)
+            RETURNS BOOLEAN
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                RETURN core.validate_item_image(p_item_id);
+            END;
+            $$;
+
+            CREATE TABLE core.item (id SERIAL PRIMARY KEY, image TEXT);
+            CREATE FUNCTION core.item_image_guard() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.image IS NULL THEN
+                    CALL core.raise_error(ROW(NEW.id)::errors.new_item_image_required);
+                END IF;
+                RETURN NEW;
+            END;
+            $$;
+            CREATE TRIGGER item_image_guard BEFORE INSERT ON core.item
+                FOR EACH ROW EXECUTE FUNCTION core.item_image_guard();
+
+            CREATE OR REPLACE FUNCTION api.insert_item(p_image TEXT) RETURNS VOID
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                INSERT INTO core.item (image) VALUES (p_image);
+            END;
+            $$;
         "#,
         )
-        .expect("Should create validate_item_image function");
+        .expect("Should create validate_item_image function and callers");
 
-        // Generate code
+        // A query file calling the helper gets the typed variant too.
         let temp_dir = TempDir::new().expect("Should create temp directory");
-        let output_path = temp_dir.path();
+        let queries_path = temp_dir.path().join("queries.sql");
+        std::fs::write(
+            &queries_path,
+            "-- name: CheckImage :one\nSELECT core.validate_item_image(:item_id) AS ok;\n",
+        )
+        .unwrap();
 
-        pgrpc::PgrpcBuilder::new()
-            .connection_string(conn_string)
-            .schema("core")
-            .enable_errors("errors")
-            .output_path(output_path)
-            .build()
-            .expect("Should generate code");
+        // Generate into a compilable project so the variant shapes are checked
+        // by rustc, not just by substring.
+        let project = create_test_cargo_project_with(conn_string, |b| {
+            b.schema("core")
+                .schema("api")
+                .enable_errors("errors")
+                .queries_config(pgrpc::QueriesConfig {
+                    paths: vec![queries_path.to_string_lossy().to_string()],
+                })
+        });
+        let output_path = project.path().join("src").join("generated");
 
         // Verify the generated error type
         let custom_errors_content = read_pretty(output_path.join("custom_errors.rs"));
@@ -277,9 +341,41 @@ fn test_custom_error_json_deserialization() {
             "Should generate error enum for validate_item_image function"
         );
 
-        // Check if the error enum includes the custom error variant
-        // Since we're calling core.raise_error with new_item_image_required,
-        // it should be detected even though it's not a direct RAISE statement
+        let typed = compact("NewItemImageRequired(super::custom_errors::NewItemImageRequired, #[source] tokio_postgres::error::DbError)");
+        assert!(
+            compact(&core_content).contains(&typed),
+            "validate_item_image should carry the typed payload:\n{core_content}"
+        );
+
+        // Through a call from another schema, and through a trigger on a
+        // table the function writes.
+        let api_content = read_pretty(output_path.join("api.rs"));
+        for enum_name in ["PublishItemError", "InsertItemError"] {
+            let start = api_content
+                .find(&format!("pub enum {enum_name} {{"))
+                .unwrap_or_else(|| panic!("{enum_name} missing"));
+            let block = &api_content[start..];
+            let block = &block[..block.find("\n}\n").unwrap()];
+            assert!(compact(block).contains(&typed), "{enum_name}: {block}");
+        }
+
+        // Through a query file.
+        let queries_content = read_pretty(output_path.join("queries.rs"));
+        assert!(
+            compact(&queries_content).contains(&typed),
+            "CheckImageError should carry the typed payload:\n{queries_content}"
+        );
+
+        // PgRpcError keeps the DbError alongside the payload.
+        let errors_content = read_pretty(output_path.join("errors.rs"));
+        assert!(
+            compact(&errors_content).contains(&compact(
+                "CustomError(super::custom_errors::CustomError, #[source] tokio_postgres::error::DbError)"
+            )),
+            "{errors_content}"
+        );
+
+        assert_compilation_success(compile_project(project.path()));
 
         println!("Custom error JSON deserialization test completed successfully!");
     });

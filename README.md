@@ -510,6 +510,162 @@ println!("Deleted {} rows", deleted);
 - **Documentation:** SQL queries included in generated doc comments
 - **Incremental:** Works alongside function-based approach
 
+## Error analysis scope
+
+Every PL/pgSQL and SQL function in every user schema is introspected, but Rust
+bindings are only written for the schemas listed in `schemas`. The rest exist so
+that error analysis can see through calls:
+
+```sql
+create function core.reserve_stock(p_listing_id int, p_qty int) returns void
+language plpgsql as $$
+begin
+  update listing set stock = stock - p_qty where listing_id = p_listing_id;
+  if not found then
+    raise exception 'no such listing' using errcode = 'M0404';
+  end if;
+end $$;
+
+create function api.checkout(p_listing_id int, p_qty int) returns void
+language plpgsql as $$
+begin
+  perform core.reserve_stock(p_listing_id, p_qty);
+end $$;
+```
+
+With `schemas = ["api"]`, `CheckoutError` carries both a `ListingConstraint`
+variant (for the `update` inside the helper) and the `M0404` variant, exactly as
+if the statements were written in `api.checkout` itself. Calls are followed
+transitively and through SQL-language helpers; recursion is fine.
+
+A call is followed when it is a static, direct call: `perform s.f(...)`,
+`v := s.f(...)`, `select s.f(...) into ...`, `select * from s.f(...)`,
+`call s.p(...)`, or a call nested inside one of those expressions. The callee is
+resolved by name: a schema-qualified call directly, an unqualified call first in
+the caller's schema and then in `public`. Dynamic SQL (`execute`), overload
+selection by argument type, and functions from extensions are not followed.
+
+The same applies to [SQL query files](#sql-query-files): a query such as
+`select core.reserve_stock(:listing_id, :qty)` gets the helper's variants on its
+error enum. An unqualified call in a query file resolves in `public`.
+
+Because the analysis over-approximates, a helper used by many functions makes
+its callers' error enums larger. If a specific function needs an extra variant
+that the analysis cannot see (a `raise` behind `execute`, for example), put
+`@pgrpc_throws XXXXX` in the function's comment.
+
+## User-facing constraint messages
+
+A constraint violation is typed (`CreateSubmissionError::SubmissionConstraint(SubmissionConstraint::TitleLength, db)`)
+but the Postgres message is not something to show a user. Put the message in
+the constraint's comment:
+
+```sql
+comment on constraint title_length on submission is $$
+  Printed on the certificate, where there is room for this much.
+
+  @pgrpc_message Title must be 60 characters or fewer
+$$;
+
+-- A multi-column CHECK: form-level rather than tied to a field.
+comment on constraint token_follows_grading on submission is $$
+  @pgrpc_message A token can only be assigned once the piece is graded
+  @pgrpc_field()
+$$;
+
+-- The form field is not named after the column.
+comment on constraint promotion_code_key on promotion is $$
+  @pgrpc_message That code isn't valid
+  @pgrpc_field(promo_code)
+$$;
+
+-- Domain CHECKs work the same way.
+comment on constraint postcode_format on domain postcode is '@pgrpc_message Not a valid postcode';
+```
+
+`@pgrpc_message` runs from the tag to the end of the line. The field defaults
+to the constraint's single column; `@pgrpc_field(name)` overrides it and
+`@pgrpc_field()` means none. The rest of the comment stays documentation, and
+a constraint without the tag is untouched.
+
+Every per-table constraint enum gets `name()` (the Postgres constraint name,
+also what `Display` prints), `message()`, `field()` and `user_message()`. For
+violations that reached you without a typed variant, every generated error
+enum has `user_message()`, which looks the message up by the table (or domain)
+and constraint names on the `DbError`:
+
+```rust
+use db::errors::{PgRpcErrorExt, ConstraintMessage};
+
+fn validation_from(err: &impl PgRpcErrorExt) -> Option<ValidationErrors> {
+    let ConstraintMessage { message, field } = err.user_message()?;
+    Some(match field {
+        Some(f) => ValidationErrors::new().add_field_error(f, message),
+        None => ValidationErrors::new().add_form_error(message),
+    })
+}
+```
+
+The underlying lookups, `constraint_message(table, constraint)` and
+`domain_constraint_message(domain, constraint)`, are public in the `errors`
+module. Not-null violations have no comment target in Postgres; they already
+report `column()`.
+
+## Typed errors
+
+A plain `RAISE ... USING ERRCODE = 'M0422'` surfaces as a variant named after
+the SQLSTATE and carrying the `DbError`. For errors that need structured data,
+put composite types in an errors schema and enable it:
+
+```rust
+PgrpcBuilder::new()
+    .enable_errors("errors")   // schema holding the payload types;
+                               // raise helper defaults to core.raise_error
+```
+
+```toml
+[errors]
+schema = "errors"
+raise_function = "core.raise_error"
+```
+
+```sql
+create type errors.insufficient_inventory as (item_id bigint, requested int, available int);
+
+create procedure core.raise_error(p_error anyelement, p_sqlstate text default 'M0422')
+language plpgsql as $$
+begin
+  raise exception using
+    errcode = p_sqlstate,
+    hint    = 'application/json',
+    message = (jsonb_build_object('type', substring(pg_typeof(p_error)::text from '([^.]+)$'))
+               || to_jsonb(p_error))::text;
+end $$;
+
+-- anywhere, including helpers and triggers:
+call core.raise_error(row(p_item_id, p_qty, v_available)::errors.insufficient_inventory);
+```
+
+Every composite type in the schema becomes a payload struct in
+`custom_errors.rs`. A function, trigger or query that raises one (directly or
+through any function it calls) gets a variant holding both the deserialized
+payload and the `DbError`:
+
+```rust
+match api::reserve(&client, item_id, qty).await {
+    Err(ReserveError::InsufficientInventory(payload, db)) => {
+        // payload.available, db.column(), …
+    }
+    …
+}
+```
+
+The variant is selected by the `application/json` hint and the `type` field
+in the message, before any SQLSTATE matching, so a typed error raised with a
+mapped code such as `M0422` is still the typed variant. A hand-written `RAISE`
+that sets the hint and builds its message with a literal `'type', 'name'` pair
+is recognised too.
+
 ## Justification
 
 Currently it is common to write a 'repository layer' for applications that handles persistence with the database.

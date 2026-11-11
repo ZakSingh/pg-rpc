@@ -38,6 +38,8 @@ impl QueryIndex {
         trigger_index: Option<&TriggerIndex>,
         domain_index: &crate::domain_index::DomainIndex,
         composite_index: &crate::composite_index::CompositeIndex,
+        fn_index: Option<&crate::fn_index::FunctionIndex>,
+        errors_config: Option<&crate::config::ErrorsConfig>,
     ) -> Result<Self> {
         let parser = SqlParser::new();
 
@@ -50,6 +52,8 @@ impl QueryIndex {
             trigger_index,
             domain_index,
             composite_index,
+            fn_index,
+            errors_config,
         );
 
         // Introspect queries in parallel using rayon with thread-local DB connections

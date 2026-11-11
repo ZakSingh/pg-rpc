@@ -29,6 +29,20 @@ pub fn read_pretty(path: impl AsRef<Path>) -> String {
 
 /// Create a minimal Cargo project for testing generated code
 pub fn create_test_cargo_project(conn_string: &str, schemas: Vec<&str>) -> TempDir {
+    create_test_cargo_project_with(conn_string, |mut builder| {
+        for schema in &schemas {
+            builder = builder.schema(*schema);
+        }
+        builder
+    })
+}
+
+/// Like [`create_test_cargo_project`], but the caller finishes configuring the
+/// builder (schemas, errors config, queries, …).
+pub fn create_test_cargo_project_with(
+    conn_string: &str,
+    configure: impl FnOnce(pgrpc::PgrpcBuilder) -> pgrpc::PgrpcBuilder,
+) -> TempDir {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let project_dir = temp_dir.path();
 
@@ -40,13 +54,11 @@ pub fn create_test_cargo_project(conn_string: &str, schemas: Vec<&str>) -> TempD
     let pgrpc_dir = src_dir.join("generated");
     std::fs::create_dir(&pgrpc_dir).expect("Should create generated directory");
 
-    let mut builder = pgrpc::PgrpcBuilder::new()
-        .connection_string(conn_string)
-        .output_path(&pgrpc_dir);
-
-    for schema in schemas {
-        builder = builder.schema(schema);
-    }
+    let builder = configure(
+        pgrpc::PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .output_path(&pgrpc_dir),
+    );
 
     builder.build().expect("Code generation should succeed");
 
