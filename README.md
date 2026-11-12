@@ -510,6 +510,21 @@ println!("Deleted {} rows", deleted);
 - **Documentation:** SQL queries included in generated doc comments
 - **Incremental:** Works alongside function-based approach
 
+## Decode errors
+
+When a row column cannot be read into its generated Rust type, the error names
+the column rather than just its position:
+
+```
+GetUserRow: failed to decode column `created_at` (index 7): error deserializing column 7: …
+```
+
+It is `PgRpcError::Decode(DecodeError)` with `item`, `column`, `index` and the
+`tokio_postgres::Error` source, reachable through every generated error enum's
+`Other` variant. The usual cause is a database that differs from the one the
+code was generated against, for example a `select *` over a table whose column
+order changed.
+
 ## Error analysis scope
 
 Every PL/pgSQL and SQL function in every user schema is introspected, but Rust
@@ -548,6 +563,12 @@ selection by argument type, and functions from extensions are not followed.
 The same applies to [SQL query files](#sql-query-files): a query such as
 `select core.reserve_stock(:listing_id, :qty)` gets the helper's variants on its
 error enum. An unqualified call in a query file resolves in `public`.
+
+Triggers are followed the same way: the triggers that fire for a function's
+DML contribute their raises, the raises of the functions they call, and the
+constraints of the tables they write. A `delete` contributes the `RESTRICT` and
+`NO ACTION` foreign keys of the tables that reference the deleted one, under
+those tables' enums, since that is where Postgres reports the violation.
 
 Because the analysis over-approximates, a helper used by many functions makes
 its callers' error enums larger. If a specific function needs an extra variant
@@ -591,8 +612,10 @@ a constraint without the tag is untouched.
 Every per-table constraint enum gets `name()` (the Postgres constraint name,
 also what `Display` prints), `message()`, `field()` and `user_message()`. For
 violations that reached you without a typed variant, every generated error
-enum has `user_message()`, which looks the message up by the table (or domain)
-and constraint names on the `DbError`:
+enum, and a bare `DbError` destructured out of one, has `user_message()`. It
+looks the message up by the schema, table (or domain) and constraint names on
+the `DbError`, or for a typed error by the `@pgrpc_message` on its payload
+type (see below):
 
 ```rust
 use db::errors::{PgRpcErrorExt, ConstraintMessage};
@@ -606,16 +629,21 @@ fn validation_from(err: &impl PgRpcErrorExt) -> Option<ValidationErrors> {
 }
 ```
 
-The underlying lookups, `constraint_message(table, constraint)` and
-`domain_constraint_message(domain, constraint)`, are public in the `errors`
-module. Not-null violations have no comment target in Postgres; they already
-report `column()`.
+The underlying lookups, `constraint_message(schema, table, constraint)` and
+`domain_constraint_message(schema, domain, constraint)`, are public in the
+`errors` module; `schema` is an `Option` and `None` takes the first match. A
+domain CHECK has no column to default to, so only an explicit `@pgrpc_field`
+attaches a field there. Not-null violations have no comment target in
+Postgres; they already report `column()`.
 
 ## Typed errors
 
-A plain `RAISE ... USING ERRCODE = 'M0422'` surfaces as a variant named after
-the SQLSTATE and carrying the `DbError`. For errors that need structured data,
-put composite types in an errors schema and enable it:
+A plain `RAISE ... USING ERRCODE = 'M0422'` surfaces as a variant carrying the
+`DbError`, named after the `[exceptions]` entry for the code if there is one,
+otherwise the standard condition name (`UniqueViolation`, `NoDataFound`), and
+otherwise the raw code (`M0422`). `select ... into strict` contributes
+`NoDataFound` and `TooManyRows`. For errors that need structured data, put
+composite types in an errors schema and enable it:
 
 ```rust
 PgrpcBuilder::new()
@@ -665,6 +693,18 @@ in the message, before any SQLSTATE matching, so a typed error raised with a
 mapped code such as `M0422` is still the typed variant. A hand-written `RAISE`
 that sets the hint and builds its message with a literal `'type', 'name'` pair
 is recognised too.
+
+Because a typed error's `message()` is JSON, a generic "show the message"
+path should refuse them: `is_typed_error()` and `typed_error_name()` are on
+`PgRpcErrorExt`. Better, tag the payload type and let `user_message()` cover
+it with no Rust arm:
+
+```sql
+comment on type errors.insufficient_inventory is $$
+  @pgrpc_message Not enough stock for that quantity
+  @pgrpc_field(quantity)
+$$;
+```
 
 ## Justification
 

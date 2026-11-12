@@ -1,6 +1,6 @@
 use crate::call_graph::CallTarget;
 use crate::codegen::OID;
-use crate::constraint_analysis::RelDep;
+use crate::constraint_analysis::{populate_trigger_exceptions, trigger_rel_deps, RelDep};
 use crate::exceptions::PgException;
 use crate::pg_fn::PgFn;
 use crate::rel_index::RelIndex;
@@ -29,6 +29,9 @@ pub struct FunctionIndex {
     codegen_schemas: BTreeSet<String>,
     /// `(schema, name)` -> OID, for resolving calls by name.
     by_name: HashMap<(String, String), OID>,
+    /// The connection's effective search path (`current_schemas(true)`), used
+    /// to resolve unqualified calls the way Postgres would.
+    search_path: Vec<String>,
 }
 
 impl Deref for FunctionIndex {
@@ -46,13 +49,20 @@ impl DerefMut for FunctionIndex {
 }
 
 impl FunctionIndex {
+    /// Indexes and analyzes every function and follows calls between them.
+    /// Trigger exceptions are layered on afterwards with [`Self::apply_triggers`],
+    /// because trigger functions may themselves call indexed functions.
     pub fn new(
         db: &mut Client,
         rel_index: &RelIndex,
-        trigger_index: &TriggerIndex,
         codegen_schemas: &[String],
         errors_config: Option<&crate::config::ErrorsConfig>,
     ) -> anyhow::Result<Self> {
+        let search_path: Vec<String> = db
+            .query_one("SELECT current_schemas(true) AS path", &[])
+            .context("Failed to read search_path")?
+            .get("path");
+
         let fn_rows = db
             .query(FUNCTION_INTROSPECTION_QUERY, &[])
             .context("Function introspection query failed")?;
@@ -63,7 +73,7 @@ impl FunctionIndex {
                 let oid: OID = row.get("oid");
                 let schema: String = row.get("schema_name");
                 let name: String = row.get("function_name");
-                PgFn::from_row(row, rel_index, Some(trigger_index), errors_config)
+                PgFn::from_row(row, rel_index, None, errors_config)
                     .map(|f| (oid, f))
                     .with_context(|| format!("Failed to index function {schema}.{name}"))
             })
@@ -74,6 +84,7 @@ impl FunctionIndex {
             fns,
             codegen_schemas: codegen_schemas.iter().cloned().collect(),
             by_name,
+            search_path,
         };
         index.follow_calls();
         Ok(index)
@@ -88,14 +99,16 @@ impl FunctionIndex {
             fns,
             codegen_schemas: codegen_schemas.iter().map(|s| s.to_string()).collect(),
             by_name,
+            search_path: vec!["public".to_string()],
         }
     }
 
     /// Resolve a call target to an indexed function.
     ///
     /// A schema-qualified name resolves directly. An unqualified name is looked
-    /// up in `caller_schema` (if any) and then in `public`. Built-ins,
-    /// extension functions and anything else not indexed resolve to `None`.
+    /// up in `caller_schema` (if any) and then along the connection's search
+    /// path, in order. Built-ins, extension functions and anything else not
+    /// indexed resolve to `None`.
     pub fn resolve(&self, target: &CallTarget, caller_schema: Option<&str>) -> Option<&PgFn> {
         let lookup = |schema: &str| {
             self.by_name
@@ -104,7 +117,9 @@ impl FunctionIndex {
         };
         match &target.schema {
             Some(schema) => lookup(schema),
-            None => caller_schema.and_then(lookup).or_else(|| lookup("public")),
+            None => caller_schema
+                .and_then(lookup)
+                .or_else(|| self.search_path.iter().find_map(|s| lookup(s))),
         }
     }
 
@@ -143,7 +158,7 @@ impl FunctionIndex {
     /// whoever calls `core.helper()`, so the caller's error enum must carry
     /// those variants too. Calls are resolved by name: a qualified
     /// `schema.name(...)` directly, an unqualified `name(...)` first in the
-    /// caller's own schema and then in `public`. Unresolvable names (built-ins,
+    /// caller's own schema and then along the search path. Unresolvable names (built-ins,
     /// extension functions, dynamic SQL) are ignored. Recursion is handled by
     /// computing the reachable set per function before mutating anything.
     pub fn follow_calls(&mut self) {
@@ -216,6 +231,30 @@ impl FunctionIndex {
                 .unique()
                 .collect();
             f.rel_deps.extend(rel_deps);
+        }
+    }
+
+    /// Fold in the triggers that fire for each function's DML (its own and its
+    /// callees'): their exceptions, and the tables they write so those get
+    /// constraint arms too.
+    pub fn apply_triggers(&mut self, trigger_index: &TriggerIndex) {
+        for f in self.fns.values_mut() {
+            populate_trigger_exceptions(&mut f.rel_deps, trigger_index);
+            let trigger_deps = trigger_rel_deps(&f.rel_deps, trigger_index);
+            let trigger_exceptions: Vec<PgException> = f
+                .rel_deps
+                .iter()
+                .flat_map(|d| d.trigger_exceptions.iter().cloned())
+                .collect();
+            if trigger_exceptions.is_empty() && trigger_deps.is_empty() {
+                continue;
+            }
+            f.exceptions.extend(trigger_exceptions);
+            f.exceptions = std::mem::take(&mut f.exceptions)
+                .into_iter()
+                .unique()
+                .collect();
+            f.rel_deps.extend(trigger_deps);
         }
     }
 

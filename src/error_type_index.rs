@@ -17,6 +17,8 @@ const ERROR_TYPE_INTROSPECTION_QUERY: &str = include_str!("./queries/error_type_
 pub struct ErrorType {
     pub error_name: String,
     pub type_oid: OID,
+    /// `comment on type`, carrying `@pgrpc_message` / `@pgrpc_field`.
+    pub comment: Option<String>,
     pub fields: Vec<ErrorField>,
 }
 
@@ -60,6 +62,7 @@ impl ErrorTypeIndex {
                 let error_name: String = row.try_get("error_name")?;
                 let type_oid: i32 = row.try_get("type_oid")?;
                 let type_oid = type_oid as u32;
+                let comment: Option<String> = row.try_get("comment")?;
                 let fields_json: Value = row.try_get("fields")?;
 
                 let fields_vec = if fields_json.is_null() {
@@ -98,6 +101,7 @@ impl ErrorTypeIndex {
                     ErrorType {
                         error_name,
                         type_oid,
+                        comment,
                         fields,
                     },
                 ))
@@ -226,6 +230,36 @@ pub fn generate_error_payload_structs(
         },
         referenced_schemas,
     )
+}
+
+/// `custom_error_message(type_name)`: the `@pgrpc_message` / `@pgrpc_field`
+/// from a payload type's comment, keyed by the JSON `type` name the raise
+/// helper emits. Lets `user_message()` cover typed errors with no Rust arm.
+pub fn generate_custom_error_message_lookup(error_index: &ErrorTypeIndex) -> TokenStream {
+    let mut names: Vec<&String> = error_index.keys().collect();
+    names.sort();
+    let arms = names.into_iter().filter_map(|name| {
+        let error_type = &error_index[name];
+        let comment = error_type.comment.as_deref()?;
+        let message = crate::annotations::parse_message(comment)?;
+        let field = match crate::annotations::parse_field(comment) {
+            Some(Some(f)) => quote! { Some(#f) },
+            _ => quote! { None },
+        };
+        let type_name = error_type.error_name.as_str();
+        Some(quote! {
+            #type_name => Some(super::errors::ConstraintMessage { message: #message, field: #field })
+        })
+    });
+    quote! {
+        /// The user-facing message tagged on a typed error's payload type.
+        pub fn custom_error_message(type_name: &str) -> Option<super::errors::ConstraintMessage> {
+            match type_name {
+                #(#arms,)*
+                _ => None,
+            }
+        }
+    }
 }
 
 /// Generate an enum of all error types for pattern matching

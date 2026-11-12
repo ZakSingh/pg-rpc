@@ -48,6 +48,10 @@ pub struct ForeignKeyConstraint {
     /// The referenced columns in the foreign table
     #[serde(default)]
     pub(crate) ref_columns: Option<SmallVec<Ustr, 2>>,
+    /// OID of the referenced table, for finding the foreign keys that point
+    /// *at* a table (a DELETE there fails on RESTRICT / NO ACTION ones).
+    #[serde(default)]
+    pub(crate) ref_table_oid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
@@ -87,6 +91,9 @@ pub struct DomainConstraint {
     /// Name of the domain the CHECK belongs to (what `DbError::datatype()` reports).
     #[serde(default)]
     pub(crate) domain: Option<String>,
+    /// Schema of that domain (what `DbError::schema()` reports).
+    #[serde(default)]
+    pub(crate) domain_schema: Option<String>,
     #[serde(default)]
     pub(crate) comment: Option<String>,
 }

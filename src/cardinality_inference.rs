@@ -1713,6 +1713,7 @@ mod tests {
                 }),
                 Constraint::ForeignKey(ForeignKeyConstraint {
                     comment: None,
+                    ref_table_oid: None,
                     name: ustr("orders_customer_id_fkey"),
                     columns: smallvec![ustr("customer_id")],
                     on_delete: OnDelete::NoAction,
@@ -1766,6 +1767,7 @@ mod tests {
                 }),
                 Constraint::ForeignKey(ForeignKeyConstraint {
                     comment: None,
+                    ref_table_oid: None,
                     name: ustr("order_items_order_id_fkey"),
                     columns: smallvec![ustr("order_id")],
                     on_delete: OnDelete::Cascade,
@@ -1774,6 +1776,7 @@ mod tests {
                 }),
                 Constraint::ForeignKey(ForeignKeyConstraint {
                     comment: None,
+                    ref_table_oid: None,
                     name: ustr("order_items_product_id_fkey"),
                     columns: smallvec![ustr("product_id")],
                     on_delete: OnDelete::Restrict,

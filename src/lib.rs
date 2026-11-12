@@ -349,17 +349,23 @@ impl PgrpcBuilder {
         // query, and SQL-function nullability inference can see through
         // `(col).attr` projections.
         let composite_index = composite_index::CompositeIndex::new(&mut db.client)?;
-        let trigger_index =
-            trigger_index::TriggerIndex::new(&mut db.client, &rel_index, config.errors.as_ref())?;
         // Indexes every user schema (so calls into helpers elsewhere can be
-        // followed); only `config.schemas` get Rust output.
+        // followed); only `config.schemas` get Rust output. Triggers come
+        // after: trigger functions call indexed functions, and the triggers'
+        // effects are then layered onto every function whose DML fires them.
         let mut fn_index = FunctionIndex::new(
             &mut db.client,
             &rel_index,
-            &trigger_index,
             &config.schemas,
             config.errors.as_ref(),
         )?;
+        let trigger_index = trigger_index::TriggerIndex::new(
+            &mut db.client,
+            &rel_index,
+            config.errors.as_ref(),
+            &fn_index,
+        )?;
+        fn_index.apply_triggers(&trigger_index);
 
         // Collect type OIDs from functions, task types, and error types
         let mut type_oids = fn_index.get_type_oids();
@@ -608,11 +614,10 @@ fn generate_error_code(
     errors_config: &config::ErrorsConfig,
     ty_index: &TypeIndex,
 ) -> anyhow::Result<Option<String>> {
+    // Always emitted when errors are configured: `errors.rs` refers to this
+    // module (`PgRpcError::CustomError`, `custom_error_message`) even when the
+    // errors schema has no types yet.
     let error_index = error_type_index::ErrorTypeIndex::new(db_client, errors_config)?;
-
-    if error_index.is_empty() {
-        return Ok(None);
-    }
 
     let config = crate::config::Config {
         errors: Some(errors_config.clone()),
@@ -621,6 +626,7 @@ fn generate_error_code(
     let (payload_structs, referenced_schemas) =
         error_type_index::generate_error_payload_structs(&error_index, ty_index, &config);
     let error_enum = error_type_index::generate_error_type_enum(&error_index);
+    let message_lookup = error_type_index::generate_custom_error_message_lookup(&error_index);
     let schema_imports: Vec<TokenStream> = referenced_schemas
         .iter()
         .filter(|s: &&String| s.as_str() != "custom_errors")
@@ -644,6 +650,8 @@ fn generate_error_code(
             #payload_structs
 
             #error_enum
+
+            #message_lookup
         }.to_string();
 
     Ok(Some(warning_ignores.to_string() + &error_code))

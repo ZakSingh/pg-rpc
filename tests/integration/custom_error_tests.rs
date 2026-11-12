@@ -4,11 +4,11 @@ use crate::integration::compile_helpers::{
     assert_compilation_success, compile_project, create_test_cargo_project_with, read_pretty,
 };
 
-/// Strip whitespace (and the trailing comma prettyplease adds before a
-/// closing paren when it wraps) so substring checks survive formatting.
+/// Strip whitespace, braces and the trailing commas prettyplease adds when it
+/// wraps, so substring checks survive formatting.
 fn compact(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_whitespace())
+        .filter(|c| !c.is_whitespace() && *c != '{' && *c != '}')
         .collect::<String>()
         .replace(",)", ")")
 }
@@ -220,7 +220,12 @@ fn test_custom_error_json_deserialization() {
             r#"
             CREATE TYPE errors.new_item_image_required AS (
                 item_id INTEGER
-            )
+            );
+            COMMENT ON TYPE errors.new_item_image_required IS $$
+                Raised when publishing an item that has no images yet.
+                @pgrpc_message Add at least one image before publishing
+                @pgrpc_field(images)
+            $$;
         "#,
         )
         .expect("Should create new_item_image_required type");
@@ -366,8 +371,22 @@ fn test_custom_error_json_deserialization() {
             "CheckImageError should carry the typed payload:\n{queries_content}"
         );
 
+        // The payload type's @pgrpc_message is reachable through user_message()
+        // by the JSON `type` name, with no Rust arm.
+        let custom_errors_content = read_pretty(output_path.join("custom_errors.rs"));
+        assert!(
+            compact(&custom_errors_content).contains(&compact(
+                "\"new_item_image_required\" => Some(super::errors::ConstraintMessage { message: \"Add at least one image before publishing\", field: Some(\"images\") })"
+            )),
+            "{custom_errors_content}"
+        );
+
         // PgRpcError keeps the DbError alongside the payload.
         let errors_content = read_pretty(output_path.join("errors.rs"));
+        assert!(
+            compact(&errors_content).contains(&compact("return super::custom_errors::custom_error_message(&type_name);")),
+            "{errors_content}"
+        );
         assert!(
             compact(&errors_content).contains(&compact(
                 "CustomError(super::custom_errors::CustomError, #[source] tokio_postgres::error::DbError)"

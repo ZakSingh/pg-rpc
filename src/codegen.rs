@@ -82,6 +82,12 @@ pub fn generate_date_serde_module() -> TokenStream {
     }
 }
 
+/// `super::errors::DecodeError::at(item, column, index)`: the `map_err`
+/// closure that attributes a `try_get` failure to one column.
+pub(crate) fn decode_err(item: &str, column: &str, index: usize) -> TokenStream {
+    quote! { super::errors::DecodeError::at(#item, #column, #index) }
+}
+
 /// Generate code split by schema
 pub fn codegen_split(
     fn_index: &FunctionIndex,
@@ -659,6 +665,16 @@ fn generate_unified_errors(
     // Generate constraint enums and the name-keyed message lookup
     let constraint_enums = unified_error::generate_constraint_enums(&table_constraints);
     let constraint_lookup = unified_error::generate_constraint_message_lookup(&table_constraints);
+    // Typed-error messages live in custom_errors.rs, which only exists when
+    // an errors schema is configured.
+    let typed_message_lookup = if config.errors.is_some() {
+        quote! { return super::custom_errors::custom_error_message(&type_name); }
+    } else {
+        quote! {
+            let _ = type_name;
+            return None;
+        }
+    };
 
     // Generate the unified error type
     let error_enum =
@@ -733,21 +749,47 @@ fn generate_unified_errors(
                 self.as_db_error().and_then(|e| e.routine())
             }
 
-            /// The `@pgrpc_message` of the violated constraint, if the
-            /// constraint carries one, looked up by the table (or domain) and
-            /// constraint names on the underlying `DbError`. Works for every
-            /// generated error enum, including violations that surfaced as
-            /// `Other(PgRpcError)` without a typed variant.
+            /// `true` when the underlying error is a typed payload raised
+            /// through the raise helper (JSON-hinted). Its `message()` is a
+            /// JSON document, not something to show a user.
+            fn is_typed_error(&self) -> bool {
+                self.as_db_error()
+                    .is_some_and(|e| e.hint() == Some("application/json"))
+            }
+
+            /// The `type` name inside a typed error's JSON message
+            /// (`new_item_image_required`), if this is one.
+            fn typed_error_name(&self) -> Option<String> {
+                let db = self.as_db_error()?;
+                if db.hint() != Some("application/json") {
+                    return None;
+                }
+                serde_json::from_str::<serde_json::Value>(db.message())
+                    .ok()?
+                    .get("type")?
+                    .as_str()
+                    .map(str::to_string)
+            }
+
+            /// The user-facing message for this error, if the schema carries
+            /// one: the `@pgrpc_message` on the violated constraint (looked up
+            /// by schema, table or domain, and constraint name), or the one on
+            /// a typed error's payload type. Works for every generated error
+            /// enum and for a bare `DbError`, including violations that
+            /// surfaced as `Other(PgRpcError)` without a typed variant.
             fn user_message(&self) -> Option<ConstraintMessage> {
                 let db = self.as_db_error()?;
+                if let Some(type_name) = self.typed_error_name() {
+                    #typed_message_lookup
+                }
                 let constraint = db.constraint()?;
                 if let Some(table) = db.table() {
-                    if let Some(found) = constraint_message(table, constraint) {
+                    if let Some(found) = constraint_message(db.schema(), table, constraint) {
                         return Some(found);
                     }
                 }
                 if let Some(datatype) = db.datatype() {
-                    return domain_constraint_message(datatype, constraint);
+                    return domain_constraint_message(db.schema(), datatype, constraint);
                 }
                 None
             }
@@ -755,6 +797,48 @@ fn generate_unified_errors(
 
         /// Blanket implementation of PgRpcErrorExt for all types that implement AsDbError
         impl<T: AsDbError> PgRpcErrorExt for T {}
+
+        /// A bare `DbError`, as destructured from any variant, has the same helpers.
+        impl AsDbError for tokio_postgres::error::DbError {
+            fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError> {
+                Some(self)
+            }
+        }
+
+        impl AsDbError for tokio_postgres::Error {
+            fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError> {
+                tokio_postgres::Error::as_db_error(self)
+            }
+        }
+
+        /// A row column could not be decoded into its generated Rust type.
+        ///
+        /// Typically the database the code was generated from and the one it
+        /// runs against disagree on a column's type or position (a `select *`
+        /// over a table whose column order differs, a widened type, …).
+        #[derive(Debug, thiserror::Error)]
+        #[error("{item}: failed to decode column `{column}` (index {index}): {source}")]
+        pub struct DecodeError {
+            /// The generated function, query or row struct the column belongs to.
+            pub item: &'static str,
+            /// The SQL column name as it was at generation time.
+            pub column: &'static str,
+            /// Zero-based position in the row.
+            pub index: usize,
+            #[source]
+            pub source: tokio_postgres::Error,
+        }
+
+        impl DecodeError {
+            /// A `map_err` closure attributing a decode failure to one column.
+            pub fn at(
+                item: &'static str,
+                column: &'static str,
+                index: usize,
+            ) -> impl FnOnce(tokio_postgres::Error) -> DecodeError {
+                move |source| DecodeError { item, column, index, source }
+            }
+        }
 
         #constraint_lookup
 
@@ -994,13 +1078,14 @@ fn generate_query_code(
                 if columns.len() == 1 {
                     let scalar_type = get_column_type(&columns[0], type_index);
                     let return_type = quote! { Result<#scalar_type, #error_enum_name> };
+                    let decode = decode_err(&query.name, &columns[0].name, 0);
                     let execution = quote! {
                         client.query_opt(&stmt, &params).await
+                            .map_err(#error_enum_name::from)
                             .and_then(|opt_row| {
                                 let row = opt_row.expect("query returned no rows");
-                                row.try_get(0)
+                                row.try_get(0).map_err(#decode).map_err(#error_enum_name::from)
                             })
-                            .map_err(#error_enum_name::from)
                     };
                     (return_type, execution, quote! {})
                 } else {
@@ -1011,11 +1096,11 @@ fn generate_query_code(
                     let return_type = quote! { Result<#struct_name, #error_enum_name> };
                     let execution = quote! {
                         client.query_opt(&stmt, &params).await
+                            .map_err(#error_enum_name::from)
                             .and_then(|opt_row| {
                                 let row = opt_row.expect("query returned no rows");
-                                row.try_into()
+                                row.try_into().map_err(#error_enum_name::from)
                             })
-                            .map_err(#error_enum_name::from)
                     };
 
                     (return_type, execution, row_struct)
@@ -1036,13 +1121,14 @@ fn generate_query_code(
                 if columns.len() == 1 {
                     let scalar_type = get_column_type(&columns[0], type_index);
                     let return_type = quote! { Result<Option<#scalar_type>, #error_enum_name> };
+                    let decode = decode_err(&query.name, &columns[0].name, 0);
                     let execution = quote! {
                         client.query_opt(&stmt, &params).await
+                            .map_err(#error_enum_name::from)
                             .and_then(|row| match row {
-                                Some(row) => Ok(Some(row.try_get(0)?)),
+                                Some(row) => row.try_get(0).map(Some).map_err(#decode).map_err(#error_enum_name::from),
                                 None => Ok(None),
                             })
-                            .map_err(#error_enum_name::from)
                     };
                     (return_type, execution, quote! {})
                 } else {
@@ -1053,11 +1139,11 @@ fn generate_query_code(
                     let return_type = quote! { Result<Option<#struct_name>, #error_enum_name> };
                     let execution = quote! {
                         client.query_opt(&stmt, &params).await
+                            .map_err(#error_enum_name::from)
                             .and_then(|row| match row {
-                                Some(row) => Ok(Some(row.try_into()?)),
+                                Some(row) => row.try_into().map(Some).map_err(#error_enum_name::from),
                                 None => Ok(None),
                             })
-                            .map_err(#error_enum_name::from)
                     };
 
                     (return_type, execution, row_struct)
@@ -1077,10 +1163,15 @@ fn generate_query_code(
                 if columns.len() == 1 {
                     let scalar_type = get_column_type(&columns[0], type_index);
                     let return_type = quote! { Result<Vec<#scalar_type>, #error_enum_name> };
+                    let decode = decode_err(&query.name, &columns[0].name, 0);
                     let execution = quote! {
                         client.query(&stmt, &params).await
-                            .and_then(|rows| rows.into_iter().map(|row| row.try_get(0)).collect())
                             .map_err(#error_enum_name::from)
+                            .and_then(|rows| {
+                                rows.into_iter()
+                                    .map(|row| row.try_get(0).map_err(#decode).map_err(#error_enum_name::from))
+                                    .collect()
+                            })
                     };
                     (return_type, execution, quote! {})
                 } else {
@@ -1091,8 +1182,12 @@ fn generate_query_code(
                     let return_type = quote! { Result<Vec<#struct_name>, #error_enum_name> };
                     let execution = quote! {
                         client.query(&stmt, &params).await
-                            .and_then(|rows| rows.into_iter().map(|row| row.try_into()).collect())
                             .map_err(#error_enum_name::from)
+                            .and_then(|rows| {
+                                rows.into_iter()
+                                    .map(|row| row.try_into().map_err(#error_enum_name::from))
+                                    .collect()
+                            })
                     };
 
                     (return_type, execution, row_struct)
@@ -1725,6 +1820,12 @@ fn generate_query_error_enum(
             }
         }
 
+        impl From<super::errors::DecodeError> for #error_enum_name {
+            fn from(err: super::errors::DecodeError) -> Self {
+                #error_enum_name::Other(super::errors::PgRpcError::Decode(err))
+            }
+        }
+
         impl super::errors::AsDbError for #error_enum_name {
             fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError> {
                 match self {
@@ -1766,6 +1867,7 @@ fn generate_row_struct(
     columns: &[crate::query_introspector::QueryColumn],
     type_index: &TypeIndex,
 ) -> TokenStream {
+    let struct_name_str = struct_name.to_string();
     use crate::column_grouping::{group_by_double_underscore, GroupedField};
     use crate::ident::{sql_to_rs_ident, CaseType};
     use crate::query_introspector::QueryColumn;
@@ -1834,7 +1936,8 @@ fn generate_row_struct(
                 });
 
                 parent_field_assignments.push(quote! {
-                    #field_name: row.try_get(#idx)?
+                    #field_name: row.try_get(#idx)
+                        .map_err(super::errors::DecodeError::at(#struct_name_str, #column_name, #idx))?
                 });
             }
             GroupedField::Group {
@@ -1912,7 +2015,11 @@ fn generate_row_struct(
                             "{}",
                             sql_to_rs_ident(&col.name, CaseType::Snake).to_string()
                         );
-                        quote! { #f_name: row.try_get(#idx)? }
+                        let c_name = col.name.as_str();
+                        quote! {
+                            #f_name: row.try_get(#idx)
+                                .map_err(super::errors::DecodeError::at(#struct_name_str, #c_name, #idx))?
+                        }
                     })
                     .collect();
 
@@ -1933,6 +2040,7 @@ fn generate_row_struct(
                     // Postgres type, sidestepping the type-compatibility check
                     // that a typed sentinel would trip.
                     let first_idx = fields[0].0;
+                    let first_col = fields[0].1.name.as_str();
 
                     let group_type = quote! { Option<#nested_struct_name> };
 
@@ -1941,7 +2049,10 @@ fn generate_row_struct(
                     });
 
                     parent_field_assignments.push(quote! {
-                        #group_field_name: if row.try_get::<usize, super::nullable::NullProbe>(#first_idx)?.is_null {
+                        #group_field_name: if row.try_get::<usize, super::nullable::NullProbe>(#first_idx)
+                            .map_err(super::errors::DecodeError::at(#struct_name_str, #first_col, #first_idx))?
+                            .is_null
+                        {
                             None
                         } else {
                             Some(#nested_struct_name {
@@ -1973,7 +2084,7 @@ fn generate_row_struct(
         }
 
         impl TryFrom<tokio_postgres::Row> for #struct_name {
-            type Error = tokio_postgres::Error;
+            type Error = super::errors::DecodeError;
 
             fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
                 Ok(Self {
@@ -2041,6 +2152,8 @@ fn generate_row_struct_flat(
             )
         })
         .collect();
+    let column_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    let struct_name_str = struct_name.to_string();
 
     quote! {
         #[derive(Debug, Clone, serde::Serialize)]
@@ -2049,12 +2162,13 @@ fn generate_row_struct_flat(
         }
 
         impl TryFrom<tokio_postgres::Row> for #struct_name {
-            type Error = tokio_postgres::Error;
+            type Error = super::errors::DecodeError;
 
             fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
                 Ok(Self {
                     #(
-                        #field_names: row.try_get(#field_indices)?,
+                        #field_names: row.try_get(#field_indices)
+                            .map_err(super::errors::DecodeError::at(#struct_name_str, #column_names, #field_indices))?,
                     )*
                 })
             }

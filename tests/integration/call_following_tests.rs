@@ -43,7 +43,46 @@ fn setup(client: &mut Client) -> Result<(), postgres::Error> {
             RAISE EXCEPTION 'dynamic' USING ERRCODE = p_code;
         END $$;
 
+        -- A table referencing widget with RESTRICT: deleting a widget that
+        -- is logged fails on widget_log's foreign key, reported on widget_log.
+        CREATE TABLE helpers.widget_log (
+            id SERIAL PRIMARY KEY,
+            widget_id INT NOT NULL REFERENCES helpers.widget(id) ON DELETE RESTRICT,
+            note TEXT
+        );
+
+        -- A trigger whose body calls a helper that raises.
+        CREATE FUNCTION helpers.check_note(p_note TEXT) RETURNS VOID
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            IF p_note = '' THEN
+                RAISE EXCEPTION 'empty note' USING ERRCODE = 'P0405';
+            END IF;
+        END $$;
+
+        CREATE FUNCTION helpers.widget_log_guard() RETURNS TRIGGER
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            PERFORM helpers.check_note(NEW.note);
+            RETURN NEW;
+        END $$;
+
+        CREATE TRIGGER widget_log_guard BEFORE INSERT ON helpers.widget_log
+            FOR EACH ROW EXECUTE FUNCTION helpers.widget_log_guard();
+
         CREATE SCHEMA call_api;
+
+        CREATE FUNCTION call_api.log_widget(p_widget_id INT, p_note TEXT) RETURNS VOID
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            INSERT INTO helpers.widget_log (widget_id, note) VALUES (p_widget_id, p_note);
+        END $$;
+
+        CREATE FUNCTION call_api.delete_widget(p_id INT) RETURNS VOID
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            DELETE FROM helpers.widget WHERE id = p_id;
+        END $$;
 
         CREATE FUNCTION call_api.via_perform(p_name TEXT) RETURNS VOID
         LANGUAGE plpgsql AS $$
@@ -146,6 +185,21 @@ fn callee_errors_surface_on_callers() {
             assert!(block.contains("WidgetConstraint("), "{name}: {block}");
             assert!(block.contains("P0404("), "{name}: {block}");
         }
+
+        // A trigger on the written table calls a helper that raises: the
+        // raise surfaces on the function that writes the table.
+        let log_widget = enum_block(&api, "LogWidgetError");
+        assert!(log_widget.contains("P0405("), "{log_widget}");
+
+        // DELETE is blocked by a RESTRICT foreign key on the referencing table,
+        // and Postgres reports it on that table, so the variant is its enum.
+        let delete_widget = enum_block(&api, "DeleteWidgetError");
+        assert!(delete_widget.contains("WidgetLogConstraint("), "{delete_widget}");
+        assert!(
+            !delete_widget.contains("WidgetConstraint("),
+            "a delete cannot violate the deleted table's own constraints: {delete_widget}"
+        );
+        assert!(api.contains("\"widget_log_widget_id_fkey\""), "fk arm");
 
         // The constraint enum for the helper's table is still emitted into
         // errors.rs so the variants have something to refer to.
