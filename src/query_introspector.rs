@@ -1,7 +1,7 @@
 use crate::cardinality_inference::CardinalityAnalyzer;
 use crate::codegen::OID;
 use crate::call_graph;
-use crate::constraint_analysis::{constraints_from_deps, sql_rel_deps};
+use crate::constraint_analysis::{constraints_from_deps, sql_rel_deps, trigger_rel_deps};
 use crate::fn_index::FunctionIndex;
 use itertools::Itertools;
 use crate::exceptions::PgException;
@@ -123,7 +123,7 @@ impl<'a> QueryIntrospector<'a> {
         if let Some(fn_index) = self.fn_index {
             for target in call_graph::sql_callees(&parsed) {
                 // Query files have no schema of their own; unqualified names
-                // resolve in `public`.
+                // resolve along the connection's search path.
                 let Some(callee) = fn_index.resolve(&target, None) else { continue };
                 log::debug!(
                     "Query {} calls {}.{}; folding its errors in",
@@ -135,6 +135,11 @@ impl<'a> QueryIntrospector<'a> {
                 exceptions.extend(callee.exceptions.iter().cloned());
                 rel_deps.extend(callee.rel_deps.iter().cloned());
             }
+        }
+
+        // Tables written by the triggers that fire for this query's DML.
+        if let Some(trigger_index) = self.trigger_index {
+            rel_deps.extend(trigger_rel_deps(&rel_deps, trigger_index));
         }
 
         let (own_exceptions, table_dependencies) = constraints_from_deps(&rel_deps, self.rel_index);

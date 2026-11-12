@@ -1,6 +1,6 @@
 use crate::annotations;
 use crate::config::Config;
-use crate::constraint_analysis::{extract_queries, get_rel_deps, Cmd, ConflictTarget, RelDep};
+use crate::constraint_analysis::{applicable_constraints, extract_queries, get_rel_deps, RelDep};
 use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
 use crate::pg_constraint::Constraint;
@@ -12,13 +12,11 @@ use proc_macro2::TokenStream;
 use quote::ToTokens;
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::ops::Deref;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PgException {
     Explicit(SqlState),
     Constraint(Constraint),
-    Strict,
     CustomError(String), // Name of the error type from errors schema
                          // Cast(String, String), // parsed from 'cannot cast x to y' IntegerStringCast
 }
@@ -26,15 +24,12 @@ pub enum PgException {
 impl PgException {
     pub fn rs_name(&self, config: &Config) -> TokenStream {
         match self {
-            PgException::Explicit(ex) => sql_to_rs_ident(
-                config
-                    .exceptions
-                    .get(ex.code())
-                    .map(|x| x.as_str())
-                    .unwrap_or(ex.code()),
-                Pascal,
-            ),
-            PgException::Strict => "Strict".parse().unwrap(),
+            // A configured description wins; otherwise the standard condition
+            // name (`NoDataFound`), falling back to the raw code (`M0422`).
+            PgException::Explicit(ex) => match config.exceptions.get(ex.code()) {
+                Some(description) => sql_to_rs_ident(description, Pascal),
+                None => ex.rs_name(),
+            },
             PgException::Constraint(c) => c.to_token_stream(),
             PgException::CustomError(name) => sql_to_rs_ident(name, Pascal),
         }
@@ -83,77 +78,12 @@ pub fn get_exceptions_from_deps(
     errors_config: Option<&crate::config::ErrorsConfig>,
     scope: &str,
 ) -> anyhow::Result<Vec<PgException>> {
-    let constraints: Vec<&Constraint> = rel_deps
+    let constraints: Vec<Constraint> = rel_deps
         .iter()
-        .flat_map(|dep| {
-            let rel_oid = dep.rel_oid;
-            let constraints = rel_index.deref().get(&rel_oid).unwrap().constraints.iter();
-            match &dep.cmd {
-                Cmd::Update { cols } => constraints.filter(|c| c.contains_columns(cols)).collect(),
-                Cmd::Insert { cols, on_conflict } => {
-                    constraints
-                        .filter(|c| {
-                            // Filter out constraints that we know will not apply via static analysis.
-
-                            #[cfg(not(feature = "null_tracking"))]
-                            if matches!(c, Constraint::NotNull(..)) {
-                                return false;
-                            }
-
-                            // Default constraints can't cause an exception
-                            if matches!(c, Constraint::Default(..)) {
-                                return false;
-                            }
-
-                            if !c.contains_columns(cols) {
-                                // If the constraint doesn't apply to the columns being inserted,
-                                // we can safely assume it will never occur.
-                                return false;
-                            }
-
-                            // Filter out unique/primary key constraints if they're handled by ON CONFLICT
-                            if let Some(conflict) = on_conflict {
-                                match c {
-                                    Constraint::PrimaryKey(pk) => {
-                                        let constraint_cols = &pk.columns;
-                                        match &conflict.target {
-                                            ConflictTarget::Columns(conflict_cols) => {
-                                                !constraint_cols.iter().eq(conflict_cols.iter())
-                                            }
-                                            ConflictTarget::Constraint(name) => {
-                                                c.name().as_str() != name
-                                            }
-                                            ConflictTarget::Any => false,
-                                        }
-                                    }
-                                    Constraint::Unique(unique) => {
-                                        let constraint_cols = &unique.columns;
-
-                                        match &conflict.target {
-                                            // If specific columns listed, only filter if they match the constraint
-                                            ConflictTarget::Columns(conflict_cols) => {
-                                                !constraint_cols.iter().eq(conflict_cols.iter())
-                                            }
-                                            // If specific constraint named, only filter that one
-                                            ConflictTarget::Constraint(name) => &c.name() != name,
-                                            // If no target specified, filter all unique/primary key constraints
-                                            ConflictTarget::Any => false,
-                                        }
-                                    }
-                                    _ => true,
-                                }
-                            } else {
-                                true
-                            }
-                        })
-                        .collect()
-                }
-                Cmd::Delete => constraints
-                    .filter(|c| matches!(c, Constraint::ForeignKey(_)))
-                    .collect(),
-                _ => vec![],
-            }
-        })
+        .flat_map(|dep| applicable_constraints(dep, rel_index))
+        .map(|(_, c)| c)
+        // NOT NULL can't be attributed to a statement without null tracking.
+        .filter(|c| cfg!(feature = "null_tracking") || !matches!(c, Constraint::NotNull(..)))
         .collect();
 
     let (raised_sql_states, custom_errors) =
@@ -180,7 +110,6 @@ pub fn get_exceptions_from_deps(
     let exceptions: Vec<PgException> = constraints
         .into_iter()
         .unique_by(|c| c.name())
-        .cloned()
         .map(PgException::Constraint)
         .chain(raised_exceptions)
         .chain(custom_error_exceptions)
@@ -334,25 +263,32 @@ fn json_hint_raise_types(fn_json: &Value) -> anyhow::Result<BTreeSet<String>> {
 
 /// `unique_violation` -> `23505`; anything else is taken as a literal code.
 fn sql_state_from_literal(s: &str) -> SqlState {
-    SYM_SQL_STATE_TO_CODE
-        .get(s)
-        .cloned()
-        .unwrap_or_else(|| SqlState::from_code(s))
+    match SYM_SQL_STATE_TO_CODE.get(s) {
+        Some(code) => SqlState::from_code(code),
+        None => SqlState::from_code(s),
+    }
 }
 
-fn get_strict_exceptions(parsed: &Value) -> Option<PgException> {
+/// `SELECT ... INTO STRICT` raises `no_data_found` (P0002) for zero rows and
+/// `too_many_rows` (P0003) for more than one.
+fn get_strict_exceptions(parsed: &Value) -> Vec<PgException> {
     let strict_path = JsonPath::try_from("$..PLpgSQL_stmt_execsql[?(@.strict)]").unwrap();
 
-    strict_path
-        .find_slice(parsed)
-        .into_iter()
-        .find(|x| match x {
-            JsonPathValue::Slice(data, _) => data
-                .get("strict")
-                .is_some_and(|s| s.as_bool().is_some_and(|b| b)),
-            _ => false,
-        })
-        .map(|_| PgException::Strict)
+    let has_strict = strict_path.find_slice(parsed).into_iter().any(|x| match x {
+        JsonPathValue::Slice(data, _) => data
+            .get("strict")
+            .is_some_and(|s| s.as_bool().is_some_and(|b| b)),
+        _ => false,
+    });
+
+    if has_strict {
+        vec![
+            PgException::Explicit(SqlState::from_code("P0002")),
+            PgException::Explicit(SqlState::from_code("P0003")),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn get_comment_exceptions(comment: &str) -> Vec<PgException> {
@@ -433,7 +369,8 @@ mod test {
         "#;
 
         let s = get_strict_exceptions(&parse_plpgsql(fn_def).unwrap());
-        assert_eq!(s, Some(PgException::Strict));
+        assert!(s.contains(&PgException::Explicit(SqlState::from_code("P0002"))), "{s:?}");
+        assert!(s.contains(&PgException::Explicit(SqlState::from_code("P0003"))), "{s:?}");
     }
 
     #[test]
@@ -451,7 +388,7 @@ mod test {
         "#;
 
         let s = get_strict_exceptions(&parse_plpgsql(fn_def).unwrap());
-        assert_eq!(s, None);
+        assert!(s.is_empty(), "{s:?}");
     }
 
     #[test]

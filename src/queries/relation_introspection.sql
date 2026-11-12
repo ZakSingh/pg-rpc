@@ -68,6 +68,7 @@ with recursive user_relations as (
                                   'type', 'domain',
                                   'column', cth.root_column_name,
                                   'domain', t.typname::text,
+                                  'domain_schema', (select nspname from pg_namespace where oid = t.typnamespace),
                                   'is_array', cth.is_array,
                                   'check_clause', pg_get_constraintdef(dc.oid),
                                   'comment', obj_description(dc.oid, 'pg_constraint')
@@ -129,6 +130,7 @@ with recursive user_relations as (
                                             'on_delete', con.confdeltype,
                                             'comment', obj_description(con.oid, 'pg_constraint'),
                                             'ref_table', ref_class.relname::text,
+                                            'ref_table_oid', con.confrelid::bigint,
                                             'ref_columns', (select array_agg(a.attname order by array_position(con.confkey::int[], a.attnum::int))
                                                             from unnest(con.confkey) k
                                                                      join pg_attribute a on a.attrelid = con.confrelid and a.attnum = k))::json as constraint_info

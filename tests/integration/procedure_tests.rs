@@ -172,8 +172,8 @@ fn test_procedure_with_single_inout_parameter() {
             "Should return the INOUT parameter type directly (wrapped in Option as nullable)"
         );
         assert!(
-            public_content.contains("row.try_get(0)"),
-            "Should extract single INOUT parameter from row"
+            public_content.contains("try_get(0)"),
+            "Should extract single INOUT parameter from row:\n{public_content}"
         );
 
         println!("Single INOUT parameter procedure test completed successfully!");

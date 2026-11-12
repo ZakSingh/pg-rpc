@@ -26,12 +26,21 @@ fn setup(client: &mut Client) -> Result<(), postgres::Error> {
         COMMENT ON CONSTRAINT postcode_format ON DOMAIN postcode IS
             '@pgrpc_message Not a valid postcode';
 
+        -- A domain has no column to default to; only an explicit field applies.
+        CREATE DOMAIN slug AS TEXT
+            CONSTRAINT is_valid_slug CHECK (VALUE ~ '^[a-z0-9-]+$');
+        COMMENT ON CONSTRAINT is_valid_slug ON DOMAIN slug IS $$
+            @pgrpc_message Use lowercase letters, digits and dashes only
+            @pgrpc_field(handle)
+        $$;
+
         CREATE TABLE submission (
             id SERIAL PRIMARY KEY,
             title TEXT NOT NULL,
             token TEXT,
             graded BOOLEAN NOT NULL DEFAULT FALSE,
             postcode postcode,
+            handle slug,
             account_id INT REFERENCES account(account_id),
             CONSTRAINT title_length CHECK (length(title) <= 60),
             CONSTRAINT token_follows_grading CHECK (token IS NULL OR graded),
@@ -99,12 +108,15 @@ fn constraint_messages_are_generated_and_compile() {
         // Display prints the Postgres name now.
         assert!(errors_c.contains(&compact("f.write_str(self.name())")), "{errors}");
 
-        // Flat lookups by raw names.
+        // Flat lookups by raw names, keyed by schema so same-named tables in
+        // two schemas cannot collide; `None` accepts any schema.
         for expected in [
-            "(\"submission\", \"title_length\") => Some(ConstraintMessage { message: \"Title must be 60 characters or fewer\", field: Some(\"title\") })",
-            "(\"submission\", \"token_follows_grading\") => Some(ConstraintMessage { message: \"A token can only be assigned once the piece is graded\", field: None })",
-            "(\"submission\", \"submission_token_key\") => Some(ConstraintMessage { message: \"That token isn't valid, it's taken\", field: Some(\"token_code\") })",
-            "(\"postcode\", \"postcode_format\") => Some(ConstraintMessage { message: \"Not a valid postcode\", field: None })",
+            "(Some(\"public\") | None, \"submission\", \"title_length\") => Some(ConstraintMessage { message: \"Title must be 60 characters or fewer\", field: Some(\"title\") })",
+            "(Some(\"public\") | None, \"submission\", \"token_follows_grading\") => Some(ConstraintMessage { message: \"A token can only be assigned once the piece is graded\", field: None })",
+            "(Some(\"public\") | None, \"submission\", \"submission_token_key\") => Some(ConstraintMessage { message: \"That token isn't valid, it's taken\", field: Some(\"token_code\") })",
+            "(Some(\"public\") | None, \"postcode\", \"postcode_format\") => Some(ConstraintMessage { message: \"Not a valid postcode\", field: None })",
+            // explicit @pgrpc_field on a domain CHECK is honoured
+            "(Some(\"public\") | None, \"slug\", \"is_valid_slug\") => Some(ConstraintMessage { message: \"Use lowercase letters, digits and dashes only\", field: Some(\"handle\") })",
         ] {
             assert!(errors_c.contains(&compact(expected)), "missing {expected}\n{errors}");
         }
@@ -113,8 +125,10 @@ fn constraint_messages_are_generated_and_compile() {
             "untagged constraint must not get a message:\n{errors}"
         );
 
-        // One generic conversion on every error enum.
+        // One generic conversion on every error enum, and on a bare DbError.
         assert!(errors_c.contains(&compact("fn user_message(&self) -> Option<ConstraintMessage>")), "{errors}");
+        assert!(errors_c.contains(&compact("impl AsDbError for tokio_postgres::error::DbError")), "{errors}");
+        assert!(errors_c.contains(&compact("fn is_typed_error(&self) -> bool")), "{errors}");
 
         // The function's own enum still routes the typed variants.
         let api = read_pretty(generated.join("msg_api.rs"));

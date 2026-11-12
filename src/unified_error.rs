@@ -241,57 +241,64 @@ pub fn generate_constraint_enums(
 pub fn generate_constraint_message_lookup(
     table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
 ) -> TokenStream {
-    // (table, constraint) -> (message, field); first schema wins on a clash.
-    let mut table_entries: BTreeMap<(String, String), (String, Option<String>)> = BTreeMap::new();
-    // (domain, constraint) -> message
-    let mut domain_entries: BTreeMap<(String, String), String> = BTreeMap::new();
+    // (schema, table, constraint) -> (message, field)
+    let mut table_entries: BTreeMap<(String, String, String), (String, Option<String>)> =
+        BTreeMap::new();
+    // (domain schema, domain, constraint) -> (message, explicit field)
+    let mut domain_entries: BTreeMap<(String, String, String), (String, Option<String>)> =
+        BTreeMap::new();
 
     for (table_id, constraints) in table_constraints {
         for constraint in constraints {
             let Some(message) = constraint.message() else { continue };
             match constraint {
                 Constraint::Domain(d) => {
-                    let Some(domain) = &d.domain else { continue };
+                    let (Some(domain), Some(schema)) = (&d.domain, &d.domain_schema) else {
+                        continue;
+                    };
+                    // A domain has no column to default to: only an explicit
+                    // `@pgrpc_field(name)` attaches a field.
+                    let field = match constraint.comment().and_then(crate::annotations::parse_field) {
+                        Some(Some(f)) => Some(f),
+                        _ => None,
+                    };
                     domain_entries
-                        .entry((domain.clone(), d.name.to_string()))
-                        .or_insert(message);
+                        .entry((schema.clone(), domain.clone(), d.name.to_string()))
+                        .or_insert((message, field));
                 }
                 _ => {
-                    let key = (table_id.name().to_string(), constraint.name().to_string());
-                    let value = (message, constraint.field());
-                    if let Some(existing) = table_entries.get(&key) {
-                        if *existing != value {
-                            log::warn!(
-                                "Constraint {}.{} is tagged with different messages in two schemas; using the first",
-                                key.0, key.1
-                            );
-                        }
-                        continue;
-                    }
-                    table_entries.insert(key, value);
+                    table_entries.insert(
+                        (
+                            table_id.schema().to_string(),
+                            table_id.name().to_string(),
+                            constraint.name().to_string(),
+                        ),
+                        (message, constraint.field()),
+                    );
                 }
             }
         }
     }
 
-    let table_arms = table_entries.iter().map(|((table, constraint), (message, field))| {
+    // `(Some("schema") | None, "table", "constraint")`: an exact schema
+    // matches, and a caller without a schema gets the first entry in
+    // (schema, table, constraint) order.
+    let arm = |(schema, name, constraint): &(String, String, String), (message, field): &(String, Option<String>)| {
         let field = match field {
             Some(f) => quote! { Some(#f) },
             None => quote! { None },
         };
         quote! {
-            (#table, #constraint) => Some(ConstraintMessage { message: #message, field: #field })
+            (Some(#schema) | None, #name, #constraint) => Some(ConstraintMessage { message: #message, field: #field })
         }
-    });
-    let domain_arms = domain_entries.iter().map(|((domain, constraint), message)| {
-        quote! {
-            (#domain, #constraint) => Some(ConstraintMessage { message: #message, field: None })
-        }
-    });
+    };
+    let table_arms = table_entries.iter().map(|(k, v)| arm(k, v));
+    let domain_arms = domain_entries.iter().map(|(k, v)| arm(k, v));
 
     quote! {
-        /// A user-facing message attached to a constraint with `@pgrpc_message`,
-        /// and the form field it belongs to (see `@pgrpc_field`).
+        /// A user-facing message attached to a constraint (or a typed error's
+        /// payload type) with `@pgrpc_message`, and the form field it belongs
+        /// to (see `@pgrpc_field`).
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct ConstraintMessage {
             pub message: &'static str,
@@ -299,19 +306,22 @@ pub fn generate_constraint_message_lookup(
             pub field: Option<&'static str>,
         }
 
-        /// `(table, constraint)` -> message, for every tagged table constraint.
-        /// Keyed by the bare names `DbError::table()` and `DbError::constraint()` report.
-        pub fn constraint_message(table: &str, constraint: &str) -> Option<ConstraintMessage> {
-            match (table, constraint) {
+        /// `(schema, table, constraint)` -> message, for every tagged table
+        /// constraint, keyed by the bare names `DbError::schema()`,
+        /// `DbError::table()` and `DbError::constraint()` report. With
+        /// `schema = None` the first matching table wins.
+        pub fn constraint_message(schema: Option<&str>, table: &str, constraint: &str) -> Option<ConstraintMessage> {
+            match (schema, table, constraint) {
                 #(#table_arms,)*
                 _ => None,
             }
         }
 
-        /// `(domain, constraint)` -> message, for every tagged domain CHECK.
-        /// Keyed by `DbError::datatype()` and `DbError::constraint()`.
-        pub fn domain_constraint_message(domain: &str, constraint: &str) -> Option<ConstraintMessage> {
-            match (domain, constraint) {
+        /// `(schema, domain, constraint)` -> message, for every tagged domain
+        /// CHECK, keyed by `DbError::schema()`, `DbError::datatype()` and
+        /// `DbError::constraint()`.
+        pub fn domain_constraint_message(schema: Option<&str>, domain: &str, constraint: &str) -> Option<ConstraintMessage> {
+            match (schema, domain, constraint) {
                 #(#domain_arms,)*
                 _ => None,
             }
@@ -377,6 +387,12 @@ pub fn generate_unified_error(
             CustomError(super::custom_errors::CustomError, #[source] tokio_postgres::error::DbError)
         });
     }
+
+    // A row column that could not be decoded into the generated Rust type.
+    error_variants.push(quote! {
+        #[error(transparent)]
+        Decode(DecodeError)
+    });
 
     // Add generic database error - using transparent to show underlying SQL error
     error_variants.push(quote! {
@@ -671,6 +687,7 @@ pub fn generate_as_db_error_impl(
                 match self {
                     #(#constraint_arms,)*
                     #(#custom_arms,)*
+                    PgRpcError::Decode(e) => e.source.as_db_error(),
                     PgRpcError::Database(e) => e.as_db_error(),
                 }
             }

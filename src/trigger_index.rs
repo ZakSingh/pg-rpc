@@ -1,5 +1,10 @@
 use crate::codegen::OID;
-use crate::exceptions::{get_exceptions_with_triggers, PgException};
+use crate::call_graph::{self, CallTarget};
+use crate::constraint_analysis::{extract_queries, get_rel_deps, RelDep};
+use crate::exceptions::{get_exceptions_from_deps, PgException};
+use crate::fn_index::FunctionIndex;
+use itertools::Itertools;
+use std::collections::BTreeSet;
 use crate::rel_index::RelIndex;
 use pg_query::parse_plpgsql;
 use postgres::Client;
@@ -36,8 +41,13 @@ pub struct TriggerFunction {
     pub schema: String,
     pub source: String,
     pub comment: Option<String>,
-    /// Exceptions that this trigger function can raise
+    /// Exceptions that this trigger function can raise, including those of
+    /// the functions it calls.
     pub exceptions: Vec<PgException>,
+    /// DML the trigger function (and its callees) performs.
+    pub rel_deps: Vec<RelDep>,
+    /// Functions called from the trigger body, by name as written.
+    pub callees: BTreeSet<CallTarget>,
 }
 
 /// Information about a trigger
@@ -69,6 +79,7 @@ impl TriggerIndex {
         db: &mut Client,
         rel_index: &RelIndex,
         errors_config: Option<&crate::config::ErrorsConfig>,
+        fn_index: &FunctionIndex,
     ) -> anyhow::Result<Self> {
         let trigger_sql = include_str!("./queries/trigger_introspection.sql");
 
@@ -120,14 +131,14 @@ impl TriggerIndex {
             };
 
             // Analyze the trigger function for exceptions
-            let exceptions = Self::analyze_trigger_function(
+            let (exceptions, rel_deps, callees) = Self::analyze_trigger_function(
                 &function_source,
                 function_comment.as_ref(),
                 rel_index,
                 errors_config,
                 &format!("trigger function {function_schema}.{function_name}"),
             )
-            .unwrap_or_else(|_| Vec::new());
+            .unwrap_or_default();
 
             let trigger_function = TriggerFunction {
                 oid: function_oid,
@@ -136,6 +147,8 @@ impl TriggerIndex {
                 source: function_source,
                 comment: function_comment,
                 exceptions,
+                rel_deps,
+                callees,
             };
 
             let trigger = Trigger {
@@ -154,7 +167,52 @@ impl TriggerIndex {
                 .push(trigger);
         }
 
-        Ok(Self { triggers_by_table })
+        let mut index = Self { triggers_by_table };
+        index.follow_calls(fn_index);
+        Ok(index)
+    }
+
+    /// Union each trigger function's callees' exceptions and DML into the
+    /// trigger, so `perform core.validate(...)` inside a trigger body surfaces
+    /// on every function that writes the triggered table. Callee data is
+    /// already transitive after `FunctionIndex::follow_calls`.
+    fn follow_calls(&mut self, fn_index: &FunctionIndex) {
+        for trigger in self.triggers_by_table.values_mut().flatten() {
+            let function = &mut trigger.function;
+            let mut extra_exceptions = Vec::new();
+            let mut extra_deps = Vec::new();
+            for target in &function.callees {
+                let Some(callee) = fn_index.resolve(target, Some(&function.schema)) else {
+                    continue;
+                };
+                log::debug!(
+                    "trigger function {}.{} calls {}.{}; folding its errors in",
+                    function.schema,
+                    function.name,
+                    callee.schema,
+                    callee.name
+                );
+                extra_exceptions.extend(callee.exceptions.iter().cloned());
+                extra_deps.extend(callee.rel_deps.iter().cloned());
+            }
+            if extra_exceptions.is_empty() && extra_deps.is_empty() {
+                continue;
+            }
+            function.exceptions.extend(extra_exceptions);
+            function.exceptions = std::mem::take(&mut function.exceptions)
+                .into_iter()
+                .unique()
+                .collect();
+            function.rel_deps.extend(extra_deps);
+        }
+    }
+
+    /// DML performed by the triggers that fire for an event on a table.
+    pub fn get_rel_deps_for_event(&self, table_oid: OID, event: &TriggerEvent) -> Vec<RelDep> {
+        self.get_triggers_for_event(table_oid, event)
+            .into_iter()
+            .flat_map(|trigger| trigger.function.rel_deps.iter().cloned())
+            .collect()
     }
 
     /// Get all triggers for a specific table
@@ -193,7 +251,7 @@ impl TriggerIndex {
         rel_index: &RelIndex,
         errors_config: Option<&crate::config::ErrorsConfig>,
         scope: &str,
-    ) -> anyhow::Result<Vec<PgException>> {
+    ) -> anyhow::Result<(Vec<PgException>, Vec<RelDep>, BTreeSet<CallTarget>)> {
         // Create a mock function definition for parsing
         let function_def = format!(
             "CREATE OR REPLACE FUNCTION trigger_func() RETURNS TRIGGER AS $$ {} $$ LANGUAGE plpgsql;",
@@ -203,12 +261,23 @@ impl TriggerIndex {
         // Parse the function using pg_query
         match parse_plpgsql(&function_def) {
             Ok(parsed) => {
-                // Use existing exception analysis logic
-                get_exceptions_with_triggers(&parsed, comment, rel_index, None, errors_config, scope)
+                let queries = extract_queries(&parsed, scope);
+                let rel_deps = get_rel_deps(&queries, rel_index, scope);
+                let exceptions = get_exceptions_from_deps(
+                    &parsed,
+                    &rel_deps,
+                    comment,
+                    rel_index,
+                    errors_config,
+                    scope,
+                )?;
+                let callees = call_graph::plpgsql_callees(&parsed);
+                Ok((exceptions, rel_deps, callees))
             }
             Err(_) => {
                 // If parsing fails, try to extract basic RAISE statements with regex
-                Self::extract_basic_exceptions(source, comment)
+                let exceptions = Self::extract_basic_exceptions(source, comment)?;
+                Ok((exceptions, Vec::new(), BTreeSet::new()))
             }
         }
     }

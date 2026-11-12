@@ -4,6 +4,7 @@ WITH error_types AS (
     SELECT 
         t.oid AS type_oid,
         t.typname AS error_name,
+        obj_description(t.oid, 'pg_type') AS comment,
         json_agg(
             json_build_object(
                 'name', a.attname,
@@ -27,6 +28,7 @@ WITH error_types AS (
 SELECT 
     error_name,
     type_oid::oid::int4 AS type_oid,
+    comment,
     COALESCE(fields, '[]'::json) AS fields
 FROM error_types
 ORDER BY error_name;

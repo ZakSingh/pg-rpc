@@ -5,11 +5,10 @@
 
 use crate::codegen::OID;
 use crate::exceptions::PgException;
-use crate::pg_constraint::Constraint;
+use crate::pg_constraint::{Constraint, OnDelete};
 use crate::pg_id::PgId;
 use crate::rel_index::RelIndex;
 use crate::trigger_index::{TriggerEvent, TriggerIndex};
-use itertools::Itertools;
 use jsonpath_rust::JsonPath;
 use log::warn;
 use pg_query::protobuf::node::Node;
@@ -109,6 +108,26 @@ pub fn get_rel_deps(queries: &[ParseResult], rel_index: &RelIndex, scope: &str) 
         .collect()
 }
 
+/// The event a DML dependency fires triggers for, if any.
+pub fn trigger_event_for(cmd: &Cmd) -> Option<TriggerEvent> {
+    match cmd {
+        Cmd::Insert { .. } => Some(TriggerEvent::Insert),
+        Cmd::Update { .. } => Some(TriggerEvent::Update),
+        Cmd::Delete => Some(TriggerEvent::Delete),
+        Cmd::Select { .. } => None,
+    }
+}
+
+/// The DML performed by triggers that fire for these dependencies, so the
+/// tables a trigger writes get their constraint arms on the caller too.
+pub fn trigger_rel_deps(rel_deps: &[RelDep], trigger_index: &TriggerIndex) -> Vec<RelDep> {
+    rel_deps
+        .iter()
+        .filter_map(|dep| trigger_event_for(&dep.cmd).map(|event| (dep.rel_oid, event)))
+        .flat_map(|(oid, event)| trigger_index.get_rel_deps_for_event(oid, &event))
+        .collect()
+}
+
 /// Populate trigger exceptions for relation dependencies
 pub fn populate_trigger_exceptions(rel_deps: &mut [RelDep], trigger_index: &TriggerIndex) {
     for rel_dep in rel_deps {
@@ -162,6 +181,68 @@ pub fn sql_rel_deps(
     rel_deps
 }
 
+/// The constraints one DML dependency can violate, each paired with the table
+/// Postgres reports the violation on (`DbError::table()`).
+///
+/// INSERT and UPDATE can trip the written table's own constraints on the
+/// touched columns (minus unique/primary keys an `ON CONFLICT` absorbs).
+/// DELETE cannot violate the deleted table's own constraints; what fails is a
+/// `RESTRICT` / `NO ACTION` foreign key on *another* table that still
+/// references the row, so those are returned under the referencing table.
+/// `NOT NULL` is included; callers that cannot classify it drop it.
+pub fn applicable_constraints(dep: &RelDep, rel_index: &RelIndex) -> Vec<(PgId, Constraint)> {
+    let Some(rel) = rel_index.get(&dep.rel_oid) else {
+        return Vec::new();
+    };
+    match &dep.cmd {
+        Cmd::Update { cols } => rel
+            .constraints
+            .iter()
+            .filter(|c| !matches!(c, Constraint::Default(_)) && c.contains_columns(cols))
+            .map(|c| (rel.id.clone(), c.clone()))
+            .collect(),
+        Cmd::Insert { cols, on_conflict } => rel
+            .constraints
+            .iter()
+            .filter(|c| {
+                if matches!(c, Constraint::Default(_)) || !c.contains_columns(cols) {
+                    return false;
+                }
+                let key_columns = match c {
+                    Constraint::PrimaryKey(pk) => &pk.columns,
+                    Constraint::Unique(u) => &u.columns,
+                    _ => return true,
+                };
+                // ON CONFLICT absorbs the matching unique/primary key.
+                match on_conflict.as_ref().map(|oc| &oc.target) {
+                    None => true,
+                    Some(ConflictTarget::Any) => false,
+                    Some(ConflictTarget::Columns(conflict_cols)) => {
+                        !key_columns.iter().eq(conflict_cols.iter())
+                    }
+                    Some(ConflictTarget::Constraint(name)) => c.name() != *name,
+                }
+            })
+            .map(|c| (rel.id.clone(), c.clone()))
+            .collect(),
+        Cmd::Delete => rel_index
+            .values()
+            .flat_map(|other| {
+                other.constraints.iter().filter_map(move |c| match c {
+                    Constraint::ForeignKey(fk)
+                        if fk.ref_table_oid == Some(dep.rel_oid)
+                            && matches!(fk.on_delete, OnDelete::Restrict | OnDelete::NoAction) =>
+                    {
+                        Some((other.id.clone(), c.clone()))
+                    }
+                    _ => None,
+                })
+            })
+            .collect(),
+        Cmd::Select { .. } => Vec::new(),
+    }
+}
+
 /// The constraints that the given relation dependencies can violate, as both
 /// a flat exception list (constraints plus trigger exceptions) and a
 /// per-table map used to build `XxxConstraint` error variants.
@@ -173,85 +254,13 @@ pub fn constraints_from_deps(
     let mut table_constraints: BTreeMap<PgId, Vec<Constraint>> = BTreeMap::new();
 
     for dep in rel_deps {
-        // Find the PgId for this OID
-        let pg_id = rel_index
-            .iter()
-            .find(|(oid, _)| **oid == dep.rel_oid)
-            .map(|(_, rel)| &rel.id);
-
-        if let Some(id) = pg_id {
-            if let Some(rel) = rel_index.get(&dep.rel_oid) {
-                let relevant_constraints: Vec<Constraint> = rel
-                    .constraints
-                    .iter()
-                    .filter(|c| {
-                        // Filter constraints based on the operation type
-                        match &dep.cmd {
-                            Cmd::Update { cols } => c.contains_columns(cols),
-                            Cmd::Insert { cols, on_conflict } => {
-                                // Skip default constraints
-                                if matches!(c, Constraint::Default(_)) {
-                                    return false;
-                                }
-
-                                if !c.contains_columns(cols) {
-                                    return false;
-                                }
-
-                                // Filter out unique/primary key constraints if they're handled by ON CONFLICT
-                                if let Some(conflict) = on_conflict {
-                                    match c {
-                                        Constraint::PrimaryKey(pk) => {
-                                            let constraint_cols = &pk.columns;
-                                            match &conflict.target {
-                                                ConflictTarget::Columns(conflict_cols) => {
-                                                    !constraint_cols.iter().eq(conflict_cols.iter())
-                                                }
-                                                ConflictTarget::Constraint(name) => {
-                                                    c.name().as_str() != name.as_str()
-                                                }
-                                                ConflictTarget::Any => false,
-                                            }
-                                        }
-                                        Constraint::Unique(unique) => {
-                                            let constraint_cols = &unique.columns;
-                                            match &conflict.target {
-                                                ConflictTarget::Columns(conflict_cols) => {
-                                                    !constraint_cols.iter().eq(conflict_cols.iter())
-                                                }
-                                                ConflictTarget::Constraint(name) => {
-                                                    c.name().as_str() != name.as_str()
-                                                }
-                                                ConflictTarget::Any => false,
-                                            }
-                                        }
-                                        _ => true,
-                                    }
-                                } else {
-                                    true
-                                }
-                            }
-                            Cmd::Delete => matches!(c, Constraint::ForeignKey(_)),
-                            _ => false,
-                        }
-                    })
-                    .cloned()
-                    .collect();
-
-                if !relevant_constraints.is_empty() {
-                    // Add constraint exceptions
-                    for constraint in &relevant_constraints {
-                        exceptions.push(PgException::Constraint(constraint.clone()));
-                    }
-                    // Merge: the same table may be written by several
-                    // statements, or by the query and a function it calls.
-                    let entry = table_constraints.entry(id.clone()).or_default();
-                    entry.extend(relevant_constraints);
-                    *entry = std::mem::take(entry)
-                        .into_iter()
-                        .unique_by(|c| c.name())
-                        .collect();
-                }
+        for (table_id, constraint) in applicable_constraints(dep, rel_index) {
+            exceptions.push(PgException::Constraint(constraint.clone()));
+            // Merge: the same table may be written by several statements, or
+            // by the query and a function it calls.
+            let entry = table_constraints.entry(table_id).or_default();
+            if !entry.iter().any(|c| c.name() == constraint.name()) {
+                entry.push(constraint);
             }
         }
 

@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 // Re-export constraint analysis types for backward compatibility
 pub use crate::constraint_analysis::{
-    extract_queries, get_rel_deps, populate_trigger_exceptions, Cmd, ConflictTarget,
+    applicable_constraints, extract_queries, get_rel_deps, populate_trigger_exceptions,
 };
 
 const VOID_TYPE_OID: u32 = 2278;
@@ -382,42 +382,19 @@ impl PgFn {
         // Relations written by this function and by everything it calls.
         let rel_deps = &self.rel_deps;
 
-        // Collect constraints from tables this function touches
+        // Collect constraints from tables this function touches, keyed by the
+        // table the violation is reported on (a DELETE blocked by a foreign key
+        // is reported on the referencing table).
         for dep in rel_deps {
-            // Find the PgId for this OID
-            let pg_id = rel_index
-                .iter()
-                .find(|(oid, _)| **oid == dep.rel_oid)
-                .map(|(_, rel)| &rel.id);
-
-            if let Some(id) = pg_id {
-                if let Some(constraints) = table_constraints.get(id) {
-                    let relevant_constraints: Vec<Constraint> = constraints
-                        .iter()
-                        .filter(|c| {
-                            // Filter constraints based on the operation type
-                            match &dep.cmd {
-                                Cmd::Update { cols } => c.contains_columns(cols),
-                                Cmd::Insert { cols, .. } => {
-                                    c.contains_columns(cols) && !matches!(c, Constraint::Default(_))
-                                }
-                                Cmd::Delete => matches!(c, Constraint::ForeignKey(_)),
-                                _ => false,
-                            }
-                        })
-                        .cloned()
-                        .collect();
-
-                    if !relevant_constraints.is_empty() {
-                        // Merge: the same table may be written more than once
-                        // (several statements, or caller + callee).
-                        let entry = used_constraints.entry(id.clone()).or_default();
-                        entry.extend(relevant_constraints);
-                        *entry = std::mem::take(entry)
-                            .into_iter()
-                            .unique_by(|c| c.name())
-                            .collect();
-                    }
+            for (table_id, constraint) in applicable_constraints(dep, rel_index) {
+                if !table_constraints.contains_key(&table_id) {
+                    continue;
+                }
+                // Merge: the same table may be written more than once
+                // (several statements, or caller + callee).
+                let entry = used_constraints.entry(table_id).or_default();
+                if !entry.iter().any(|c| c.name() == constraint.name()) {
+                    entry.push(constraint);
                 }
             }
         }
@@ -598,6 +575,12 @@ impl PgFn {
             impl From<super::errors::PgRpcError> for #error_enum_name {
                 fn from(err: super::errors::PgRpcError) -> Self {
                     #error_enum_name::Other(err)
+                }
+            }
+
+            impl From<super::errors::DecodeError> for #error_enum_name {
+                fn from(err: super::errors::DecodeError) -> Self {
+                    #error_enum_name::Other(super::errors::PgRpcError::Decode(err))
                 }
             }
 
@@ -856,27 +839,11 @@ impl PgFn {
 
                         // Collect constraint-based exceptions
                         for dep in &rel_deps {
-                            if let Some(rel) = rel_index.get(&dep.rel_oid) {
-                                for constraint in &rel.constraints {
-                                    // Filter constraints based on the operation type
-                                    let include = match &dep.cmd {
-                                        Cmd::Update { cols } => constraint.contains_columns(cols),
-                                        Cmd::Insert { cols, .. } => {
-                                            constraint.contains_columns(cols)
-                                                && !matches!(constraint, Constraint::Default(_))
-                                        }
-                                        Cmd::Delete => {
-                                            matches!(constraint, Constraint::ForeignKey(_))
-                                        }
-                                        _ => false,
-                                    };
-
-                                    if include {
-                                        exceptions
-                                            .push(PgException::Constraint(constraint.clone()));
-                                    }
-                                }
-                            }
+                            exceptions.extend(
+                                applicable_constraints(dep, rel_index)
+                                    .into_iter()
+                                    .map(|(_, c)| PgException::Constraint(c)),
+                            );
                         }
 
                         // Add trigger-based exceptions if available
@@ -1038,6 +1005,16 @@ impl ToRust for PgFn {
                 format!("select {}.{}", self.schema, self.name)
             };
 
+            // Attribution for scalar decode failures: the function, and the
+            // single OUT parameter or the (unnamed) return value.
+            let item = format!("{}.{}", self.schema, self.name);
+            let result_col = self
+                .out_args
+                .first()
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| "result".to_string());
+            let decode = crate::codegen::decode_err(&item, &result_col, 0);
+
             let query = if self.is_procedure {
                 // Handle procedures differently
                 if self.out_args.is_empty() {
@@ -1055,8 +1032,8 @@ impl ToRust for PgFn {
                         client
                             .query_one(&stmt, &params)
                             .await
-                            .and_then(|row| row.try_get(0))
                             .map_err(#err_type::from)
+                            .and_then(|row| row.try_get(0).map_err(#decode).map_err(#err_type::from))
                     }
                 } else {
                     // Multiple OUT parameters - return as tuple or struct
@@ -1065,8 +1042,8 @@ impl ToRust for PgFn {
                         client
                             .query_one(&stmt, &params)
                             .await
-                            .and_then(|row| row.try_into())
                             .map_err(#err_type::from)
+                            .and_then(|row| row.try_into().map_err(#err_type::from))
                     }
                 }
             } else if return_opt {
@@ -1074,11 +1051,11 @@ impl ToRust for PgFn {
                     client
                         .query_opt(&stmt, &params)
                         .await
+                        .map_err(#err_type::from)
                         .and_then(|opt_row| match opt_row {
                             None => Ok(None),
-                            Some(row) => row.try_get(0).map(Some),
+                            Some(row) => row.try_get(0).map(Some).map_err(#decode).map_err(#err_type::from),
                         })
-                        .map_err(#err_type::from)
                 }
             } else if self.returns_set {
                 if self.return_type_oid == VOID_TYPE_OID {
@@ -1096,9 +1073,12 @@ impl ToRust for PgFn {
                         client
                             .query(&stmt, &params)
                             .await
+                            .map_err(#err_type::from)
                             .and_then(|rows| {
-                                rows.into_iter().map(TryInto::try_into).collect()
-                            }).map_err(#err_type::from)
+                                rows.into_iter()
+                                    .map(|row| row.try_into().map_err(#err_type::from))
+                                    .collect()
+                            })
                     }
                 } else {
                     // Check if return type is composite or primitive
@@ -1110,9 +1090,12 @@ impl ToRust for PgFn {
                                 client
                                     .query(&stmt, &params)
                                     .await
+                                    .map_err(#err_type::from)
                                     .and_then(|rows| {
-                                        rows.into_iter().map(TryInto::try_into).collect()
-                                    }).map_err(#err_type::from)
+                                        rows.into_iter()
+                                            .map(|row| row.try_into().map_err(#err_type::from))
+                                            .collect()
+                                    })
                             }
                         }
                         _ => {
@@ -1121,9 +1104,12 @@ impl ToRust for PgFn {
                                 client
                                     .query(&stmt, &params)
                                     .await
+                                    .map_err(#err_type::from)
                                     .and_then(|rows| {
-                                        rows.into_iter().map(|row| row.try_get(0)).collect()
-                                    }).map_err(#err_type::from)
+                                        rows.into_iter()
+                                            .map(|row| row.try_get(0).map_err(#decode).map_err(#err_type::from))
+                                            .collect()
+                                    })
                             }
                         }
                     }
@@ -1134,8 +1120,8 @@ impl ToRust for PgFn {
                     client
                         .query_one(&stmt, &params)
                         .await
-                        .and_then(|r| r.try_into())
                         .map_err(#err_type::from)
+                        .and_then(|r| r.try_into().map_err(#err_type::from))
                 }
             } else if self.return_type_oid == VOID_TYPE_OID {
                 // Void returning function
@@ -1153,8 +1139,8 @@ impl ToRust for PgFn {
                     client
                         .query_one(&stmt, &params)
                         .await
-                        .and_then(|r| r.try_into())
                         .map_err(#err_type::from)
+                        .and_then(|r| r.try_into().map_err(#err_type::from))
                 }
             } else {
                 // Use try_get for single return value
@@ -1162,8 +1148,8 @@ impl ToRust for PgFn {
                     client
                         .query_one(&stmt, &params)
                         .await
-                        .and_then(|r| r.try_get(0))
                         .map_err(#err_type::from)
+                        .and_then(|r| r.try_get(0).map_err(#decode).map_err(#err_type::from))
                 }
             };
 
@@ -1420,6 +1406,8 @@ impl PgFn {
             .map(|arg| arg.rs_out_name())
             .collect();
         let field_indices: Vec<usize> = (0..self.out_args.len()).collect();
+        let column_names: Vec<&str> = self.out_args.iter().map(|a| a.name.as_str()).collect();
+        let struct_name_str = struct_name.to_string();
 
         quote! {
             #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1428,12 +1416,13 @@ impl PgFn {
             }
 
             impl TryFrom<tokio_postgres::Row> for #struct_name {
-                type Error = tokio_postgres::Error;
+                type Error = super::errors::DecodeError;
 
                 fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
                     Ok(Self {
                         #(
-                            #field_names: row.try_get(#field_indices)?,
+                            #field_names: row.try_get(#field_indices)
+                                .map_err(super::errors::DecodeError::at(#struct_name_str, #column_names, #field_indices))?,
                         )*
                     })
                 }
@@ -1447,6 +1436,7 @@ impl PgFn {
         struct_name: &TokenStream,
         types: &BTreeMap<OID, PgType>,
     ) -> TokenStream {
+        let struct_name_str = struct_name.to_string();
         use crate::column_grouping::{group_by_double_underscore, GroupedField};
 
         // Build indexed args with clean names (strip o_/p_ prefix). These prefixes
@@ -1507,7 +1497,8 @@ impl PgFn {
                         pub #field_name: #field_type
                     });
                     parent_field_assignments.push(quote! {
-                        #field_name: row.try_get(#idx)?
+                        #field_name: row.try_get(#idx)
+                            .map_err(super::errors::DecodeError::at(#struct_name_str, #sql_name, #idx))?
                     });
                 }
                 GroupedField::Group {
@@ -1563,7 +1554,11 @@ impl PgFn {
                         .iter()
                         .map(|(idx, arg)| {
                             let f_name = sql_to_rs_ident(&arg.name, CaseType::Snake);
-                            quote! { #f_name: row.try_get(#idx)? }
+                            let c_name = arg.name.as_str();
+                            quote! {
+                                #f_name: row.try_get(#idx)
+                                    .map_err(super::errors::DecodeError::at(#struct_name_str, #c_name, #idx))?
+                            }
                         })
                         .collect();
 
@@ -1579,6 +1574,7 @@ impl PgFn {
                         // accepts every Postgres type, so the probe never
                         // trips tokio-postgres's type-compatibility check.
                         let first_idx = fields[0].0;
+                        let first_col = fields[0].1.name.as_str();
                         let group_type = quote! { Option<#nested_struct_name> };
 
                         parent_fields.push(quote! {
@@ -1586,7 +1582,10 @@ impl PgFn {
                         });
 
                         parent_field_assignments.push(quote! {
-                            #group_field_name: if row.try_get::<usize, super::nullable::NullProbe>(#first_idx)?.is_null {
+                            #group_field_name: if row.try_get::<usize, super::nullable::NullProbe>(#first_idx)
+                                .map_err(super::errors::DecodeError::at(#struct_name_str, #first_col, #first_idx))?
+                                .is_null
+                            {
                                 None
                             } else {
                                 Some(#nested_struct_name {
@@ -1618,7 +1617,7 @@ impl PgFn {
             }
 
             impl TryFrom<tokio_postgres::Row> for #struct_name {
-                type Error = tokio_postgres::Error;
+                type Error = super::errors::DecodeError;
 
                 fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
                     Ok(Self {
@@ -1880,9 +1879,14 @@ mod test {
         let generated = pg_fn.to_rust(&types, &config);
         let generated_str = generated.to_string();
 
-        // Verify that for primitive SETOF return types, we use row.try_get(0)
-        assert!(generated_str
-            .contains("rows . into_iter () . map (| row | row . try_get (0)) . collect ()"));
+        // Verify that for primitive SETOF return types, we use row.try_get(0),
+        // attributing a decode failure to the function's result column.
+        assert!(
+            generated_str.contains(
+                "rows . into_iter () . map (| row | row . try_get (0) . map_err (super :: errors :: DecodeError :: at ("
+            ),
+            "{generated_str}"
+        );
         // Should NOT contain TryInto::try_into for primitive types
         assert!(!generated_str.contains("TryInto :: try_into"));
     }
@@ -1963,9 +1967,10 @@ mod test {
         let generated = pg_fn.to_rust(&types, &config);
         let generated_str = generated.to_string();
 
-        // Verify that for composite SETOF return types, we use TryInto::try_into
+        // Verify that for composite SETOF return types, we convert each row
         assert!(
-            generated_str.contains("rows . into_iter () . map (TryInto :: try_into) . collect ()")
+            generated_str.contains("rows . into_iter () . map (| row | row . try_into () . map_err ("),
+            "{generated_str}"
         );
         // Should NOT contain try_get(0) for composite types
         assert!(!generated_str.contains("row . try_get (0)"));
