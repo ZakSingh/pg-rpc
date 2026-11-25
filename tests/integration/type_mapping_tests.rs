@@ -169,7 +169,7 @@ fn unsupported_types_are_skipped() {
     assert_eq!(rows.len(), 1);
     assert_eq!((rows[0].id, rows[0].label.as_str()), (1, "first"));
 
-    let mixed = un::mixed().id(5).exec(&client).await.expect("composite").expect("row");
+    let mixed = un::mixed().id(5).exec(&client).await.expect("composite");
     assert_eq!((mixed.id, mixed.label.as_deref()), (Some(5), Some("m")));
 
     assert_eq!(un::label().id(1).exec(&client).await.expect("label").as_deref(), Some("first"));

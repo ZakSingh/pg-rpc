@@ -127,7 +127,7 @@ rejected, so a typo fails loudly instead of being ignored.
 | `connection_string` | `DATABASE_URL` env var | Database to introspect |
 | `output_path` | required (or `-o`) | Directory for the generated files |
 | `schemas` | required | Schemas to generate bindings for. Every user schema is still *analyzed*, so calls into helpers elsewhere are followed |
-| `infer_view_nullability` | `true` | Infer NOT NULL for view columns, query results and SQL-function `OUT` columns |
+| `infer_view_nullability` | `true` | Infer NOT NULL for view columns, query results, and the `OUT` columns and return values of `LANGUAGE sql` functions |
 | `disable_deserialize` | `[]` | `"schema.type"` names that should not derive `serde::Deserialize` |
 | `strict_domains` | `[]` | `"schema.domain"` names generated as validated newtypes (see [Strict domain types](#strict-domain-types)) |
 | `builders` | `[]` | `"schema.type"` names of composite types and views that also derive `bon::Builder` |
@@ -999,6 +999,17 @@ length_amount` generates `length_amount: Decimal` rather than `Option<Decimal>`.
 projection stays `Option` when the base column is nullable or on the outer side of a
 join, when there is no evidence for the attribute, or when it is subscripted
 (`(p.x).tags[1]`).
+
+### SQL function results
+
+For a `LANGUAGE sql` function the `OUT` columns, or the single returned value, are
+inferred from the body's last statement. A function that does not return a set yields
+NULL when that statement returns no row, so its result is only inferred NOT NULL when
+the statement provably returns exactly one row (an ungrouped aggregate, a `SELECT`
+without `FROM`). `select name from t where id = p_id` stays `Option` however `name` is
+declared. Nothing is inferred for a `STRICT` function that has a defaulted argument,
+since a NULL default makes it return NULL without running. PL/pgSQL bodies are not
+analyzed: annotate those with `@pgrpc_not_null`.
 
 ## Strict domain types
 

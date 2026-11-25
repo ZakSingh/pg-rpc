@@ -34,6 +34,10 @@ pub use crate::exceptions::extract_custom_errors_from_queries;
 
 const VOID_TYPE_OID: u32 = 2278;
 
+/// How a function's single returned value is named in diagnostics and in
+/// the body analysis.
+const RETURN_VALUE: &str = "return value";
+
 #[derive(Debug)]
 pub struct PgFn {
     pub oid: OID,
@@ -43,6 +47,11 @@ pub struct PgFn {
     pub out_args: Vec<PgArg>,
     pub return_type_oid: OID,
     pub returns_set: bool,
+    /// `STRICT`: returns NULL, without running, when any argument is NULL.
+    pub is_strict: bool,
+    /// The single returned value of a `LANGUAGE sql` function was inferred
+    /// NOT NULL from its body (see [`PgFn::infer_result_nullability`]).
+    pub return_not_null: bool,
     pub is_procedure: bool,
     pub has_table_params: bool,
     /// `pg_language.lanname`: `sql` or `plpgsql`.
@@ -264,32 +273,43 @@ impl PgFn {
         self.language == "sql"
     }
 
-    /// Infer nullability of OUT parameters for SQL language functions
-    /// using the ViewNullabilityAnalyzer on the function body
-    pub fn infer_out_param_nullability(
+    /// Infer what a `LANGUAGE sql` function's result can be NULL in, from
+    /// its body: the OUT parameters, or the single returned value.
+    ///
+    /// A function that does not return a set yields NULL (every OUT column
+    /// NULL) when its last statement returns no row, so nothing is inferred
+    /// NOT NULL for it unless that statement provably returns exactly one
+    /// row; nor when the function is STRICT and can be called with a NULL
+    /// argument, which returns NULL without running the body.
+    pub fn infer_result_nullability(
         &mut self,
         rel_index: &RelIndex,
         view_nullability_cache: &crate::view_nullability::ViewNullabilityCache,
         composite_index: &crate::composite_index::CompositeIndex,
     ) -> anyhow::Result<()> {
-        // Only apply to SQL language functions with OUT parameters
-        if !self.is_sql() || self.out_args.is_empty() {
+        if !self.is_sql() || self.is_procedure {
+            return Ok(());
+        }
+        let scalar = self.out_args.is_empty();
+        if scalar && (self.returns_set || self.return_type_oid == VOID_TYPE_OID) {
+            // Rows of a set are never NULL-wrapped; void has no value.
             return Ok(());
         }
 
-        // Parse @pgrpc_not_null annotations - these take precedence over inference
-        let not_null_annotations = parse_out_param_not_null_annotations(&self.comment);
-
         // Extract the function body, and make sure it parses as SQL
         let body = self.body().into_owned();
-        if let Err(e) = pg_query::parse(&body) {
-            log::warn!(
-                "Failed to parse SQL function body for nullability analysis (function: {}): {}",
-                self.name,
-                e
-            );
-            return Ok(()); // Gracefully fall back to default nullable
-        }
+        let parsed = match pg_query::parse(&body) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                log::warn!(
+                    "Failed to parse SQL function body for nullability analysis (function: {}): {}",
+                    self.name,
+                    e
+                );
+                return Ok(()); // Gracefully fall back to default nullable
+            }
+        };
+        let certain_row = self.returns_set || self.always_yields_a_row(&parsed.protobuf, rel_index);
 
         // Create analyzer
         let mut analyzer = crate::view_nullability::ViewNullabilityAnalyzer::new(
@@ -298,68 +318,95 @@ impl PgFn {
         )
         .with_composite_index(composite_index);
 
-        // Collect column names from OUT parameters
-        let column_names: Vec<String> = self.out_args.iter().map(|arg| arg.name.clone()).collect();
+        // The output columns: the OUT parameters, or the one returned value
+        let column_names: Vec<String> = if scalar {
+            vec![RETURN_VALUE.to_string()]
+        } else {
+            self.out_args.iter().map(|arg| arg.name.clone()).collect()
+        };
 
         // Analyze the query
-        match analyzer.analyze_function_body(&body, &column_names) {
-            Ok(nullability_map) => {
-                log::info!(
-                    "Inferred nullability for SQL function {}: {:?}",
-                    self.name,
-                    nullability_map
-                );
-
-                // Update OUT parameter nullability
-                for out_arg in &mut self.out_args {
-                    // Skip if annotation exists (annotations take precedence)
-                    if not_null_annotations.contains(&out_arg.name) {
-                        if nullability_map
-                            .get(&out_arg.name)
-                            .is_some_and(|cn| cn.nullable_due_to_join)
-                        {
-                            log::warn!(
-                                "function {}.{}: @pgrpc_not_null on OUT param `{}`, which comes from \
-                                 the nullable side of an outer join; rows without a match will fail to decode",
-                                self.schema,
-                                self.name,
-                                out_arg.name
-                            );
-                        }
-                        if nullability_map.get(&out_arg.name).is_some_and(|cn| cn.is_not_null()) {
-                            annotations::warn_redundant(
-                                &format!("function {}.{}", self.schema, self.name),
-                                &out_arg.name,
-                            );
-                        }
-                        out_arg.nullable = false;
-                        continue;
-                    }
-
-                    // Apply inferred nullability
-                    if let Some(cn) = nullability_map.get(&out_arg.name) {
-                        out_arg.nullable = cn.is_nullable();
-                        out_arg.nullable_due_to_join = cn.nullable_due_to_join;
-                        log::debug!(
-                            "Function {}: OUT param {} inferred as {}",
-                            self.name,
-                            out_arg.name,
-                            if cn.is_not_null() { "NOT NULL" } else { "NULLABLE" }
-                        );
-                    }
-                }
-            }
+        let nullability_map = match analyzer.analyze_function_body(&body, &column_names) {
+            Ok(map) => map,
             Err(e) => {
                 log::warn!(
                     "Failed to analyze SQL function nullability (function: {}): {}",
                     self.name,
                     e
                 );
-                // Gracefully fall back to default nullable behavior
+                return Ok(()); // Gracefully fall back to default nullable
+            }
+        };
+        log::info!(
+            "Inferred nullability for SQL function {} (certain row: {}): {:?}",
+            self.name,
+            certain_row,
+            nullability_map
+        );
+        let owner = format!("function {}.{}", self.schema, self.name);
+
+        if scalar {
+            let inferred = certain_row
+                && nullability_map.get(RETURN_VALUE).is_some_and(|cn| cn.is_not_null());
+            if inferred && Annotations::of(self.comment.as_deref()).not_null_this {
+                annotations::warn_redundant(&owner, RETURN_VALUE);
+            }
+            self.return_not_null = inferred;
+            return Ok(());
+        }
+
+        // @pgrpc_not_null annotations take precedence over inference
+        let not_null_annotations = parse_out_param_not_null_annotations(&self.comment);
+        for out_arg in &mut self.out_args {
+            let cn = nullability_map.get(&out_arg.name);
+            let inferred = certain_row && cn.is_some_and(|cn| cn.is_not_null());
+
+            if not_null_annotations.contains(&out_arg.name) {
+                if cn.is_some_and(|cn| cn.nullable_due_to_join) {
+                    log::warn!(
+                        "{}: @pgrpc_not_null on OUT param `{}`, which comes from \
+                         the nullable side of an outer join; rows without a match will fail to decode",
+                        owner,
+                        out_arg.name
+                    );
+                }
+                if inferred {
+                    annotations::warn_redundant(&owner, &out_arg.name);
+                }
+                out_arg.nullable = false;
+                continue;
+            }
+
+            if let Some(cn) = cn {
+                out_arg.nullable = !inferred;
+                out_arg.nullable_due_to_join = cn.nullable_due_to_join;
             }
         }
 
         Ok(())
+    }
+
+    /// Whether a call always produces a row from the body's last statement:
+    /// the statement returns exactly one row whatever the data, and the
+    /// function is not one that skips its body. A STRICT function returns
+    /// NULL when given a NULL argument, which a caller can only do by leaving
+    /// out an argument whose default is (or may be) NULL.
+    fn always_yields_a_row(&self, parsed: &pg_query::protobuf::ParseResult, rel_index: &RelIndex) -> bool {
+        if self.is_strict && self.args.iter().any(|arg| arg.has_default) {
+            return false;
+        }
+        let Some(last) = parsed.stmts.last() else {
+            return false;
+        };
+        let last_only = pg_query::protobuf::ParseResult {
+            version: parsed.version,
+            stmts: vec![last.clone()],
+        };
+        crate::cardinality_inference::CardinalityAnalyzer::new(rel_index)
+            .infer_parsed(&last_only)
+            .is_ok_and(|inference| {
+                inference.cardinality == crate::cardinality_inference::InferredCardinality::One
+            })
     }
 }
 
@@ -430,6 +477,8 @@ impl PgFn {
             schema,
             definition,
             returns_set: row.try_get("returns_set")?,
+            is_strict: row.try_get("is_strict")?,
+            return_not_null: false,
             is_procedure: prokind == b'p' as i8, // 'p' for procedure, 'f' for function
             has_table_params,
             language,
@@ -774,7 +823,8 @@ impl PgFn {
                 let decode_row = if is_composite { decode_struct } else { decode_scalar };
                 (inner_ty, Some(decode_row))
             } else {
-                let return_not_null = Annotations::of(self.comment.as_deref()).not_null_this;
+                let return_not_null = self.return_not_null
+                    || Annotations::of(self.comment.as_deref()).not_null_this;
                 let ty = if return_not_null {
                     inner_ty
                 } else {
@@ -1198,6 +1248,8 @@ mod test {
             args: vec![],
             out_args: vec![],
             returns_set: true,
+            is_strict: false,
+            return_not_null: false,
             is_procedure: false,
             has_table_params: false,
             language: "sql".to_string(),
@@ -1261,6 +1313,8 @@ mod test {
             args: vec![],
             out_args: vec![],
             returns_set: true,
+            is_strict: false,
+            return_not_null: false,
             is_procedure: false,
             has_table_params: false,
             language: "sql".to_string(),
@@ -1349,6 +1403,8 @@ mod test {
             args: vec![],
             out_args: vec![],
             returns_set: false,
+            is_strict: false,
+            return_not_null: false,
             is_procedure: false,
             has_table_params: false,
             language: "sql".to_string(),
@@ -1420,6 +1476,8 @@ mod test {
             args: vec![],
             out_args: vec![],
             returns_set: false,
+            is_strict: false,
+            return_not_null: false,
             is_procedure: false,
             has_table_params: false,
             language: "sql".to_string(),

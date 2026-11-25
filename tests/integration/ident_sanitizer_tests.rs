@@ -82,8 +82,7 @@ fn awkward_sql_names_generate_and_run() {
 
     // Arguments keep distinct names; the composite's fields do too.
     let made: Weird = my_schema::make().p_id(1).id(2).p(3).self_(4).exec(&client).await
-        .expect("make")
-        .expect("row");
+        .expect("make");
     assert_eq!(made.self_, Some(1));
     assert_eq!(made.my_col.as_deref(), Some("x"));
     assert_eq!(made.r#type.as_deref(), Some("t"));
