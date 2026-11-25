@@ -81,13 +81,11 @@ pub struct RelDep {
 ///
 /// `scope` names the function (or query) being analyzed, for diagnostics.
 pub fn extract_queries(fn_json: &Value, scope: &str) -> Vec<ParseResult> {
-    let query_path = JsonPath::try_from("$..PLpgSQL_expr.query").unwrap();
-
-    query_path
-        .find_slice(fn_json)
+    fn_json
+        .query("$..PLpgSQL_expr.query")
+        .unwrap()
         .into_iter()
-        .filter_map(|x| {
-            let data = x.to_data();
+        .filter_map(|data| {
             match data.as_str() {
                 Some(query_str) => Some(pg_query::parse(query_str)),
                 None => {
@@ -508,7 +506,7 @@ mod tests {
                     Constraint::Unique(UniqueConstraint {
                         comment: None,
                         name: ustr("users_email_key"),
-                        columns: SmallVec::from_slice(&[ustr("email")]),
+                        columns: SmallVec::from([ustr("email")]),
                     }),
                     Constraint::NotNull(NotNullConstraint {
                         name: ustr("users_email_not_null"),

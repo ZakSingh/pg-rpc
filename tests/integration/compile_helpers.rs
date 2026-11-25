@@ -78,8 +78,11 @@ pub fn create_test_cargo_project_with(
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        // `mod.rs` is the umbrella; `errors` is already handled above.
-        if matches!(stem, "mod" | "errors") {
+        // `mod.rs` is the umbrella; `errors` is already handled above;
+        // `composite` and `schema_cache` are shared helpers with generic
+        // names (`read`, `write`, `clear`) that have no business in the
+        // crate root.
+        if matches!(stem, "mod" | "errors" | "composite" | "schema_cache") {
             continue;
         }
         lib_rs.push_str(&format!(
@@ -102,14 +105,14 @@ pub fn create_test_cargo_project_with(
         serde = { version = "1.0", features = ["derive"] }
         serde_json = "1.0"
         time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }
-        thiserror = "1.0"
-        deadpool-postgres = "0.12"
+        thiserror = "2"
+        deadpool-postgres = "0.14"
         tokio = { version = "1.0", features = ["full"] }
         postgis-butmaintained = "0.12"
         rust_decimal = "1"
-        bon = "2"
+        bon = "3"
         uuid = { version = "1", features = ["serde", "v4"] }
-        derive_more = { version = "1", features = ["full"] }
+        derive_more = { version = "2", features = ["full"] }
         
     "#};
     std::fs::write(project_dir.join("Cargo.toml"), cargo_toml_content)

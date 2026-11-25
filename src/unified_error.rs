@@ -714,12 +714,12 @@ mod tests {
             Constraint::Unique(UniqueConstraint {
                 comment: None,
                 name: ustr("users_email_key"),
-                columns: SmallVec::from_slice(&[ustr("email")]),
+                columns: SmallVec::from([ustr("email")]),
             }),
             Constraint::Check(CheckConstraint {
                 comment: None,
                 name: ustr("users_age_check"),
-                columns: SmallVec::from_slice(&[ustr("age")]),
+                columns: SmallVec::from([ustr("age")]),
                 check_expression: None,
             }),
         ];
@@ -748,7 +748,7 @@ mod tests {
         let users_constraints = vec![Constraint::Unique(UniqueConstraint {
             comment: None,
             name: ustr("users_email_key"),
-            columns: SmallVec::from_slice(&[ustr("email")]),
+            columns: SmallVec::from([ustr("email")]),
         })];
 
         let users_id = PgId::new(Some(ustr("public")), ustr("users"));
@@ -797,7 +797,7 @@ mod tests {
             constraints: vec![Constraint::Unique(UniqueConstraint {
                 comment: None,
                 name: ustr("users_email_key"),
-                columns: SmallVec::from_slice(&[ustr("email")]),
+                columns: SmallVec::from([ustr("email")]),
             })],
             columns: vec![ustr("id"), ustr("email"), ustr("name")],
             column_types: vec![],

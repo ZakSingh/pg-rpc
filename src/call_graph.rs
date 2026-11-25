@@ -51,10 +51,8 @@ pub fn parse_plpgsql_expr(query: &str) -> Option<ParseResult> {
 /// All functions called from a PL/pgSQL function body (the JSON produced by
 /// `pg_query::parse_plpgsql`).
 pub fn plpgsql_callees(fn_json: &Value) -> BTreeSet<CallTarget> {
-    let query_path = JsonPath::try_from("$..PLpgSQL_expr.query").unwrap();
     let mut out = BTreeSet::new();
-    for slice in query_path.find_slice(fn_json) {
-        let data = slice.to_data();
+    for data in fn_json.query("$..PLpgSQL_expr.query").unwrap() {
         let Some(query) = data.as_str() else { continue };
         if let Some(parsed) = parse_plpgsql_expr(query) {
             out.extend(sql_callees(&parsed));

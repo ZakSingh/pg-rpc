@@ -65,8 +65,8 @@ fn create_test_project(conn_string: &str) -> TempDir {
         serde = { version = \"1.0\", features = [\"derive\"] }
         serde_json = \"1.0\"
         time = { version = \"0.3\", features = [\"serde\", \"macros\", \"formatting\", \"parsing\"] }
-        thiserror = \"1.0\"
-        deadpool-postgres = \"0.12\"
+        thiserror = \"2\"
+        deadpool-postgres = \"0.14\"
         rust_decimal = { version = \"1.36\", features = [\"serde\"] }
         bon = \"3.3\"
         postgis-butmaintained = \"0.12\"

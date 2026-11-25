@@ -525,6 +525,52 @@ It is `PgRpcError::Decode(DecodeError)` with `item`, `column`, `index` and the
 code was generated against, for example a `select *` over a table whose column
 order changed.
 
+## Schema changes under a running client
+
+Code generated against one schema keeps working after the schema gains things,
+so a migration that only adds can be applied while older processes are still
+serving:
+
+| Added to the schema | An older client |
+|---|---|
+| Enum label | Reads and writes the labels it knows. A value carrying the new label fails to decode, as a `DecodeError`. |
+| Composite attribute | Reads ignore it. Writes send it as NULL. |
+| Column appended to a view or table that a function returns rows of | Never receives it: generated calls select the columns known at generation time, by name. |
+| Column added to a `RETURNS TABLE` result | Same. |
+| Parameter with a default | Unaffected. |
+
+Removing, renaming or retyping any of these still fails, loudly.
+
+Two limits:
+
+- **Composite writes on a connection opened before the change fail until the
+  connection forgets the old type.** A connection caches each type's attribute
+  list, so it encodes the composite the old way and Postgres rejects it
+  (`42804`, "wrong number of columns"). Reads on the same connection are fine.
+  Generated functions only see a `GenericClient`, which cannot drop that
+  cache, so the generated `schema_cache` module does it from the pool:
+
+  ```rust
+  // On every pool:
+  let pool = config
+      .builder(tls)?
+      .runtime(deadpool_postgres::Runtime::Tokio1)
+      .pre_recycle(schema_cache::hook())
+      .build()?;
+
+  // When the application learns a migration committed:
+  schema_cache::invalidate();
+  ```
+
+  Each connection then drops its type and statement caches at its next
+  checkout. A connection that is checked out while the migration commits can
+  still fail one write before it is returned.
+- **Query files that use `select *`** decode by position and are prepared with
+  the `*` in place, so they do not get this guarantee. Name the columns.
+
+Sending NULL for an unknown attribute means an older client that reads a
+composite, changes it and writes it back clears the new attribute.
+
 ## Error analysis scope
 
 Every PL/pgSQL and SQL function in every user schema is introspected, but Rust

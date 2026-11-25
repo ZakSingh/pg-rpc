@@ -11,7 +11,8 @@
 //! only ever reads `&self.field`, which works equally for `T` and `&T` because
 //! `impl<T: ToSql> ToSql for &T` exists in postgres-types.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 use postgres_types::private::BytesMut;
 use postgres_types::{Field, Kind, ToSql, Type};
 use uuid::Uuid;
