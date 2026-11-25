@@ -20,7 +20,7 @@
 
 use super::*;
 use crate::integration::compile_helpers::{
-    add_test_binary, compile_and_run_with_args, create_test_cargo_project, print_output,
+    add_test_binary, compile_and_run_with_args, create_test_cargo_project_with, print_output,
     read_pretty,
 };
 use indoc::indoc;
@@ -81,6 +81,20 @@ const SCHEMA_N: &str = indoc! {"
         language sql as $$ select 'hello ' || p_name $$;
 "};
 
+/// Query files with a star that is not last. After the migration the view
+/// behind `v.*` has one more column, which lands in the middle of the row.
+const QUERIES: &str = indoc! {"
+    -- name: evo_star_many :many
+    select v.*, p.name as person_name, 7 as seven
+    from evo_person_view v join evo_person p using (id)
+    where v.id = :id;
+
+    -- name: evo_star_opt :opt
+    select v.*, p.name as person_name, 7 as seven
+    from evo_person_view v join evo_person p using (id)
+    where v.id = :id;
+"};
+
 /// The additive migration, one statement per entry: a new enum label cannot
 /// be used in the transaction that adds it.
 const MIGRATION: &[&str] = &[
@@ -103,7 +117,15 @@ fn old_client_survives_additive_schema_changes() {
     with_isolated_database_and_container(|client, _container, conn_string| {
         execute_sql(client, SCHEMA_N).expect("Should create schema N");
 
-        let project = create_test_cargo_project(conn_string, vec!["public", "api"]);
+        let queries_dir = tempfile::TempDir::new().expect("temp dir");
+        let queries_path = queries_dir.path().join("queries.sql");
+        std::fs::write(&queries_path, QUERIES).expect("write queries");
+
+        let project = create_test_cargo_project_with(conn_string, |b| {
+            b.schema("public").schema("api").queries_config(pgrpc::QueriesConfig {
+                paths: vec![queries_path.to_string_lossy().to_string()],
+            })
+        });
 
         let migration = MIGRATION
             .iter()
@@ -113,7 +135,7 @@ fn old_client_survives_additive_schema_changes() {
         let test_code = indoc! {r#"
             use deadpool_postgres::{Config, Pool, Runtime};
             use test_project::api::*;
-            use test_project::generated::schema_cache;
+            use test_project::generated::{queries, schema_cache};
             use test_project::public::{EvoCheckedContact, EvoContact, EvoMood};
 
             const MIGRATION: &[&str] = &[
@@ -210,6 +232,23 @@ fn old_client_survives_additive_schema_changes() {
                 Ok(())
             }
 
+            /// Query files whose star is followed by more columns. Row
+            /// structs find their columns by name, so the column the view
+            /// gains in the middle of the row must not shift the rest.
+            async fn star_queries(client: &deadpool_postgres::Client) -> Result<(), String> {
+                let rows = queries::evo_star_many(client, 1).await.map_err(|e| format!("{e:?}"))?;
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].name, "ann");
+                assert_eq!(rows[0].person_name, "ann");
+                assert_eq!(rows[0].seven, 7);
+
+                let row = queries::evo_star_opt(client, 1).await.map_err(|e| format!("{e:?}"))?
+                    .expect("row");
+                assert_eq!(row.person_name, "ann");
+                assert_eq!(row.seven, 7);
+                Ok(())
+            }
+
             #[tokio::main]
             async fn main() {
                 let conn_string = std::env::args().nth(1).expect("Connection string required");
@@ -219,6 +258,7 @@ fn old_client_survives_additive_schema_changes() {
                 let warm = warm_pool.get().await.expect("warm client");
                 reads(&warm, "warm, before").await;
                 composite_writes(&warm).await.expect("composite writes before the migration");
+                star_queries(&warm).await.expect("star queries before the migration");
                 let mood = evo_get_mood().id(2).exec(&warm).await.expect("read enum");
                 assert_eq!(mood, Some(EvoMood::Sad));
 
@@ -251,6 +291,15 @@ fn old_client_survives_additive_schema_changes() {
                 assert!(fax_is_null, "an attribute the client does not know is written as NULL");
                 println!("OK: fresh composite writes");
 
+                star_queries(&fresh).await.expect("star queries on a fresh connection");
+                println!("OK: fresh star queries");
+
+                // A warm connection still holds the statement prepared with
+                // the old expansion of the star.
+                let err = star_queries(&warm).await
+                    .expect_err("a cached statement with a star cannot survive the view change");
+                println!("warm star query: {err}");
+
                 // A label the client has never heard of fails at the value,
                 // with an error rather than a panic, on either connection.
                 for (when, client) in [("warm", &warm), ("fresh", &fresh)] {
@@ -282,6 +331,8 @@ fn old_client_survives_additive_schema_changes() {
                     .expect("composite writes on a warm connection after invalidate()");
                 reads(&warm, "warm, after invalidate").await;
                 println!("OK: warm composite write after invalidate");
+                star_queries(&warm).await.expect("star queries on a warm connection after invalidate()");
+                println!("OK: warm star queries after invalidate");
 
                 println!("OK: schema evolution");
             }
@@ -319,5 +370,53 @@ fn old_client_survives_additive_schema_changes() {
             "evo_people should select the columns known at generation time. Got:\n{}",
             api_rs
         );
+    });
+}
+
+/// Row structs find their columns by name, so a query whose result has two
+/// columns with one name is rejected at generation time, with every such
+/// query listed.
+#[test]
+fn duplicate_result_column_names_are_rejected() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        execute_sql(
+            client,
+            "create table dup_a (id int primary key, label text);
+             create table dup_b (id int primary key, label text);",
+        )
+        .expect("Should create tables");
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let queries_path = dir.path().join("queries.sql");
+        std::fs::write(
+            &queries_path,
+            indoc! {"
+                -- name: dup_star :many
+                select a.*, b.label from dup_a a join dup_b b using (id);
+
+                -- name: dup_named :many
+                select a.id, b.id from dup_a a join dup_b b using (id);
+
+                -- name: dup_fine :many
+                select a.*, b.label as b_label from dup_a a join dup_b b using (id);
+            "},
+        )
+        .expect("write queries");
+
+        let err = pgrpc::PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .output_path(dir.path().join("out"))
+            .schema("public")
+            .queries_config(pgrpc::QueriesConfig {
+                paths: vec![queries_path.to_string_lossy().to_string()],
+            })
+            .build()
+            .expect_err("duplicate column names should fail generation");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("distinct names"), "{message}");
+        assert!(message.contains("dup_star") && message.contains("label"), "{message}");
+        assert!(message.contains("dup_named") && message.contains("id"), "{message}");
+        assert!(!message.contains("dup_fine"), "{message}");
     });
 }

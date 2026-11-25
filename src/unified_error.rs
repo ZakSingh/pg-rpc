@@ -687,7 +687,7 @@ pub fn generate_as_db_error_impl(
                 match self {
                     #(#constraint_arms,)*
                     #(#custom_arms,)*
-                    PgRpcError::Decode(e) => e.source.as_db_error(),
+                    PgRpcError::Decode(e) => e.source.downcast_ref::<tokio_postgres::Error>().and_then(|e| e.as_db_error()),
                     PgRpcError::Database(e) => e.as_db_error(),
                 }
             }

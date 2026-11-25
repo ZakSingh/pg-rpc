@@ -2,7 +2,7 @@ use crate::codegen::OID;
 use crate::config::QueriesConfig;
 use crate::query_introspector::{IntrospectedQuery, QueryIntrospector};
 use crate::rel_index::RelIndex;
-use crate::sql_parser::{SqlParser, QueryType};
+use crate::sql_parser::{QueryType, SqlParser};
 use crate::trigger_index::TriggerIndex;
 use anyhow::Result;
 use postgres::{Client, NoTls};
@@ -106,6 +106,8 @@ impl QueryIndex {
             queries.insert(id, introspected);
         }
 
+        reject_duplicate_columns(&queries)?;
+
         Ok(Self { queries })
     }
 
@@ -147,5 +149,73 @@ impl QueryIndex {
         }
 
         grouped
+    }
+}
+
+
+/// Fail the build if any query returns two columns with the same name.
+///
+/// Row structs locate their columns by name, so that a column added later
+/// (through a `*` over a table or view that gained one) cannot shift the
+/// others. Two columns with one name cannot be told apart that way, and
+/// would be two struct fields with one name besides.
+///
+/// Every offending query is reported at once.
+fn reject_duplicate_columns(queries: &BTreeMap<QueryId, IntrospectedQuery>) -> Result<()> {
+    let problems: Vec<String> = queries
+        .values()
+        .filter_map(|q| {
+            let duplicates = duplicate_names(
+                q.return_columns.iter().flatten().map(|c| c.name.as_str()),
+            );
+            (!duplicates.is_empty()).then(|| {
+                format!(
+                    "  {} ({}:{}): {}",
+                    q.name,
+                    q.file_path,
+                    q.line_number,
+                    duplicates.join(", ")
+                )
+            })
+        })
+        .collect();
+
+    if problems.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "query result columns must have distinct names:\n{}\n\
+         Row structs find their columns by name. Alias the duplicates with `as`.",
+        problems.join("\n")
+    )
+}
+
+/// Names that occur more than once, each listed once, in first-seen order.
+fn duplicate_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut duplicates: Vec<&str> = Vec::new();
+    for name in names {
+        if seen.contains(&name) {
+            if !duplicates.contains(&name) {
+                duplicates.push(name);
+            }
+        } else {
+            seen.push(name);
+        }
+    }
+    duplicates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::duplicate_names;
+
+    #[test]
+    fn duplicates_are_listed_once_in_first_seen_order() {
+        assert!(duplicate_names(["id", "name", "owner__id"].into_iter()).is_empty());
+        assert_eq!(
+            duplicate_names(["id", "b", "id", "a", "b", "id"].into_iter()),
+            vec!["id", "b"]
+        );
     }
 }

@@ -519,11 +519,13 @@ the column rather than just its position:
 GetUserRow: failed to decode column `created_at` (index 7): error deserializing column 7: …
 ```
 
-It is `PgRpcError::Decode(DecodeError)` with `item`, `column`, `index` and the
-`tokio_postgres::Error` source, reachable through every generated error enum's
-`Other` variant. The usual cause is a database that differs from the one the
-code was generated against, for example a `select *` over a table whose column
-order changed.
+It is `PgRpcError::Decode(DecodeError)` with `item`, `column`, `index` and a
+boxed `source`, reachable through every generated error enum's `Other`
+variant. The source is a `tokio_postgres::Error` when a value failed to
+convert, and a plain message when a query row's column could not be located
+by name (it is gone, or the result now has two columns of that name). The
+usual cause is a database that differs from the one the code was generated
+against.
 
 ## Schema changes under a running client
 
@@ -536,6 +538,7 @@ serving:
 | Enum label | Reads and writes the labels it knows. A value carrying the new label fails to decode, as a `DecodeError`. |
 | Composite attribute | Reads ignore it. Writes send it as NULL. |
 | Column appended to a view or table that a function returns rows of | Never receives it: generated calls select the columns known at generation time, by name. |
+| Column added to a table or view behind a `*` in a query file | Ignored wherever it lands, once the statement is re-prepared (see the limits below). |
 | Column added to a `RETURNS TABLE` result | Same. |
 | Parameter with a default | Unaffected. |
 
@@ -565,8 +568,13 @@ Two limits:
   Each connection then drops its type and statement caches at its next
   checkout. A connection that is checked out while the migration commits can
   still fail one write before it is returned.
-- **Query files that use `select *`** decode by position and are prepared with
-  the `*` in place, so they do not get this guarantee. Name the columns.
+- **Query files with a `*` fail on a connection that prepared them before the
+  change**, with "cached plan must not change result type", until that
+  connection's statement cache is dropped (`schema_cache` above does this).
+  Once re-prepared they decode correctly wherever the new column landed: row
+  structs find their columns by name. For the same reason a query whose
+  result has two columns with one name is rejected at generation time. Naming
+  the columns instead of using `*` avoids the failure altogether.
 
 Sending NULL for an unknown attribute means an older client that reads a
 composite, changes it and writes it back clears the new attribute.
