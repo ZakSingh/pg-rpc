@@ -9,8 +9,10 @@ use smallvec::SmallVec;
 use std::error::Error;
 use ustr::Ustr;
 
+/// What a foreign key does to its rows when the referenced row is deleted
+/// (`confdeltype`) or its key is updated (`confupdtype`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
-pub enum OnDelete {
+pub enum FkAction {
     #[serde(rename = "r")]
     Restrict,
     #[serde(rename = "c")]
@@ -41,7 +43,8 @@ pub struct ForeignKeyConstraint {
     #[serde(default)]
     pub(crate) comment: Option<String>,
     pub(crate) columns: SmallVec<Ustr, 2>,
-    pub(crate) on_delete: OnDelete,
+    pub(crate) on_delete: FkAction,
+    pub(crate) on_update: FkAction,
     /// The referenced table name (schema-qualified if not in search_path)
     #[serde(default)]
     pub(crate) ref_table: Option<String>,
@@ -49,7 +52,8 @@ pub struct ForeignKeyConstraint {
     #[serde(default)]
     pub(crate) ref_columns: Option<SmallVec<Ustr, 2>>,
     /// OID of the referenced table, for finding the foreign keys that point
-    /// *at* a table (a DELETE there fails on RESTRICT / NO ACTION ones).
+    /// *at* a table (a DELETE or key UPDATE there fails on RESTRICT /
+    /// NO ACTION ones).
     #[serde(default)]
     pub(crate) ref_table_oid: Option<u32>,
 }

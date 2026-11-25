@@ -1092,15 +1092,13 @@ fn generate_unified_errors(
             let columns = row.columns();
             let mut at = [0usize; N];
             for (i, name) in names.iter().enumerate() {
-                // Usual case: nothing moved since generation.
-                let unmoved = columns.get(i).is_some_and(|c| c.name() == *name);
                 let mut matches = columns
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| c.name() == *name)
                     .map(|(position, _)| position);
                 let located = match (matches.next(), matches.next()) {
-                    (Some(position), None) => Ok(if unmoved { i } else { position }),
+                    (Some(position), None) => Ok(position),
                     (None, _) => Err("the result has no column of that name"),
                     (Some(_), Some(_)) => Err("the result has more than one column of that name"),
                 };
@@ -2130,10 +2128,6 @@ fn generate_datetime_serde_attr(pg_type: &PgType, nullable: bool) -> Option<Toke
     }
 }
 
-/// Generate a row struct for query results.
-///
-/// Columns with double-underscore names (`prefix__field`) are automatically
-/// grouped into nested structs.
 /// The by-name plumbing shared by every query row struct: the column count,
 /// the associated items that locate columns and decode many rows, and the
 /// `TryFrom<Row>` impl. The struct's own `decode(row, at)` reads column `i`
@@ -2176,6 +2170,10 @@ fn row_decode_support(
     (column_count, decode_fns, try_from_impl)
 }
 
+/// Generate a row struct for query results.
+///
+/// Columns with double-underscore names (`prefix__field`) are automatically
+/// grouped into nested structs.
 fn generate_row_struct(
     struct_name: &proc_macro2::Ident,
     columns: &[crate::query_introspector::QueryColumn],

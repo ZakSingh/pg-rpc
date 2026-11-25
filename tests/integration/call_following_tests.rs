@@ -70,7 +70,48 @@ fn setup(client: &mut Client) -> Result<(), postgres::Error> {
         CREATE TRIGGER widget_log_guard BEFORE INSERT ON helpers.widget_log
             FOR EACH ROW EXECUTE FUNCTION helpers.widget_log_guard();
 
+        -- A trigger that writes another table, which has a raising trigger
+        -- and a constraint of its own: both reach whoever writes widget_log.
+        CREATE TABLE helpers.widget_audit (
+            id SERIAL PRIMARY KEY,
+            note TEXT CONSTRAINT widget_audit_note_short CHECK (length(note) < 100)
+        );
+
+        CREATE FUNCTION helpers.widget_audit_guard() RETURNS TRIGGER
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.note = 'forbidden' THEN
+                RAISE EXCEPTION 'forbidden note' USING ERRCODE = 'P0406';
+            END IF;
+            RETURN NEW;
+        END $$;
+
+        CREATE TRIGGER widget_audit_guard BEFORE INSERT ON helpers.widget_audit
+            FOR EACH ROW EXECUTE FUNCTION helpers.widget_audit_guard();
+
+        CREATE FUNCTION helpers.widget_log_audit() RETURNS TRIGGER
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            INSERT INTO helpers.widget_audit (note) VALUES (NEW.note);
+            RETURN NEW;
+        END $$;
+
+        CREATE TRIGGER widget_log_audit AFTER INSERT ON helpers.widget_log
+            FOR EACH ROW EXECUTE FUNCTION helpers.widget_log_audit();
+
         CREATE SCHEMA call_api;
+
+        CREATE FUNCTION call_api.renumber_widget(p_id INT, p_new_id INT) RETURNS VOID
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            UPDATE helpers.widget SET id = p_new_id WHERE id = p_id;
+        END $$;
+
+        CREATE FUNCTION call_api.rename_widget(p_id INT, p_name TEXT) RETURNS VOID
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            UPDATE helpers.widget SET name = p_name WHERE id = p_id;
+        END $$;
 
         CREATE FUNCTION call_api.log_widget(p_widget_id INT, p_note TEXT) RETURNS VOID
         LANGUAGE plpgsql AS $$
@@ -190,6 +231,18 @@ fn callee_errors_surface_on_callers() {
         // raise surfaces on the function that writes the table.
         let log_widget = enum_block(&api, "LogWidgetError");
         assert!(log_widget.contains("P0405("), "{log_widget}");
+
+        // That table has a trigger that writes a second table: the second
+        // table's own trigger and constraints surface on the writer too.
+        assert!(log_widget.contains("P0406("), "{log_widget}");
+        assert!(log_widget.contains("WidgetAuditConstraint("), "{log_widget}");
+
+        // Changing a referenced key is blocked by the NO ACTION foreign key
+        // on the referencing table; changing another column is not.
+        let renumber_widget = enum_block(&api, "RenumberWidgetError");
+        assert!(renumber_widget.contains("WidgetLogConstraint("), "{renumber_widget}");
+        let rename_widget = enum_block(&api, "RenameWidgetError");
+        assert!(!rename_widget.contains("WidgetLogConstraint("), "{rename_widget}");
 
         // DELETE is blocked by a RESTRICT foreign key on the referencing table,
         // and Postgres reports it on that table, so the variant is its enum.

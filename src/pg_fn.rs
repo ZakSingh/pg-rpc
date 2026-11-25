@@ -997,17 +997,14 @@ impl ToRust for PgFn {
                 req_args.iter().map(|a| a.param_reference(types)).collect();
             let opt_arg_names: Vec<TokenStream> = opt_args.iter().map(|a| a.rs_name()).collect();
 
+            // Quoted, so a mixed-case or reserved-word name still resolves.
+            let callee = format!("{}.{}", quote_ident(&self.schema), quote_ident(&self.name));
             let query_string = if self.is_procedure {
-                format!("CALL {}.{}", self.schema, self.name)
+                format!("CALL {callee}")
             } else if self.returns_set || (!self.is_procedure && self.out_args.len() > 1) {
-                format!(
-                    "select {} from {}.{}",
-                    self.result_column_list(types),
-                    self.schema,
-                    self.name
-                )
+                format!("select {} from {callee}", self.result_column_list(types))
             } else {
-                format!("select {}.{}", self.schema, self.name)
+                format!("select {callee}")
             };
 
             // Attribution for scalar decode failures: the function, and the
@@ -1175,7 +1172,7 @@ impl ToRust for PgFn {
                 // Generate code for functions with optional parameters using string building
                 let opt_param_handling: Vec<TokenStream> = opt_args.iter().enumerate().map(|(i, arg)| {
                     let arg_name = arg.rs_name();
-                    let sql_param_name = &arg.name;
+                    let sql_param_name = quote_ident(&arg.name);
                     let param_index = req_args.len() + i + 1;
                     // We need to use as_ref() to avoid moving the value out of the Option
                     let param_ref = if arg.needs_reference(types) {
@@ -1361,6 +1358,12 @@ impl ToRust for PgFn {
     }
 }
 
+/// A SQL identifier, double-quoted so it is taken exactly as the catalog
+/// spells it.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 impl PgFn {
     /// The select list for a call that returns rows: the columns known at
     /// generation time, by name.
@@ -1386,11 +1389,7 @@ impl PgFn {
         if names.is_empty() || names.iter().any(|n| n.is_empty()) {
             return "*".to_string();
         }
-        names
-            .iter()
-            .map(|n| format!("\"{}\"", n.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(", ")
+        names.iter().map(|n| quote_ident(n)).join(", ")
     }
 
     /// Generate a flat (non-grouped) struct for OUT parameters / RETURN TABLE

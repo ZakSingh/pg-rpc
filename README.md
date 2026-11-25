@@ -620,9 +620,12 @@ error enum. An unqualified call in a query file resolves in `public`.
 
 Triggers are followed the same way: the triggers that fire for a function's
 DML contribute their raises, the raises of the functions they call, and the
-constraints of the tables they write. A `delete` contributes the `RESTRICT` and
+constraints of the tables they write. Those writes fire triggers of their own,
+which are followed too, to any depth. A `delete` contributes the `RESTRICT` and
 `NO ACTION` foreign keys of the tables that reference the deleted one, under
-those tables' enums, since that is where Postgres reports the violation.
+those tables' enums, since that is where Postgres reports the violation. An
+`update` that sets a referenced key column does the same for the foreign keys
+whose `ON UPDATE` action is `RESTRICT` or `NO ACTION`.
 
 Because the analysis over-approximates, a helper used by many functions makes
 its callers' error enums larger. If a specific function needs an extra variant
