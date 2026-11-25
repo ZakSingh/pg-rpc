@@ -1885,6 +1885,8 @@ mod tests {
             out_args: vec![],
             return_type_oid: 23,
             returns_set,
+            is_strict: false,
+            return_not_null: false,
             is_procedure: false,
             has_table_params: false,
             definition: String::new(),

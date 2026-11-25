@@ -16,6 +16,7 @@ select distinct on (n.nspname, p.proname)
              order by a.position)                                    as arg_type_names,
        p.prorettype                                                  as return_type,
        p.proretset                                                   as returns_set,
+       p.proisstrict                                                 as is_strict,
        -- Per input argument: the trailing `pronargdefaults` have a default.
        array(select i > (p.pronargs - p.pronargdefaults)
              from generate_series(1, p.pronargs) as i

@@ -156,6 +156,64 @@ fn not_null_all_with_nullable_exceptions_and_config_builders() {
     });
 }
 
+/// What a `LANGUAGE sql` function's result is inferred NOT NULL from: the
+/// column's own nullability, and, for a function that does not return a set,
+/// proof that its last statement always returns a row (otherwise the call
+/// yields NULL). A STRICT function that can be handed a NULL proves nothing.
+#[test]
+fn sql_function_result_nullability_needs_a_certain_row() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        execute_sql(
+            client,
+            r#"
+            create schema rn;
+            create table rn.t (id int primary key, name text not null);
+
+            -- One row whatever the data, and count(*) is never NULL.
+            create function rn.sure_scalar() returns int
+                language sql as $$ select count(*)::int from rn.t $$;
+            -- `name` is NOT NULL, but no row may match.
+            create function rn.maybe_scalar(p_id int) returns text
+                language sql as $$ select name from rn.t where id = p_id $$;
+            -- Skips its body, returning NULL, when the default NULL is used.
+            create function rn.strict_scalar(p_n int default null) returns int
+                language sql strict as $$ select count(*)::int from rn.t $$;
+
+            create function rn.sure_pair(out o_sure_a int, out o_sure_b int)
+                language sql as $$ select count(*)::int, count(id)::int from rn.t $$;
+            create function rn.maybe_pair(p_id int, out o_maybe_a int, out o_maybe_b text)
+                language sql as $$ select id, name from rn.t where id = p_id $$;
+
+            -- Rows of a set exist or they do not: nothing wraps them in NULL.
+            create function rn.listing() returns table (set_a int, set_b text)
+                language sql as $$ select id, name from rn.t $$;
+            "#,
+        )
+        .expect("schema");
+
+        let out = tempfile::TempDir::new().expect("temp dir");
+        pgrpc::PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("rn")
+            .output_path(out.path())
+            .build()
+            .expect("generation");
+        let code = read_pretty(out.path().join("rn.rs"));
+        let squashed: String = code.split_whitespace().collect();
+
+        assert!(squashed.contains("->Result<i32,SureScalarError>"), "{code}");
+        assert!(squashed.contains("->Result<Option<String>,MaybeScalarError>"), "{code}");
+        assert!(squashed.contains("->Result<Option<i32>,StrictScalarError>"), "{code}");
+
+        assert!(squashed.contains("pubsure_a:i32,"), "{code}");
+        assert!(squashed.contains("pubmaybe_a:Option<i32>,"), "{code}");
+        assert!(squashed.contains("pubmaybe_b:Option<String>,"), "{code}");
+
+        assert!(squashed.contains("pubset_a:i32,"), "{code}");
+        assert!(squashed.contains("pubset_b:String,"), "{code}");
+    });
+}
+
 /// Unnamed, partially named and VARIADIC arguments all reach the generated
 /// function, and SQL-standard bodies are analyzed like dollar-quoted ones.
 #[test]

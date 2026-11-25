@@ -282,7 +282,7 @@ impl FunctionIndex {
         }
     }
 
-    /// Apply nullability inference to SQL language functions with OUT parameters
+    /// Apply nullability inference to the results of SQL language functions
     /// This should be called after the view nullability cache has been built
     pub fn apply_sql_function_nullability(
         &mut self,
@@ -296,14 +296,14 @@ impl FunctionIndex {
         let mut error_count = 0;
 
         for pg_fn in self.codegen_fns_mut() {
-            // Only analyze SQL language functions with OUT parameters
-            if pg_fn.out_args.is_empty() || !pg_fn.is_sql() {
+            // Only SQL language functions: nothing is inferred from PL/pgSQL
+            if !pg_fn.is_sql() {
                 continue;
             }
 
             analyzed_count += 1;
 
-            match pg_fn.infer_out_param_nullability(
+            match pg_fn.infer_result_nullability(
                 rel_index,
                 view_nullability_cache,
                 composite_index,
