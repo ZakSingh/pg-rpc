@@ -593,6 +593,9 @@ impl<'a> QueryIntrospector<'a> {
         // Columns each parameter is compared with (`col = $N`), for names and types
         let compared = parse_result.map(compared_columns).unwrap_or_default();
 
+        // The type each parameter is explicitly cast to (`$N::text`)
+        let casts = parse_result.map(param_casts).unwrap_or_default();
+
         // Columns each parameter is written to (INSERT or UPDATE), for
         // column-based nullability/default inference
         let targets = parse_result.map(extract_param_targets).unwrap_or_default();
@@ -611,10 +614,22 @@ impl<'a> QueryIntrospector<'a> {
             // when the reference resolves — in the scope it is written in —
             // to a catalog column. Not for `col = ANY($N)`: the parameter is
             // an array there.
-            let inferred_type = compared_column
-                .filter(|compared| compared.same_type)
-                .and_then(|compared| analysis?.column_ref_source(compared.location))
-                .and_then(|source| self.rel_index.column_type(source.rel_oid, &source.column));
+            //
+            // A cast the author wrote on the parameter wins over that: it is
+            // the only way to say what the parameter is. `$N::text` compared
+            // with an `email` column is text; `$N::email` is the domain
+            // (which the statement's own metadata would report as its base
+            // type).
+            let inferred_type = match casts.get(&position) {
+                Some(type_name) => self
+                    .domain_index
+                    .get(&type_name.join("."))
+                    .or_else(|| self.domain_index.get(type_name.last()?)),
+                None => compared_column
+                    .filter(|compared| compared.same_type)
+                    .and_then(|compared| analysis?.column_ref_source(compared.location))
+                    .and_then(|source| self.rel_index.column_type(source.rel_oid, &source.column)),
+            };
 
             // Get context-inferred nullability for this parameter
             let context_nullable = context_nullability.get(i).copied().unwrap_or(false);
@@ -765,6 +780,45 @@ fn extract_param_position(node: &pb::Node) -> Option<usize> {
         Some(N::TypeCast(tc)) => tc.arg.as_ref().and_then(|a| extract_param_position(a)),
         _ => None,
     }
+}
+
+/// For each parameter with an explicit cast written directly on it
+/// (`$N::text`, also inside a further cast: `$N::text::citext`), the name of
+/// the type it is cast to, as written (`["text"]`, `["public", "email"]`).
+/// When a parameter is cast in several places, the first in the query text
+/// wins; Postgres itself rejects casts that disagree.
+fn param_casts(parse_result: &pg_query::ParseResult) -> HashMap<usize, Vec<String>> {
+    // position -> (location of the cast, type name)
+    let mut found: HashMap<usize, (i32, Vec<String>)> = HashMap::new();
+    walk_statements(parse_result, &mut |node| {
+        let N::TypeCast(type_cast) = node else { return };
+        let Some(N::ParamRef(param)) = type_cast.arg.as_ref().and_then(|a| a.node.as_ref()) else {
+            return;
+        };
+        let Some(type_name) = &type_cast.type_name else { return };
+        // An array cast (`$N::text[]`) names the element type; whatever that
+        // is, the parameter is not a value of it.
+        let names: Vec<String> = if type_name.array_bounds.is_empty() {
+            type_name
+                .names
+                .iter()
+                .filter_map(|n| match &n.node {
+                    Some(N::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let position = param.number as usize;
+        match found.get(&position) {
+            Some((existing, _)) if *existing <= type_cast.location => {}
+            _ => {
+                found.insert(position, (type_cast.location, names));
+            }
+        }
+    });
+    found.into_iter().map(|(position, (_, names))| (position, names)).collect()
 }
 
 /// A comparison operator: `=`, `<>`, `!=`, `<`, `>`, `<=`, `>=`.
@@ -1820,6 +1874,25 @@ mod tests {
         assert_eq!(info[1], ("bio".to_string(), false, Some(TEXT), false));
         // Named after the column, but an array: no type taken from it.
         assert_eq!(info[2], ("email_3".to_string(), false, None, false));
+    }
+
+    #[test]
+    fn an_explicit_cast_on_a_parameter_decides_its_type() {
+        // Compared with the `email` domain column, but the author said text:
+        // no type is taken from the column (the name still is).
+        let info = param_info("SELECT * FROM users u WHERE u.email = $1::text", &[], 1);
+        assert_eq!(info[0].0, "email");
+        assert_eq!(info[0].2, None);
+
+        // The cast need not be at the comparison, and an outer cast does not
+        // change what the parameter itself is.
+        let sql = "SELECT * FROM users u WHERE ($1::text IS NULL OR u.email = $1::text::citext)";
+        assert_eq!(param_types(sql, 1), vec![None]);
+        let sql = "SELECT * FROM users u WHERE ($1::text IS NULL OR u.email = $1)";
+        assert_eq!(param_types(sql, 1), vec![None]);
+
+        // Without a cast the column's declared type is used, as before.
+        assert_eq!(param_types("SELECT * FROM users u WHERE u.email = $1", 1), vec![Some(EMAIL)]);
     }
 
     #[test]
