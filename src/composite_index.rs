@@ -19,7 +19,7 @@
 //! and domain outside the system schemas — a projection may reach a type in
 //! any schema regardless of which schemas code is generated for.
 
-use crate::annotations;
+use crate::annotations::Annotations;
 use crate::codegen::OID;
 use crate::parse_domain::non_null_cols_from_checks;
 use anyhow::Context;
@@ -219,17 +219,15 @@ impl CompositeIndex {
     /// `@pgrpc_not_null(...)` is honored); each attribute's own comment and
     /// `attnotnull` are folded into its `not_null` bit.
     pub fn insert_composite(&mut self, oid: OID, comment: Option<&str>, attrs: Vec<RawAttr>) {
-        let bulk_not_null = comment.map(annotations::parse_not_null).unwrap_or_default();
+        let type_annotations = Annotations::of(comment);
 
         let attrs = attrs
             .into_iter()
             .map(|a| {
-                let annotated = a
-                    .comment
-                    .as_deref()
-                    .is_some_and(annotations::has_not_null);
+                let annotated = type_annotations
+                    .child_not_null(&a.name, &Annotations::of(a.comment.as_deref()));
                 CompositeAttr {
-                    not_null: a.attnotnull || annotated || bulk_not_null.contains(&a.name),
+                    not_null: a.attnotnull || annotated,
                     name: a.name,
                     attnum: a.attnum,
                     type_oid: a.type_oid,

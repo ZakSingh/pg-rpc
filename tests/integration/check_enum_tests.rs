@@ -241,3 +241,52 @@ fn test_complex_check_constraint_not_enum() {
         "Should NOT generate enum for complex constraint"
     );
 }
+
+/// An inferred enum is named `{table}_{column}`. When a real type in the
+/// schema already has that name the inferred one is renamed, so the module
+/// still compiles.
+#[test]
+fn test_check_enum_name_does_not_shadow_a_real_type() {
+    use crate::integration::compile_helpers::{
+        assert_compilation_success, compile_project, create_test_cargo_project, read_pretty,
+    };
+
+    let container = get_test_container();
+    let db_name = container
+        .create_test_database()
+        .expect("Failed to create test database");
+    let mut client = container
+        .connect_to_database(&db_name)
+        .expect("Failed to connect to test database");
+
+    execute_sql(
+        &mut client,
+        indoc! {"
+            CREATE SCHEMA ce;
+            -- A real enum with the name the inferred one would get.
+            CREATE TYPE ce.orders_status AS ENUM ('real');
+            CREATE TABLE ce.orders (
+                id SERIAL PRIMARY KEY,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'shipped'))
+            );
+            -- Two tables whose inferred names coincide: a_b + c, a + b_c.
+            CREATE TABLE ce.a_b (c TEXT CHECK (c IN ('x', 'y')));
+            CREATE TABLE ce.a (b_c TEXT CHECK (b_c IN ('p', 'q')));
+
+            CREATE FUNCTION ce.echo(p_status ce.orders_status) RETURNS ce.orders_status
+                LANGUAGE sql AS $$ SELECT p_status $$;
+        "},
+    )
+    .expect("Failed to create schema");
+
+    let conn_string = container.database_connection_string(&db_name);
+    let project = create_test_cargo_project(&conn_string, vec!["ce"]);
+    let ce_rs = read_pretty(project.path().join("src/generated/ce.rs"));
+
+    assert_eq!(ce_rs.matches("pub enum OrdersStatus {").count(), 1, "{ce_rs}");
+    assert!(ce_rs.contains("pub enum OrdersStatusCheck {"), "{ce_rs}");
+    assert_eq!(ce_rs.matches("pub enum ABC {").count(), 1, "{ce_rs}");
+    assert!(ce_rs.contains("pub enum ABCCheck {"), "{ce_rs}");
+
+    assert_compilation_success(compile_project(project.path()));
+}

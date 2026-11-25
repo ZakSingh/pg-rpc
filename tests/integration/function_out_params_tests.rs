@@ -87,7 +87,7 @@ fn test_function_out_params_query_syntax() {
             "Should generate function for single OUT parameter"
         );
         assert!(
-            content.contains("-> Result<Option<time::OffsetDateTime>,"),
+            content.contains("-> Result<Option<time::PrimitiveDateTime>,"),
             "Single OUT parameter should be nullable by default"
         );
 
@@ -112,7 +112,7 @@ fn test_function_out_params_query_syntax() {
             "server_version should not be wrapped in Option due to @pgrpc_not_null"
         );
         assert!(
-            content.contains("pub server_time: Option<time::OffsetDateTime>"),
+            content.contains("pub server_time: Option<time::PrimitiveDateTime>"),
             "server_time should be wrapped in Option (nullable by default)"
         );
         assert!(
@@ -296,7 +296,7 @@ fn test_out_param_prefix_stripping() {
             "o_email should become 'email' field (o_ prefix stripped)"
         );
         assert!(
-            content.contains("pub created_at: Option<time::OffsetDateTime>"),
+            content.contains("pub created_at: Option<time::PrimitiveDateTime>"),
             "o_created_at should become 'created_at' field (o_ prefix stripped)"
         );
 

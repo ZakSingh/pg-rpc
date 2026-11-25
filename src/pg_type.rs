@@ -1,28 +1,24 @@
-use crate::annotations;
+use crate::annotations::Annotations;
 use crate::codegen::ToRust;
 use crate::codegen::{SchemaName, OID};
 use crate::config::Config;
-use crate::ident::{sql_to_rs_ident, sql_to_rs_string, CaseType};
+use crate::ident::{
+    schema_mod_ident, sql_to_rs_ident, sql_to_rs_string, unique_rs_idents, CaseType,
+};
 use crate::parse_domain::non_null_cols_from_checks;
+use crate::row_struct::{
+    flat_layout, grouped_layout, Decode, FieldParts, RowMember, RowShape,
+};
 use itertools::izip;
 use postgres::Row;
-use postgres_types::FromSql;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 
-/// Parse @pgrpc_not_null(col1, col2, ...) annotations from a comment
-pub fn parse_bulk_not_null_columns(comment: &Option<String>) -> BTreeSet<String> {
-    comment
-        .as_ref()
-        .map(|c| annotations::parse_not_null(c))
-        .unwrap_or_default()
-}
-
-#[derive(Debug, FromSql)]
-struct DomainConstraint {
-    name: String,
+/// A CHECK constraint on a domain, as `pg_get_constraintdef` prints it.
+#[derive(Debug)]
+pub struct DomainConstraint {
     definition: String,
 }
 
@@ -60,19 +56,21 @@ pub enum PgType {
         constraints: Vec<DomainConstraint>,
         comment: Option<String>,
     },
-    Custom {
-        schema: String,
-        name: String,
-    },
     Int16,
     Int32,
     Int64,
+    /// `oid`: unsigned, unlike `int4`.
+    Oid,
+    /// The one-byte internal `"char"` type (not `char(n)`, which is text).
+    Char,
     Float32,
     Float64,
     Numeric,
     Bool,
     Text,
     Timestamptz,
+    /// `timestamp` without time zone.
+    Timestamp,
     Date,
     INet,
     Void,
@@ -86,6 +84,19 @@ pub enum PgType {
     /// name lets us produce useful error messages when these flow into a function
     /// signature, instead of panicking at codegen time.
     Pseudo(String),
+    /// A type with no Rust mapping (ranges, `interval`, `money`, …). Carrying
+    /// the name lets codegen skip whatever uses it and say why, instead of
+    /// failing the whole run. See [`unsupported_type`].
+    Unsupported {
+        name: String,
+    },
+    /// A type the user mapped to a Rust type of their own with `[types]`.
+    /// `rust` is a type path that has been checked to parse; the type must
+    /// implement `FromSql`/`ToSql` (and `Clone`, `Debug`, serde) itself.
+    Mapped {
+        name: String,
+        rust: String,
+    },
     Geography,
     Geometry,
     TsVector,
@@ -103,19 +114,17 @@ struct SqlField {
     ty: TokenStream,
 }
 
-impl SqlField {
-    fn new(field: &PgField, nullable: bool, types: &BTreeMap<OID, PgType>) -> Self {
-        let ident = types.get(&field.type_oid).unwrap().to_rust_ident(types);
-        SqlField {
-            pg_name: field.name.clone(),
-            rs_field: sql_to_rs_ident(&field.name, CaseType::Snake),
-            ty: if nullable {
-                quote! { Option<#ident> }
-            } else {
-                ident
-            },
-        }
-    }
+/// The codec's view of a struct that has one field per attribute.
+fn sql_fields(shape: &RowShape) -> Vec<SqlField> {
+    shape
+        .columns()
+        .into_iter()
+        .map(|f| SqlField {
+            pg_name: f.column.clone(),
+            rs_field: f.ident.clone(),
+            ty: f.ty.clone(),
+        })
+        .collect()
 }
 
 /// `impl FromSql for #target` that matches attributes by name through the
@@ -205,38 +214,114 @@ fn composite_to_sql_impl(
     }
 }
 
-/// `row.try_get("<column>")?` for a generated `TryFrom<Row>` impl, with a
-/// failure attributed to `item` and the column as a `DecodeError`. The column
-/// is found by name; `index` is its position at generation time.
-fn row_get(item: &str, column: &str, index: usize) -> TokenStream {
-    let decode = crate::codegen::decode_err(item, column, index);
-    quote! { row.try_get(#column).map_err(#decode)? }
+/// The struct for a composite's attributes: one field each, or, with
+/// `grouped` (views), `prefix__field` attributes folded into nested structs
+/// named `{nested_prefix}{Group}`. Decode failures name the struct and the
+/// original column.
+fn composite_shape(
+    rs_name: &TokenStream,
+    nested_prefix: &str,
+    fields: &[PgField],
+    grouped: bool,
+    types: &BTreeMap<OID, PgType>,
+) -> RowShape {
+    let layout = if grouped {
+        grouped_layout(
+            fields
+                .iter()
+                .map(|f| (f.name.as_str(), f.nullable_due_to_join)),
+        )
+    } else {
+        flat_layout(fields.len())
+    };
+    RowShape::build(
+        rs_name.clone(),
+        nested_prefix,
+        layout,
+        |place| {
+            let name = place.member.unwrap_or(&fields[place.index].name);
+            sql_to_rs_string(name, CaseType::Snake)
+        },
+        |place, ident| {
+            let field = &fields[place.index];
+            // A grouped field is named, and serialized, without its prefix.
+            let (attrs, ty) = match place.member {
+                Some(member) => PgField {
+                    name: member.to_string(),
+                    ..field.clone()
+                }
+                .rust_field_parts(types, ident),
+                None => field.rust_field_parts(types, ident),
+            };
+            FieldParts {
+                column: field.name.clone(),
+                label: field.name.clone(),
+                ty,
+                attrs,
+            }
+        },
+    )
 }
 
-/// `impl TryFrom<Row> for #rs_name`, for a struct with one field per
-/// composite attribute: used when a function returns rows of the type.
-fn composite_try_from_row_impl(rs_name: &TokenStream, fields: &[PgField]) -> TokenStream {
-    let item = rs_name.to_string();
-    let rs_fields: Vec<TokenStream> = fields
-        .iter()
-        .map(|f| sql_to_rs_ident(&f.name, CaseType::Snake))
-        .collect();
-    let values: Vec<TokenStream> = fields
-        .iter()
-        .enumerate()
-        .map(|(i, f)| row_get(&item, &f.name, i))
-        .collect();
+/// The doc comment and derives on a composite's struct.
+fn composite_struct_attrs(
+    schema: &str,
+    name: &str,
+    comment: &Option<String>,
+    config: &Config,
+) -> TokenStream {
+    let comment_macro = if comment.is_some() {
+        quote! { #[doc=#comment] }
+    } else {
+        quote! {}
+    };
+
+    let deserialize_derive = if config.should_disable_deserialize(schema, name) {
+        quote! {}
+    } else {
+        quote! { serde::Deserialize, }
+    };
+
+    let builder_derive = if config.derives_builder(schema, name) {
+        quote! { bon::Builder, }
+    } else {
+        quote! {}
+    };
 
     quote! {
-        impl TryFrom<tokio_postgres::Row> for #rs_name {
-            type Error = super::errors::DecodeError;
+        #comment_macro
+        #[derive(Clone, Debug, #builder_derive serde::Serialize, #deserialize_derive)]
+    }
+}
 
-            fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
-                Ok(Self {
-                    #(#rs_fields: #values),*
-                })
-            }
-        }
+/// A struct with one field per attribute of a composite, with its by-name
+/// codec and `TryFrom<Row>` (used when a function returns rows of the type).
+/// `pg_names` are the type names the codec accepts.
+fn flat_composite(
+    rs_name: &TokenStream,
+    pg_names: &[&str],
+    struct_attrs: &TokenStream,
+    fields: &[PgField],
+    types: &BTreeMap<OID, PgType>,
+) -> TokenStream {
+    // Two attributes can fold to one Rust name (`foo-bar`, `foo_bar`); the
+    // shape makes them unique and every emitter below uses its list.
+    let shape = composite_shape(rs_name, "", fields, false, types);
+    let sql_fields = sql_fields(&shape);
+
+    let struct_def = shape.emit_structs(struct_attrs, &quote! {});
+    let from_sql_impl = composite_from_sql_impl(rs_name, pg_names, &sql_fields);
+    let to_sql_impl = composite_to_sql_impl(rs_name, &quote! {}, pg_names, &sql_fields);
+    let try_from_impl = shape.emit_decoder(Decode::Name { locals: false });
+
+    quote! {
+        #struct_def
+
+        #from_sql_impl
+
+        #to_sql_impl
+
+        #try_from_impl
     }
 }
 
@@ -253,6 +338,38 @@ pub struct PgField {
     pub comment: Option<String>,
 }
 
+/// Stand-in for a type that has no Rust mapping. Codegen leaves out
+/// everything that would need one, so this is only reached if something was
+/// missed, and then the generated code fails to compile where it is used
+/// instead of the generator panicking.
+fn no_rust_type(name: &str) -> TokenStream {
+    let message = format!("pgrpc: no Rust type for the Postgres type `{name}`");
+    quote! { compile_error!(#message) }
+}
+
+/// The Rust type for `oid`, see [`PgType::to_rust_ident`].
+pub(crate) fn rust_type_of(oid: OID, types: &BTreeMap<OID, PgType>) -> TokenStream {
+    match types.get(&oid) {
+        Some(ty) => ty.to_rust_ident(types),
+        None => no_rust_type(&format!("oid {oid}")),
+    }
+}
+
+/// If the type `oid` cannot be represented in Rust — it is unmapped itself,
+/// or is an array of or a domain over such a type — the name of the unmapped
+/// type. Composites are never unsupported: their unmappable attributes are
+/// dropped when the type index is built.
+pub fn unsupported_type(oid: OID, types: &BTreeMap<OID, PgType>) -> Option<String> {
+    match types.get(&oid)? {
+        PgType::Unsupported { name } => Some(name.clone()),
+        PgType::Array {
+            element_type_oid, ..
+        } => unsupported_type(*element_type_oid, types).map(|name| format!("{name}[]")),
+        PgType::Domain { type_oid, .. } => unsupported_type(*type_oid, types),
+        _ => None,
+    }
+}
+
 impl PgType {
     pub fn schema(&self) -> SchemaName {
         match self {
@@ -261,8 +378,6 @@ impl PgType {
             PgType::CheckInferredEnum { schema, .. } => schema,
             PgType::Array { schema, .. } => schema,
             PgType::Domain { schema, .. } => schema,
-            PgType::Custom { schema, .. } => schema,
-            PgType::Record => "pg_catalog",
             _ => "pg_catalog",
         }
         .to_owned()
@@ -274,19 +389,23 @@ impl PgType {
             PgType::Enum { name, .. } => name,
             PgType::CheckInferredEnum { name, .. } => name,
             PgType::Domain { name, .. } => name,
-            PgType::Custom { name, .. } => name,
+            PgType::Unsupported { name } => name,
+            PgType::Mapped { name, .. } => name,
             PgType::Array { .. } => "array",
             PgType::Bool => "bool",
             PgType::Bytea => "bytea",
             PgType::Int16 => "int16",
             PgType::Int32 => "int32",
             PgType::Int64 => "int64",
+            PgType::Oid => "oid",
+            PgType::Char => "char",
             PgType::Float32 => "float32",
             PgType::Float64 => "float64",
             PgType::Numeric => "numeric",
             PgType::Text => "text",
             PgType::Json => "json",
             PgType::Timestamptz => "timestamptz",
+            PgType::Timestamp => "timestamp",
             PgType::Date => "date",
             PgType::INet => "inet",
             PgType::Record => "record",
@@ -302,115 +421,65 @@ impl PgType {
         }
     }
 
+    /// The Rust type for a value of this Postgres type, as written from
+    /// inside a generated schema module (`super::schema::Name`).
     pub fn to_rust_ident(&self, types: &BTreeMap<OID, PgType>) -> TokenStream {
-        match self {
-            // For user-defined types, qualify with schema name
-            PgType::Domain { schema, name, .. } => {
-                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
-                let type_name = sql_to_rs_ident(name, CaseType::Pascal);
-                quote! { super::#schema_mod::#type_name }
-            }
-            PgType::Composite { schema, name, .. } => {
-                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
-                let type_name = sql_to_rs_ident(name, CaseType::Pascal);
-                quote! { super::#schema_mod::#type_name }
-            }
-            PgType::Enum { schema, name, .. } => {
-                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
-                let type_name = sql_to_rs_ident(name, CaseType::Pascal);
-                quote! { super::#schema_mod::#type_name }
-            }
-            PgType::CheckInferredEnum { schema, name, .. } => {
-                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
-                let type_name = sql_to_rs_ident(name, CaseType::Pascal);
-                quote! { super::#schema_mod::#type_name }
-            }
-            PgType::Array {
-                element_type_oid, ..
-            } => {
-                let inner = types.get(element_type_oid).unwrap().to_rust_ident(types);
-                quote! { Vec<#inner> }
-            }
-            // Built-in types don't need schema qualification
-            PgType::Int16 => quote! { i16 },
-            PgType::Int32 => quote! { i32 },
-            PgType::Int64 => quote! { i64 },
-            PgType::Float32 => quote! { f32 },
-            PgType::Float64 => quote! { f64 },
-            PgType::Numeric => quote! { rust_decimal::Decimal },
-            PgType::Bool => quote! { bool },
-            PgType::Text => quote! { String },
-            PgType::Timestamptz => quote! { time::OffsetDateTime },
-            PgType::Date => quote! { time::Date },
-            PgType::INet => quote! { std::net::IpAddr },
-            PgType::Bytea => quote! { Vec<u8> },
-            PgType::Json => quote! { serde_json::Value },
-            PgType::Void => quote! { () },
-            PgType::Record => quote! { tokio_postgres::Row },
-            PgType::Geography => quote! { postgis_butmaintained::ewkb::Geometry },
-            PgType::Geometry => quote! { postgis_butmaintained::ewkb::Geometry },
-            PgType::TsVector => quote! { tsvector::TsVector },
-            PgType::TsQuery => quote! { tsvector::TsQuery },
-            PgType::Vector => quote! { pgvector::Vector },
-            PgType::Uuid => quote! { uuid::Uuid },
-            PgType::Time => quote! { time::Time },
-            x => unimplemented!("unknown type {:?}", x),
-        }
+        self.rust_type(types, true, &mut BTreeSet::new())
     }
 
-    /// Get the Rust type identifier and collect referenced schemas
+    /// The Rust type as written from a module that imports the schema
+    /// modules it needs (`schema::Name`), and the modules to import.
     pub fn to_rust_ident_with_schemas(
         &self,
         types: &BTreeMap<OID, PgType>,
     ) -> (TokenStream, BTreeSet<String>) {
         let mut schemas = BTreeSet::new();
+        let tokens = self.rust_type(types, false, &mut schemas);
+        (tokens, schemas)
+    }
 
-        let tokens = match self {
-            // For user-defined types, use schema-qualified name without super::
-            PgType::Domain { schema, name, .. } => {
-                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
+    fn rust_type(
+        &self,
+        types: &BTreeMap<OID, PgType>,
+        via_super: bool,
+        schemas: &mut BTreeSet<String>,
+    ) -> TokenStream {
+        match self {
+            // User-defined types live in their schema's module.
+            PgType::Domain { schema, name, .. }
+            | PgType::Composite { schema, name, .. }
+            | PgType::Enum { schema, name, .. }
+            | PgType::CheckInferredEnum { schema, name, .. } => {
+                let schema_mod = schema_mod_ident(schema);
                 let type_name = sql_to_rs_ident(name, CaseType::Pascal);
                 schemas.insert(schema_mod.to_string());
-                quote! { #schema_mod::#type_name }
-            }
-            PgType::Composite { schema, name, .. } => {
-                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
-                let type_name = sql_to_rs_ident(name, CaseType::Pascal);
-                schemas.insert(schema_mod.to_string());
-                quote! { #schema_mod::#type_name }
-            }
-            PgType::Enum { schema, name, .. } => {
-                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
-                let type_name = sql_to_rs_ident(name, CaseType::Pascal);
-                schemas.insert(schema_mod.to_string());
-                quote! { #schema_mod::#type_name }
-            }
-            PgType::CheckInferredEnum { schema, name, .. } => {
-                let schema_mod = sql_to_rs_ident(schema, CaseType::Snake);
-                let type_name = sql_to_rs_ident(name, CaseType::Pascal);
-                schemas.insert(schema_mod.to_string());
-                quote! { #schema_mod::#type_name }
+                if via_super {
+                    quote! { super::#schema_mod::#type_name }
+                } else {
+                    quote! { #schema_mod::#type_name }
+                }
             }
             PgType::Array {
                 element_type_oid, ..
             } => {
-                let (inner, inner_schemas) = types
-                    .get(element_type_oid)
-                    .unwrap()
-                    .to_rust_ident_with_schemas(types);
-                schemas.extend(inner_schemas);
+                let inner = match types.get(element_type_oid) {
+                    Some(element) => element.rust_type(types, via_super, schemas),
+                    None => no_rust_type(&format!("array element (oid {element_type_oid})")),
+                };
                 quote! { Vec<#inner> }
             }
-            // Built-in types don't need schema qualification
             PgType::Int16 => quote! { i16 },
             PgType::Int32 => quote! { i32 },
             PgType::Int64 => quote! { i64 },
+            PgType::Oid => quote! { u32 },
+            PgType::Char => quote! { i8 },
             PgType::Float32 => quote! { f32 },
             PgType::Float64 => quote! { f64 },
             PgType::Numeric => quote! { rust_decimal::Decimal },
             PgType::Bool => quote! { bool },
             PgType::Text => quote! { String },
             PgType::Timestamptz => quote! { time::OffsetDateTime },
+            PgType::Timestamp => quote! { time::PrimitiveDateTime },
             PgType::Date => quote! { time::Date },
             PgType::INet => quote! { std::net::IpAddr },
             PgType::Bytea => quote! { Vec<u8> },
@@ -419,15 +488,41 @@ impl PgType {
             PgType::Record => quote! { tokio_postgres::Row },
             PgType::Geography => quote! { postgis_butmaintained::ewkb::Geometry },
             PgType::Geometry => quote! { postgis_butmaintained::ewkb::Geometry },
-            PgType::TsVector => quote! { tsvector::TsVector },
-            PgType::TsQuery => quote! { tsvector::TsQuery },
+            // One definition, shared by every generated module.
+            PgType::TsVector => quote! { super::tsvector::TsVector },
+            PgType::TsQuery => quote! { super::tsvector::TsQuery },
             PgType::Vector => quote! { pgvector::Vector },
             PgType::Uuid => quote! { uuid::Uuid },
             PgType::Time => quote! { time::Time },
-            x => unimplemented!("unknown type {:?}", x),
-        };
+            // Codegen skips everything that uses these (see `unsupported_type`).
+            // Should one slip through, the generated code fails to compile at
+            // the place it is used rather than the generator panicking.
+            PgType::Pseudo(name) | PgType::Unsupported { name } => no_rust_type(name),
+            PgType::Mapped { name, rust } => match syn::parse_str::<syn::Type>(rust) {
+                Ok(ty) => quote! { #ty },
+                Err(_) => no_rust_type(name),
+            },
+        }
+    }
 
-        (tokens, schemas)
+    /// The type of a function or query parameter: by value for the small
+    /// `Copy` types, `&str` for text, a reference otherwise.
+    pub fn to_rust_param(&self, types: &BTreeMap<OID, PgType>) -> TokenStream {
+        match self {
+            PgType::Int16
+            | PgType::Int32
+            | PgType::Int64
+            | PgType::Oid
+            | PgType::Char
+            | PgType::Bool
+            | PgType::Enum { .. } => self.to_rust_ident(types),
+            PgType::Text => quote! { &str },
+            PgType::Mapped { rust, .. } if rust == "String" => quote! { &str },
+            other => {
+                let ident = other.to_rust_ident(types);
+                quote! { &#ident }
+            }
+        }
     }
 
     /// Generate code for a composite type (view/matview) with double-underscore
@@ -437,7 +532,6 @@ impl PgType {
     /// `postgres_types::FromSql`/`ToSql` because the struct shape doesn't match
     /// the Postgres wire format. They only use `TryFrom<Row>`.
     fn to_rust_grouped_composite(
-        &self,
         rs_name: &TokenStream,
         pg_name: &str,
         schema: &str,
@@ -446,289 +540,77 @@ impl PgType {
         types: &BTreeMap<OID, PgType>,
         config: &Config,
     ) -> TokenStream {
-        use crate::column_grouping::{group_by_double_underscore, GroupedField};
+        let nested_prefix = sql_to_rs_string(pg_name, CaseType::Pascal);
+        let shape = composite_shape(rs_name, &nested_prefix, fields, true, types);
 
-        let grouped = group_by_double_underscore(
-            fields.to_vec(),
-            |f| &f.name,
-            |f| f.nullable_due_to_join,
-            |f, new_name| f.name = new_name,
+        let struct_defs = shape.emit_structs(
+            &composite_struct_attrs(schema, pg_name, comment, config),
+            &quote! { #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)] },
         );
-
-        // Decode failures name the struct and the original column, at its
-        // position in the ungrouped column list.
-        let item = rs_name.to_string();
-        let index_of =
-            |column: &str| fields.iter().position(|f| f.name == column).unwrap_or(0);
-
-        let mut nested_struct_defs: Vec<TokenStream> = Vec::new();
-        let mut parent_fields: Vec<TokenStream> = Vec::new();
-        let mut parent_extractions: Vec<TokenStream> = Vec::new();
-        let mut parent_assignments: Vec<TokenStream> = Vec::new();
-
-        for grouped_field in &grouped {
-            match grouped_field {
-                GroupedField::Plain(field) => {
-                    let field_token = field.to_rust_inner(types, false);
-                    let sql_name = &field.name;
-                    let var_name = format_ident!("_{}", &field.name);
-                    let rs_field_name = sql_to_rs_ident(&field.name, CaseType::Snake);
-
-                    parent_fields.push(field_token);
-                    let value = row_get(&item, sql_name, index_of(sql_name));
-                    parent_extractions.push(quote! {
-                        let #var_name = #value;
-                    });
-                    parent_assignments.push(quote! { #rs_field_name: #var_name });
-                }
-                GroupedField::Group {
-                    group_name,
-                    fields: group_fields,
-                    optional,
-                } => {
-                    let nested_name = format_ident!(
-                        "{}{}",
-                        sql_to_rs_string(pg_name, CaseType::Pascal),
-                        sql_to_rs_string(group_name, CaseType::Pascal)
-                    );
-                    let group_field_name = sql_to_rs_ident(group_name, CaseType::Snake);
-
-                    // Generate nested struct fields
-                    let nested_field_tokens: Vec<TokenStream> = group_fields
-                        .iter()
-                        .map(|f| {
-                            // Nested struct fields use their natural nullability.
-                            // Fields nullable on base OR due to join stay Option.
-                            f.to_rust_inner(types, false)
-                        })
-                        .collect();
-
-                    // Generate extraction code — we need to use the ORIGINAL SQL
-                    // column name (with the prefix__) to extract from the row.
-                    // The original name is `{group_name}__{field.name}`.
-                    let nested_extractions: Vec<TokenStream> = group_fields
-                        .iter()
-                        .map(|f| {
-                            let original_sql_name =
-                                format!("{}__{}", group_name, f.name);
-                            let var_name = format_ident!(
-                                "_{}__{}",
-                                group_name,
-                                f.name
-                            );
-                            let value =
-                                row_get(&item, &original_sql_name, index_of(&original_sql_name));
-                            quote! {
-                                let #var_name = #value;
-                            }
-                        })
-                        .collect();
-
-                    let nested_assignments: Vec<TokenStream> = group_fields
-                        .iter()
-                        .map(|f| {
-                            let rs_field = sql_to_rs_ident(&f.name, CaseType::Snake);
-                            let var_name = format_ident!(
-                                "_{}__{}",
-                                group_name,
-                                f.name
-                            );
-                            quote! { #rs_field: #var_name }
-                        })
-                        .collect();
-
-                    nested_struct_defs.push(quote! {
-                        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-                        pub struct #nested_name {
-                            #(#nested_field_tokens),*
-                        }
-                    });
-
-                    parent_extractions.extend(nested_extractions);
-
-                    if *optional {
-                        // Use the first field as sentinel for NULL detection
-                        let first_original_name =
-                            format!("{}__{}", group_name, group_fields[0].name);
-                        let sentinel_var = format_ident!(
-                            "_{}__{}",
-                            group_name,
-                            group_fields[0].name
-                        );
-
-                        parent_fields.push(quote! {
-                            pub #group_field_name: Option<#nested_name>
-                        });
-
-                        // We check if the sentinel variable is None.
-                        // Since we already extracted all variables above, we can
-                        // check the sentinel and construct accordingly.
-                        // However, for optional groups, the extracted values are
-                        // wrapped in Option<T> (since Postgres returns NULL for
-                        // LEFT JOIN'd columns). The nested struct expects non-Option
-                        // for base-not-null fields. We need to unwrap.
-                        //
-                        // Actually, `row.try_get` returns `Option<T>` when T is
-                        // the inner type and the column is nullable. But the variable
-                        // type is inferred from usage. Since the nested struct field
-                        // might not be Option, we need a different extraction strategy.
-                        //
-                        // Simplest approach: extract all as raw values in the Some branch.
-                        // Let's restructure to use a conditional extraction.
-
-                        // Clear the extractions we just added for this group —
-                        // we'll do conditional extraction instead.
-                        for _ in 0..group_fields.len() {
-                            parent_extractions.pop();
-                        }
-
-                        let sentinel_sql_name = format!("{}__{}", group_name, group_fields[0].name);
-                        let conditional_extractions: Vec<TokenStream> = group_fields
-                            .iter()
-                            .map(|f| {
-                                let original_sql_name = format!("{}__{}", group_name, f.name);
-                                let var_name = format_ident!("_{}_{}", group_name, f.name);
-                                let value = row_get(
-                                    &item,
-                                    &original_sql_name,
-                                    index_of(&original_sql_name),
-                                );
-                                quote! {
-                                    let #var_name = #value;
-                                }
-                            })
-                            .collect();
-
-                        let conditional_assignments: Vec<TokenStream> = group_fields
-                            .iter()
-                            .map(|f| {
-                                let rs_field = sql_to_rs_ident(&f.name, CaseType::Snake);
-                                let var_name = format_ident!("_{}_{}", group_name, f.name);
-                                quote! { #rs_field: #var_name }
-                            })
-                            .collect();
-
-                        let sentinel_value =
-                            row_get(&item, &sentinel_sql_name, index_of(&sentinel_sql_name));
-                        parent_extractions.push(quote! {
-                            let #sentinel_var: Option<serde_json::Value> = #sentinel_value;
-                        });
-
-                        parent_assignments.push(quote! {
-                            #group_field_name: if #sentinel_var.is_none() {
-                                None
-                            } else {
-                                #(#conditional_extractions)*
-                                Some(#nested_name {
-                                    #(#conditional_assignments),*
-                                })
-                            }
-                        });
-                    } else {
-                        parent_fields.push(quote! {
-                            pub #group_field_name: #nested_name
-                        });
-
-                        parent_assignments.push(quote! {
-                            #group_field_name: #nested_name {
-                                #(#nested_assignments),*
-                            }
-                        });
-                    }
-                }
-            }
-        }
-
-        let comment_macro = if comment.is_some() {
-            quote! { #[doc=#comment] }
-        } else {
-            quote! {}
-        };
-
-        let deserialize_derive = if config.should_disable_deserialize(schema, pg_name) {
-            quote! {}
-        } else {
-            quote! { serde::Deserialize, }
-        };
-
-        let builder_derive =
-            if comment.as_ref().map_or(false, |c| annotations::has_builder(c)) {
-                quote! { bon::Builder, }
-            } else {
-                quote! {}
-            };
+        // An optional group is probed first and its columns only read when it
+        // is present, so each column is bound to a local where it is read.
+        let try_from_impl = shape.emit_decoder(Decode::Name { locals: true });
 
         // Generate an inner flat struct that matches the Postgres wire format.
         // This is needed so that other composite types referencing this view
         // can still use FromSql/ToSql.
-        let inner_struct_name = format_ident!(
-            "Inner{}",
-            sql_to_rs_string(pg_name, CaseType::Pascal)
-        );
+        let inner_struct_name = format_ident!("Inner{}", nested_prefix);
         // Borrowed twin of `InnerXxx`, used only as a zero-clone destination for
         // `ToSql`. Its fields are `&'a T` (or `Option<&'a T>`) instead of owned,
         // so building one in the generated `impl ToSql for Rs` costs nothing.
-        let inner_ref_struct_name = format_ident!(
-            "Inner{}Ref",
-            sql_to_rs_string(pg_name, CaseType::Pascal)
-        );
+        let inner_ref_struct_name = format_ident!("Inner{}Ref", nested_prefix);
 
-        // Determine which fields belong to optional groups so we can make
-        // ALL their inner struct fields Option (needed for FromSql/ToSql roundtrip
-        // when the group is None).
-        let optional_group_fields: std::collections::HashSet<String> = grouped
+        // The flat twins have one field per original column, under names
+        // made unique across the whole column list.
+        let inner_idents = unique_rs_idents(fields.iter().map(|f| f.name.as_str()), CaseType::Snake);
+
+        // ALL columns of an optional group are `Option` in the flat twins
+        // (needed for the FromSql/ToSql roundtrip when the group is None),
+        // next to those that are nullable on the base column.
+        let optional_group_columns: BTreeSet<usize> = shape
+            .members
             .iter()
-            .filter_map(|gf| match gf {
-                GroupedField::Group { group_name, fields: gf_fields, optional: true } => {
-                    Some(gf_fields.iter().map(|f| format!("{}__{}", group_name, f.name)).collect::<Vec<_>>())
-                }
+            .filter_map(|member| match member {
+                RowMember::Group(group) if group.optional => Some(&group.fields),
                 _ => None,
             })
             .flatten()
+            .map(|f| f.index)
             .collect();
+        let inner_nullable =
+            |index: usize| fields[index].nullable || optional_group_columns.contains(&index);
 
-        // Generate inner struct fields — these use the ORIGINAL flat field names
-        // with #[postgres(name = ...)] attributes for the Postgres derive macros.
-        // All fields in optional groups are made Option so the FromSql/ToSql
-        // roundtrip works when the group is None.
-        // We only emit #[postgres(name = ...)] — no serde attrs since the inner
-        // struct doesn't derive Serialize/Deserialize.
-        let inner_field_tokens: Vec<TokenStream> = fields
-            .iter()
-            .map(|f| {
-                let ident = types.get(&f.type_oid).unwrap().to_rust_ident(types);
-                let field_name = sql_to_rs_ident(&f.name, CaseType::Snake);
-                // In the inner struct, field must be Option if:
-                // - it's nullable on base, OR
-                // - it belongs to an optional group (all fields become Option)
-                let is_nullable = f.nullable || optional_group_fields.contains(&f.name);
-                let field_type = if is_nullable {
-                    quote! { Option<#ident> }
-                } else {
-                    quote! { #ident }
-                };
-                quote! {
-                    pub #field_name: #field_type
+        // The owned twin (`FromSql` destination) and the borrowed one, whose
+        // nullable fields are `Option<&'a T>` rather than `&'a Option<T>` so
+        // the optional-group projections (`as_ref().and_then(|g| g.f.as_ref())`)
+        // can hand a value in directly without an intermediate owned `Option`.
+        // Wire output is identical: `ToSql for Option<T>` matches `T` either way.
+        let inner_sql_fields: Vec<SqlField> = izip!(fields, &inner_idents)
+            .enumerate()
+            .map(|(index, (f, ident))| {
+                let ty = rust_type_of(f.type_oid, types);
+                SqlField {
+                    pg_name: f.name.clone(),
+                    rs_field: ident.clone(),
+                    ty: if inner_nullable(index) {
+                        quote! { Option<#ty> }
+                    } else {
+                        ty
+                    },
                 }
             })
             .collect();
-
-        // By-name codec impls for the two flat twins.
-        let inner_sql_fields: Vec<SqlField> = fields
-            .iter()
-            .map(|f| SqlField::new(f, f.nullable || optional_group_fields.contains(&f.name), types))
-            .collect();
-        let inner_ref_sql_fields: Vec<SqlField> = fields
-            .iter()
-            .map(|f| {
-                let ident = types.get(&f.type_oid).unwrap().to_rust_ident(types);
+        let inner_ref_sql_fields: Vec<SqlField> = izip!(fields, &inner_idents)
+            .enumerate()
+            .map(|(index, (f, ident))| {
+                let ty = rust_type_of(f.type_oid, types);
                 SqlField {
                     pg_name: f.name.clone(),
-                    rs_field: sql_to_rs_ident(&f.name, CaseType::Snake),
-                    ty: if f.nullable || optional_group_fields.contains(&f.name) {
-                        quote! { Option<&'a #ident> }
+                    rs_field: ident.clone(),
+                    ty: if inner_nullable(index) {
+                        quote! { Option<&'a #ty> }
                     } else {
-                        quote! { &'a #ident }
+                        quote! { &'a #ty }
                     },
                 }
             })
@@ -742,82 +624,53 @@ impl PgType {
             &inner_ref_sql_fields,
         );
 
-        // Mirror of `inner_field_tokens` for the borrowed Ref struct.
-        // Nullable fields become `Option<&'a T>` rather than `&'a Option<T>` so
-        // the optional-group projections (`as_ref().and_then(|g| g.f.as_ref())`)
-        // can hand a value in directly without an intermediate owned `Option`.
-        // Wire output is identical: `ToSql for Option<T>` matches `T` either way.
-        let inner_ref_field_tokens: Vec<TokenStream> = fields
-            .iter()
-            .map(|f| {
-                let ident = types.get(&f.type_oid).unwrap().to_rust_ident(types);
-                let field_name = sql_to_rs_ident(&f.name, CaseType::Snake);
-                let is_nullable = f.nullable || optional_group_fields.contains(&f.name);
-                let field_type = if is_nullable {
-                    quote! { Option<&'a #ident> }
-                } else {
-                    quote! { &'a #ident }
-                };
-                quote! {
-                    #field_name: #field_type
-                }
-            })
-            .collect();
+        // No serde attrs: the twins derive neither Serialize nor Deserialize.
+        let inner_field_tokens = inner_sql_fields.iter().map(|SqlField { rs_field, ty, .. }| {
+            quote! { pub #rs_field: #ty }
+        });
+        let inner_ref_field_tokens =
+            inner_ref_sql_fields.iter().map(|SqlField { rs_field, ty, .. }| {
+                quote! { #rs_field: #ty }
+            });
 
         // Generate conversion from inner flat struct to grouped struct.
         // For each grouped field, we read from the inner struct's flat fields.
         let mut from_inner_assignments: Vec<TokenStream> = Vec::new();
-        // Generate conversion from grouped struct to inner flat struct.
-        let mut to_inner_assignments: Vec<TokenStream> = Vec::new();
         // Borrowed variant: assignments that feed `InnerXxxRef`, with `&self.*`
         // instead of `self.*.clone()` — used by `impl ToSql for Rs`.
         let mut to_inner_ref_assignments: Vec<TokenStream> = Vec::new();
 
-        for grouped_field in &grouped {
-            match grouped_field {
-                GroupedField::Plain(field) => {
-                    let rs_field = sql_to_rs_ident(&field.name, CaseType::Snake);
-                    from_inner_assignments.push(quote! { #rs_field: inner.#rs_field });
-                    to_inner_assignments.push(quote! { #rs_field: self.#rs_field.clone() });
+        for member in &shape.members {
+            match member {
+                RowMember::Field(field) => {
+                    let rs_field = &field.ident;
+                    let inner_rs = &inner_idents[field.index];
+                    from_inner_assignments.push(quote! { #rs_field: inner.#inner_rs });
                     // Ref field type for a nullable plain field is `Option<&T>`,
                     // so project with `.as_ref()` instead of `&self.field`
                     // (which would yield `&Option<T>`).
-                    let is_nullable = field.nullable || optional_group_fields.contains(&field.name);
-                    if is_nullable {
+                    if inner_nullable(field.index) {
                         to_inner_ref_assignments
-                            .push(quote! { #rs_field: self.#rs_field.as_ref() });
+                            .push(quote! { #inner_rs: self.#rs_field.as_ref() });
                     } else {
-                        to_inner_ref_assignments.push(quote! { #rs_field: &self.#rs_field });
+                        to_inner_ref_assignments.push(quote! { #inner_rs: &self.#rs_field });
                     }
                 }
-                GroupedField::Group {
-                    group_name,
-                    fields: group_fields,
-                    optional,
-                } => {
-                    let group_field_name = sql_to_rs_ident(group_name, CaseType::Snake);
-                    let nested_name = format_ident!(
-                        "{}{}",
-                        sql_to_rs_string(pg_name, CaseType::Pascal),
-                        sql_to_rs_string(group_name, CaseType::Pascal)
-                    );
+                RowMember::Group(group) => {
+                    let group_field_name = &group.ident;
+                    let nested_name = &group.struct_name;
 
-                    // Field names in the inner struct use the original SQL name
-                    // e.g. owner__account_id -> owner_account_id (Rust ident)
-                    let inner_field_rs_names: Vec<_> = group_fields
-                        .iter()
-                        .map(|f| {
-                            let original = format!("{}__{}", group_name, f.name);
-                            sql_to_rs_ident(&original, CaseType::Snake)
-                        })
-                        .collect();
+                    // Each member: its column, its field in the flat twins
+                    // (named after the original column, `owner__id` ->
+                    // `owner_id`) and its field in the nested struct.
+                    let group_fields: Vec<&PgField> =
+                        group.fields.iter().map(|m| &fields[m.index]).collect();
+                    let inner_field_rs_names: Vec<&TokenStream> =
+                        group.fields.iter().map(|m| &inner_idents[m.index]).collect();
+                    let nested_field_rs_names: Vec<&TokenStream> =
+                        group.fields.iter().map(|m| &m.ident).collect();
 
-                    let nested_field_rs_names: Vec<_> = group_fields
-                        .iter()
-                        .map(|f| sql_to_rs_ident(&f.name, CaseType::Snake))
-                        .collect();
-
-                    if *optional {
+                    if group.optional {
                         // inner -> grouped: check sentinel, construct Option<NestedStruct>
                         //
                         // ALL inner struct fields in optional groups are Option<T>.
@@ -838,10 +691,23 @@ impl PgType {
                                     // Both Option — direct clone
                                     quote! { #nested_rs: inner.#inner_rs.clone() }
                                 } else {
-                                    // Inner is Option, nested is T — unwrap (safe:
-                                    // sentinel check ensures the row exists, and this
-                                    // field is NOT NULL on its source table)
-                                    quote! { #nested_rs: inner.#inner_rs.clone().unwrap() }
+                                    // Inner is Option, nested is T. The
+                                    // sentinel says the group is present and
+                                    // the column is NOT NULL at its source,
+                                    // so a NULL here means the value does not
+                                    // match the schema this was generated from.
+                                    let column = &f.name;
+                                    quote! {
+                                        #nested_rs: inner.#inner_rs.clone().ok_or_else(
+                                            || -> Box<dyn std::error::Error + std::marker::Sync + std::marker::Send> {
+                                                format!(
+                                                    "{}.{} is NULL although its group is present",
+                                                    #pg_name, #column
+                                                )
+                                                .into()
+                                            },
+                                        )?
+                                    }
                                 }
                             })
                             .collect();
@@ -855,32 +721,6 @@ impl PgType {
                                 })
                             }
                         });
-
-                        // grouped -> inner: expand Option<NestedStruct> back to flat Option fields
-                        let to_inner_field_conversions: Vec<TokenStream> = group_fields
-                            .iter()
-                            .zip(inner_field_rs_names.iter())
-                            .zip(nested_field_rs_names.iter())
-                            .map(|((f, inner_rs), nested_rs)| {
-                                let nested_is_option = f.nullable || f.nullable_due_to_join;
-                                if nested_is_option {
-                                    // Both Option — flatten
-                                    quote! {
-                                        #inner_rs: match &self.#group_field_name {
-                                            Some(g) => g.#nested_rs.clone(),
-                                            None => None,
-                                        }
-                                    }
-                                } else {
-                                    // Inner is Option, nested is T — wrap in Some
-                                    quote! {
-                                        #inner_rs: self.#group_field_name.as_ref().map(|g| g.#nested_rs.clone())
-                                    }
-                                }
-                            })
-                            .collect();
-
-                        to_inner_assignments.extend(to_inner_field_conversions);
 
                         // Borrowed variant of the above. Inner field is `Option<&T>`.
                         // When the nested field itself is `Option<T>`, we flatten with
@@ -923,16 +763,6 @@ impl PgType {
                             }
                         });
 
-                        let to_inner_field_conversions: Vec<TokenStream> = inner_field_rs_names
-                            .iter()
-                            .zip(nested_field_rs_names.iter())
-                            .map(|(inner_rs, nested_rs)| {
-                                quote! { #inner_rs: self.#group_field_name.#nested_rs.clone() }
-                            })
-                            .collect();
-
-                        to_inner_assignments.extend(to_inner_field_conversions);
-
                         // Inner Ref field is `Option<&T>` when the base column
                         // is nullable, `&T` otherwise. Project with `.as_ref()`
                         // for the nullable case to avoid `&Option<T>`.
@@ -960,13 +790,7 @@ impl PgType {
         }
 
         quote! {
-            #(#nested_struct_defs)*
-
-            #comment_macro
-            #[derive(Clone, Debug, #builder_derive serde::Serialize, #deserialize_derive)]
-            pub struct #rs_name {
-                #(#parent_fields),*
-            }
+            #struct_defs
 
             /// Internal flat struct matching the Postgres wire format.
             /// Used only as a `FromSql` destination — `ToSql` is implemented via
@@ -1023,17 +847,7 @@ impl PgType {
                 postgres_types::to_sql_checked!();
             }
 
-            impl TryFrom<tokio_postgres::Row> for #rs_name {
-                type Error = super::errors::DecodeError;
-
-                fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
-                    #(#parent_extractions)*
-
-                    Ok(Self {
-                        #(#parent_assignments),*
-                    })
-                }
-            }
+            #try_from_impl
         }
     }
 }
@@ -1051,19 +865,20 @@ impl TryFrom<Row> for PgType {
                 "int2" => PgType::Int16,
                 "int4" => PgType::Int32,
                 "int8" => PgType::Int64,
-                "oid" => PgType::Int32, // OID maps to u32/i32
+                "oid" => PgType::Oid,
                 "numeric" => PgType::Numeric,
                 "text" | "citext" => PgType::Text,
-                "char" | "bpchar" => PgType::Text, // char and bpchar (blank-padded char) map to String
+                // `"char"` is the internal one-byte type; `char(n)` is bpchar.
+                "char" => PgType::Char,
+                "bpchar" => PgType::Text,
                 "varchar" => PgType::Text,
                 "bool" => PgType::Bool,
                 "timestamptz" => PgType::Timestamptz,
-                "timestamp" => PgType::Timestamptz, // timestamp without timezone also maps to timestamptz
+                "timestamp" => PgType::Timestamp,
                 "time" => PgType::Time,
-                "timetz" => PgType::Time,
                 "uuid" => PgType::Uuid,
-                "float4" | "real" => PgType::Float32,
-                "float8" | "double precision" => PgType::Float64,
+                "float4" => PgType::Float32,
+                "float8" => PgType::Float64,
                 // `name` is a built-in string type. It must be matched
                 // explicitly *before* the array guard below: PostgreSQL stores
                 // `name` internally as an array of `char`, so its `typelem` is
@@ -1092,7 +907,10 @@ impl TryFrom<Row> for PgType {
                 "tsvector" => PgType::TsVector,
                 "tsquery" => PgType::TsQuery,
                 "vector" => PgType::Vector,
-                x => unimplemented!("base type not implemented {}", x),
+                // No type that implements FromSql/ToSql for these with the
+                // crates generated code depends on: timetz, interval, money,
+                // cidr, macaddr, bit, xml, geometric types, …
+                _ => PgType::Unsupported { name },
             },
             'c' => {
                 // Get view information if this is a view
@@ -1103,17 +921,15 @@ impl TryFrom<Row> for PgType {
                     .flatten()
                     .map(|v| v as u8 as char);
                 let view_definition: Option<String> = t.try_get("view_definition").ok().flatten();
-                let _is_view = relkind == Some('v') || relkind == Some('m');
 
-                // Check if composite_field_names is NULL (happens when composite type has no fields)
-                let field_names_opt: Option<Vec<&str>> = t.try_get("composite_field_names").ok();
+                // composite_field_names is NULL when the composite type has no fields
+                let field_names: Vec<&str> = t
+                    .try_get::<_, Option<Vec<&str>>>("composite_field_names")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
 
-                if field_names_opt.is_none()
-                    || field_names_opt
-                        .as_ref()
-                        .map(|v| v.is_empty())
-                        .unwrap_or(true)
-                {
+                if field_names.is_empty() {
                     // Handle composite types with no fields
                     let type_oid: u32 = t.get("oid");
                     eprintln!(
@@ -1136,30 +952,30 @@ impl TryFrom<Row> for PgType {
                         view_definition,
                     }
                 } else {
-                    // Parse type-level bulk not null annotations
-                    let bulk_not_null_columns = parse_bulk_not_null_columns(&comment);
-                    
+                    // Type-level `@pgrpc_not_null(a, b)` / `(*)`
+                    let type_annotations = Annotations::of(comment.as_deref());
+
                     PgType::Composite {
                         schema,
                         name,
                         comment,
                         fields: izip!(
-                            field_names_opt.unwrap(),
+                            field_names,
                             t.get::<&str, Vec<u32>>("composite_field_types"),
                             t.get::<&str, Vec<bool>>("composite_field_nullables"),
                             t.get::<&str, Vec<Option<String>>>("composite_field_comments")
                         )
                         .map(|(name, ty, nullable, comment)| {
                             let field_name = name.to_string();
-                            let is_bulk_not_null = bulk_not_null_columns.contains(&field_name);
-                            let is_column_not_null = comment
-                                .as_ref()
-                                .is_some_and(|c| annotations::has_not_null(c));
+                            let annotated_not_null = type_annotations.child_not_null(
+                                &field_name,
+                                &Annotations::of(comment.as_deref()),
+                            );
 
                             PgField {
                                 name: field_name,
                                 type_oid: ty,
-                                nullable: nullable && !is_column_not_null && !is_bulk_not_null,
+                                nullable: nullable && !annotated_not_null,
                                 nullable_due_to_join: false,
                                 comment: comment.clone(),
                             }
@@ -1171,14 +987,12 @@ impl TryFrom<Row> for PgType {
                 }
             }
             'd' => {
-                let constraints = izip!(
-                    t.try_get::<_, Vec<String>>("domain_constraint_names")
-                        .unwrap_or(Vec::default()),
-                    t.try_get::<_, Vec<String>>("domain_composite_constraints")
-                        .unwrap_or(Vec::default())
-                )
-                .map(|(name, definition)| DomainConstraint { name, definition })
-                .collect();
+                let constraints = t
+                    .try_get::<_, Vec<String>>("domain_composite_constraints")
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|definition| DomainConstraint { definition })
+                    .collect();
 
                 PgType::Domain {
                     schema,
@@ -1203,10 +1017,53 @@ impl TryFrom<Row> for PgType {
                 // function codegen skip any signature that touches this.
                 _ => PgType::Pseudo(name.to_string()),
             },
-            x => unimplemented!("ttype not implemented {}", x),
+            // Range ('r') and multirange ('m') types.
+            _ => PgType::Unsupported { name },
         };
 
         Ok(pg_type)
+    }
+}
+
+/// The comparison traits a generated or mapped Rust type implements, which
+/// bound what a domain newtype around it (or around a `Vec` of it) can derive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Comparable {
+    partial_eq: bool,
+    eq_hash: bool,
+}
+
+impl Comparable {
+    const NONE: Self = Self { partial_eq: false, eq_hash: false };
+    const PARTIAL: Self = Self { partial_eq: true, eq_hash: false };
+    const FULL: Self = Self { partial_eq: true, eq_hash: true };
+}
+
+fn comparable(pg_type: &PgType, types: &BTreeMap<OID, PgType>) -> Comparable {
+    match pg_type {
+        // NaN: no total equality.
+        PgType::Float32 | PgType::Float64 | PgType::Vector => Comparable::PARTIAL,
+        // `ewkb::Geometry`, `Row` and generated composite structs have no
+        // `PartialEq` at all.
+        PgType::Geography
+        | PgType::Geometry
+        | PgType::Record
+        | PgType::Composite { .. }
+        | PgType::Pseudo(_)
+        | PgType::Unsupported { .. }
+        // Nothing is known about a user's own type; derive the minimum.
+        | PgType::Mapped { .. } => Comparable::NONE,
+        PgType::Array {
+            element_type_oid, ..
+        } => types
+            .get(element_type_oid)
+            .map_or(Comparable::NONE, |element| comparable(element, types)),
+        // A domain newtype derives what its inner type allows; a domain over
+        // a composite is emitted as a plain struct.
+        PgType::Domain { type_oid, .. } => types
+            .get(type_oid)
+            .map_or(Comparable::NONE, |inner| comparable(inner, types)),
+        _ => Comparable::FULL,
     }
 }
 
@@ -1214,13 +1071,19 @@ impl TryFrom<Row> for PgType {
 fn determine_domain_traits(
     inner_type: &PgType,
     domain_name: &TokenStream,
+    types: &BTreeMap<OID, PgType>,
 ) -> (Vec<TokenStream>, Vec<TokenStream>) {
     let mut derives = Vec::new();
     let mut impls = Vec::new();
 
     match inner_type {
         // Copy types - add Copy and ordering traits
-        PgType::Int16 | PgType::Int32 | PgType::Int64 | PgType::Bool => {
+        PgType::Int16
+        | PgType::Int32
+        | PgType::Int64
+        | PgType::Oid
+        | PgType::Char
+        | PgType::Bool => {
             derives.push(quote! { PartialEq });
             derives.push(quote! { Eq });
             derives.push(quote! { Hash });
@@ -1255,7 +1118,7 @@ fn determine_domain_traits(
         }
 
         // Other orderable types - add ordering traits but not Copy
-        PgType::Numeric | PgType::Timestamptz | PgType::Date => {
+        PgType::Numeric | PgType::Timestamptz | PgType::Timestamp | PgType::Date => {
             derives.push(quote! { PartialEq });
             derives.push(quote! { Eq });
             derives.push(quote! { Hash });
@@ -1263,11 +1126,16 @@ fn determine_domain_traits(
             derives.push(quote! { Ord });
         }
 
-        // For all other types, just the basic traits
-        _ => {
-            derives.push(quote! { PartialEq });
-            derives.push(quote! { Eq });
-            derives.push(quote! { Hash });
+        // Everything else: only the equality traits the inner type has.
+        other => {
+            let comparable = comparable(other, types);
+            if comparable.partial_eq {
+                derives.push(quote! { PartialEq });
+            }
+            if comparable.eq_hash {
+                derives.push(quote! { Eq });
+                derives.push(quote! { Hash });
+            }
         }
     }
 
@@ -1293,57 +1161,18 @@ impl ToRust for PgType {
                     && fields.iter().any(|f| f.name.contains("__"));
 
                 if has_grouped_fields {
-                    return self.to_rust_grouped_composite(
+                    return Self::to_rust_grouped_composite(
                         &rs_name, name, schema, comment, fields, types, config,
                     );
                 }
 
-                let field_tokens: Vec<TokenStream> = fields
-                    .into_iter()
-                    .map(|f| f.to_rust_inner(types, false))
-                    .collect();
-
-                let sql_fields: Vec<SqlField> = fields
-                    .iter()
-                    .map(|f| SqlField::new(f, f.nullable, types))
-                    .collect();
-                let from_sql_impl = composite_from_sql_impl(&rs_name, &[name.as_str()], &sql_fields);
-                let to_sql_impl =
-                    composite_to_sql_impl(&rs_name, &quote! {}, &[name.as_str()], &sql_fields);
-
-                let try_from_impl = composite_try_from_row_impl(&rs_name, fields);
-
-                let comment_macro = if comment.is_some() {
-                    quote! { #[doc=#comment] }
-                } else {
-                    quote! {}
-                };
-
-                let deserialize_derive = if config.should_disable_deserialize(schema, name) {
-                    quote! {}
-                } else {
-                    quote! { serde::Deserialize, }
-                };
-
-                let builder_derive = if comment.as_ref().map_or(false, |c| annotations::has_builder(c)) {
-                    quote! { bon::Builder, }
-                } else {
-                    quote! {}
-                };
-
-                quote! {
-                    #comment_macro
-                    #[derive(Clone, Debug, #builder_derive serde::Serialize, #deserialize_derive)]
-                    pub struct #rs_name {
-                        #(#field_tokens),*
-                    }
-
-                    #from_sql_impl
-
-                    #to_sql_impl
-
-                    #try_from_impl
-                }
+                flat_composite(
+                    &rs_name,
+                    &[name.as_str()],
+                    &composite_struct_attrs(schema, name, comment, config),
+                    fields,
+                    types,
+                )
             }
             PgType::Domain {
                 name,
@@ -1355,175 +1184,36 @@ impl ToRust for PgType {
             } => {
                 let rs_name = sql_to_rs_ident(name, CaseType::Pascal);
 
-                match types.get(type_oid).unwrap() {
+                let Some(inner_type) = types.get(type_oid) else {
+                    log::warn!(
+                        "Domain {}.{} skipped: its base type (oid {}) was not introspected",
+                        schema, name, type_oid
+                    );
+                    return quote! {};
+                };
+                // Reported once, with the objects that use it, when the type
+                // index is built.
+                if unsupported_type(*type_oid, types).is_some() {
+                    return quote! {};
+                }
+
+                match inner_type {
                     PgType::Composite {
                         fields,
                         name: pg_inner_name,
-                        schema: _inner_schema,
                         ..
-                    } => {
-                        if comment.as_ref().is_some_and(|c| annotations::has_strict(c))
-                            || config.is_strict_domain(schema, name)
-                        {
-                            log::warn!(
-                                "@pgrpc_strict on domain {}.{} ignored: strict mode is not supported for domains over composite types",
-                                schema, name
-                            );
-                        }
-
-                        // If the domain wraps a composite type, we want to create a new composite type
-                        // with the non-null constraints enforced by the domain rather than creating a new wrapper type.
-                        // TODO: Refactor for DRY
-                        let c: Vec<&str> = constraints
-                            .into_iter()
-                            .map(|s| s.definition.as_str())
-                            .collect();
-                        let non_null_cols = non_null_cols_from_checks(&c).unwrap();
-
-                        // TODO: strip out 'postgres()
-                        let field_tokens: Vec<TokenStream> = fields
-                            .into_iter()
-                            .map(|f| {
-                                PgField {
-                                    nullable: f.nullable && !non_null_cols.contains(&f.name),
-                                    nullable_due_to_join: false,
-                                    name: f.name.clone(),
-                                    comment: f.comment.clone(),
-                                    type_oid: f.type_oid,
-                                }
-                                .to_rust_inner(types, false)
-                            })
-                            .collect();
-
-                        // The wire type is the domain, or the underlying
-                        // composite where Postgres reports the base type, so
-                        // the impls accept both names and the codec looks
-                        // through the domain.
-                        let sql_fields: Vec<SqlField> = fields
-                            .iter()
-                            .map(|f| {
-                                SqlField::new(
-                                    f,
-                                    f.nullable && !non_null_cols.contains(&f.name),
-                                    types,
-                                )
-                            })
-                            .collect();
-                        let pg_names = [name.as_str(), pg_inner_name.as_str()];
-                        let from_sql_impl =
-                            composite_from_sql_impl(&rs_name, &pg_names, &sql_fields);
-                        let to_sql_impl =
-                            composite_to_sql_impl(&rs_name, &quote! {}, &pg_names, &sql_fields);
-
-                        let try_from_impl = composite_try_from_row_impl(&rs_name, fields);
-
-                        let comment_macro = if comment.is_some() {
-                            quote! { #[doc=#comment] }
-                        } else {
-                            quote! {}
-                        };
-
-                        let deserialize_derive = if config.should_disable_deserialize(schema, name) {
-                            quote! {}
-                        } else {
-                            quote! { serde::Deserialize, }
-                        };
-
-                        let builder_derive = if comment.as_ref().map_or(false, |c| annotations::has_builder(c)) {
-                            quote! { bon::Builder, }
-                        } else {
-                            quote! {}
-                        };
-
-                        quote! {
-                            #comment_macro
-                            #[derive(Clone, Debug, #builder_derive serde::Serialize, #deserialize_derive)]
-                            pub struct #rs_name {
-                                #(#field_tokens),*
-                            }
-
-                            #from_sql_impl
-
-                            #to_sql_impl
-
-                            #try_from_impl
-                        }
-                    }
-                    pg_type => {
-                        // For any type besides composite types, domains are just a wrapper.
-                        let inner = pg_type.to_rust_ident(types);
-                        let (additional_derives, custom_impls) =
-                            determine_domain_traits(pg_type, &rs_name);
-
-                        let is_strict = comment.as_ref().is_some_and(|c| annotations::has_strict(c))
-                            || config.is_strict_domain(schema, name);
-                        let deserialize_disabled = config.should_disable_deserialize(schema, name);
-
-                        let deserialize_derive = if deserialize_disabled {
-                            quote! {}
-                        } else {
-                            quote! { serde::Deserialize, }
-                        };
-
-                        // Strict domains route Deserialize through the user's `TryFrom<#inner>` impl.
-                        let serde_try_from_attr = if is_strict && !deserialize_disabled {
-                            let inner_ty_str = inner.to_string().replace(' ', "");
-                            quote! { #[serde(try_from = #inner_ty_str)] }
-                        } else {
-                            quote! {}
-                        };
-
-                        // Strict domains hide the inner field so values can only be
-                        // built through the user's validating TryFrom impl (or the
-                        // explicit unchecked escape hatch below).
-                        let field_vis = if is_strict { quote! {} } else { quote! { pub } };
-
-                        let strict_impls = if is_strict {
-                            quote! {
-                                impl #rs_name {
-                                    /// Constructs the value WITHOUT running domain validation.
-                                    /// Intended for trusted inputs and for use inside your
-                                    /// `TryFrom` impl. The database still enforces the CHECK
-                                    /// constraint on write.
-                                    pub fn new_unchecked(value: #inner) -> Self {
-                                        Self(value)
-                                    }
-
-                                    /// Consumes the wrapper, returning the inner value.
-                                    pub fn into_inner(self) -> #inner {
-                                        self.0
-                                    }
-                                }
-                            }
-                        } else {
-                            quote! {}
-                        };
-
-                        let base_derives = quote! { Debug, Clone, derive_more::Deref, serde::Serialize, #deserialize_derive postgres_types::ToSql, postgres_types::FromSql };
-                        let all_derives = if additional_derives.is_empty() {
-                            base_derives
-                        } else {
-                            quote! { #base_derives, #(#additional_derives),* }
-                        };
-
-                        quote! {
-                            #[derive(#all_derives)]
-                            #[postgres(name = #name)]
-                            #serde_try_from_attr
-                            pub struct #rs_name(#field_vis #inner);
-
-                            impl #rs_name {
-                                /// Returns a reference to the inner (base-type) value.
-                                pub fn as_inner(&self) -> &#inner {
-                                    &self.0
-                                }
-                            }
-
-                            #strict_impls
-
-                            #(#custom_impls)*
-                        }
-                    }
+                    } => domain_over_composite(
+                        &rs_name,
+                        schema,
+                        name,
+                        comment,
+                        constraints,
+                        fields,
+                        pg_inner_name,
+                        types,
+                        config,
+                    ),
+                    pg_type => wrapper_domain(&rs_name, schema, name, pg_type, types, config),
                 }
             }
             PgType::Enum {
@@ -1532,157 +1222,20 @@ impl ToRust for PgType {
                 comment,
                 variants,
                 ..
-            } => {
-                let rs_enum_name = sql_to_rs_ident(name, CaseType::Pascal);
-                let rs_variants: Vec<TokenStream> = variants
-                    .into_iter()
-                    .map(|sql_variant| {
-                        let rs_variant = sql_to_rs_ident(&sql_variant, CaseType::Pascal);
-
-                        quote! {
-                            #[postgres(name = #sql_variant)]
-                            #[serde(rename = #sql_variant)]
-                            #rs_variant
-                        }
-                    })
-                    .collect();
-
-                let comment_macro = if comment.is_some() {
-                    quote! { #[doc=#comment] }
-                } else {
-                    quote! {}
-                };
-
-                let deserialize_derive = if config.should_disable_deserialize(schema, name) {
-                    quote! {}
-                } else {
-                    quote! { serde::Deserialize, }
-                };
-
-                quote! {
-                    #comment_macro
-                    // `allow_mismatch`: accept the type by name alone, so a
-                    // label added after this code was generated does not make
-                    // every read and write of the enum fail. Only a value
-                    // carrying an unknown label fails to decode.
-                    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, postgres_types::FromSql, postgres_types::ToSql, #deserialize_derive serde::Serialize)]
-                    #[postgres(name = #name, allow_mismatch)]
-                    pub enum #rs_enum_name {
-                        #(#rs_variants),*
-                    }
-                }
-            }
+            } => pg_enum(schema, name, comment, variants, config),
             PgType::CheckInferredEnum {
                 name,
                 schema,
                 variants,
                 constraint_name,
-            } => {
-                let rs_enum_name = sql_to_rs_ident(name, CaseType::Pascal);
-                let rs_variants: Vec<TokenStream> = variants
-                    .iter()
-                    .map(|sql_variant| {
-                        let rs_variant = sql_to_rs_ident(sql_variant, CaseType::Pascal);
-                        quote! {
-                            #[serde(rename = #sql_variant)]
-                            #rs_variant
-                        }
-                    })
-                    .collect();
-
-                // Generate FromSql match arms
-                let from_sql_arms: Vec<TokenStream> = variants
-                    .iter()
-                    .map(|sql_variant| {
-                        let rs_variant = sql_to_rs_ident(sql_variant, CaseType::Pascal);
-                        quote! {
-                            #sql_variant => Ok(Self::#rs_variant)
-                        }
-                    })
-                    .collect();
-
-                // Generate ToSql match arms
-                let to_sql_arms: Vec<TokenStream> = variants
-                    .iter()
-                    .map(|sql_variant| {
-                        let rs_variant = sql_to_rs_ident(sql_variant, CaseType::Pascal);
-                        quote! {
-                            Self::#rs_variant => #sql_variant
-                        }
-                    })
-                    .collect();
-
-                let deserialize_derive = if config.should_disable_deserialize(schema, name) {
-                    quote! {}
-                } else {
-                    quote! { serde::Deserialize, }
-                };
-
-                let doc_comment = format!(
-                    "Enum inferred from CHECK constraint `{}`",
-                    constraint_name
-                );
-
-                quote! {
-                    #[doc = #doc_comment]
-                    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, #deserialize_derive serde::Serialize)]
-                    pub enum #rs_enum_name {
-                        #(#rs_variants),*
-                    }
-
-                    impl<'a> postgres_types::FromSql<'a> for #rs_enum_name {
-                        fn from_sql(
-                            _ty: &postgres_types::Type,
-                            raw: &'a [u8],
-                        ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-                            let s = std::str::from_utf8(raw)?;
-                            match s {
-                                #(#from_sql_arms,)*
-                                other => Err(format!("Invalid {} value: {}", #name, other).into()),
-                            }
-                        }
-
-                        fn accepts(ty: &postgres_types::Type) -> bool {
-                            matches!(
-                                *ty,
-                                postgres_types::Type::TEXT
-                                    | postgres_types::Type::VARCHAR
-                                    | postgres_types::Type::BPCHAR
-                            )
-                        }
-                    }
-
-                    impl postgres_types::ToSql for #rs_enum_name {
-                        fn to_sql(
-                            &self,
-                            _ty: &postgres_types::Type,
-                            out: &mut postgres_types::private::BytesMut,
-                        ) -> std::result::Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>>
-                        {
-                            let s = match self {
-                                #(#to_sql_arms,)*
-                            };
-                            out.extend_from_slice(s.as_bytes());
-                            Ok(postgres_types::IsNull::No)
-                        }
-
-                        fn accepts(ty: &postgres_types::Type) -> bool {
-                            matches!(
-                                *ty,
-                                postgres_types::Type::TEXT
-                                    | postgres_types::Type::VARCHAR
-                                    | postgres_types::Type::BPCHAR
-                            )
-                        }
-
-                        postgres_types::to_sql_checked!();
-                    }
-                }
-            }
+            } => check_inferred_enum(schema, name, variants, constraint_name, config),
             // Skip base types like i32/i64 as they are already-defined primitives
             PgType::Int32
             | PgType::Int64
             | PgType::Int16
+            | PgType::Oid
+            | PgType::Char
+            | PgType::Timestamp
             | PgType::Float32
             | PgType::Float64
             | PgType::Text
@@ -1704,50 +1257,367 @@ impl ToRust for PgType {
             | PgType::Time => {
                 quote! {}
             }
-            // Pseudo types like `anyelement` are placeholders — no Rust type to emit.
-            PgType::Pseudo(_) => quote! {},
+            // Pseudo types like `anyelement` are placeholders, and unsupported
+            // types have no mapping — no Rust type to emit for either.
+            PgType::Pseudo(_) | PgType::Unsupported { .. } | PgType::Mapped { .. } => quote! {},
             // No need to create type aliases for arrays. Instead they'll be used as Vec<Inner>
             PgType::Array { .. } => quote! {},
-            x => unimplemented!("Unhandled PgType {:?}", x),
         }
     }
 }
 
-impl ToRust for PgField {
-    fn to_rust(&self, types: &BTreeMap<OID, PgType>, _config: &Config) -> TokenStream {
-        self.to_rust_inner(types, true)
+/// A domain over a composite type: a struct like the composite's own, with
+/// the non-null constraints of the domain's CHECKs applied to its fields,
+/// rather than a wrapper around the composite's struct.
+#[allow(clippy::too_many_arguments)]
+fn domain_over_composite(
+    rs_name: &TokenStream,
+    schema: &str,
+    name: &str,
+    comment: &Option<String>,
+    constraints: &[DomainConstraint],
+    fields: &[PgField],
+    pg_inner_name: &str,
+    types: &BTreeMap<OID, PgType>,
+    config: &Config,
+) -> TokenStream {
+    if config.is_strict_domain(schema, name) {
+        log::warn!(
+            "strict_domains: {}.{} ignored: strict mode is not supported for domains over composite types",
+            schema, name
+        );
+    }
+
+    // If the domain wraps a composite type, we want to create a new composite type
+    // with the non-null constraints enforced by the domain rather than creating a new wrapper type.
+    let checks: Vec<&str> = constraints
+        .iter()
+        .map(|s| s.definition.as_str())
+        .collect();
+    // A CHECK that cannot be parsed proves nothing, so
+    // the attributes keep their own nullability.
+    let non_null_cols = non_null_cols_from_checks(&checks).unwrap_or_else(|e| {
+        log::warn!(
+            "Could not parse CHECK constraints of domain {}.{} for attribute nullability: {}",
+            schema, name, e
+        );
+        Default::default()
+    });
+    let fields: Vec<PgField> = fields
+        .iter()
+        .map(|f| PgField {
+            nullable: f.nullable && !non_null_cols.contains(&f.name),
+            nullable_due_to_join: false,
+            ..f.clone()
+        })
+        .collect();
+
+    // The wire type is the domain, or the underlying
+    // composite where Postgres reports the base type, so
+    // the impls accept both names and the codec looks
+    // through the domain.
+    flat_composite(
+        rs_name,
+        &[name, pg_inner_name],
+        &composite_struct_attrs(schema, name, comment, config),
+        &fields,
+        types,
+    )
+
+}
+
+/// A domain over anything but a composite: a newtype around the base type.
+fn wrapper_domain(
+    rs_name: &TokenStream,
+    schema: &str,
+    name: &str,
+    pg_type: &PgType,
+    types: &BTreeMap<OID, PgType>,
+    config: &Config,
+) -> TokenStream {
+    // For any type besides composite types, domains are just a wrapper.
+    let inner = pg_type.to_rust_ident(types);
+    let (additional_derives, custom_impls) =
+        determine_domain_traits(pg_type, rs_name, types);
+
+    let is_strict = config.is_strict_domain(schema, name);
+    let deserialize_disabled = config.should_disable_deserialize(schema, name);
+
+    let deserialize_derive = if deserialize_disabled {
+        quote! {}
+    } else {
+        quote! { serde::Deserialize, }
+    };
+
+    // Strict domains route Deserialize through the user's `TryFrom<#inner>` impl.
+    let serde_try_from_attr = if is_strict && !deserialize_disabled {
+        let inner_ty_str = inner.to_string().replace(' ', "");
+        quote! { #[serde(try_from = #inner_ty_str)] }
+    } else {
+        quote! {}
+    };
+
+    // Strict domains hide the inner field so values can only be
+    // built through the user's validating TryFrom impl (or the
+    // explicit unchecked escape hatch below).
+    let field_vis = if is_strict { quote! {} } else { quote! { pub } };
+
+    let strict_impls = if is_strict {
+        quote! {
+            impl #rs_name {
+                /// Constructs the value WITHOUT running domain validation.
+                /// Intended for trusted inputs and for use inside your
+                /// `TryFrom` impl. The database still enforces the CHECK
+                /// constraint on write.
+                pub fn new_unchecked(value: #inner) -> Self {
+                    Self(value)
+                }
+
+                /// Consumes the wrapper, returning the inner value.
+                pub fn into_inner(self) -> #inner {
+                    self.0
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let base_derives = quote! { Debug, Clone, derive_more::Deref, serde::Serialize, #deserialize_derive postgres_types::ToSql, postgres_types::FromSql };
+    let all_derives = if additional_derives.is_empty() {
+        base_derives
+    } else {
+        quote! { #base_derives, #(#additional_derives),* }
+    };
+
+    quote! {
+        #[derive(#all_derives)]
+        #[postgres(name = #name)]
+        #serde_try_from_attr
+        pub struct #rs_name(#field_vis #inner);
+
+        impl #rs_name {
+            /// Returns a reference to the inner (base-type) value.
+            pub fn as_inner(&self) -> &#inner {
+                &self.0
+            }
+        }
+
+        #strict_impls
+
+        #(#custom_impls)*
+    }
+}
+
+/// A Postgres enum type.
+fn pg_enum(
+    schema: &str,
+    name: &str,
+    comment: &Option<String>,
+    variants: &[String],
+    config: &Config,
+) -> TokenStream {
+    let rs_enum_name = sql_to_rs_ident(name, CaseType::Pascal);
+    // Labels can fold to one Rust name (`A+`, `A-`) or to none
+    // (`+`); the list is made valid and unique as a whole.
+    let variant_idents =
+        unique_rs_idents(variants.iter().map(String::as_str), CaseType::Pascal);
+    let rs_variants: Vec<TokenStream> = variants
+        .iter()
+        .zip(&variant_idents)
+        .map(|(sql_variant, rs_variant)| {
+            quote! {
+                #[postgres(name = #sql_variant)]
+                #[serde(rename = #sql_variant)]
+                #rs_variant
+            }
+        })
+        .collect();
+
+    let comment_macro = if comment.is_some() {
+        quote! { #[doc=#comment] }
+    } else {
+        quote! {}
+    };
+
+    let deserialize_derive = if config.should_disable_deserialize(schema, name) {
+        quote! {}
+    } else {
+        quote! { serde::Deserialize, }
+    };
+
+    quote! {
+        #comment_macro
+        // `allow_mismatch`: accept the type by name alone, so a
+        // label added after this code was generated does not make
+        // every read and write of the enum fail. Only a value
+        // carrying an unknown label fails to decode.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, postgres_types::FromSql, postgres_types::ToSql, #deserialize_derive serde::Serialize)]
+        #[postgres(name = #name, allow_mismatch)]
+        pub enum #rs_enum_name {
+            #(#rs_variants),*
+        }
+    }
+}
+
+/// An enum inferred from a `CHECK (col IN (...))` constraint on a text column.
+fn check_inferred_enum(
+    schema: &str,
+    name: &str,
+    variants: &[String],
+    constraint_name: &str,
+    config: &Config,
+) -> TokenStream {
+    let rs_enum_name = sql_to_rs_ident(name, CaseType::Pascal);
+    let variant_idents =
+        unique_rs_idents(variants.iter().map(String::as_str), CaseType::Pascal);
+    let rs_variants: Vec<TokenStream> = variants
+        .iter()
+        .zip(&variant_idents)
+        .map(|(sql_variant, rs_variant)| {
+            quote! {
+                #[serde(rename = #sql_variant)]
+                #rs_variant
+            }
+        })
+        .collect();
+
+    // Generate FromSql match arms
+    let from_sql_arms: Vec<TokenStream> = variants
+        .iter()
+        .zip(&variant_idents)
+        .map(|(sql_variant, rs_variant)| {
+            quote! {
+                #sql_variant => Ok(Self::#rs_variant)
+            }
+        })
+        .collect();
+
+    // Generate ToSql match arms
+    let to_sql_arms: Vec<TokenStream> = variants
+        .iter()
+        .zip(&variant_idents)
+        .map(|(sql_variant, rs_variant)| {
+            quote! {
+                Self::#rs_variant => #sql_variant
+            }
+        })
+        .collect();
+
+    let deserialize_derive = if config.should_disable_deserialize(schema, name) {
+        quote! {}
+    } else {
+        quote! { serde::Deserialize, }
+    };
+
+    let doc_comment = format!(
+        "Enum inferred from CHECK constraint `{}`",
+        constraint_name
+    );
+
+    quote! {
+        #[doc = #doc_comment]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, #deserialize_derive serde::Serialize)]
+        pub enum #rs_enum_name {
+            #(#rs_variants),*
+        }
+
+        impl<'a> postgres_types::FromSql<'a> for #rs_enum_name {
+            fn from_sql(
+                _ty: &postgres_types::Type,
+                raw: &'a [u8],
+            ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+                let s = std::str::from_utf8(raw)?;
+                match s {
+                    #(#from_sql_arms,)*
+                    other => Err(format!("Invalid {} value: {}", #name, other).into()),
+                }
+            }
+
+            fn accepts(ty: &postgres_types::Type) -> bool {
+                matches!(
+                    *ty,
+                    postgres_types::Type::TEXT
+                        | postgres_types::Type::VARCHAR
+                        | postgres_types::Type::BPCHAR
+                )
+            }
+        }
+
+        impl postgres_types::ToSql for #rs_enum_name {
+            fn to_sql(
+                &self,
+                _ty: &postgres_types::Type,
+                out: &mut postgres_types::private::BytesMut,
+            ) -> std::result::Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>>
+            {
+                let s = match self {
+                    #(#to_sql_arms,)*
+                };
+                out.extend_from_slice(s.as_bytes());
+                Ok(postgres_types::IsNull::No)
+            }
+
+            fn accepts(ty: &postgres_types::Type) -> bool {
+                matches!(
+                    *ty,
+                    postgres_types::Type::TEXT
+                        | postgres_types::Type::VARCHAR
+                        | postgres_types::Type::BPCHAR
+                )
+            }
+
+            postgres_types::to_sql_checked!();
+        }
     }
 }
 
 /// Generate serde annotation for datetime types that need special serialization
-fn generate_datetime_serde_attr(pg_type: &PgType, nullable: bool) -> Option<TokenStream> {
-    match pg_type {
-        PgType::Timestamptz => {
-            if nullable {
-                Some(quote! { #[serde(with = "time::serde::rfc3339::option")] })
-            } else {
-                Some(quote! { #[serde(with = "time::serde::rfc3339")] })
-            }
-        }
-        PgType::Date => {
-            if nullable {
-                Some(quote! { #[serde(with = "date_serde::option")] })
-            } else {
-                Some(quote! { #[serde(with = "date_serde")] })
-            }
-        }
-        _ => None,
+pub(crate) fn generate_datetime_serde_attr(pg_type: &PgType, nullable: bool) -> Option<TokenStream> {
+    let module = match pg_type {
+        PgType::Timestamptz => "time::serde::rfc3339",
+        PgType::Timestamp => "timestamp_serde",
+        PgType::Date => "date_serde",
+        _ => return None,
+    };
+    let path = if nullable {
+        format!("{module}::option")
+    } else {
+        module.to_string()
+    };
+    Some(quote! { #[serde(with = #path)] })
+}
+
+/// The `#[serde(...)]` attributes for a generated struct field: a rename when
+/// `rename` is given, `default` for nullable fields, and the datetime codec
+/// when the type needs one.
+pub(crate) fn field_serde_attrs(
+    pg_type: Option<&PgType>,
+    nullable: bool,
+    rename: Option<&str>,
+) -> TokenStream {
+    let datetime = pg_type.and_then(|t| generate_datetime_serde_attr(t, nullable));
+    let rename_attr = match (rename, nullable) {
+        (Some(name), true) => quote! { #[serde(rename = #name, default)] },
+        (Some(name), false) => quote! { #[serde(rename = #name)] },
+        (None, true) => quote! { #[serde(default)] },
+        (None, false) => quote! {},
+    };
+    quote! {
+        #rename_attr
+        #datetime
     }
 }
 
 impl PgField {
-    pub fn to_rust_inner(
+    /// The attributes (doc, serde) and the Rust type of the struct field for
+    /// this attribute under the Rust name `field_name`.
+    fn rust_field_parts(
         &self,
         types: &BTreeMap<OID, PgType>,
-        include_pg_derive: bool,
-    ) -> TokenStream {
-        let ident = types.get(&self.type_oid).unwrap().to_rust_ident(types);
-        let field_name = sql_to_rs_ident(&self.name, CaseType::Snake);
+        field_name: &TokenStream,
+    ) -> (TokenStream, TokenStream) {
+        let ident = rust_type_of(self.type_oid, types);
         let pg_name = &self.name;
 
         let comment_macro = match self.comment.as_ref() {
@@ -1755,59 +1625,27 @@ impl PgField {
             None => quote! {},
         };
 
-        let pg_macro = if include_pg_derive {
-            quote! { #[postgres(name = #pg_name)] }
-        } else {
-            quote! {}
-        };
-        let option_macro = if self.nullable {
+        let ty = if self.nullable {
             quote! { Option<#ident> }
         } else {
-            quote! {#ident}
+            ident
         };
-
-        // Generate datetime serde annotation if needed
-        let pg_type = types.get(&self.type_oid).unwrap();
-        let datetime_serde_attr = generate_datetime_serde_attr(pg_type, self.nullable);
 
         // Only add serde rename if the Rust name differs from the PostgreSQL name
-        let rs_name_str = sql_to_rs_string(&self.name, CaseType::Snake);
-        let needs_rename = rs_name_str != self.name;
+        let needs_rename = field_name.to_string() != self.name;
+        let serde_attr = field_serde_attrs(
+            types.get(&self.type_oid),
+            self.nullable,
+            needs_rename.then_some(pg_name.as_str()),
+        );
 
-        let serde_attr = match (datetime_serde_attr, self.nullable, needs_rename) {
-            (Some(attr), true, true) => quote! {
-                #[serde(rename = #pg_name, default)]
-                #attr
+        (
+            quote! {
+                #comment_macro
+                #serde_attr
             },
-            (Some(attr), true, false) => quote! {
-                #[serde(default)]
-                #attr
-            },
-            (Some(attr), false, true) => quote! {
-                #[serde(rename = #pg_name)]
-                #attr
-            },
-            (Some(attr), false, false) => quote! {
-                #attr
-            },
-            (None, true, true) => quote! {
-                #[serde(rename = #pg_name, default)]
-            },
-            (None, true, false) => quote! {
-                #[serde(default)]
-            },
-            (None, false, true) => quote! {
-                #[serde(rename = #pg_name)]
-            },
-            (None, false, false) => quote! {},
-        };
-
-        quote! {
-            #comment_macro
-            #pg_macro
-            #serde_attr
-            pub #field_name: #option_macro
-        }
+            ty,
+        )
     }
 }
 
@@ -1817,8 +1655,6 @@ mod tests {
 
     #[test]
     fn test_domain_smart_derives() {
-        use std::collections::HashMap;
-
         let mut types = BTreeMap::new();
 
         // Test int32 domain (should get Copy + ordering traits)
@@ -1910,9 +1746,13 @@ mod tests {
     }
 
     #[test]
-    fn test_strict_domain_via_annotation() {
-        let (types, domain) = strict_text_domain(Some("US zip code. @pgrpc_strict"));
-        let code_str = domain.to_rust(&types, &Config::default()).to_string();
+    fn test_strict_domain_via_config() {
+        let (types, domain) = strict_text_domain(None);
+        let config = Config {
+            strict_domains: vec!["public.zip".to_string()],
+            ..Default::default()
+        };
+        let code_str = domain.to_rust(&types, &config).to_string();
 
         // Inner field is private
         assert!(code_str.contains("pub struct Zip (String)"));
@@ -1927,23 +1767,8 @@ mod tests {
     }
 
     #[test]
-    fn test_strict_domain_via_config() {
-        let (types, domain) = strict_text_domain(None);
-        let config = Config {
-            strict_domains: vec!["public.zip".to_string()],
-            ..Default::default()
-        };
-        let code_str = domain.to_rust(&types, &config).to_string();
-
-        assert!(code_str.contains("pub struct Zip (String)"));
-        assert!(!code_str.contains("pub String"));
-        assert!(code_str.contains(r#"try_from = "String""#));
-        assert!(code_str.contains("fn new_unchecked"));
-    }
-
-    #[test]
     fn test_strict_domain_with_deserialize_disabled() {
-        let (types, domain) = strict_text_domain(Some("@pgrpc_strict"));
+        let (types, domain) = strict_text_domain(None);
         let config = Config {
             strict_domains: vec!["public.zip".to_string()],
             disable_deserialize: vec!["public.zip".to_string()],
@@ -1969,9 +1794,13 @@ mod tests {
             name: "price".to_string(),
             type_oid: 1,
             constraints: vec![],
-            comment: Some("@pgrpc_strict".to_string()),
+            comment: None,
         };
-        let code_str = domain.to_rust(&types, &Config::default()).to_string();
+        let config = Config {
+            strict_domains: vec!["public.price".to_string()],
+            ..Default::default()
+        };
+        let code_str = domain.to_rust(&types, &config).to_string();
 
         // Path-qualified inner types must render without spaces in the serde attr
         assert!(code_str.contains(r#"try_from = "rust_decimal::Decimal""#));

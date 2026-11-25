@@ -20,7 +20,7 @@ fn get_constraints(check_strs: &[&str]) -> anyhow::Result<Vec<Node>> {
     ))?
     .protobuf
     .stmts
-    .get(0) // get the 'create domain' statement
+    .first() // get the 'create domain' statement
     .and_then(|stmt| stmt.stmt.as_ref())
     .and_then(|stmt| stmt.node.as_ref())
     .and_then(|node| {
@@ -91,11 +91,13 @@ fn collect_from_node(node: &Node, columns: &mut HashSet<String>) {
             // e.g. extract `field` from (value).field
             if let Some(arg) = &a_ind.arg {
                 if let Some(NodeEnum::ColumnRef(col_ref)) = &arg.node {
-                    if let Some(NodeEnum::String(value)) = &col_ref.fields[0].node {
+                    let base = col_ref.fields.first().and_then(|f| f.node.as_ref());
+                    let field = a_ind.indirection.first().and_then(|f| f.node.as_ref());
+                    if let (Some(NodeEnum::String(value)), Some(NodeEnum::String(field))) =
+                        (base, field)
+                    {
                         if value.sval.to_lowercase() == "value" {
-                            if let Some(NodeEnum::String(field)) = &a_ind.indirection[0].node {
-                                columns.insert(field.sval.clone());
-                            }
+                            columns.insert(field.sval.clone());
                         }
                     }
                 }
@@ -240,5 +242,27 @@ mod tests {
         let non_null_cols = collect_non_null_columns(&constraint_nodes);
 
         assert_eq!(non_null_cols, names(&["a"]));
+    }
+
+    /// A `(value).field` reference is read without assuming either list is
+    /// non-empty.
+    #[test]
+    fn indirection_without_parts_is_ignored() {
+        use pg_query::protobuf::{AIndirection, ColumnRef};
+
+        let empty = Node {
+            node: Some(NodeEnum::AIndirection(Box::new(AIndirection {
+                arg: Some(Box::new(Node {
+                    node: Some(NodeEnum::ColumnRef(ColumnRef {
+                        fields: vec![],
+                        location: 0,
+                    })),
+                })),
+                indirection: vec![],
+            }))),
+        };
+        let mut columns = HashSet::new();
+        collect_from_node(&empty, &mut columns);
+        assert!(columns.is_empty());
     }
 }

@@ -1,3 +1,4 @@
+use crate::check_expr::{is_equality_op, parse_check_expr, string_literal};
 use pg_query::protobuf::BoolExprType;
 use pg_query::{Node, NodeEnum};
 
@@ -24,58 +25,8 @@ pub fn parse_check_as_enum(check_expression: &str, columns: &[&str]) -> Option<C
 
     let column = columns[0];
 
-    // Parse the CHECK expression as a SQL statement
-    // pg_get_constraintdef returns "CHECK (expr)" so we wrap it in a CREATE TABLE
-    let parse_result = pg_query::parse(&format!(
-        "CREATE TABLE _t (_c TEXT {})",
-        check_expression
-    ));
-
-    let parsed = match parse_result {
-        Ok(p) => p,
-        Err(_) => return None,
-    };
-
-    // Navigate to the CHECK constraint expression
-    // The constraint is inside a ColumnDef, not at the CreateStmt level
-    let constraint_expr = parsed
-        .protobuf
-        .stmts
-        .get(0)
-        .and_then(|stmt| stmt.stmt.as_ref())
-        .and_then(|stmt| stmt.node.as_ref())
-        .and_then(|node| {
-            if let pg_query::protobuf::node::Node::CreateStmt(create) = node {
-                // Find the ColumnDef and then the CHECK constraint within it
-                create.table_elts.iter().find_map(|elt| {
-                    if let Some(NodeEnum::ColumnDef(col_def)) = &elt.node {
-                        // Look for CHECK constraint in the column's constraints
-                        col_def.constraints.iter().find_map(|constraint_node| {
-                            if let Some(NodeEnum::Constraint(c)) = &constraint_node.node {
-                                if c.contype() == pg_query::protobuf::ConstrType::ConstrCheck {
-                                    c.raw_expr.clone()
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                    } else if let Some(NodeEnum::Constraint(c)) = &elt.node {
-                        // Also check for table-level constraints
-                        if c.contype() == pg_query::protobuf::ConstrType::ConstrCheck {
-                            c.raw_expr.clone()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            }
-        })?;
+    // pg_get_constraintdef returns "CHECK (expr)"; dig the expression out.
+    let constraint_expr = parse_check_expr(check_expression)?;
 
     // Try to extract enum variants from the expression
     extract_enum_variants(&constraint_expr, column)
@@ -97,14 +48,13 @@ fn extract_enum_variants(expr: &Node, expected_column: &str) -> Option<CheckEnum
                 return extract_any_array_variants(a_expr, expected_column);
             }
             // Check if this is an equality: col = 'value'
-            if a_expr.kind() == pg_query::protobuf::AExprKind::AexprOp {
-                if is_equality_op(&a_expr.name) {
-                    return extract_single_equality(a_expr, expected_column)
-                        .map(|v| CheckEnumInfo {
-                            column: expected_column.to_string(),
-                            variants: vec![v],
-                        });
-                }
+            if a_expr.kind() == pg_query::protobuf::AExprKind::AexprOp
+                && is_equality_op(&a_expr.name)
+            {
+                return extract_single_equality(a_expr, expected_column).map(|v| CheckEnumInfo {
+                    column: expected_column.to_string(),
+                    variants: vec![v],
+                });
             }
             None
         }
@@ -118,17 +68,6 @@ fn extract_enum_variants(expr: &Node, expected_column: &str) -> Option<CheckEnum
         }
         _ => None,
     }
-}
-
-/// Check if an operator name list represents an equality operator
-fn is_equality_op(name: &[Node]) -> bool {
-    name.iter().any(|n| {
-        if let Some(NodeEnum::String(s)) = &n.node {
-            s.sval == "="
-        } else {
-            false
-        }
-    })
 }
 
 /// Extract variants from an IN expression
@@ -178,7 +117,7 @@ fn extract_any_array_variants(
 
     let values: Vec<String> = elements
         .iter()
-        .filter_map(extract_string_value)
+        .filter_map(string_literal)
         .collect();
 
     if values.is_empty() || values.len() != elements.len() {
@@ -201,7 +140,7 @@ fn extract_single_equality(
         return None;
     }
 
-    extract_string_value(a_expr.rexpr.as_ref()?)
+    string_literal(a_expr.rexpr.as_ref()?)
 }
 
 /// Extract variants from OR chain: col = 'a' OR col = 'b' OR col = 'c'
@@ -273,7 +212,7 @@ fn extract_string_list(node: &Node) -> Option<Vec<String>> {
         let values: Vec<String> = list
             .items
             .iter()
-            .filter_map(|item| extract_string_value(item))
+            .filter_map(string_literal)
             .collect();
 
         if values.len() == list.items.len() {
@@ -284,26 +223,6 @@ fn extract_string_list(node: &Node) -> Option<Vec<String>> {
         }
     } else {
         None
-    }
-}
-
-/// Extract a string value from a constant node.
-///
-/// Handles `TypeCast` wrappers because `pg_get_constraintdef` emits explicit
-/// casts (e.g. `'pending'::text`) for every literal in a CHECK expression.
-fn extract_string_value(node: &Node) -> Option<String> {
-    match &node.node {
-        Some(NodeEnum::AConst(a_const)) => {
-            if let Some(val) = &a_const.val {
-                if let pg_query::protobuf::a_const::Val::Sval(s) = val {
-                    return Some(s.sval.clone());
-                }
-            }
-            None
-        }
-        Some(NodeEnum::String(s)) => Some(s.sval.clone()),
-        Some(NodeEnum::TypeCast(cast)) => cast.arg.as_deref().and_then(extract_string_value),
-        _ => None,
     }
 }
 

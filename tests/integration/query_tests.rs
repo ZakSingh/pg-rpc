@@ -23,13 +23,13 @@ UPDATE users SET name = :name, email = :email WHERE id = :user_id;
     // First query - GetUser
     let get_user = &queries[0];
     assert_eq!(get_user.name, "GetUser");
-    assert_eq!(get_user.query_type, pgrpc::sql_parser::QueryType::One);
+    assert_eq!(get_user.explicit_query_type, Some(pgrpc::sql_parser::QueryType::One));
     assert_eq!(get_user.parameters.len(), 1);
 
     if let pgrpc::sql_parser::ParameterSpec::Named { name, position, nullable } = &get_user.parameters[0] {
         assert_eq!(name, "user_id");
         assert_eq!(*position, 1);
-        assert_eq!(*nullable, false);
+        assert!(!(*nullable));
     } else {
         panic!("Expected named parameter");
     }
@@ -41,14 +41,14 @@ UPDATE users SET name = :name, email = :email WHERE id = :user_id;
     // Second query - UpdateUser
     let update_user = &queries[1];
     assert_eq!(update_user.name, "UpdateUser");
-    assert_eq!(update_user.query_type, pgrpc::sql_parser::QueryType::Exec);
+    assert_eq!(update_user.explicit_query_type, Some(pgrpc::sql_parser::QueryType::Exec));
     assert_eq!(update_user.parameters.len(), 3);
 
     // Parameters should be in order: name, email, user_id
     let param_names: Vec<String> = update_user.parameters.iter().map(|p| {
         match p {
             pgrpc::sql_parser::ParameterSpec::Named { name, nullable, .. } => {
-                assert_eq!(*nullable, false);
+                assert!(!(*nullable));
                 name.clone()
             },
             _ => panic!("Expected named parameter"),
@@ -105,11 +105,11 @@ DELETE FROM users WHERE inactive = true;
     let queries = parser.parse_content(sql, PathBuf::from("test.sql")).unwrap();
 
     assert_eq!(queries.len(), 5);
-    assert_eq!(queries[0].query_type, pgrpc::sql_parser::QueryType::One);
-    assert_eq!(queries[1].query_type, pgrpc::sql_parser::QueryType::Opt);
-    assert_eq!(queries[2].query_type, pgrpc::sql_parser::QueryType::Many);
-    assert_eq!(queries[3].query_type, pgrpc::sql_parser::QueryType::Exec);
-    assert_eq!(queries[4].query_type, pgrpc::sql_parser::QueryType::ExecRows);
+    assert_eq!(queries[0].explicit_query_type, Some(pgrpc::sql_parser::QueryType::One));
+    assert_eq!(queries[1].explicit_query_type, Some(pgrpc::sql_parser::QueryType::Opt));
+    assert_eq!(queries[2].explicit_query_type, Some(pgrpc::sql_parser::QueryType::Many));
+    assert_eq!(queries[3].explicit_query_type, Some(pgrpc::sql_parser::QueryType::Exec));
+    assert_eq!(queries[4].explicit_query_type, Some(pgrpc::sql_parser::QueryType::ExecRows));
 }
 
 /// Test query introspection with real database
@@ -323,7 +323,7 @@ DELETE FROM users WHERE id = :user_id;
         assert!(generated_code.contains("Result<GetUserRow, GetUserError>"), "Should return Result<GetUserRow, GetUserError> for :one");
         assert!(generated_code.contains("struct GetUserRow"), "Should generate GetUserRow struct");
         assert!(generated_code.contains("pub enum GetUserError"), "Should generate GetUserError enum");
-        assert!(generated_code.contains(".expect(\"query returned no rows\")"), ":one should use .expect() for panic on no rows");
+        assert!(generated_code.contains("PgRpcError::NoRows"), ":one should return a NoRows error when there is no row");
 
         // Verify FindUserByEmail function - :opt returns Result<Option<T>, Error>
         assert!(generated_code.contains("pub async fn find_user_by_email"), "Should generate find_user_by_email function");
@@ -1129,7 +1129,7 @@ LEFT JOIN items i ON i.item_nanoid = :item_nanoid;
         std::fs::write(&sql_file_path, sql).unwrap();
 
         let output_dir = temp_dir.path().join("generated");
-        let mut builder = PgrpcBuilder::new()
+        let builder = PgrpcBuilder::new()
             .connection_string(conn_string)
             .schema("public")
             .output_path(&output_dir)
@@ -1238,7 +1238,7 @@ SELECT * FROM users WHERE status = $1;
         // CreateUser - INSERT with RETURNING should infer :one
         assert!(generated_code.contains("pub async fn create_user"), "Should generate create_user function");
         assert!(generated_code.contains("Result<CreateUserRow, CreateUserError>"), "INSERT RETURNING should return Result<T>");
-        assert!(generated_code.contains(".expect(\"query returned no rows\")"), ":one should use .expect()");
+        assert!(generated_code.contains("PgRpcError::NoRows"), ":one should return a NoRows error when there is no row");
 
         // GetFirstUser - SELECT with LIMIT 1 should infer :opt
         assert!(generated_code.contains("pub async fn get_first_user"), "Should generate get_first_user function");
@@ -1353,8 +1353,8 @@ RETURNING *;
         assert!(generated_code.contains("pub async fn upsert_user"), "Should generate upsert_user function");
         assert!(generated_code.contains("Result<UpsertUserRow, UpsertUserError>"),
             "ON CONFLICT DO UPDATE RETURNING should return Result<T> (one)");
-        assert!(generated_code.contains(".expect(\"query returned no rows\")"),
-            "Upsert should use .expect() since it always returns exactly one row");
+        assert!(generated_code.contains("PgRpcError::NoRows"),
+            "Upsert is :one, so no row is a NoRows error");
 
         // InsertOrIgnore - ON CONFLICT DO NOTHING RETURNING should infer :opt
         assert!(generated_code.contains("pub async fn insert_or_ignore"), "Should generate insert_or_ignore function");
@@ -1563,9 +1563,11 @@ SELECT * FROM users WHERE ($1::text IS NULL OR email = $1);
         let queries_file = output_dir.join("queries.rs");
         let generated_code = prettify(&std::fs::read_to_string(&queries_file).expect("Should read queries.rs"));
 
-        // param should be impl Into<Option<...>> because it's used in IS NULL check
+        // param should be impl Into<Option<...>> because it's used in IS NULL check.
+        // It is named after the column it is compared with (`email = $1`),
+        // even though that is not the parameter's first appearance.
         assert!(
-            generated_code.contains("param_1: impl Into<Option<"),
+            generated_code.contains("email: impl Into<Option<"),
             "param used in IS NULL should be impl Into<Option<...>>, got:\n{}",
             generated_code
         );
@@ -1913,6 +1915,129 @@ SELECT * FROM inserted;
             generated_code.contains("DEFAULT"),
             "Generated code should include DEFAULT keyword for None cases in CTE, got:\n{}",
             generated_code
+        );
+    });
+}
+
+/// End-to-end checks, against a real database, of query analysis that must
+/// not over-claim: parameters are found by tokenizing (not by pattern-matching
+/// the text), cardinality is only narrowed when provable, RETURNING columns
+/// only inherit NOT NULL from the target's own columns.
+#[test]
+fn test_query_analysis_does_not_over_claim() {
+    with_isolated_database_and_container(|client, _container, _conn_string| {
+        client
+            .batch_execute(
+                "CREATE TABLE teams (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT
+                 );
+                 CREATE TABLE users (
+                    id SERIAL PRIMARY KEY,
+                    team_id INT REFERENCES teams(id),
+                    name TEXT NOT NULL,
+                    tags TEXT[] NOT NULL DEFAULT '{}',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                 );",
+            )
+            .unwrap();
+
+        let sql = r#"
+-- name: FormatCreated
+-- The colons in the format string are not parameters: :not_a_param
+SELECT to_char(created_at, 'HH24:MI:SS') AS at, tags[1:2] AS first_tags
+FROM users WHERE id = :id;
+
+-- name: TwoUsers
+SELECT id, name FROM users WHERE id = :a OR id = :b;
+
+-- name: UserTags
+SELECT unnest(tags) AS tag FROM users WHERE id = :id;
+
+-- name: UsersWithTotal
+SELECT id, count(*) OVER () AS total FROM users;
+
+-- name: CountUsers
+SELECT count(*)::int AS n FROM users WHERE team_id = :team_id;
+
+-- name: UserExists
+SELECT EXISTS(SELECT 1 FROM users WHERE id = :id) AS found;
+
+-- name: RenameIfChanged
+INSERT INTO users (id, name) VALUES (:id, :name)
+ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE users.name <> excluded.name
+RETURNING id;
+
+-- name: RenameTeamMembers
+UPDATE users SET name = :name FROM teams t
+WHERE t.id = :team_id AND users.team_id = t.id
+RETURNING users.id, t.name, upper(users.name) AS shout;
+"#;
+
+        let parser = pgrpc::sql_parser::SqlParser::new();
+        let queries = parser.parse_content(sql, PathBuf::from("test.sql")).unwrap();
+
+        let rel_index = pgrpc::rel_index::RelIndex::new(client).unwrap();
+        let view_cache = pgrpc::view_nullability::ViewNullabilityCache::new();
+        let domain_index = pgrpc::domain_index::DomainIndex::empty();
+        let composite_index = pgrpc::composite_index::CompositeIndex::empty();
+        let introspector = pgrpc::query_introspector::QueryIntrospector::new(
+            &rel_index,
+            &view_cache,
+            None,
+            &domain_index,
+            &composite_index,
+            None,
+            None,
+        );
+
+        let mut introspect = |name: &str| {
+            let parsed = queries
+                .iter()
+                .find(|q| q.name == name)
+                .unwrap_or_else(|| panic!("no query {name}"));
+            introspector
+                .introspect(client, parsed)
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"))
+        };
+        use pgrpc::sql_parser::QueryType;
+
+        // One parameter; the format string and the slice are left alone.
+        let q = introspect("FormatCreated");
+        assert_eq!(q.params.len(), 1);
+        assert_eq!(q.params[0].name, "id");
+        assert!(q.sql.contains("'HH24:MI:SS'") && q.sql.contains("tags[1:2]"));
+        assert_eq!(q.query_type, QueryType::Opt);
+
+        // `id = $1 OR id = $2` can return two rows.
+        assert_eq!(introspect("TwoUsers").query_type, QueryType::Many);
+        // A set-returning function multiplies the single matched row.
+        assert_eq!(introspect("UserTags").query_type, QueryType::Many);
+        // A window function is not an aggregate.
+        assert_eq!(introspect("UsersWithTotal").query_type, QueryType::Many);
+        // An aggregate under a cast still is.
+        assert_eq!(introspect("CountUsers").query_type, QueryType::One);
+        assert_eq!(introspect("UserExists").query_type, QueryType::One);
+        // The conflicting row is only returned when the WHERE holds.
+        assert_eq!(introspect("RenameIfChanged").query_type, QueryType::Opt);
+
+        // UPDATE ... FROM: the key matched belongs to the other table.
+        let q = introspect("RenameTeamMembers");
+        assert_eq!(q.query_type, QueryType::Many);
+        let columns = q.return_columns.as_ref().unwrap();
+        let nullable: Vec<(&str, bool)> = columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.nullable))
+            .collect();
+        assert_eq!(
+            nullable,
+            vec![
+                ("id", false),   // users.id
+                ("name", true),  // teams.name is nullable; users.name is not
+                // RETURNING goes through the same expression rules as a
+                // SELECT list: a strict function of a NOT NULL column.
+                ("shout", false),
+            ]
         );
     });
 }

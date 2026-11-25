@@ -1,9 +1,4 @@
-use crate::ident::sql_to_rs_ident;
-use crate::ident::CaseType::Pascal;
-use postgres::error::SqlState;
 use postgres::types::{FromSql, Type};
-use proc_macro2::TokenStream;
-use quote::ToTokens;
 use serde::Deserialize;
 use smallvec::SmallVec;
 use std::error::Error;
@@ -73,7 +68,14 @@ pub struct UniqueConstraint {
     /// `comment on constraint ...`, carrying `@pgrpc_message` / `@pgrpc_field`.
     #[serde(default)]
     pub(crate) comment: Option<String>,
+    /// The plain key columns. Empty for an index over expressions only.
     pub columns: SmallVec<Ustr, 2>,
+    /// A partial (`WHERE ...`) or expression unique index. Its uniqueness
+    /// depends on more than `columns`: a write to *any* column of the table
+    /// (one the predicate or an expression reads) can violate it, and
+    /// equality on `columns` does not identify a single row.
+    #[serde(default)]
+    pub conditional: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
@@ -191,14 +193,14 @@ impl Constraint {
 
     /// The user-facing `@pgrpc_message` from the constraint's comment.
     pub fn message(&self) -> Option<String> {
-        self.comment().and_then(crate::annotations::parse_message)
+        crate::annotations::Annotations::of(self.comment()).message
     }
 
     /// The form field a violation belongs to: the `@pgrpc_field` override if
     /// present (`@pgrpc_field()` meaning none), otherwise the single
     /// constrained column, otherwise none.
     pub fn field(&self) -> Option<String> {
-        match self.comment().and_then(crate::annotations::parse_field) {
+        match crate::annotations::Annotations::of(self.comment()).field {
             Some(explicit) => explicit,
             None => match self.columns() {
                 [single] => Some(single.to_string()),
@@ -207,38 +209,77 @@ impl Constraint {
         }
     }
 
-    /// Given a vec of column names, check whether any of those column names are present in the constraint.
-    pub fn contains_columns(&self, cols: &Vec<Ustr>) -> bool {
+    /// Whether a write to `cols` can violate this constraint.
+    ///
+    /// True when any written column is one the constraint spans. A constraint
+    /// whose column list does not tell the whole story is conservatively
+    /// affected by every write: a partial or expression unique index (the
+    /// predicate and expressions read other columns), and any multi-column
+    /// kind that arrived with no columns at all (an exclusion constraint over
+    /// expressions, a `CHECK` that names no column).
+    pub fn contains_columns(&self, cols: &[Ustr]) -> bool {
         match self {
-            Constraint::Check(c) => cols.iter().any(|item| c.columns.contains(item)),
-            Constraint::ForeignKey(f) => cols.iter().any(|item| f.columns.contains(item)),
-            Constraint::PrimaryKey(p) => cols.iter().any(|item| p.columns.contains(item)),
-            Constraint::Unique(u) => cols.iter().any(|item| u.columns.contains(item)),
+            Constraint::Unique(u) if u.conditional => true,
+            Constraint::Check(_)
+            | Constraint::ForeignKey(_)
+            | Constraint::PrimaryKey(_)
+            | Constraint::Unique(_)
+            | Constraint::Exclusion(_) => {
+                let spanned = self.columns();
+                spanned.is_empty() || cols.iter().any(|c| spanned.contains(c))
+            }
             Constraint::NotNull(n) => cols.contains(&n.column),
             Constraint::Default(d) => cols.contains(&d.column),
             Constraint::Domain(d) => cols.contains(&d.column),
-            Constraint::Exclusion(x) => cols.iter().any(|item| x.columns.contains(item)),
         }
     }
 }
 
-impl From<Constraint> for SqlState {
-    fn from(c: Constraint) -> Self {
-        match c {
-            Constraint::Check(..) => SqlState::CHECK_VIOLATION,
-            Constraint::ForeignKey(..) => SqlState::FOREIGN_KEY_VIOLATION,
-            Constraint::PrimaryKey(..) => SqlState::UNIQUE_VIOLATION,
-            Constraint::Unique(..) => SqlState::UNIQUE_VIOLATION,
-            Constraint::NotNull(..) => SqlState::NOT_NULL_VIOLATION,
-            Constraint::Domain(..) => SqlState::CHECK_VIOLATION, // TODO: is this always right?
-            Constraint::Default(..) => unreachable!("No SQLSTATE for DEFAULT constraint"),
-            Constraint::Exclusion(..) => SqlState::EXCLUSION_VIOLATION,
-        }
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ustr::ustr;
 
-impl ToTokens for Constraint {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-        tokens.extend(sql_to_rs_ident(&self.name(), Pascal))
+    fn parse(json: &str) -> Constraint {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn plain_unique_index_only_matches_its_columns() {
+        let c = parse(r#"{"type":"u","name":"t_email_idx","columns":["email"],"conditional":false}"#);
+        assert!(c.contains_columns(&[ustr("email")]));
+        assert!(!c.contains_columns(&[ustr("name")]));
+    }
+
+    #[test]
+    fn unique_constraint_json_without_conditional_key_is_unconditional() {
+        // pg_constraint-backed UNIQUE rows carry no `conditional` key.
+        let c = parse(r#"{"type":"u","name":"t_email_key","columns":["email"]}"#);
+        assert!(matches!(&c, Constraint::Unique(u) if !u.conditional));
+    }
+
+    #[test]
+    fn partial_unique_index_is_affected_by_any_write() {
+        // `unique (email) where deleted_at is null`: un-deleting a row writes
+        // only `deleted_at` and can still collide.
+        let c = parse(r#"{"type":"u","name":"t_live_email","columns":["email"],"conditional":true}"#);
+        assert!(c.contains_columns(&[ustr("deleted_at")]));
+        assert!(c.contains_columns(&[]));
+        assert_eq!(c.field().as_deref(), Some("email"));
+    }
+
+    #[test]
+    fn expression_only_unique_index_has_no_columns_and_matches_everything() {
+        let c = parse(r#"{"type":"u","name":"t_lower_email","columns":[],"conditional":true}"#);
+        assert!(c.columns().is_empty());
+        assert!(c.contains_columns(&[ustr("anything")]));
+    }
+
+    #[test]
+    fn column_less_check_and_exclusion_are_conservative() {
+        let check = parse(r#"{"type":"c","name":"t_check","columns":[]}"#);
+        assert!(check.contains_columns(&[ustr("a")]));
+        let excl = parse(r#"{"type":"x","name":"t_excl","columns":[]}"#);
+        assert!(excl.contains_columns(&[ustr("a")]));
     }
 }

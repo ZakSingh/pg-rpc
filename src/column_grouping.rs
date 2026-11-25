@@ -1,8 +1,8 @@
-/// Automatic grouping of double-underscore prefixed columns into nested structs.
-///
-/// Columns named `{prefix}__{field}` are grouped into a nested struct named after
-/// the prefix. For example, `product__name`, `product__slug`, `product__msrp`
-/// become a `Product` struct with fields `name`, `slug`, `msrp`.
+//! Automatic grouping of double-underscore prefixed columns into nested structs.
+//!
+//! Columns named `{prefix}__{field}` are grouped into a nested struct named after
+//! the prefix. For example, `product__name`, `product__slug`, `product__msrp`
+//! become a `Product` struct with fields `name`, `slug`, `msrp`.
 
 /// Represents a field that may be a plain column or a group of columns
 /// sharing a double-underscore prefix.

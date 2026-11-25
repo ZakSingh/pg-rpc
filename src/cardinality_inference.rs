@@ -1,13 +1,24 @@
+use crate::call_graph::CallTarget;
+use crate::fn_index::FunctionIndex;
 use crate::pg_constraint::Constraint;
 use crate::pg_rel::PgRel;
 use crate::rel_index::RelIndex;
 use crate::sql_parser::QueryType;
 use anyhow::{anyhow, Result};
+use pg_query::protobuf as pb;
+use pg_query::protobuf::node::Node as N;
 use std::collections::{HashMap, HashSet};
 
 /// Analyzes SQL queries to infer their cardinality (one, opt, many, exec, execrows).
+///
+/// The inference is deliberately one-sided: `One` and `Opt` are only reported
+/// when the row count is provable from the statement and the catalog. Anything
+/// the analyzer does not understand is `Many`.
 pub struct CardinalityAnalyzer<'a> {
     rel_index: &'a RelIndex,
+    /// When given, user-defined functions in a target list are checked for
+    /// `RETURNS SETOF`, which multiplies rows.
+    fn_index: Option<&'a FunctionIndex>,
 }
 
 /// Result of cardinality inference.
@@ -67,12 +78,17 @@ pub enum InferenceReason {
     InsertMultipleRowsReturning,
     /// INSERT ... ON CONFLICT DO UPDATE ... RETURNING (upsert)
     UpsertReturning,
+    /// INSERT ... ON CONFLICT DO UPDATE ... WHERE ... RETURNING: the conflicting
+    /// row is only updated (and returned) when the WHERE holds
+    ConditionalUpsertReturning,
     /// INSERT ... ON CONFLICT DO NOTHING ... RETURNING
     InsertOnConflictDoNothingReturning,
     /// SELECT with LIMIT 1
     SelectLimit1,
     /// Aggregate function without GROUP BY
     AggregateWithoutGroupBy,
+    /// SELECT without a FROM clause and without set-returning functions
+    SelectWithoutFrom,
     /// WHERE clause matches primary key columns
     PrimaryKeyMatch { table: String, columns: Vec<String> },
     /// WHERE clause matches unique constraint columns
@@ -100,42 +116,43 @@ enum MatchedConstraint {
     Unique { name: String },
 }
 
-/// Information about a table in the FROM clause
+/// A table reference as written in the query.
 #[derive(Debug, Clone)]
 struct TableRef {
-    /// The actual table name in the database
+    /// Schema qualifier, when the query wrote one
+    schema: Option<String>,
+    /// The table name as written
     name: String,
     /// The alias used in the query (if any)
     alias: Option<String>,
 }
 
 impl TableRef {
-    /// Get the name used to reference this table in the query (alias if present, otherwise name)
+    fn from_range_var(range_var: &pb::RangeVar) -> Self {
+        Self {
+            schema: (!range_var.schemaname.is_empty()).then(|| range_var.schemaname.clone()),
+            name: range_var.relname.clone(),
+            alias: range_var.alias.as_ref().map(|a| a.aliasname.clone()),
+        }
+    }
+
+    /// The name columns of this table are qualified with (alias if present, otherwise name)
     fn query_name(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.name)
     }
 }
+
+/// `a.x = b.y` in a join condition: (qualifier, column) on each side.
+type JoinEquality = ((String, String), (String, String));
 
 /// Information about a JOIN in the query
 #[derive(Debug, Clone)]
 struct JoinInfo {
     /// The table being joined to
     table: TableRef,
-    /// The join type (INNER, LEFT, RIGHT, FULL)
-    join_type: JoinType,
-    /// Columns from the left side of the join condition
-    left_columns: Vec<(String, String)>, // (table_ref, column)
-    /// Columns from the right side of the join condition
-    right_columns: Vec<(String, String)>, // (table_ref, column)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JoinType {
-    Inner,
-    Left,
-    Right,
-    Full,
-    Cross,
+    /// `a.x = b.y` pairs from the AND-ed join condition, as (qualifier, column)
+    /// on each side. Unqualified columns are not recorded.
+    equalities: Vec<JoinEquality>,
 }
 
 /// Extracted FROM clause information including base table and joins
@@ -145,216 +162,528 @@ struct FromClauseInfo {
     base_table: TableRef,
     /// All joins in order
     joins: Vec<JoinInfo>,
-    /// Map from query reference name (alias or table name) to actual table name
-    table_map: HashMap<String, String>,
+}
+
+impl FromClauseInfo {
+    /// The table a column qualifier refers to.
+    fn table_for_qualifier(&self, qualifier: &str) -> Option<&TableRef> {
+        std::iter::once(&self.base_table)
+            .chain(self.joins.iter().map(|j| &j.table))
+            .find(|t| t.query_name() == qualifier)
+    }
+}
+
+/// Columns compared for equality against a value, keyed by the column's
+/// qualifier as written (`""` when unqualified). Each column carries the
+/// values it is compared to, in a canonical form, so that two branches of an
+/// OR can be checked for comparing against the *same* value.
+type EqualityMap = HashMap<String, HashMap<String, HashSet<String>>>;
+
+/// What a scan of the target list found.
+#[derive(Debug, Default)]
+struct TargetScan {
+    /// A plain (non-window) aggregate call
+    aggregate: bool,
+    /// A function known to return a set
+    set_returning: bool,
+    /// A function or expression that could not be proven single-valued
+    unproven: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionKind {
+    SetReturning,
+    Scalar,
+    Unknown,
+}
+
+/// Built-in aggregates. A call to one of these without `OVER` collapses the
+/// query to a single group.
+const AGGREGATES: &[&str] = &[
+    "count", "sum", "avg", "min", "max", "array_agg", "string_agg", "bool_and", "bool_or",
+    "every", "bit_and", "bit_or", "bit_xor", "json_agg", "jsonb_agg", "json_agg_strict",
+    "jsonb_agg_strict", "json_object_agg", "jsonb_object_agg", "json_object_agg_strict",
+    "jsonb_object_agg_strict", "json_object_agg_unique", "jsonb_object_agg_unique", "xmlagg",
+    "any_value", "range_agg", "range_intersect_agg", "stddev", "stddev_pop", "stddev_samp",
+    "variance", "var_pop", "var_samp", "corr", "covar_pop", "covar_samp",
+];
+
+/// Built-in set-returning functions. In a target list these multiply rows.
+const SET_RETURNING: &[&str] = &[
+    "unnest", "generate_series", "generate_subscripts", "regexp_matches",
+    "regexp_split_to_table", "string_to_table", "json_array_elements", "jsonb_array_elements",
+    "json_array_elements_text", "jsonb_array_elements_text", "json_each", "jsonb_each",
+    "json_each_text", "jsonb_each_text", "json_object_keys", "jsonb_object_keys",
+    "json_populate_recordset", "jsonb_populate_recordset", "json_to_recordset",
+    "jsonb_to_recordset", "jsonb_path_query", "ts_stat", "ts_parse", "ts_token_type",
+    "ts_debug", "aclexplode", "xpath_table", "pg_listening_channels",
+];
+
+/// Built-in functions known to return exactly one value. Only consulted where
+/// a function must be *proven* single-valued (a SELECT without FROM).
+const SCALARS: &[&str] = &[
+    "now", "clock_timestamp", "statement_timestamp", "transaction_timestamp", "timeofday",
+    "gen_random_uuid", "random", "version", "current_database", "current_schema",
+    "current_setting", "set_config", "nextval", "currval", "setval", "lastval", "txid_current",
+    "pg_advisory_lock", "pg_advisory_xact_lock", "pg_try_advisory_lock",
+    "pg_try_advisory_xact_lock", "pg_advisory_unlock", "pg_notify", "lower", "upper", "length",
+    "char_length", "concat", "concat_ws", "format", "md5", "abs", "round", "ceil", "floor",
+    "trim", "btrim", "ltrim", "rtrim", "replace", "to_char", "to_date", "to_timestamp",
+    "to_number", "date_trunc", "date_part", "age", "to_json", "to_jsonb", "row_to_json",
+    "json_build_object", "jsonb_build_object", "json_build_array", "jsonb_build_array",
+    "array_length", "cardinality", "array_append", "array_cat", "array_position",
+    "pg_typeof", "nullif",
+];
+
+fn low(reason: InferenceReason) -> CardinalityInference {
+    CardinalityInference {
+        cardinality: InferredCardinality::Many,
+        confidence: InferenceConfidence::Low,
+        reason,
+    }
+}
+
+fn high(cardinality: InferredCardinality, reason: InferenceReason) -> CardinalityInference {
+    CardinalityInference {
+        cardinality,
+        confidence: InferenceConfidence::High,
+        reason,
+    }
+}
+
+/// `col = value` and nothing else: not `= ANY (...)`, `NULLIF`, `IS DISTINCT
+/// FROM` or another operator whose name merely contains `=`.
+fn is_plain_equality(a_expr: &pb::AExpr) -> bool {
+    if a_expr.kind() != pb::AExprKind::AexprOp {
+        return false;
+    }
+    let names: Vec<&str> = a_expr
+        .name
+        .iter()
+        .filter_map(|n| match &n.node {
+            Some(N::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    matches!(names.as_slice(), ["="] | ["pg_catalog", "="])
+}
+
+/// The string parts of a name list (`funcname`, `ColumnRef.fields`, type names).
+/// `None` if any part is not a plain string (e.g. `*`).
+fn name_parts(nodes: &[pb::Node]) -> Option<Vec<&str>> {
+    nodes
+        .iter()
+        .map(|n| match &n.node {
+            Some(N::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A column reference as (qualifier, column); the qualifier is `""` when the
+/// column is unqualified. Three-part names (`schema.table.col`) are not handled.
+fn column_ref(node: &pb::Node) -> Option<(String, String)> {
+    let Some(N::ColumnRef(col_ref)) = &node.node else {
+        return None;
+    };
+    match name_parts(&col_ref.fields)?.as_slice() {
+        [column] => Some((String::new(), (*column).to_string())),
+        [qualifier, column] => Some(((*qualifier).to_string(), (*column).to_string())),
+        _ => None,
+    }
+}
+
+/// A canonical spelling for a parameter or literal (optionally cast), used to
+/// tell whether two comparisons are against the same value. `None` for
+/// anything else, including a NULL literal (`col = NULL` matches nothing).
+fn value_key(node: &pb::Node) -> Option<String> {
+    use pb::a_const::Val;
+    match node.node.as_ref()? {
+        N::ParamRef(p) => Some(format!("${}", p.number)),
+        N::AConst(c) => match c.val.as_ref()? {
+            Val::Ival(v) => Some(format!("i:{}", v.ival)),
+            Val::Fval(v) => Some(format!("f:{}", v.fval)),
+            Val::Boolval(v) => Some(format!("b:{}", v.boolval)),
+            Val::Sval(v) => Some(format!("s:{:?}", v.sval)),
+            Val::Bsval(v) => Some(format!("x:{:?}", v.bsval)),
+        },
+        N::TypeCast(tc) => {
+            let inner = value_key(tc.arg.as_deref()?)?;
+            let type_name = tc.type_name.as_ref()?;
+            let name = name_parts(&type_name.names)?.join(".");
+            let typmods = type_name
+                .typmods
+                .iter()
+                .map(value_key)
+                .collect::<Option<Vec<_>>>()?
+                .join(",");
+            Some(format!(
+                "({inner})::{name}({typmods})[{}]",
+                type_name.array_bounds.len()
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Direct sub-expressions of an expression node. A `SubLink`'s subquery is not
+/// entered: it is a query of its own and yields a single value to this one.
+/// `None` for node kinds this walker does not know.
+fn expr_children(node: &pb::Node) -> Option<Vec<&pb::Node>> {
+    let mut out: Vec<&pb::Node> = Vec::new();
+    match node.node.as_ref()? {
+        N::ColumnRef(_)
+        | N::ParamRef(_)
+        | N::AConst(_)
+        | N::AStar(_)
+        | N::String(_)
+        | N::Integer(_)
+        | N::Float(_)
+        | N::SqlvalueFunction(_)
+        | N::SetToDefault(_) => {}
+        N::ResTarget(t) => {
+            out.extend(t.val.as_deref());
+            out.extend(&t.indirection);
+        }
+        N::FuncCall(f) => {
+            out.extend(&f.args);
+            out.extend(&f.agg_order);
+            out.extend(f.agg_filter.as_deref());
+            if let Some(over) = &f.over {
+                out.extend(&over.partition_clause);
+                out.extend(&over.order_clause);
+                out.extend(over.start_offset.as_deref());
+                out.extend(over.end_offset.as_deref());
+            }
+        }
+        N::TypeCast(t) => out.extend(t.arg.as_deref()),
+        N::CollateClause(c) => out.extend(c.arg.as_deref()),
+        N::NamedArgExpr(a) => out.extend(a.arg.as_deref()),
+        N::AExpr(a) => {
+            out.extend(a.lexpr.as_deref());
+            out.extend(a.rexpr.as_deref());
+        }
+        N::BoolExpr(b) => out.extend(&b.args),
+        N::NullTest(t) => out.extend(t.arg.as_deref()),
+        N::BooleanTest(t) => out.extend(t.arg.as_deref()),
+        N::CoalesceExpr(c) => out.extend(&c.args),
+        N::MinMaxExpr(m) => out.extend(&m.args),
+        N::CaseExpr(c) => {
+            out.extend(c.arg.as_deref());
+            out.extend(&c.args);
+            out.extend(c.defresult.as_deref());
+        }
+        N::CaseWhen(w) => {
+            out.extend(w.expr.as_deref());
+            out.extend(w.result.as_deref());
+        }
+        N::AIndirection(i) => {
+            out.extend(i.arg.as_deref());
+            out.extend(&i.indirection);
+        }
+        N::AIndices(i) => {
+            out.extend(i.lidx.as_deref());
+            out.extend(i.uidx.as_deref());
+        }
+        N::AArrayExpr(a) => out.extend(&a.elements),
+        N::RowExpr(r) => out.extend(&r.args),
+        N::List(l) => out.extend(&l.items),
+        N::SortBy(s) => out.extend(s.node.as_deref()),
+        N::SubLink(s) => out.extend(s.testexpr.as_deref()),
+        _ => return None,
+    }
+    Some(out)
 }
 
 impl<'a> CardinalityAnalyzer<'a> {
     pub fn new(rel_index: &'a RelIndex) -> Self {
-        Self { rel_index }
+        Self {
+            rel_index,
+            fn_index: None,
+        }
+    }
+
+    /// Consult the function index for `RETURNS SETOF` when a target list calls
+    /// a user-defined function.
+    pub(crate) fn with_fn_index(mut self, fn_index: Option<&'a FunctionIndex>) -> Self {
+        self.fn_index = fn_index;
+        self
     }
 
     /// Infer the cardinality of a SQL query.
     pub fn infer(&self, sql: &str) -> Result<CardinalityInference> {
         let parse_result =
             pg_query::parse(sql).map_err(|e| anyhow!("Failed to parse SQL: {}", e))?;
+        self.infer_parsed(&parse_result.protobuf)
+    }
 
+    /// Infer the cardinality of an already-parsed query.
+    pub fn infer_parsed(&self, parse_result: &pb::ParseResult) -> Result<CardinalityInference> {
         let stmt = parse_result
-            .protobuf
             .stmts
             .first()
             .and_then(|s| s.stmt.as_ref())
             .ok_or_else(|| anyhow!("No statement found in SQL"))?;
 
-        match &stmt.node {
-            Some(pg_query::protobuf::node::Node::SelectStmt(select)) => {
-                self.analyze_select(select)
-            }
-            Some(pg_query::protobuf::node::Node::InsertStmt(insert)) => {
-                self.analyze_insert(insert)
-            }
-            Some(pg_query::protobuf::node::Node::UpdateStmt(update)) => {
-                self.analyze_update(update)
-            }
-            Some(pg_query::protobuf::node::Node::DeleteStmt(delete)) => {
-                self.analyze_delete(delete)
-            }
-            _ => Ok(CardinalityInference {
-                cardinality: InferredCardinality::Many,
-                confidence: InferenceConfidence::Low,
-                reason: InferenceReason::ComplexQuery,
-            }),
-        }
+        Ok(match &stmt.node {
+            Some(N::SelectStmt(select)) => self.analyze_select(select),
+            Some(N::InsertStmt(insert)) => self.analyze_insert(insert),
+            Some(N::UpdateStmt(update)) => self.analyze_dml_returning(
+                update.relation.as_ref(),
+                update.where_clause.as_deref(),
+                !update.from_clause.is_empty(),
+                &update.returning_list,
+            ),
+            Some(N::DeleteStmt(delete)) => self.analyze_dml_returning(
+                delete.relation.as_ref(),
+                delete.where_clause.as_deref(),
+                !delete.using_clause.is_empty(),
+                &delete.returning_list,
+            ),
+            _ => low(InferenceReason::ComplexQuery),
+        })
     }
 
     /// Analyze a SELECT statement.
-    fn analyze_select(
-        &self,
-        select: &pg_query::protobuf::SelectStmt,
-    ) -> Result<CardinalityInference> {
-        // Check for UNION/INTERSECT/EXCEPT - these are complex queries
-        if select.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
-            return Ok(CardinalityInference {
-                cardinality: InferredCardinality::Many,
-                confidence: InferenceConfidence::Low,
-                reason: InferenceReason::ComplexQuery,
-            });
+    fn analyze_select(&self, select: &pb::SelectStmt) -> CardinalityInference {
+        // UNION/INTERSECT/EXCEPT and bare VALUES lists are not analyzed.
+        if select.op() != pb::SetOperation::SetopNone || !select.values_lists.is_empty() {
+            return low(InferenceReason::ComplexQuery);
         }
 
-        // Check for LIMIT 1
-        if let Some(limit_count) = &select.limit_count {
-            if let Some(pg_query::protobuf::node::Node::AConst(a_const)) = &limit_count.node {
-                if let Some(val) = &a_const.val {
-                    if let pg_query::protobuf::a_const::Val::Ival(int_val) = val {
-                        if int_val.ival == 1 {
-                            return Ok(CardinalityInference {
-                                cardinality: InferredCardinality::Opt,
-                                confidence: InferenceConfidence::High,
-                                reason: InferenceReason::SelectLimit1,
-                            });
+        // LIMIT 1 caps the result at one row -- unless it is `FETCH FIRST 1
+        // ROW WITH TIES`, which returns every row tied with the first.
+        if select.limit_option() != pb::LimitOption::WithTies && Self::is_limit_one(select) {
+            return high(InferredCardinality::Opt, InferenceReason::SelectLimit1);
+        }
+
+        let targets = self.scan_targets(&select.target_list);
+
+        // LIMIT n / OFFSET n can remove the single row a query would return.
+        let exactly_one = if select.limit_count.is_none() && select.limit_offset.is_none() {
+            InferredCardinality::One
+        } else {
+            InferredCardinality::Opt
+        };
+
+        // Without GROUP BY, an aggregate (or a HAVING clause) makes the whole
+        // input one group. A window function (`count(*) OVER ()`) does not.
+        // HAVING can discard that one group; a set-returning function in the
+        // target list can multiply it.
+        if select.group_clause.is_empty() && !targets.set_returning {
+            if select.having_clause.is_some() {
+                return high(InferredCardinality::Opt, InferenceReason::AggregateWithoutGroupBy);
+            }
+            if targets.aggregate {
+                return high(exactly_one, InferenceReason::AggregateWithoutGroupBy);
+            }
+        }
+
+        // No FROM: one row, as long as nothing in the target list returns a set.
+        // A WHERE clause can still discard it.
+        if select.from_clause.is_empty()
+            && select.group_clause.is_empty()
+            && select.having_clause.is_none()
+            && !select.target_list.is_empty()
+            && !targets.set_returning
+            && !targets.unproven
+        {
+            let cardinality = if select.where_clause.is_some() {
+                InferredCardinality::Opt
+            } else {
+                exactly_one
+            };
+            return high(cardinality, InferenceReason::SelectWithoutFrom);
+        }
+
+        // A unique-key match bounds the rows read from the table, not the rows
+        // returned: a set-returning function or GROUPING SETS can emit several
+        // rows for the one that matched.
+        let has_grouping_sets = select
+            .group_clause
+            .iter()
+            .any(|g| matches!(g.node, Some(N::GroupingSet(_))));
+        if !targets.set_returning && !has_grouping_sets {
+            if let Some(inference) = self.analyze_where_for_uniqueness(select) {
+                return inference;
+            }
+        }
+
+        low(InferenceReason::DefaultSelect)
+    }
+
+    /// `LIMIT 1` / `FETCH FIRST 1 ROW ONLY` with a literal count.
+    fn is_limit_one(select: &pb::SelectStmt) -> bool {
+        let Some(limit_count) = &select.limit_count else {
+            return false;
+        };
+        match &limit_count.node {
+            Some(N::AConst(a_const)) => {
+                matches!(&a_const.val, Some(pb::a_const::Val::Ival(i)) if i.ival == 1)
+            }
+            _ => false,
+        }
+    }
+
+    /// Look through the target list for aggregates and set-returning functions.
+    fn scan_targets(&self, target_list: &[pb::Node]) -> TargetScan {
+        let mut scan = TargetScan::default();
+        for target in target_list {
+            self.scan_expr(target, &mut scan);
+        }
+        scan
+    }
+
+    fn scan_expr(&self, node: &pb::Node, scan: &mut TargetScan) {
+        if let Some(N::FuncCall(func_call)) = &node.node {
+            self.scan_func_call(func_call, scan);
+        }
+        match expr_children(node) {
+            Some(children) => {
+                for child in children {
+                    self.scan_expr(child, scan);
+                }
+            }
+            None => {
+                // A node kind the walker does not know: nothing in it can be
+                // proven single-valued. Still look for known set-returning
+                // functions anywhere beneath it.
+                scan.unproven = true;
+                if let Some(inner) = &node.node {
+                    for (descendant, _, _, _) in inner.nodes() {
+                        if let pg_query::NodeRef::FuncCall(func_call) = descendant {
+                            if func_call.over.is_none()
+                                && self.classify_function(func_call) == FunctionKind::SetReturning
+                            {
+                                scan.set_returning = true;
+                            }
                         }
                     }
                 }
             }
         }
-
-        // Check for aggregate functions without GROUP BY
-        if select.group_clause.is_empty() && self.has_aggregate_without_group_by(select) {
-            return Ok(CardinalityInference {
-                cardinality: InferredCardinality::One,
-                confidence: InferenceConfidence::High,
-                reason: InferenceReason::AggregateWithoutGroupBy,
-            });
-        }
-
-        // Check for unique constraint matches in WHERE clause
-        if let Some(inference) = self.analyze_where_for_uniqueness(select)? {
-            return Ok(inference);
-        }
-
-        // Default: return many
-        Ok(CardinalityInference {
-            cardinality: InferredCardinality::Many,
-            confidence: InferenceConfidence::Low,
-            reason: InferenceReason::DefaultSelect,
-        })
     }
 
-    /// Check if the SELECT has aggregate functions without GROUP BY.
-    fn has_aggregate_without_group_by(&self, select: &pg_query::protobuf::SelectStmt) -> bool {
-        // Look for aggregate function calls in target list
-        for target in &select.target_list {
-            if self.node_contains_aggregate(target) {
-                return true;
-            }
+    fn scan_func_call(&self, func_call: &pb::FuncCall, scan: &mut TargetScan) {
+        // Window functions neither collapse nor multiply rows.
+        if func_call.over.is_some() {
+            return;
         }
-        false
+        if Self::is_aggregate_call(func_call) {
+            scan.aggregate = true;
+            return;
+        }
+        match self.classify_function(func_call) {
+            FunctionKind::SetReturning => scan.set_returning = true,
+            FunctionKind::Unknown => scan.unproven = true,
+            FunctionKind::Scalar => {}
+        }
     }
 
-    /// Check if a node contains an aggregate function call.
-    fn node_contains_aggregate(&self, node: &pg_query::protobuf::Node) -> bool {
-        if let Some(inner) = &node.node {
-            match inner {
-                pg_query::protobuf::node::Node::ResTarget(res_target) => {
-                    if let Some(val) = &res_target.val {
-                        return self.node_contains_aggregate(val);
-                    }
-                }
-                pg_query::protobuf::node::Node::FuncCall(func_call) => {
-                    // Check if this is an aggregate function
-                    let func_name = func_call
-                        .funcname
-                        .iter()
-                        .filter_map(|n| {
-                            if let Some(pg_query::protobuf::node::Node::String(s)) = &n.node {
-                                Some(s.sval.to_lowercase())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(".");
+    /// Whether a (non-window) call is an aggregate: a built-in aggregate by
+    /// name, or any call using aggregate-only syntax.
+    fn is_aggregate_call(func_call: &pb::FuncCall) -> bool {
+        if func_call.agg_star
+            || func_call.agg_distinct
+            || func_call.agg_within_group
+            || func_call.agg_filter.is_some()
+            || !func_call.agg_order.is_empty()
+        {
+            return true;
+        }
+        match name_parts(&func_call.funcname).as_deref() {
+            Some([name]) | Some(["pg_catalog", name]) => AGGREGATES.contains(name),
+            _ => false,
+        }
+    }
 
-                    // Common aggregate functions
-                    let aggregates = [
-                        "count", "sum", "avg", "min", "max", "array_agg", "string_agg", "bool_and",
-                        "bool_or", "every", "bit_and", "bit_or", "json_agg", "jsonb_agg",
-                        "json_object_agg", "jsonb_object_agg", "xmlagg",
-                    ];
+    fn classify_function(&self, func_call: &pb::FuncCall) -> FunctionKind {
+        let (schema, name) = match name_parts(&func_call.funcname).as_deref() {
+            Some([name]) => (None, *name),
+            Some([schema, name]) => (Some(*schema), *name),
+            _ => return FunctionKind::Unknown,
+        };
+        let builtin = matches!(schema, None | Some("pg_catalog"));
 
-                    if aggregates.contains(&func_name.as_str()) {
-                        return true;
-                    }
+        if builtin && SET_RETURNING.contains(&name) {
+            return FunctionKind::SetReturning;
+        }
 
-                    // Also check if agg_star or agg_distinct is set
-                    if func_call.agg_star || func_call.agg_distinct {
-                        return true;
-                    }
-                }
-                _ => {}
+        if let Some(fn_index) = self.fn_index {
+            let target = CallTarget {
+                schema: schema.map(str::to_string),
+                name: name.to_string(),
+            };
+            if let Some(resolved) = fn_index.resolve(&target, None) {
+                // Overloads share a name; any of them returning a set counts.
+                let returns_set = fn_index.values().any(|f| {
+                    f.schema == resolved.schema && f.name == resolved.name && f.returns_set
+                });
+                return if returns_set {
+                    FunctionKind::SetReturning
+                } else {
+                    FunctionKind::Scalar
+                };
             }
         }
-        false
+
+        if builtin && SCALARS.contains(&name) {
+            return FunctionKind::Scalar;
+        }
+        FunctionKind::Unknown
     }
 
     /// Analyze WHERE clause for unique constraint matches, including through joins.
     fn analyze_where_for_uniqueness(
         &self,
-        select: &pg_query::protobuf::SelectStmt,
-    ) -> Result<Option<CardinalityInference>> {
-        // Extract FROM clause info (base table + joins)
-        let from_info = match self.extract_from_clause_info(select) {
-            Some(info) => info,
-            None => return Ok(None),
+        select: &pb::SelectStmt,
+    ) -> Option<CardinalityInference> {
+        let from_info = Self::extract_from_clause_info(select)?;
+
+        // A CTE shadows a table of the same name.
+        let cte_names: HashSet<&str> = select
+            .with_clause
+            .iter()
+            .flat_map(|w| &w.ctes)
+            .filter_map(|cte| match &cte.node {
+                Some(N::CommonTableExpr(cte)) => Some(cte.ctename.as_str()),
+                _ => None,
+            })
+            .collect();
+        let find_rel = |table: &TableRef| {
+            if table.schema.is_none() && cte_names.contains(table.name.as_str()) {
+                return None;
+            }
+            self.find_table_rel(table)
         };
 
-        // Find the base table in rel_index
-        let base_table_rel = match self.find_table_rel(&from_info.base_table.name) {
-            Some(rel) => rel,
-            None => return Ok(None),
-        };
+        let base_table_rel = find_rel(&from_info.base_table)?;
+        let where_clause = select.where_clause.as_deref()?;
 
-        // Extract equality conditions from WHERE clause
-        let where_clause = match &select.where_clause {
-            Some(w) => w,
-            None => return Ok(None),
-        };
-
-        // Extract equality conditions for each table
-        let equality_map = self.extract_equality_columns_by_table(where_clause, &from_info);
-
-        // Get equality columns for the base table
-        let base_query_name = from_info.base_table.query_name().to_string();
-        let base_equality_columns = equality_map
-            .get(&base_query_name)
-            .cloned()
-            .unwrap_or_default();
-
+        let equalities = Self::collect_equalities(where_clause);
+        let base_equality_columns =
+            Self::columns_for(&equalities, &["", from_info.base_table.query_name()]);
         if base_equality_columns.is_empty() {
-            return Ok(None);
+            return None;
         }
 
-        // Check if base table has uniqueness guarantee
-        let matched_constraint = match self.find_matching_uniqueness_constraint(base_table_rel, &base_equality_columns) {
-            Some(m) => m,
-            None => return Ok(None),
-        };
+        let matched_constraint =
+            Self::find_matching_uniqueness_constraint(base_table_rel, &base_equality_columns)?;
 
-        // If no joins, return simple uniqueness match
         if from_info.joins.is_empty() {
-            return Ok(Some(self.create_uniqueness_inference(
+            return Some(Self::create_uniqueness_inference(
                 &from_info.base_table.name,
-                &base_equality_columns,
                 matched_constraint,
-            )));
+            ));
         }
 
-        // Check if all joins are "to-one" (joining to unique/primary key columns)
+        // Every join must be "to-one" (joining to unique/primary key columns),
+        // otherwise it could produce several rows for the one base row.
         let mut join_descriptions = Vec::new();
         for join in &from_info.joins {
-            if !self.is_to_one_join(&join, &from_info)? {
-                // This join could produce multiple rows, so we can't guarantee uniqueness
-                return Ok(None);
+            let joined_rel = find_rel(&join.table)?;
+            if !self.is_to_one_join(join, joined_rel, &from_info, &find_rel) {
+                return None;
             }
             join_descriptions.push(format!(
                 "{} -> {}",
@@ -363,38 +692,44 @@ impl<'a> CardinalityAnalyzer<'a> {
             ));
         }
 
-        // All joins are to-one, so uniqueness is preserved
-        Ok(Some(CardinalityInference {
+        let mut columns: Vec<String> = base_equality_columns.into_iter().collect();
+        columns.sort();
+        Some(CardinalityInference {
             cardinality: InferredCardinality::Opt,
             confidence: InferenceConfidence::Medium,
             reason: InferenceReason::UniqueMatchWithJoins {
                 base_table: from_info.base_table.name.clone(),
-                columns: base_equality_columns.into_iter().collect(),
+                columns,
                 joins: join_descriptions,
             },
-        }))
+        })
     }
 
-    /// Check if a table has a uniqueness guarantee based on equality columns.
-    /// Returns Some with the matched constraint info, or None if no uniqueness constraint matches.
+    /// The primary key or unique constraint whose columns are all pinned by
+    /// `equality_columns`, if any. Shared by SELECT, UPDATE and DELETE.
     fn find_matching_uniqueness_constraint(
-        &self,
         table_rel: &PgRel,
         equality_columns: &HashSet<String>,
-    ) -> Option<MatchedConstraint> {
+    ) -> Option<(MatchedConstraint, Vec<String>)> {
+        let covered = |columns: &[ustr::Ustr]| {
+            !columns.is_empty() && columns.iter().all(|c| equality_columns.contains(c.as_str()))
+        };
+        let names = |columns: &[ustr::Ustr]| columns.iter().map(|c| c.to_string()).collect();
+
         for constraint in &table_rel.constraints {
             match constraint {
-                Constraint::PrimaryKey(pk) => {
-                    if self.columns_match_constraint(equality_columns, &pk.columns) {
-                        return Some(MatchedConstraint::PrimaryKey);
-                    }
+                Constraint::PrimaryKey(pk) if covered(&pk.columns) => {
+                    return Some((MatchedConstraint::PrimaryKey, names(&pk.columns)));
                 }
-                Constraint::Unique(unique) => {
-                    if self.columns_match_constraint(equality_columns, &unique.columns) {
-                        return Some(MatchedConstraint::Unique {
+                // A partial / expression unique index does not make its
+                // plain columns unique on their own.
+                Constraint::Unique(unique) if !unique.conditional && covered(&unique.columns) => {
+                    return Some((
+                        MatchedConstraint::Unique {
                             name: unique.name.to_string(),
-                        });
-                    }
+                        },
+                        names(&unique.columns),
+                    ));
                 }
                 _ => {}
             }
@@ -404,20 +739,18 @@ impl<'a> CardinalityAnalyzer<'a> {
 
     /// Create a uniqueness inference result
     fn create_uniqueness_inference(
-        &self,
         table_name: &str,
-        columns: &HashSet<String>,
-        matched: MatchedConstraint,
+        (matched, columns): (MatchedConstraint, Vec<String>),
     ) -> CardinalityInference {
         let reason = match matched {
             MatchedConstraint::PrimaryKey => InferenceReason::PrimaryKeyMatch {
                 table: table_name.to_string(),
-                columns: columns.iter().cloned().collect(),
+                columns,
             },
             MatchedConstraint::Unique { name } => InferenceReason::UniqueConstraintMatch {
                 table: table_name.to_string(),
                 constraint_name: name,
-                columns: columns.iter().cloned().collect(),
+                columns,
             },
         };
         CardinalityInference {
@@ -433,830 +766,326 @@ impl<'a> CardinalityAnalyzer<'a> {
     /// This can happen in two ways:
     /// 1. The joined table's columns in the condition form a unique/primary key
     /// 2. The join follows a foreign key relationship (FK always points to unique/PK)
-    fn is_to_one_join(&self, join: &JoinInfo, from_info: &FromClauseInfo) -> Result<bool> {
-        // Get the joined table
-        let joined_table_rel = match self.find_table_rel(&join.table.name) {
-            Some(rel) => rel,
-            None => return Ok(false), // Unknown table, assume many
-        };
-
-        // Collect columns from each side of the join condition
-        let joined_table_query_name = join.table.query_name();
+    fn is_to_one_join<'r>(
+        &self,
+        join: &JoinInfo,
+        joined_rel: &PgRel,
+        from_info: &FromClauseInfo,
+        find_rel: &dyn Fn(&TableRef) -> Option<&'r PgRel>,
+    ) -> bool {
+        let joined = join.table.query_name();
         let mut joined_columns: HashSet<String> = HashSet::new();
-        let mut source_columns: Vec<(String, String)> = Vec::new(); // (table_ref, column)
+        let mut source_columns: Vec<(&str, &str)> = Vec::new(); // (qualifier, column)
 
-        // Pair up left and right columns from the join condition
-        for ((left_table, left_col), (right_table, right_col)) in
-            join.left_columns.iter().zip(join.right_columns.iter())
-        {
-            if right_table == joined_table_query_name {
+        // Pair each joined-table column with the column of *another* table it
+        // is equated to. `c.id = c.other` says nothing about the join.
+        for ((left_table, left_col), (right_table, right_col)) in &join.equalities {
+            if right_table == joined && left_table != joined {
                 joined_columns.insert(right_col.clone());
-                source_columns.push((left_table.clone(), left_col.clone()));
-            } else if left_table == joined_table_query_name {
+                source_columns.push((left_table, left_col));
+            } else if left_table == joined && right_table != joined {
                 joined_columns.insert(left_col.clone());
-                source_columns.push((right_table.clone(), right_col.clone()));
+                source_columns.push((right_table, right_col));
             }
         }
 
         if joined_columns.is_empty() {
-            return Ok(false);
+            return false;
         }
 
-        // Method 1: Check if joined columns form a unique key on the joined table
-        if self.find_matching_uniqueness_constraint(joined_table_rel, &joined_columns).is_some() {
-            return Ok(true);
+        // Method 1: the joined columns form a unique key on the joined table
+        if Self::find_matching_uniqueness_constraint(joined_rel, &joined_columns).is_some() {
+            return true;
         }
 
-        // Method 2: Check if this join follows a foreign key relationship
-        // Look for FK on any source table that references the joined table
-        if self.is_fk_based_to_one_join(&source_columns, &join.table.name, &joined_columns, from_info) {
-            return Ok(true);
+        // Method 2: the join follows a foreign key from a source table to the
+        // joined table (whose target must be unique).
+        let mut columns_by_source: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (qualifier, column) in source_columns {
+            columns_by_source.entry(qualifier).or_default().push(column);
         }
-
-        Ok(false)
-    }
-
-    /// Check if a join follows a foreign key relationship, making it "to-one".
-    ///
-    /// For a join like: `orders JOIN customers ON orders.customer_id = customers.customer_id`
-    /// If orders.customer_id has a FK to customers.customer_id (which must be unique/PK),
-    /// then this is a to-one join.
-    fn is_fk_based_to_one_join(
-        &self,
-        source_columns: &[(String, String)], // (table_ref, column) from source side
-        target_table_name: &str,
-        target_columns: &HashSet<String>,
-        from_info: &FromClauseInfo,
-    ) -> bool {
-        // Group source columns by their table
-        let mut columns_by_source_table: HashMap<String, Vec<String>> = HashMap::new();
-        for (table_ref, col) in source_columns {
-            // Resolve table_ref to actual table name
-            let actual_table = if table_ref.is_empty() {
-                from_info.base_table.name.clone()
-            } else if table_ref == from_info.base_table.query_name() {
-                from_info.base_table.name.clone()
-            } else {
-                // Check joins for matching alias
-                from_info.joins.iter()
-                    .find(|j| j.table.query_name() == table_ref)
-                    .map(|j| j.table.name.clone())
-                    .unwrap_or_else(|| table_ref.clone())
-            };
-            columns_by_source_table
-                .entry(actual_table)
-                .or_default()
-                .push(col.clone());
-        }
-
-        // Check each source table for a matching FK
-        for (source_table_name, source_cols) in &columns_by_source_table {
-            if let Some(source_rel) = self.find_table_rel(source_table_name) {
-                if self.has_matching_fk(source_rel, source_cols, target_table_name, target_columns) {
-                    return true;
-                }
-            }
-        }
-
-        false
+        columns_by_source.iter().any(|(qualifier, source_cols)| {
+            from_info
+                .table_for_qualifier(qualifier)
+                .and_then(find_rel)
+                .is_some_and(|source_rel| {
+                    Self::has_matching_fk(source_rel, source_cols, joined_rel, &joined_columns)
+                })
+        })
     }
 
     /// Check if a table has a foreign key that matches the join condition.
     ///
     /// Returns true if there's an FK where:
     /// - FK columns match source_cols
-    /// - FK references target_table
+    /// - FK references the joined table
     /// - FK referenced columns match target_cols
     fn has_matching_fk(
-        &self,
         source_rel: &PgRel,
-        source_cols: &[String],
-        target_table_name: &str,
+        source_cols: &[&str],
+        target_rel: &PgRel,
         target_cols: &HashSet<String>,
     ) -> bool {
-        let source_cols_set: HashSet<&str> = source_cols.iter().map(|s| s.as_str()).collect();
+        let source_cols_set: HashSet<&str> = source_cols.iter().copied().collect();
 
-        for constraint in &source_rel.constraints {
-            if let Constraint::ForeignKey(fk) = constraint {
-                // Check if FK references the target table
-                let fk_ref_table = match &fk.ref_table {
-                    Some(t) => t,
-                    None => continue,
-                };
-
-                if fk_ref_table != target_table_name {
-                    continue;
-                }
-
-                // Check if FK columns match source columns
-                let fk_cols: HashSet<&str> = fk.columns.iter().map(|c| c.as_str()).collect();
-                if fk_cols != source_cols_set {
-                    continue;
-                }
-
-                // Check if FK referenced columns match target columns
-                let fk_ref_cols: HashSet<String> = match &fk.ref_columns {
-                    Some(cols) => cols.iter().map(|c| c.to_string()).collect(),
-                    None => continue,
-                };
-
-                if &fk_ref_cols == target_cols {
-                    // Found matching FK - this is a to-one join
-                    return true;
-                }
+        source_rel.constraints.iter().any(|constraint| {
+            let Constraint::ForeignKey(fk) = constraint else {
+                return false;
+            };
+            // Prefer the referenced table's OID; the name alone is ambiguous
+            // across schemas.
+            let references_target = match fk.ref_table_oid {
+                Some(oid) => oid == target_rel.oid,
+                None => fk.ref_table.as_deref() == Some(target_rel.id.name()),
+            };
+            if !references_target {
+                return false;
             }
-        }
-
-        false
-    }
-
-    /// Find a table relation by name
-    fn find_table_rel(&self, table_name: &str) -> Option<&PgRel> {
-        self.rel_index.values().find(|rel| rel.id.name() == table_name)
-    }
-
-    /// Extract FROM clause information including base table and all joins
-    fn extract_from_clause_info(
-        &self,
-        select: &pg_query::protobuf::SelectStmt,
-    ) -> Option<FromClauseInfo> {
-        if select.from_clause.len() != 1 {
-            return None;
-        }
-
-        let from_node = select.from_clause.first()?;
-        let mut table_map = HashMap::new();
-
-        match &from_node.node {
-            // Simple table reference (no joins)
-            Some(pg_query::protobuf::node::Node::RangeVar(range_var)) => {
-                let table_ref = TableRef {
-                    name: range_var.relname.clone(),
-                    alias: range_var.alias.as_ref().map(|a| a.aliasname.clone()),
-                };
-                table_map.insert(table_ref.query_name().to_string(), table_ref.name.clone());
-
-                Some(FromClauseInfo {
-                    base_table: table_ref,
-                    joins: Vec::new(),
-                    table_map,
-                })
+            let fk_cols: HashSet<&str> = fk.columns.iter().map(|c| c.as_str()).collect();
+            if fk_cols != source_cols_set {
+                return false;
             }
-            // JOIN expression
-            Some(pg_query::protobuf::node::Node::JoinExpr(join_expr)) => {
-                self.parse_join_expr(join_expr, &mut table_map)
+            match &fk.ref_columns {
+                Some(cols) => {
+                    let fk_ref_cols: HashSet<String> = cols.iter().map(|c| c.to_string()).collect();
+                    &fk_ref_cols == target_cols
+                }
+                None => false,
             }
-            _ => None,
-        }
-    }
-
-    /// Recursively parse a JoinExpr to extract base table and all joins
-    fn parse_join_expr(
-        &self,
-        join_expr: &pg_query::protobuf::JoinExpr,
-        table_map: &mut HashMap<String, String>,
-    ) -> Option<FromClauseInfo> {
-        // Parse the left side (could be a table or another join)
-        let (base_table, mut joins) = self.parse_join_arg(join_expr.larg.as_ref()?, table_map)?;
-
-        // Parse the right side (should be a table)
-        let right_table = self.extract_table_from_node(join_expr.rarg.as_ref()?, table_map)?;
-
-        // Determine join type
-        let join_type = match join_expr.jointype() {
-            pg_query::protobuf::JoinType::JoinInner => JoinType::Inner,
-            pg_query::protobuf::JoinType::JoinLeft => JoinType::Left,
-            pg_query::protobuf::JoinType::JoinRight => JoinType::Right,
-            pg_query::protobuf::JoinType::JoinFull => JoinType::Full,
-            _ => JoinType::Inner, // Default to inner
-        };
-
-        // Extract join condition columns
-        let (left_columns, right_columns) = join_expr
-            .quals
-            .as_ref()
-            .map(|quals| self.extract_join_columns(quals))
-            .unwrap_or_default();
-
-        joins.push(JoinInfo {
-            table: right_table,
-            join_type,
-            left_columns,
-            right_columns,
-        });
-
-        Some(FromClauseInfo {
-            base_table,
-            joins,
-            table_map: table_map.clone(),
         })
     }
 
-    /// Parse a join argument (left or right side of a join)
-    fn parse_join_arg(
-        &self,
-        node: &pg_query::protobuf::Node,
-        table_map: &mut HashMap<String, String>,
-    ) -> Option<(TableRef, Vec<JoinInfo>)> {
+    /// Find the relation a table reference names: exactly when it is
+    /// schema-qualified, and otherwise through the search path
+    /// (see [`RelIndex::resolve`]).
+    fn find_table_rel(&self, table: &TableRef) -> Option<&'a PgRel> {
+        self.rel_index.resolve(table.schema.as_deref(), &table.name)
+    }
+
+    /// Extract FROM clause information including base table and all joins
+    fn extract_from_clause_info(select: &pb::SelectStmt) -> Option<FromClauseInfo> {
+        let [from_node] = select.from_clause.as_slice() else {
+            return None;
+        };
+        let (base_table, joins) = Self::parse_join_arg(from_node)?;
+        Some(FromClauseInfo { base_table, joins })
+    }
+
+    /// Parse the left side of a join (or the sole FROM item): a table, or
+    /// another join.
+    fn parse_join_arg(node: &pb::Node) -> Option<(TableRef, Vec<JoinInfo>)> {
         match &node.node {
-            Some(pg_query::protobuf::node::Node::RangeVar(range_var)) => {
-                let table_ref = TableRef {
-                    name: range_var.relname.clone(),
-                    alias: range_var.alias.as_ref().map(|a| a.aliasname.clone()),
+            Some(N::RangeVar(range_var)) => Some((TableRef::from_range_var(range_var), Vec::new())),
+            Some(N::JoinExpr(join_expr)) => {
+                let (base_table, mut joins) = Self::parse_join_arg(join_expr.larg.as_deref()?)?;
+
+                // The right side must be a plain table.
+                let Some(N::RangeVar(right)) = &join_expr.rarg.as_deref()?.node else {
+                    return None;
                 };
-                table_map.insert(table_ref.query_name().to_string(), table_ref.name.clone());
-                Some((table_ref, Vec::new()))
-            }
-            Some(pg_query::protobuf::node::Node::JoinExpr(join_expr)) => {
-                let info = self.parse_join_expr(join_expr, table_map)?;
-                Some((info.base_table, info.joins))
+
+                let mut equalities = Vec::new();
+                if let Some(quals) = &join_expr.quals {
+                    Self::collect_join_equalities(quals, &mut equalities);
+                }
+                joins.push(JoinInfo {
+                    table: TableRef::from_range_var(right),
+                    equalities,
+                });
+                Some((base_table, joins))
             }
             _ => None,
         }
     }
 
-    /// Extract a table reference from a node
-    fn extract_table_from_node(
-        &self,
-        node: &pg_query::protobuf::Node,
-        table_map: &mut HashMap<String, String>,
-    ) -> Option<TableRef> {
-        if let Some(pg_query::protobuf::node::Node::RangeVar(range_var)) = &node.node {
-            let table_ref = TableRef {
-                name: range_var.relname.clone(),
-                alias: range_var.alias.as_ref().map(|a| a.aliasname.clone()),
-            };
-            table_map.insert(table_ref.query_name().to_string(), table_ref.name.clone());
-            return Some(table_ref);
-        }
-        None
-    }
-
-    /// Extract column references from a join condition
-    fn extract_join_columns(
-        &self,
-        quals: &pg_query::protobuf::Node,
-    ) -> (Vec<(String, String)>, Vec<(String, String)>) {
-        let mut left_columns = Vec::new();
-        let mut right_columns = Vec::new();
-
-        self.collect_join_equality_columns(quals, &mut left_columns, &mut right_columns);
-
-        (left_columns, right_columns)
-    }
-
-    /// Recursively collect equality column pairs from join conditions
-    fn collect_join_equality_columns(
-        &self,
-        node: &pg_query::protobuf::Node,
-        left_columns: &mut Vec<(String, String)>,
-        right_columns: &mut Vec<(String, String)>,
+    /// Collect `a.x = b.y` pairs from an AND-ed join condition. Only qualified
+    /// columns are recorded: an unqualified one cannot be attributed to either
+    /// side without resolving it.
+    fn collect_join_equalities(
+        node: &pb::Node,
+        equalities: &mut Vec<JoinEquality>,
     ) {
-        if let Some(inner) = &node.node {
-            match inner {
-                pg_query::protobuf::node::Node::BoolExpr(bool_expr) => {
-                    // Process AND expressions
-                    if bool_expr.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 {
-                        for arg in &bool_expr.args {
-                            self.collect_join_equality_columns(arg, left_columns, right_columns);
+        match &node.node {
+            Some(N::BoolExpr(bool_expr)) if bool_expr.boolop() == pb::BoolExprType::AndExpr => {
+                for arg in &bool_expr.args {
+                    Self::collect_join_equalities(arg, equalities);
+                }
+            }
+            Some(N::AExpr(a_expr)) if is_plain_equality(a_expr) => {
+                if let (Some(left), Some(right)) = (
+                    a_expr.lexpr.as_deref().and_then(column_ref),
+                    a_expr.rexpr.as_deref().and_then(column_ref),
+                ) {
+                    if !left.0.is_empty() && !right.0.is_empty() {
+                        equalities.push((left, right));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Collect the columns a WHERE clause pins to a value.
+    ///
+    /// - `a AND b`: everything either side pins.
+    /// - `a OR b`: only what *every* branch pins **to the same value**.
+    ///   `id = $1 OR id = $2` pins nothing -- it can match two rows.
+    /// - anything else (NOT, other operators, subqueries): nothing.
+    fn collect_equalities(node: &pb::Node) -> EqualityMap {
+        let mut result = EqualityMap::new();
+        match &node.node {
+            Some(N::BoolExpr(bool_expr)) => match bool_expr.boolop() {
+                pb::BoolExprType::AndExpr => {
+                    for arg in &bool_expr.args {
+                        for (table, columns) in Self::collect_equalities(arg) {
+                            let entry = result.entry(table).or_default();
+                            for (column, values) in columns {
+                                entry.entry(column).or_default().extend(values);
+                            }
                         }
                     }
                 }
-                pg_query::protobuf::node::Node::AExpr(a_expr) => {
-                    // Check if this is an equality expression
-                    let is_equality = a_expr.name.iter().any(|n| {
-                        if let Some(pg_query::protobuf::node::Node::String(s)) = &n.node {
-                            s.sval == "="
-                        } else {
-                            false
-                        }
-                    });
-
-                    if is_equality {
-                        if let (Some(lexpr), Some(rexpr)) = (&a_expr.lexpr, &a_expr.rexpr) {
-                            if let (Some(left_col), Some(right_col)) = (
-                                self.extract_qualified_column(lexpr),
-                                self.extract_qualified_column(rexpr),
-                            ) {
-                                left_columns.push(left_col);
-                                right_columns.push(right_col);
-                            }
-                        }
+                pb::BoolExprType::OrExpr => {
+                    let mut branches = bool_expr.args.iter().map(Self::collect_equalities);
+                    result = branches.next().unwrap_or_default();
+                    for branch in branches {
+                        result = result
+                            .into_iter()
+                            .filter_map(|(table, columns)| {
+                                let other = branch.get(&table)?;
+                                let common: HashMap<String, HashSet<String>> = columns
+                                    .into_iter()
+                                    .filter_map(|(column, values)| {
+                                        let shared: HashSet<String> = values
+                                            .intersection(other.get(&column)?)
+                                            .cloned()
+                                            .collect();
+                                        (!shared.is_empty()).then_some((column, shared))
+                                    })
+                                    .collect();
+                                (!common.is_empty()).then_some((table, common))
+                            })
+                            .collect();
                     }
                 }
                 _ => {}
-            }
-        }
-    }
-
-    /// Extract a qualified column reference (table.column or alias.column)
-    fn extract_qualified_column(&self, node: &pg_query::protobuf::Node) -> Option<(String, String)> {
-        if let Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) = &node.node {
-            let fields: Vec<String> = col_ref
-                .fields
-                .iter()
-                .filter_map(|f| {
-                    if let Some(pg_query::protobuf::node::Node::String(s)) = &f.node {
-                        Some(s.sval.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            match fields.len() {
-                2 => Some((fields[0].clone(), fields[1].clone())),
-                1 => Some((String::new(), fields[0].clone())), // Unqualified column
-                _ => None,
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Extract equality columns organized by table reference.
-    /// Handles AND expressions by collecting all columns, and OR expressions by
-    /// finding the intersection of columns across all branches.
-    fn extract_equality_columns_by_table(
-        &self,
-        where_clause: &pg_query::protobuf::Node,
-        from_info: &FromClauseInfo,
-    ) -> HashMap<String, HashSet<String>> {
-        self.collect_equality_columns_recursive(where_clause, from_info)
-    }
-
-    /// Recursively collect equality columns, handling both AND and OR expressions.
-    /// For AND: union of all columns from each branch
-    /// For OR: intersection of columns from each branch (only columns in ALL branches count)
-    fn collect_equality_columns_recursive(
-        &self,
-        node: &pg_query::protobuf::Node,
-        from_info: &FromClauseInfo,
-    ) -> HashMap<String, HashSet<String>> {
-        if let Some(inner) = &node.node {
-            match inner {
-                pg_query::protobuf::node::Node::BoolExpr(bool_expr) => {
-                    if bool_expr.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 {
-                        // AND: merge all columns from each branch
-                        let mut result: HashMap<String, HashSet<String>> = HashMap::new();
-                        for arg in &bool_expr.args {
-                            let branch_cols = self.collect_equality_columns_recursive(arg, from_info);
-                            for (table, cols) in branch_cols {
-                                result.entry(table).or_default().extend(cols);
-                            }
+            },
+            Some(N::AExpr(a_expr)) if is_plain_equality(a_expr) => {
+                if let (Some(lexpr), Some(rexpr)) = (a_expr.lexpr.as_deref(), a_expr.rexpr.as_deref())
+                {
+                    for (column_side, value_side) in [(lexpr, rexpr), (rexpr, lexpr)] {
+                        if let (Some((qualifier, column)), Some(value)) =
+                            (column_ref(column_side), value_key(value_side))
+                        {
+                            result
+                                .entry(qualifier)
+                                .or_default()
+                                .entry(column)
+                                .or_default()
+                                .insert(value);
                         }
-                        result
-                    } else if bool_expr.boolop == pg_query::protobuf::BoolExprType::OrExpr as i32 {
-                        // OR: intersect columns across all branches
-                        // A column only counts if it has an equality condition in EVERY branch
-                        self.intersect_or_branches(&bool_expr.args, from_info)
-                    } else {
-                        // NOT or other - ignore
-                        HashMap::new()
                     }
                 }
-                pg_query::protobuf::node::Node::AExpr(a_expr) => {
-                    let mut result: HashMap<String, HashSet<String>> = HashMap::new();
-                    let is_equality = a_expr.name.iter().any(|n| {
-                        if let Some(pg_query::protobuf::node::Node::String(s)) = &n.node {
-                            s.sval == "="
-                        } else {
-                            false
-                        }
-                    });
-
-                    if is_equality {
-                        if let (Some(lexpr), Some(rexpr)) = (&a_expr.lexpr, &a_expr.rexpr) {
-                            // Try left side as column with parameter on right
-                            if let Some((table_ref, col_name)) = self.extract_qualified_column(lexpr) {
-                                if self.is_parameter_or_literal(rexpr) {
-                                    let table_key = if table_ref.is_empty() {
-                                        from_info.base_table.query_name().to_string()
-                                    } else {
-                                        table_ref
-                                    };
-                                    result.entry(table_key).or_default().insert(col_name);
-                                }
-                            }
-                            // Try right side as column with parameter on left
-                            if let Some((table_ref, col_name)) = self.extract_qualified_column(rexpr) {
-                                if self.is_parameter_or_literal(lexpr) {
-                                    let table_key = if table_ref.is_empty() {
-                                        from_info.base_table.query_name().to_string()
-                                    } else {
-                                        table_ref
-                                    };
-                                    result.entry(table_key).or_default().insert(col_name);
-                                }
-                            }
-                        }
-                    }
-                    result
-                }
-                _ => HashMap::new(),
             }
-        } else {
-            HashMap::new()
+            _ => {}
         }
-    }
-
-    /// For OR expressions, find columns that appear in ALL branches.
-    /// Returns the intersection of equality columns across branches.
-    fn intersect_or_branches(
-        &self,
-        args: &[pg_query::protobuf::Node],
-        from_info: &FromClauseInfo,
-    ) -> HashMap<String, HashSet<String>> {
-        if args.is_empty() {
-            return HashMap::new();
-        }
-
-        // Get columns from first branch as starting point
-        let mut result = self.collect_equality_columns_recursive(&args[0], from_info);
-
-        // Intersect with each subsequent branch
-        for arg in args.iter().skip(1) {
-            let branch_cols = self.collect_equality_columns_recursive(arg, from_info);
-
-            // For each table in result, keep only columns that also exist in this branch
-            result = result
-                .into_iter()
-                .filter_map(|(table, cols)| {
-                    if let Some(branch_table_cols) = branch_cols.get(&table) {
-                        let intersection: HashSet<String> = cols
-                            .intersection(branch_table_cols)
-                            .cloned()
-                            .collect();
-                        if intersection.is_empty() {
-                            None
-                        } else {
-                            Some((table, intersection))
-                        }
-                    } else {
-                        // This table doesn't appear in this branch, remove it
-                        None
-                    }
-                })
-                .collect();
-        }
-
         result
     }
 
-    /// Extract the single table name and optional alias from the FROM clause.
-    /// Returns None if there are multiple tables or complex FROM structures.
-    fn extract_single_table_from_from_clause(
-        &self,
-        select: &pg_query::protobuf::SelectStmt,
-    ) -> Option<(String, Option<String>)> {
-        let from_info = self.extract_from_clause_info(select)?;
-        if from_info.joins.is_empty() {
-            Some((from_info.base_table.name, from_info.base_table.alias))
-        } else {
-            None
-        }
-    }
-
-    /// Extract column names that have equality conditions in the WHERE clause.
-    /// Only considers AND-connected conditions.
-    fn extract_equality_columns(
-        &self,
-        where_clause: &pg_query::protobuf::Node,
-        table_alias: Option<&str>,
-    ) -> HashSet<String> {
-        let mut columns = HashSet::new();
-        self.collect_equality_columns(where_clause, table_alias, &mut columns);
-        columns
-    }
-
-    /// Recursively collect equality columns from a WHERE clause.
-    fn collect_equality_columns(
-        &self,
-        node: &pg_query::protobuf::Node,
-        table_alias: Option<&str>,
-        columns: &mut HashSet<String>,
-    ) {
-        if let Some(inner) = &node.node {
-            match inner {
-                pg_query::protobuf::node::Node::BoolExpr(bool_expr) => {
-                    // Only process AND expressions
-                    if bool_expr.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 {
-                        for arg in &bool_expr.args {
-                            self.collect_equality_columns(arg, table_alias, columns);
-                        }
-                    }
-                    // OR expressions break uniqueness guarantees, so we don't recurse into them
-                }
-                pg_query::protobuf::node::Node::AExpr(a_expr) => {
-                    // Check if this is an equality expression
-                    let is_equality = a_expr.name.iter().any(|n| {
-                        if let Some(pg_query::protobuf::node::Node::String(s)) = &n.node {
-                            s.sval == "="
-                        } else {
-                            false
-                        }
-                    });
-
-                    if is_equality {
-                        // Check if one side is a column reference and other is a parameter or literal
-                        if let (Some(lexpr), Some(rexpr)) = (&a_expr.lexpr, &a_expr.rexpr) {
-                            // Try left side as column
-                            if let Some(col_name) =
-                                self.extract_column_name(lexpr, table_alias)
-                            {
-                                if self.is_parameter_or_literal(rexpr) {
-                                    columns.insert(col_name);
-                                }
-                            }
-                            // Try right side as column
-                            if let Some(col_name) =
-                                self.extract_column_name(rexpr, table_alias)
-                            {
-                                if self.is_parameter_or_literal(lexpr) {
-                                    columns.insert(col_name);
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Extract column name from a node if it's a column reference.
-    fn extract_column_name(
-        &self,
-        node: &pg_query::protobuf::Node,
-        table_alias: Option<&str>,
-    ) -> Option<String> {
-        if let Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) = &node.node {
-            let fields: Vec<String> = col_ref
-                .fields
-                .iter()
-                .filter_map(|f| {
-                    if let Some(pg_query::protobuf::node::Node::String(s)) = &f.node {
-                        Some(s.sval.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            match fields.len() {
-                1 => {
-                    // Just column name
-                    return Some(fields[0].clone());
-                }
-                2 => {
-                    // table.column or alias.column
-                    let qualifier = &fields[0];
-                    let column = &fields[1];
-
-                    // Accept if qualifier matches table alias or if no alias specified
-                    if table_alias.map_or(true, |alias| alias == qualifier) {
-                        return Some(column.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    /// Check if a node is a parameter ($N) or a literal value.
-    fn is_parameter_or_literal(&self, node: &pg_query::protobuf::Node) -> bool {
-        if let Some(inner) = &node.node {
-            match inner {
-                pg_query::protobuf::node::Node::ParamRef(_) => return true,
-                pg_query::protobuf::node::Node::AConst(_) => return true,
-                pg_query::protobuf::node::Node::TypeCast(type_cast) => {
-                    // Check the inner expression of a type cast
-                    if let Some(arg) = &type_cast.arg {
-                        return self.is_parameter_or_literal(arg);
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
-    /// Check if the equality columns cover all columns in a constraint.
-    fn columns_match_constraint<T: AsRef<str>>(
-        &self,
-        equality_columns: &HashSet<String>,
-        constraint_columns: &[T],
-    ) -> bool {
-        // All constraint columns must have equality conditions
-        constraint_columns
+    /// The pinned columns written with any of the given qualifiers.
+    fn columns_for(equalities: &EqualityMap, qualifiers: &[&str]) -> HashSet<String> {
+        qualifiers
             .iter()
-            .all(|c| equality_columns.contains(c.as_ref()))
+            .filter_map(|q| equalities.get(*q))
+            .flat_map(|columns| columns.keys().cloned())
+            .collect()
     }
 
     /// Analyze an INSERT statement.
-    fn analyze_insert(
-        &self,
-        insert: &pg_query::protobuf::InsertStmt,
-    ) -> Result<CardinalityInference> {
-        let has_returning = !insert.returning_list.is_empty();
-
-        if !has_returning {
-            return Ok(CardinalityInference {
-                cardinality: InferredCardinality::Exec,
-                confidence: InferenceConfidence::High,
-                reason: InferenceReason::DmlWithoutReturning,
-            });
+    fn analyze_insert(&self, insert: &pb::InsertStmt) -> CardinalityInference {
+        if insert.returning_list.is_empty() {
+            return high(InferredCardinality::Exec, InferenceReason::DmlWithoutReturning);
         }
 
-        // Check if this is INSERT ... SELECT or multi-row VALUES (could return multiple rows)
-        if insert.select_stmt.is_some() && !self.is_single_row_values(insert) {
-            return Ok(CardinalityInference {
-                cardinality: InferredCardinality::Many,
-                confidence: InferenceConfidence::High,
-                reason: InferenceReason::InsertMultipleRowsReturning,
-            });
+        // INSERT ... SELECT or multi-row VALUES (could return multiple rows)
+        if insert.select_stmt.is_some() && !Self::is_single_row_values(insert) {
+            return high(
+                InferredCardinality::Many,
+                InferenceReason::InsertMultipleRowsReturning,
+            );
         }
 
-        // Check for ON CONFLICT clause
         if let Some(on_conflict) = &insert.on_conflict_clause {
-            // ON CONFLICT DO NOTHING - may not insert (for single-row insert)
-            if on_conflict.action == pg_query::protobuf::OnConflictAction::OnconflictNothing as i32
-            {
-                return Ok(CardinalityInference {
-                    cardinality: InferredCardinality::Opt,
-                    confidence: InferenceConfidence::High,
-                    reason: InferenceReason::InsertOnConflictDoNothingReturning,
-                });
-            }
-
-            // ON CONFLICT DO UPDATE (upsert) - always returns one row for single-row insert
-            if on_conflict.action == pg_query::protobuf::OnConflictAction::OnconflictUpdate as i32 {
-                return Ok(CardinalityInference {
-                    cardinality: InferredCardinality::One,
-                    confidence: InferenceConfidence::High,
-                    reason: InferenceReason::UpsertReturning,
-                });
+            match on_conflict.action() {
+                // The row may not be inserted at all.
+                pb::OnConflictAction::OnconflictNothing => {
+                    return high(
+                        InferredCardinality::Opt,
+                        InferenceReason::InsertOnConflictDoNothingReturning,
+                    );
+                }
+                // `DO UPDATE ... WHERE cond`: a conflicting row that fails the
+                // condition is neither updated nor returned.
+                pb::OnConflictAction::OnconflictUpdate if on_conflict.where_clause.is_some() => {
+                    return high(
+                        InferredCardinality::Opt,
+                        InferenceReason::ConditionalUpsertReturning,
+                    );
+                }
+                pb::OnConflictAction::OnconflictUpdate => {
+                    return high(InferredCardinality::One, InferenceReason::UpsertReturning);
+                }
+                _ => {}
             }
         }
 
         // Single-row INSERT with RETURNING
-        Ok(CardinalityInference {
-            cardinality: InferredCardinality::One,
-            confidence: InferenceConfidence::High,
-            reason: InferenceReason::InsertReturning,
-        })
+        high(InferredCardinality::One, InferenceReason::InsertReturning)
     }
 
     /// Check if INSERT has a single-row VALUES clause.
-    fn is_single_row_values(&self, insert: &pg_query::protobuf::InsertStmt) -> bool {
-        if let Some(select_node) = &insert.select_stmt {
-            if let Some(pg_query::protobuf::node::Node::SelectStmt(select)) = &select_node.node {
-                // Check if this is a VALUES clause (not a SELECT subquery)
-                if !select.values_lists.is_empty() {
-                    // Single row = exactly one values list
-                    return select.values_lists.len() == 1;
-                }
-                // If values_lists is empty, this is INSERT ... SELECT (not single row)
-            }
+    fn is_single_row_values(insert: &pb::InsertStmt) -> bool {
+        match insert.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+            // An empty `values_lists` means INSERT ... SELECT.
+            Some(N::SelectStmt(select)) => select.values_lists.len() == 1,
+            _ => false,
         }
-        false
     }
 
-    /// Analyze an UPDATE statement.
-    fn analyze_update(
+    /// Analyze an UPDATE or DELETE.
+    ///
+    /// With RETURNING, the statement returns at most one row when its WHERE
+    /// clause pins a primary key or unique constraint of the target table.
+    /// `has_extra_tables` is UPDATE's FROM / DELETE's USING: the target row
+    /// is then joined against other tables, and a column in the WHERE clause
+    /// may belong to one of those, so nothing is inferred.
+    fn analyze_dml_returning(
         &self,
-        update: &pg_query::protobuf::UpdateStmt,
-    ) -> Result<CardinalityInference> {
-        let has_returning = !update.returning_list.is_empty();
-
-        if !has_returning {
-            return Ok(CardinalityInference {
-                cardinality: InferredCardinality::Exec,
-                confidence: InferenceConfidence::High,
-                reason: InferenceReason::DmlWithoutReturning,
-            });
+        relation: Option<&pb::RangeVar>,
+        where_clause: Option<&pb::Node>,
+        has_extra_tables: bool,
+        returning_list: &[pb::Node],
+    ) -> CardinalityInference {
+        if returning_list.is_empty() {
+            return high(InferredCardinality::Exec, InferenceReason::DmlWithoutReturning);
         }
 
-        // Check if WHERE clause matches unique constraints
-        if let Some(where_clause) = &update.where_clause {
-            if let Some(relation) = &update.relation {
-                let table_name = &relation.relname;
-
-                // Find the table in rel_index
-                if let Some(table_rel) = self.rel_index.values().find(|rel| rel.id.name() == table_name) {
-                    let equality_columns = self.extract_equality_columns(where_clause, None);
-
-                    // Check primary key
-                    for constraint in &table_rel.constraints {
-                        if let Constraint::PrimaryKey(pk) = constraint {
-                            if self.columns_match_constraint(&equality_columns, &pk.columns) {
-                                return Ok(CardinalityInference {
-                                    cardinality: InferredCardinality::Opt,
-                                    confidence: InferenceConfidence::Medium,
-                                    reason: InferenceReason::PrimaryKeyMatch {
-                                        table: table_name.clone(),
-                                        columns: pk.columns.iter().map(|c| c.to_string()).collect(),
-                                    },
-                                });
-                            }
-                        }
-                    }
-
-                    // Check unique constraints
-                    for constraint in &table_rel.constraints {
-                        if let Constraint::Unique(unique) = constraint {
-                            if self.columns_match_constraint(&equality_columns, &unique.columns) {
-                                return Ok(CardinalityInference {
-                                    cardinality: InferredCardinality::Opt,
-                                    confidence: InferenceConfidence::Medium,
-                                    reason: InferenceReason::UniqueConstraintMatch {
-                                        table: table_name.clone(),
-                                        constraint_name: unique.name.to_string(),
-                                        columns: unique.columns.iter().map(|c| c.to_string()).collect(),
-                                    },
-                                });
-                            }
-                        }
-                    }
-                }
+        let matched = || {
+            if has_extra_tables {
+                return None;
             }
-        }
+            let target = TableRef::from_range_var(relation?);
+            let table_rel = self.find_table_rel(&target)?;
+            // Only columns that are unqualified or qualified with the target's
+            // own name (its alias, when it has one) are the target's.
+            let equalities = Self::collect_equalities(where_clause?);
+            let columns = Self::columns_for(&equalities, &["", target.query_name()]);
+            let constraint = Self::find_matching_uniqueness_constraint(table_rel, &columns)?;
+            Some(Self::create_uniqueness_inference(&target.name, constraint))
+        };
 
-        // UPDATE with RETURNING but no unique constraint match - could return multiple rows
-        Ok(CardinalityInference {
-            cardinality: InferredCardinality::Many,
-            confidence: InferenceConfidence::Low,
-            reason: InferenceReason::DefaultSelect,
-        })
-    }
-
-    /// Analyze a DELETE statement.
-    fn analyze_delete(
-        &self,
-        delete: &pg_query::protobuf::DeleteStmt,
-    ) -> Result<CardinalityInference> {
-        let has_returning = !delete.returning_list.is_empty();
-
-        if !has_returning {
-            return Ok(CardinalityInference {
-                cardinality: InferredCardinality::Exec,
-                confidence: InferenceConfidence::High,
-                reason: InferenceReason::DmlWithoutReturning,
-            });
-        }
-
-        // Check if WHERE clause matches unique constraints
-        if let Some(where_clause) = &delete.where_clause {
-            if let Some(relation) = &delete.relation {
-                let table_name = &relation.relname;
-
-                // Find the table in rel_index
-                if let Some(table_rel) = self.rel_index.values().find(|rel| rel.id.name() == table_name) {
-                    let equality_columns = self.extract_equality_columns(where_clause, None);
-
-                    // Check primary key
-                    for constraint in &table_rel.constraints {
-                        if let Constraint::PrimaryKey(pk) = constraint {
-                            if self.columns_match_constraint(&equality_columns, &pk.columns) {
-                                return Ok(CardinalityInference {
-                                    cardinality: InferredCardinality::Opt,
-                                    confidence: InferenceConfidence::Medium,
-                                    reason: InferenceReason::PrimaryKeyMatch {
-                                        table: table_name.clone(),
-                                        columns: pk.columns.iter().map(|c| c.to_string()).collect(),
-                                    },
-                                });
-                            }
-                        }
-                    }
-
-                    // Check unique constraints
-                    for constraint in &table_rel.constraints {
-                        if let Constraint::Unique(unique) = constraint {
-                            if self.columns_match_constraint(&equality_columns, &unique.columns) {
-                                return Ok(CardinalityInference {
-                                    cardinality: InferredCardinality::Opt,
-                                    confidence: InferenceConfidence::Medium,
-                                    reason: InferenceReason::UniqueConstraintMatch {
-                                        table: table_name.clone(),
-                                        constraint_name: unique.name.to_string(),
-                                        columns: unique.columns.iter().map(|c| c.to_string()).collect(),
-                                    },
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // DELETE with RETURNING but no unique constraint match - could return multiple rows
-        Ok(CardinalityInference {
-            cardinality: InferredCardinality::Many,
-            confidence: InferenceConfidence::Low,
-            reason: InferenceReason::DefaultSelect,
-        })
+        // No unique match: could return multiple rows.
+        matched().unwrap_or_else(|| low(InferenceReason::DefaultSelect))
     }
 }
 
@@ -1285,6 +1114,7 @@ mod tests {
                 comment: None,
                 name: ustr("help_center_article_section_slug_idx"),
                 columns: SmallVec::from([ustr("section"), ustr("slug")]),
+                conditional: false,
             })],
             columns: vec![
                 ustr("id"),
@@ -1474,6 +1304,28 @@ mod tests {
         let inference = analyzer.infer(sql).unwrap();
 
         assert_eq!(inference.cardinality, InferredCardinality::Many);
+    }
+
+    #[test]
+    fn test_partial_unique_index_does_not_make_its_columns_unique() {
+        // `unique (section, slug) where is_published`: unpublished rows may
+        // share (section, slug), so equality on both can return many rows.
+        let mut rel_index = rel_index_with_unique_index();
+        for constraint in &mut rel_index.get_mut(&12345).unwrap().constraints {
+            if let Constraint::Unique(unique) = constraint {
+                unique.conditional = true;
+            }
+        }
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        for sql in [
+            "SELECT body_html FROM help_center_article WHERE section = $1 AND slug = $2",
+            "UPDATE help_center_article SET body_html = $3 WHERE section = $1 AND slug = $2 RETURNING id",
+            "DELETE FROM help_center_article WHERE section = $1 AND slug = $2 RETURNING id",
+        ] {
+            let inference = analyzer.infer(sql).unwrap();
+            assert_eq!(inference.cardinality, InferredCardinality::Many, "{sql}");
+        }
     }
 
     #[test]
@@ -1677,20 +1529,435 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_or_same_column() {
-        // WHERE user_id = $1 OR user_id = $2
-        // Same column in both branches, uniqueness preserved
+    fn test_or_same_column_different_values_is_many() {
+        // WHERE user_id = $1 OR user_id = $2 can match two rows: the branches
+        // pin the key to different values.
         let rel_index = rel_index_with_users_pk();
         let analyzer = CardinalityAnalyzer::new(&rel_index);
 
-        let sql = "SELECT * FROM users WHERE user_id = $1 OR user_id = $2";
-        let inference = analyzer.infer(sql).unwrap();
+        for sql in [
+            "SELECT * FROM users WHERE user_id = $1 OR user_id = $2",
+            "SELECT * FROM users WHERE user_id = 1 OR user_id = 2",
+            "SELECT * FROM users WHERE user_id = $1 OR user_id = $1::bigint",
+            "UPDATE users SET status = 'x' WHERE user_id = $1 OR user_id = $2 RETURNING *",
+        ] {
+            let inference = analyzer.infer(sql).unwrap();
+            assert_eq!(inference.cardinality, InferredCardinality::Many, "{sql}");
+        }
+    }
 
+    #[test]
+    fn test_or_same_column_same_value_is_opt() {
+        let rel_index = rel_index_with_users_pk();
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        for sql in [
+            "SELECT * FROM users WHERE user_id = $1 OR user_id = $1",
+            "SELECT * FROM users WHERE (user_id = 7 AND status = 'a') OR (7 = user_id AND email = $1)",
+        ] {
+            let inference = analyzer.infer(sql).unwrap();
+            assert_eq!(inference.cardinality, InferredCardinality::Opt, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_non_equality_operators_do_not_pin_a_key() {
+        // `= ANY`, `IN`, `IS NOT DISTINCT FROM` and friends all carry `=` in
+        // their operator name without being a single-value equality.
+        let rel_index = rel_index_with_users_pk();
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        for sql in [
+            "SELECT * FROM users WHERE user_id = ANY($1)",
+            "SELECT * FROM users WHERE user_id IN ($1, $2)",
+            "SELECT * FROM users WHERE user_id >= $1",
+            "SELECT * FROM users WHERE NOT (user_id = $1)",
+            "SELECT * FROM users WHERE user_id = NULL",
+        ] {
+            let inference = analyzer.infer(sql).unwrap();
+            assert_eq!(inference.cardinality, InferredCardinality::Many, "{sql}");
+        }
+    }
+
+    fn cardinality_of(analyzer: &CardinalityAnalyzer, sql: &str) -> InferredCardinality {
+        analyzer.infer(sql).unwrap().cardinality
+    }
+
+    #[test]
+    fn test_window_function_is_not_an_aggregate() {
+        let rel_index = empty_rel_index();
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        for sql in [
+            "SELECT count(*) OVER () FROM users",
+            "SELECT id, sum(amount) OVER (PARTITION BY user_id) FROM orders",
+            "SELECT row_number() OVER (ORDER BY id) FROM users",
+        ] {
+            assert_eq!(cardinality_of(&analyzer, sql), InferredCardinality::Many, "{sql}");
+        }
+
+        // A window over a real aggregate still sees one group.
+        assert_eq!(
+            cardinality_of(&analyzer, "SELECT sum(count(*)) OVER () FROM users"),
+            InferredCardinality::One
+        );
+    }
+
+    #[test]
+    fn test_aggregate_with_having_is_opt() {
+        let rel_index = empty_rel_index();
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        assert_eq!(
+            cardinality_of(&analyzer, "SELECT count(*) FROM users HAVING count(*) > 5"),
+            InferredCardinality::Opt
+        );
+    }
+
+    #[test]
+    fn test_aggregate_through_wrappers() {
+        let rel_index = empty_rel_index();
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        for sql in [
+            "SELECT count(*)::int FROM users",
+            "SELECT coalesce(sum(amount), 0) FROM orders",
+            "SELECT sum(amount) / nullif(count(*), 0) AS mean FROM orders",
+            "SELECT CASE WHEN count(*) > 0 THEN max(id) ELSE 0 END FROM users",
+            "SELECT count(*) FILTER (WHERE active), array_agg(id ORDER BY id) FROM users",
+            "SELECT pg_catalog.count(*) FROM users",
+        ] {
+            assert_eq!(cardinality_of(&analyzer, sql), InferredCardinality::One, "{sql}");
+        }
+
+        // An aggregate inside a scalar subquery belongs to the subquery.
+        assert_eq!(
+            cardinality_of(&analyzer, "SELECT id, (SELECT count(*) FROM orders) FROM users"),
+            InferredCardinality::Many
+        );
+        // LIMIT / OFFSET can remove the single row.
+        assert_eq!(
+            cardinality_of(&analyzer, "SELECT count(*) FROM users OFFSET $1"),
+            InferredCardinality::Opt
+        );
+        // A set-returning function multiplies it.
+        assert_eq!(
+            cardinality_of(&analyzer, "SELECT count(*), generate_series(1, 3) FROM users"),
+            InferredCardinality::Many
+        );
+    }
+
+    #[test]
+    fn test_select_without_from() {
+        let rel_index = empty_rel_index();
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        for sql in [
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)",
+            "SELECT 1",
+            "SELECT $1::int + 1 AS next, now() AS at",
+            "SELECT coalesce($1, 'x'), (SELECT max(id) FROM users)",
+        ] {
+            assert_eq!(cardinality_of(&analyzer, sql), InferredCardinality::One, "{sql}");
+        }
+
+        // WHERE can discard the row.
+        assert_eq!(
+            cardinality_of(&analyzer, "SELECT 1 WHERE $1"),
+            InferredCardinality::Opt
+        );
+
+        for sql in [
+            // Set-returning.
+            "SELECT unnest($1::int[])",
+            "SELECT generate_series(1, $1)",
+            "SELECT (jsonb_each($1)).*",
+            // Not known to be single-valued: could be RETURNS SETOF.
+            "SELECT api.list_things($1)",
+            "SELECT some_function($1)",
+            // Not a SELECT list at all.
+            "VALUES (1), (2)",
+        ] {
+            assert_eq!(cardinality_of(&analyzer, sql), InferredCardinality::Many, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_conditional_upsert_is_opt() {
+        let rel_index = empty_rel_index();
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        let sql = "INSERT INTO users (email, name) VALUES ($1, $2) \
+                   ON CONFLICT (email) DO UPDATE SET name = excluded.name \
+                   WHERE users.name IS DISTINCT FROM excluded.name RETURNING *";
+        let inference = analyzer.infer(sql).unwrap();
         assert_eq!(inference.cardinality, InferredCardinality::Opt);
         assert!(matches!(
             inference.reason,
-            InferenceReason::PrimaryKeyMatch { .. }
+            InferenceReason::ConditionalUpsertReturning
         ));
+    }
+
+    #[test]
+    fn test_dml_returning_key_match() {
+        let rel_index = rel_index_with_users_pk();
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        for sql in [
+            "UPDATE users SET status = $2 WHERE user_id = $1 RETURNING *",
+            "UPDATE users u SET status = $2 WHERE u.user_id = $1 RETURNING *",
+            "UPDATE users SET status = $2 WHERE users.user_id = $1 RETURNING *",
+            "DELETE FROM users WHERE user_id = $1 RETURNING user_id",
+            "DELETE FROM public.users AS u WHERE u.user_id = $1 RETURNING user_id",
+        ] {
+            let inference = analyzer.infer(sql).unwrap();
+            assert_eq!(inference.cardinality, InferredCardinality::Opt, "{sql}");
+            assert!(
+                matches!(inference.reason, InferenceReason::PrimaryKeyMatch { .. }),
+                "{sql}"
+            );
+        }
+
+        assert_eq!(
+            cardinality_of(&analyzer, "UPDATE users SET status = $1 WHERE status = $2 RETURNING *"),
+            InferredCardinality::Many
+        );
+    }
+
+    #[test]
+    fn test_dml_with_extra_tables_is_many() {
+        // `u.user_id = $1` pins a row of the *other* table; many target rows
+        // can reference it. The qualifier must not be ignored.
+        let mut rel_index = rel_index_with_users_pk();
+        rel_index.insert(
+            20002,
+            table_with_pk(20002, "public", "sessions", "user_id", &["user_id", "token"]),
+        );
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        for sql in [
+            "UPDATE sessions s SET token = $2 FROM users u \
+             WHERE u.user_id = $1 AND s.token = u.email RETURNING s.*",
+            "UPDATE sessions SET token = $2 FROM users u WHERE user_id = $1 RETURNING *",
+            "DELETE FROM sessions s USING users u \
+             WHERE u.user_id = $1 AND s.token = u.email RETURNING s.*",
+            // A qualifier that is not the target's.
+            "UPDATE sessions s SET token = $2 WHERE other.user_id = $1 RETURNING *",
+            // Once aliased, the table name itself is no longer a valid qualifier.
+            "UPDATE sessions s SET token = $2 WHERE sessions.user_id = $1 RETURNING *",
+        ] {
+            assert_eq!(cardinality_of(&analyzer, sql), InferredCardinality::Many, "{sql}");
+        }
+    }
+
+    fn table_with_pk(oid: u32, schema: &str, name: &str, pk: &str, columns: &[&str]) -> PgRel {
+        use crate::pg_constraint::PrimaryKeyConstraint;
+        PgRel {
+            oid,
+            id: PgId::new(Some(ustr(schema)), ustr(name)),
+            kind: PgRelKind::Table,
+            constraints: vec![Constraint::PrimaryKey(PrimaryKeyConstraint {
+                comment: None,
+                name: ustr(&format!("{name}_pkey")),
+                columns: SmallVec::from([ustr(pk)]),
+            })],
+            columns: columns.iter().map(|c| ustr(c)).collect(),
+            column_types: vec![23; columns.len()],
+        }
+    }
+
+    #[test]
+    fn test_same_named_tables_in_different_schemas() {
+        // `audit.widget` is keyed by `event_id`, `core.widget` by `widget_id`.
+        let mut rel_index = RelIndex::default();
+        rel_index.insert(
+            100,
+            table_with_pk(100, "audit", "widget", "event_id", &["event_id", "widget_id"]),
+        );
+        rel_index.insert(
+            200,
+            table_with_pk(200, "core", "widget", "widget_id", &["widget_id", "event_id"]),
+        );
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        // Qualified: the named schema's key decides.
+        for (sql, expected) in [
+            ("SELECT * FROM core.widget WHERE widget_id = $1", InferredCardinality::Opt),
+            ("SELECT * FROM core.widget WHERE event_id = $1", InferredCardinality::Many),
+            ("SELECT * FROM audit.widget WHERE event_id = $1", InferredCardinality::Opt),
+            ("SELECT * FROM audit.widget WHERE widget_id = $1", InferredCardinality::Many),
+            (
+                "DELETE FROM audit.widget WHERE widget_id = $1 RETURNING *",
+                InferredCardinality::Many,
+            ),
+            (
+                "UPDATE core.widget SET event_id = 1 WHERE widget_id = $1 RETURNING *",
+                InferredCardinality::Opt,
+            ),
+            ("SELECT * FROM nowhere.widget WHERE widget_id = $1", InferredCardinality::Many),
+        ] {
+            assert_eq!(cardinality_of(&analyzer, sql), expected, "{sql}");
+        }
+
+        // Unqualified, and neither schema is on the search path (`public`):
+        // Postgres would not find the table, so no inference either way.
+        for sql in [
+            "SELECT * FROM widget WHERE widget_id = $1",
+            "SELECT * FROM widget WHERE event_id = $1",
+            "DELETE FROM widget WHERE event_id = $1 RETURNING *",
+        ] {
+            assert_eq!(cardinality_of(&analyzer, sql), InferredCardinality::Many, "{sql}");
+        }
+
+        // Unqualified with both schemas on the path: the first one's table.
+        for (path, by_widget_id, by_event_id) in [
+            (["core", "audit"], InferredCardinality::Opt, InferredCardinality::Many),
+            (["audit", "core"], InferredCardinality::Many, InferredCardinality::Opt),
+        ] {
+            let mut rel_index = RelIndex::default().with_search_path(&path);
+            rel_index.insert(
+                100,
+                table_with_pk(100, "audit", "widget", "event_id", &["event_id", "widget_id"]),
+            );
+            rel_index.insert(
+                200,
+                table_with_pk(200, "core", "widget", "widget_id", &["widget_id", "event_id"]),
+            );
+            let analyzer = CardinalityAnalyzer::new(&rel_index);
+            for (sql, expected) in [
+                ("SELECT * FROM widget WHERE widget_id = $1", by_widget_id),
+                ("SELECT * FROM widget WHERE event_id = $1", by_event_id),
+                ("DELETE FROM widget WHERE event_id = $1 RETURNING *", by_event_id),
+                ("UPDATE widget SET event_id = 1 WHERE widget_id = $1 RETURNING *", by_widget_id),
+            ] {
+                assert_eq!(cardinality_of(&analyzer, sql), expected, "{path:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_cte_shadowing_a_table_is_not_resolved_to_it() {
+        let rel_index = rel_index_with_users_pk();
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        let sql = "WITH users AS (SELECT 1 AS user_id FROM generate_series(1, 3)) \
+                   SELECT * FROM users WHERE user_id = $1";
+        assert_eq!(cardinality_of(&analyzer, sql), InferredCardinality::Many);
+    }
+
+    #[test]
+    fn test_set_returning_target_defeats_key_match() {
+        let rel_index = rel_index_with_users_pk();
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        for sql in [
+            "SELECT unnest(tags) FROM users WHERE user_id = $1",
+            "SELECT user_id, generate_series(1, 3) FROM users WHERE user_id = $1",
+            "SELECT lower(regexp_split_to_table(email, '@')) FROM users WHERE user_id = $1",
+            "SELECT (jsonb_each(meta)).* FROM users WHERE user_id = $1",
+            "SELECT pg_catalog.jsonb_array_elements_text(meta) FROM users WHERE user_id = $1",
+            "SELECT string_to_table(email, '.') FROM users WHERE user_id = $1",
+        ] {
+            assert_eq!(cardinality_of(&analyzer, sql), InferredCardinality::Many, "{sql}");
+        }
+
+        // Ordinary functions, and set-returning functions confined to a
+        // subquery, leave the match intact. LIMIT 1 caps the result regardless.
+        for sql in [
+            "SELECT lower(email) FROM users WHERE user_id = $1",
+            "SELECT (SELECT array_agg(t) FROM unnest(tags) t) FROM users WHERE user_id = $1",
+            "SELECT unnest(tags) FROM users LIMIT 1",
+        ] {
+            assert_eq!(cardinality_of(&analyzer, sql), InferredCardinality::Opt, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_user_defined_setof_function_via_fn_index() {
+        use crate::pg_fn::PgFn;
+        use std::collections::BTreeSet;
+
+        let function = |oid: u32, name: &str, returns_set: bool| PgFn {
+            oid,
+            schema: "public".to_string(),
+            name: name.to_string(),
+            args: vec![],
+            out_args: vec![],
+            return_type_oid: 23,
+            returns_set,
+            is_procedure: false,
+            has_table_params: false,
+            definition: String::new(),
+            language: "sql".to_string(),
+            comment: None,
+            exceptions: vec![],
+            rel_deps: vec![],
+            callees: BTreeSet::new(),
+        };
+        let fn_index = FunctionIndex::from_fns(
+            [function(1, "explode", true), function(2, "tidy", false)],
+            &["public"],
+        );
+        let rel_index = rel_index_with_users_pk();
+        let analyzer = CardinalityAnalyzer::new(&rel_index).with_fn_index(Some(&fn_index));
+
+        assert_eq!(
+            cardinality_of(&analyzer, "SELECT explode(email) FROM users WHERE user_id = $1"),
+            InferredCardinality::Many
+        );
+        assert_eq!(
+            cardinality_of(&analyzer, "SELECT tidy(email) FROM users WHERE user_id = $1"),
+            InferredCardinality::Opt
+        );
+        // Without FROM, a function proven single-valued gives exactly one row.
+        assert_eq!(
+            cardinality_of(&analyzer, "SELECT public.tidy($1)"),
+            InferredCardinality::One
+        );
+        assert_eq!(
+            cardinality_of(&analyzer, "SELECT explode($1)"),
+            InferredCardinality::Many
+        );
+    }
+
+    #[test]
+    fn test_limit_1_with_ties_is_many() {
+        let rel_index = empty_rel_index();
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        assert_eq!(
+            cardinality_of(
+                &analyzer,
+                "SELECT * FROM users ORDER BY created_at FETCH FIRST 1 ROW WITH TIES"
+            ),
+            InferredCardinality::Many
+        );
+        assert_eq!(
+            cardinality_of(
+                &analyzer,
+                "SELECT * FROM users ORDER BY created_at FETCH FIRST 1 ROW ONLY"
+            ),
+            InferredCardinality::Opt
+        );
+    }
+
+    #[test]
+    fn test_join_condition_within_one_table_is_not_to_one() {
+        // `c.customer_id = c.customer_id` equates the joined table with itself:
+        // every customer row joins to the one order.
+        let rel_index = rel_index_with_orders_and_customers();
+        let analyzer = CardinalityAnalyzer::new(&rel_index);
+
+        for sql in [
+            "SELECT o.* FROM orders o JOIN customers c ON c.customer_id = c.customer_id \
+             WHERE o.order_id = $1",
+            "SELECT o.* FROM orders o JOIN customers c ON c.customer_id = customer_id \
+             WHERE o.order_id = $1",
+            "SELECT o.* FROM orders o CROSS JOIN customers c WHERE o.order_id = $1",
+            "SELECT o.* FROM orders o, customers c WHERE o.order_id = $1",
+        ] {
+            assert_eq!(cardinality_of(&analyzer, sql), InferredCardinality::Many, "{sql}");
+        }
     }
 
     /// Creates a rel_index where orders has a FK to customers, but customers.customer_id

@@ -138,7 +138,7 @@ fn test_procedure_out_param_nullability() {
         );
         
         assert!(
-            content.contains("pub last_login: Option<time::OffsetDateTime>"),
+            content.contains("pub last_login: Option<time::PrimitiveDateTime>"),
             "last_login should be wrapped in Option (nullable by default)"
         );
 
@@ -309,7 +309,9 @@ fn test_out_param_annotation_edge_cases() {
             COMMENT ON PROCEDURE test_multiple_annotations IS 
             'Test procedure @pgrpc_not_null(param1) @pgrpc_not_null(param2) @pgrpc_not_null(param3)';
             
-            -- Test with annotation for non-existent parameter (should be ignored)
+            -- A second procedure with a single annotated INOUT parameter
+            -- (an annotation naming a non-existent parameter is an error:
+            -- see bad_annotations_are_generation_errors)
             CREATE OR REPLACE PROCEDURE test_invalid_annotation(
                 INOUT real_param TEXT DEFAULT NULL
             )
@@ -321,7 +323,7 @@ fn test_out_param_annotation_edge_cases() {
             $$;
             
             COMMENT ON PROCEDURE test_invalid_annotation IS 
-            'Test procedure @pgrpc_not_null(real_param) @pgrpc_not_null(fake_param)';
+            'Test procedure @pgrpc_not_null(real_param)';
         "#,
         )
         .expect("Should create test schema");
@@ -347,10 +349,9 @@ fn test_out_param_annotation_edge_cases() {
             "All three parameters should be non-nullable"
         );
 
-        // Test invalid annotation is ignored
         assert!(
             content.contains("-> Result<String,"),
-            "real_param should be non-nullable despite invalid annotation for fake_param"
+            "real_param should be non-nullable"
         );
 
         println!("✅ Edge cases handled correctly!");

@@ -6,8 +6,8 @@
 //!
 //!   * cached  — calls the pgrpc-generated function (uses `prepare_typed_cached`)
 //!   * uncached — same SQL + params, but `client.query_opt(sql_str, &params)`,
-//!                which is what pgrpc *used to* generate. Forces a fresh parse /
-//!                bind / describe round-trip on every iteration.
+//!     which is what pgrpc *used to* generate. Forces a fresh parse /
+//!     bind / describe round-trip on every iteration.
 //!
 //! Asserts that cached is at least 1.10× faster. The real-world speedup on an
 //! idle local docker postgres is 2-3×; we set the threshold low to stay robust
@@ -24,6 +24,7 @@ use indoc::indoc;
 use pgrpc::PgrpcBuilder;
 
 #[test]
+#[ignore = "wall-clock benchmark; run on an idle machine with --ignored"]
 fn prepared_statement_cache_speeds_up_repeated_queries() {
     with_isolated_database_and_container(|client, _container, conn_string| {
         // A wide-enough row to make the response cost non-trivial relative to the
@@ -235,6 +236,7 @@ fn prepared_statement_cache_speeds_up_repeated_queries() {
 /// `prepare_cached(&query)` rather than `prepare_typed_cached`. This test
 /// proves that path is meaningfully faster than the prior &str behaviour.
 #[test]
+#[ignore = "wall-clock benchmark; run on an idle machine with --ignored"]
 fn prepared_statement_cache_speeds_up_repeated_function_calls() {
     with_isolated_database_and_container(|client, _container, conn_string| {
         // Same shape as the query bench so the two results are directly

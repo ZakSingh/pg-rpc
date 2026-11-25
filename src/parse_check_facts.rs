@@ -14,6 +14,7 @@
 //! don't recognize is silently dropped, mirroring the philosophy of
 //! [`crate::parse_check_enum`].
 
+use crate::check_expr::{is_equality_op, parse_check_expr, string_literal};
 use pg_query::protobuf::{AExprKind, BoolExprType, NullTestType};
 use pg_query::{Node, NodeEnum};
 
@@ -48,54 +49,8 @@ pub struct NotNullFact {
 /// Parse a single CHECK expression (the `pg_get_constraintdef` text) and emit
 /// any [`NotNullFact`]s it implies. Returns an empty vec for unrecognized shapes.
 pub fn parse_check_as_facts(check_expression: &str) -> Vec<NotNullFact> {
-    // Wrap in CREATE TABLE so pg_query parses it as a constraint expression,
-    // same trick parse_check_enum uses.
-    let parse_result =
-        pg_query::parse(&format!("CREATE TABLE _t (_c TEXT {})", check_expression));
-    let parsed = match parse_result {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
-
-    let expr = parsed
-        .protobuf
-        .stmts
-        .get(0)
-        .and_then(|stmt| stmt.stmt.as_ref())
-        .and_then(|stmt| stmt.node.as_ref())
-        .and_then(|node| {
-            if let pg_query::protobuf::node::Node::CreateStmt(create) = node {
-                create.table_elts.iter().find_map(|elt| {
-                    if let Some(NodeEnum::ColumnDef(col_def)) = &elt.node {
-                        col_def.constraints.iter().find_map(|c| {
-                            if let Some(NodeEnum::Constraint(c)) = &c.node {
-                                if c.contype() == pg_query::protobuf::ConstrType::ConstrCheck {
-                                    c.raw_expr.clone()
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                    } else if let Some(NodeEnum::Constraint(c)) = &elt.node {
-                        if c.contype() == pg_query::protobuf::ConstrType::ConstrCheck {
-                            c.raw_expr.clone()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            }
-        });
-
-    let expr = match expr {
-        Some(e) => e,
-        None => return Vec::new(),
+    let Some(expr) = parse_check_expr(check_expression) else {
+        return Vec::new();
     };
 
     let mut facts = Vec::new();
@@ -219,7 +174,6 @@ fn split_top_equality(node: &Node) -> Option<(&Node, &Node)> {
 /// Match `col IS NULL`, returning the column name. Mirrors
 /// [`extract_is_not_null_column`] for the negated test.
 fn extract_is_null_column(node: &Node) -> Option<String> {
-    let node = unwrap_paren(node);
     let nt = match node.node.as_ref()? {
         NodeEnum::NullTest(nt) => nt,
         _ => return None,
@@ -233,7 +187,7 @@ fn extract_is_null_column(node: &Node) -> Option<String> {
 /// Match `col = literal` (or `col IS NOT DISTINCT FROM literal`) as an atomic
 /// equality predicate.
 fn extract_equality_predicate(node: &Node) -> Option<Predicate> {
-    let a = match unwrap_paren(node).node.as_ref()? {
+    let a = match node.node.as_ref()? {
         NodeEnum::AExpr(a) => a,
         _ => return None,
     };
@@ -243,8 +197,8 @@ fn extract_equality_predicate(node: &Node) -> Option<Predicate> {
     let col = extract_column_name(a.lexpr.as_deref()?)
         .or_else(|| extract_column_name(a.rexpr.as_deref()?))?;
     // The literal can be on either side.
-    let lit = extract_string_literal(a.rexpr.as_deref()?)
-        .or_else(|| extract_string_literal(a.lexpr.as_deref()?))?;
+    let lit = string_literal(a.rexpr.as_deref()?)
+        .or_else(|| string_literal(a.lexpr.as_deref()?))?;
     Some(Predicate::Eq {
         column: col,
         value: Literal::Text(lit),
@@ -253,7 +207,6 @@ fn extract_equality_predicate(node: &Node) -> Option<Predicate> {
 
 /// Match `col IS NOT NULL`, returning the column name.
 fn extract_is_not_null_column(node: &Node) -> Option<String> {
-    let node = unwrap_paren(node);
     let nt = match node.node.as_ref()? {
         NodeEnum::NullTest(nt) => nt,
         _ => return None,
@@ -285,66 +238,87 @@ fn extract_is_not_null_column(node: &Node) -> Option<String> {
 ///     each `CaseWhen.expr` is a full predicate we can parse with our
 ///     existing equality-extractor.
 ///
+/// An arm's THEN body only constrains rows that *reach* the arm: rows for
+/// which no earlier arm matched. `CASE WHEN a = 'x' THEN … WHEN b = 'y' THEN
+/// (c IS NOT NULL)` says nothing about a row with `a = 'x' AND b = 'y'`, so
+/// `b = 'y' ⇒ c IS NOT NULL` would be wrong. A fact is therefore emitted for
+/// an arm only when every earlier arm tests **the same column against a
+/// different literal** — then the arm's own test implies none of them
+/// matched. That always holds for the first arm, and for a simple CASE over
+/// one column with distinct literals. From the first arm that breaks the
+/// pattern on, later arms contribute nothing.
+///
 /// Arms whose THEN body isn't a clean AND-chain of `IS NOT NULL` tests
-/// (e.g. the OR-mixed `captured` arm, or `IS NULL` arms) contribute nothing.
-/// We never weaken: an unparseable arm simply produces no facts, and the
-/// other arms' facts remain valid because each fact's antecedent stands on
-/// its own.
+/// (e.g. the OR-mixed `captured` arm, or `IS NULL` arms) contribute nothing
+/// either, without affecting the other arms.
 fn recognize_case_facts(node: &Node) -> Vec<NotNullFact> {
     let case = match &node.node {
         Some(NodeEnum::CaseExpr(c)) => c,
         _ => return Vec::new(),
     };
 
-    // Extract the discriminator column for the simple-CASE form. None means
-    // we're in searched-CASE territory and each WHEN arm carries its own
-    // full predicate.
-    let simple_discriminator = case
-        .arg
-        .as_deref()
-        .and_then(|n| extract_column_name(n));
+    // The discriminator column for the simple-CASE form. With a `CaseExpr.arg`
+    // that is not a plain column (`CASE lower(x) WHEN …`) nothing is recognized.
+    let simple_discriminator = match case.arg.as_deref() {
+        Some(arg) => match extract_column_name(arg) {
+            Some(column) => Some(column),
+            None => return Vec::new(),
+        },
+        None => None,
+    };
 
     let mut facts = Vec::new();
+    // (column, literal) tested by the arms so far.
+    let mut earlier: Vec<(String, Literal)> = Vec::new();
     for arm_node in &case.args {
         let arm = match &arm_node.node {
             Some(NodeEnum::CaseWhen(w)) => w,
-            _ => continue,
+            _ => break,
         };
 
-        // Antecedent: build a `Predicate::Eq` for this arm.
-        let antecedent = if let Some(disc) = &simple_discriminator {
+        // Antecedent: `column = literal` for this arm.
+        let antecedent = match &simple_discriminator {
             // Simple CASE: arm.expr is the literal compared against the
-            // discriminator. Accept any form we already know how to peel
-            // (AConst, TypeCast'd literal).
-            let value = arm.expr.as_deref().and_then(extract_string_literal);
-            match value {
-                Some(v) => Predicate::Eq {
-                    column: disc.clone(),
-                    value: Literal::Text(v),
-                },
-                None => continue,
-            }
-        } else {
-            // Searched CASE: arm.expr is a full predicate. We only handle
-            // the equality form for now — `WHEN col = 'literal' THEN …`.
-            match arm.expr.as_deref().and_then(extract_equality_predicate) {
-                Some(pred) => pred,
-                None => continue,
-            }
+            // discriminator (AConst, possibly under a TypeCast).
+            Some(disc) => arm
+                .expr
+                .as_deref()
+                .and_then(string_literal)
+                .map(|v| (disc.clone(), Literal::Text(v))),
+            // Searched CASE: arm.expr is a full predicate. Only the equality
+            // form is handled — `WHEN col = 'literal' THEN …`.
+            None => match arm.expr.as_deref().and_then(extract_equality_predicate) {
+                Some(Predicate::Eq { column, value }) => Some((column, value)),
+                _ => None,
+            },
         };
+        // An arm we cannot read might match any row; nothing after it is
+        // known to be reached. Likewise an arm on a different column.
+        let Some((column, value)) = antecedent else {
+            break;
+        };
+        if earlier.iter().any(|(c, _)| *c != column) {
+            break;
+        }
+        // The same literal again: this arm is never reached.
+        if earlier.iter().any(|(_, v)| *v == value) {
+            continue;
+        }
 
         // Consequent(s): walk the THEN body. Only `IS NOT NULL` columns
         // surface as facts; anything else in the body is silently dropped.
-        let result = match arm.result.as_deref() {
-            Some(r) => r,
-            None => continue,
-        };
-        for col in collect_is_not_null_columns(result) {
-            facts.push(NotNullFact {
-                when: antecedent.clone(),
-                column: col,
-            });
+        if let Some(result) = arm.result.as_deref() {
+            for col in collect_is_not_null_columns(result) {
+                facts.push(NotNullFact {
+                    when: Predicate::Eq {
+                        column: column.clone(),
+                        value: value.clone(),
+                    },
+                    column: col,
+                });
+            }
         }
+        earlier.push((column, value));
     }
 
     facts
@@ -447,26 +421,6 @@ fn or_two_args(node: &Node) -> Option<&[Node]> {
     Some(&b.args)
 }
 
-/// Strip surrounding `(expr)` wrappers — pg_query exposes parens via implicit
-/// nesting in some shapes but the planner output is paren-heavy and we want to
-/// see through them.
-fn unwrap_paren(node: &Node) -> &Node {
-    // pg_query doesn't have an explicit Paren node — parens collapse during parse.
-    // This helper exists in case future patterns introduce wrappers (e.g. TypeCast
-    // around a boolean expression). For now it's a no-op pass-through.
-    node
-}
-
-fn is_equality_op(name: &[Node]) -> bool {
-    name.iter().any(|n| {
-        if let Some(NodeEnum::String(s)) = &n.node {
-            s.sval == "="
-        } else {
-            false
-        }
-    })
-}
-
 fn extract_column_name(node: &Node) -> Option<String> {
     // Peel TypeCast wrappers; `(col)::text = 'x'::text` shows up in pg_get_constraintdef.
     let inner = match &node.node {
@@ -483,21 +437,6 @@ fn extract_column_name(node: &Node) -> Option<String> {
         })
     } else {
         None
-    }
-}
-
-fn extract_string_literal(node: &Node) -> Option<String> {
-    match &node.node {
-        Some(NodeEnum::AConst(c)) => {
-            if let Some(val) = &c.val {
-                if let pg_query::protobuf::a_const::Val::Sval(s) = val {
-                    return Some(s.sval.clone());
-                }
-            }
-            None
-        }
-        Some(NodeEnum::TypeCast(tc)) => tc.arg.as_deref().and_then(extract_string_literal),
-        _ => None,
     }
 }
 
@@ -712,6 +651,71 @@ mod tests {
             ],
         );
         assert_eq!(facts.len(), 2);
+    }
+
+    #[test]
+    fn searched_case_on_different_columns_only_trusts_the_first_arm() {
+        // A row with `kind = 'a' AND tier = 'gold'` takes the first arm; the
+        // second arm's body does not apply to it, so `tier = 'gold'` alone
+        // proves nothing about `perk`.
+        let expr = r#"
+            CHECK (
+                CASE
+                    WHEN kind = 'a'::text THEN (a_ref IS NOT NULL)
+                    WHEN tier = 'gold'::text THEN (perk IS NOT NULL)
+                    WHEN kind = 'b'::text THEN (b_ref IS NOT NULL)
+                    ELSE true
+                END
+            )
+        "#;
+        let facts = parse_check_as_facts(expr);
+        assert_facts_include(&facts, &[("kind", "a", "a_ref")]);
+        assert_eq!(facts.len(), 1, "{facts:?}");
+    }
+
+    #[test]
+    fn case_arm_that_cannot_be_read_hides_the_arms_after_it() {
+        // `WHEN amount > 0` may match any row, so later arms are not
+        // known to be reached.
+        let expr = r#"
+            CHECK (
+                CASE
+                    WHEN kind = 'a'::text THEN (a_ref IS NOT NULL)
+                    WHEN amount > 0 THEN true
+                    WHEN kind = 'b'::text THEN (b_ref IS NOT NULL)
+                END
+            )
+        "#;
+        let facts = parse_check_as_facts(expr);
+        assert_facts_include(&facts, &[("kind", "a", "a_ref")]);
+        assert_eq!(facts.len(), 1, "{facts:?}");
+
+        // Same for a simple CASE comparing against a non-literal.
+        let expr = r#"
+            CHECK (
+                CASE kind
+                    WHEN other_kind THEN true
+                    WHEN 'b'::text THEN (b_ref IS NOT NULL)
+                END
+            )
+        "#;
+        assert!(parse_check_as_facts(expr).is_empty());
+    }
+
+    #[test]
+    fn case_arm_repeating_a_literal_is_unreachable() {
+        let expr = r#"
+            CHECK (
+                CASE kind
+                    WHEN 'a'::text THEN (a_ref IS NOT NULL)
+                    WHEN 'a'::text THEN (never IS NOT NULL)
+                    WHEN 'b'::text THEN (b_ref IS NOT NULL)
+                END
+            )
+        "#;
+        let facts = parse_check_as_facts(expr);
+        assert_facts_include(&facts, &[("kind", "a", "a_ref"), ("kind", "b", "b_ref")]);
+        assert_eq!(facts.len(), 2, "{facts:?}");
     }
 
     #[test]

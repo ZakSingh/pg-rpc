@@ -6,16 +6,10 @@ use crate::fn_index::FunctionIndex;
 use itertools::Itertools;
 use std::collections::BTreeSet;
 use crate::rel_index::RelIndex;
+use anyhow::Context;
 use pg_query::parse_plpgsql;
 use postgres::Client;
 use std::collections::HashMap;
-
-/// Represents timing of when a trigger fires
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TriggerTiming {
-    Before,
-    After,
-}
 
 /// Represents the event that triggers the function
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,24 +17,13 @@ pub enum TriggerEvent {
     Insert,
     Update,
     Delete,
-    Truncate,
-}
-
-/// Represents the level at which a trigger fires
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TriggerLevel {
-    Row,
-    Statement,
 }
 
 /// Information about a trigger function
 #[derive(Debug, Clone)]
 pub struct TriggerFunction {
-    pub oid: OID,
     pub name: String,
     pub schema: String,
-    pub source: String,
-    pub comment: Option<String>,
     /// Exceptions that this trigger function can raise, including those of
     /// the functions it calls and of the triggers its DML fires.
     pub exceptions: Vec<PgException>,
@@ -70,10 +53,10 @@ impl TriggerFunction {
 pub struct Trigger {
     pub oid: OID,
     pub name: String,
-    pub table_oid: OID,
-    pub timing: TriggerTiming,
+    /// The events that fire it. Timing (BEFORE / AFTER / INSTEAD OF) and
+    /// level (ROW / STATEMENT) are not tracked: whichever they are, an error
+    /// in the trigger fails the statement.
     pub events: Vec<TriggerEvent>,
-    pub level: TriggerLevel,
     pub function: TriggerFunction,
 }
 
@@ -87,9 +70,10 @@ pub struct TriggerIndex {
 impl TriggerIndex {
     /// Create a new trigger index by querying the database
     ///
-    /// Covers tables in every user schema: a generated function may write to a
-    /// table outside the codegen schemas (directly or via a helper), and the
-    /// triggers on that table can still fail the call.
+    /// Covers relations in every user schema: a generated function may write
+    /// to a table outside the codegen schemas (directly or via a helper), and
+    /// the triggers on that table can still fail the call. Partitioned tables
+    /// and views (`INSTEAD OF` triggers) are included.
     pub fn new(
         db: &mut Client,
         rel_index: &RelIndex,
@@ -100,67 +84,53 @@ impl TriggerIndex {
 
         let mut triggers_by_table: HashMap<OID, Vec<Trigger>> = HashMap::new();
 
-        let rows = db.query(trigger_sql, &[])?;
+        let rows = db
+            .query(trigger_sql, &[])
+            .context("Trigger introspection query failed")?;
 
         for row in rows {
             // Postgres `oid` columns deserialize as `u32`, not `i32` —
             // postgres-rust rejects the i32 conversion for oid types.
-            let table_oid: OID = row.get("table_oid");
-            let trigger_oid: OID = row.get("trigger_oid");
+            let table_oid: OID = row.try_get("table_oid")?;
+            let trigger_oid: OID = row.try_get("trigger_oid")?;
 
-            let trigger_name: String = row.get("trigger_name");
-            let timing_str: String = row.get("timing");
-            let events_array: Vec<String> = row.get("events");
-            let level_str: String = row.get("level");
+            let trigger_name: String = row.try_get("trigger_name")?;
+            let table_name = format!(
+                "{}.{}",
+                row.try_get::<_, String>("schema_name")?,
+                row.try_get::<_, String>("table_name")?
+            );
+            let events = parse_events(
+                &row.try_get::<_, Vec<String>>("events")?,
+                &trigger_name,
+                &table_name,
+            );
 
-            let function_oid: OID = row.get("function_oid");
-            let function_name: String = row.get("function_name");
-            let function_schema: String = row.get("function_schema");
-            let function_source: String = row.get("function_source");
-            let function_comment: Option<String> = row.get("function_comment");
+            let function_name: String = row.try_get("function_name")?;
+            let function_schema: String = row.try_get("function_schema")?;
+            let function_source: String = row.try_get("function_source")?;
 
-            // Parse timing
-            let timing = match timing_str.as_str() {
-                "BEFORE" => TriggerTiming::Before,
-                "AFTER" => TriggerTiming::After,
-                _ => continue, // Skip unknown timing
-            };
-
-            // Parse events
-            let events: Vec<TriggerEvent> = events_array
-                .into_iter()
-                .filter_map(|event| match event.as_str() {
-                    "INSERT" => Some(TriggerEvent::Insert),
-                    "UPDATE" => Some(TriggerEvent::Update),
-                    "DELETE" => Some(TriggerEvent::Delete),
-                    "TRUNCATE" => Some(TriggerEvent::Truncate),
-                    _ => None,
-                })
-                .collect();
-
-            // Parse level
-            let level = match level_str.as_str() {
-                "ROW" => TriggerLevel::Row,
-                "STATEMENT" => TriggerLevel::Statement,
-                _ => continue, // Skip unknown level
-            };
-
-            // Analyze the trigger function for exceptions
+            // Analyze the trigger function for exceptions. A function that
+            // cannot be analyzed still fires; say so instead of silently
+            // treating it as raising nothing.
             let (exceptions, rel_deps, callees) = Self::analyze_trigger_function(
                 &function_source,
-                function_comment.as_ref(),
                 rel_index,
                 errors_config,
                 &format!("trigger function {function_schema}.{function_name}"),
             )
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                log::warn!(
+                    "Could not analyze trigger {trigger_name} on {table_name} \
+                     (function {function_schema}.{function_name}): {e:#}. \
+                     Errors it raises will be missing from generated error enums."
+                );
+                Default::default()
+            });
 
             let trigger_function = TriggerFunction {
-                oid: function_oid,
                 name: function_name,
                 schema: function_schema,
-                source: function_source,
-                comment: function_comment,
                 exceptions,
                 rel_deps,
                 callees,
@@ -169,10 +139,7 @@ impl TriggerIndex {
             let trigger = Trigger {
                 oid: trigger_oid,
                 name: trigger_name,
-                table_oid,
-                timing,
                 events,
-                level,
                 function: trigger_function,
             };
 
@@ -231,8 +198,9 @@ impl TriggerIndex {
                 .function
                 .rel_deps
                 .iter()
-                .filter_map(|dep| trigger_event_for(&dep.cmd).map(|event| (dep.rel_oid, event)))
-                .flat_map(|(table, event)| self.get_triggers_for_event(table, &event))
+                .flat_map(|dep| {
+                    self.get_triggers_for_event(dep.rel_oid, &trigger_event_for(&dep.cmd))
+                })
                 .map(|t| t.oid)
                 .collect()
         };
@@ -304,7 +272,6 @@ impl TriggerIndex {
     /// Analyze a trigger function source code for potential exceptions
     fn analyze_trigger_function(
         source: &str,
-        comment: Option<&String>,
         rel_index: &RelIndex,
         errors_config: Option<&crate::config::ErrorsConfig>,
         scope: &str,
@@ -323,7 +290,6 @@ impl TriggerIndex {
                 let exceptions = get_exceptions_from_deps(
                     &parsed,
                     &rel_deps,
-                    comment,
                     rel_index,
                     errors_config,
                     scope,
@@ -331,9 +297,13 @@ impl TriggerIndex {
                 let callees = call_graph::plpgsql_callees(&parsed);
                 Ok((exceptions, rel_deps, callees))
             }
-            Err(_) => {
+            Err(e) => {
                 // If parsing fails, try to extract basic RAISE statements with regex
-                let exceptions = Self::extract_basic_exceptions(source, comment)?;
+                log::warn!(
+                    "{scope}: could not parse the PL/pgSQL body ({e}); \
+                     only its RAISE EXCEPTION statements are analyzed"
+                );
+                let exceptions = Self::extract_basic_exceptions(source)?;
                 Ok((exceptions, Vec::new(), BTreeSet::new()))
             }
         }
@@ -342,7 +312,6 @@ impl TriggerIndex {
     /// Fallback method to extract basic RAISE EXCEPTION statements using regex
     fn extract_basic_exceptions(
         source: &str,
-        comment: Option<&String>,
     ) -> anyhow::Result<Vec<PgException>> {
         use crate::sql_state::SqlState;
         use regex::Regex;
@@ -370,24 +339,27 @@ impl TriggerIndex {
             }
         }
 
-        // Add comment-based exceptions if present
-        if let Some(comment) = comment {
-            use crate::exceptions::get_comment_exceptions;
-            exceptions.extend(get_comment_exceptions(comment));
-        }
-
         Ok(exceptions)
     }
+}
 
-    /// Get all tables that have triggers
-    pub fn get_tables_with_triggers(&self) -> Vec<OID> {
-        self.triggers_by_table.keys().copied().collect()
-    }
-
-    /// Check if a table has any triggers for a specific event
-    pub fn has_triggers_for_event(&self, table_oid: OID, event: &TriggerEvent) -> bool {
-        !self.get_triggers_for_event(table_oid, event).is_empty()
-    }
+/// Decode the event names the introspection query reports for a trigger.
+/// A name this code does not know is logged, not silently dropped.
+fn parse_events(events: &[String], trigger_name: &str, table_name: &str) -> Vec<TriggerEvent> {
+    events
+        .iter()
+        .filter_map(|event| match event.as_str() {
+            "INSERT" => Some(TriggerEvent::Insert),
+            "UPDATE" => Some(TriggerEvent::Update),
+            "DELETE" => Some(TriggerEvent::Delete),
+            other => {
+                log::warn!(
+                    "Trigger {trigger_name} on {table_name}: ignoring unknown event '{other}'"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -408,7 +380,7 @@ mod tests {
             END;
         "#;
 
-        let exceptions = TriggerIndex::extract_basic_exceptions(source, None).unwrap();
+        let exceptions = TriggerIndex::extract_basic_exceptions(source).unwrap();
         assert_eq!(exceptions.len(), 2);
 
         // Should find one default P0001 and one explicit 23502
@@ -421,5 +393,31 @@ mod tests {
 
         assert!(has_default);
         assert!(has_not_null);
+    }
+
+    #[test]
+    fn events_are_decoded_and_unknown_ones_skipped() {
+        let events = parse_events(
+            &["INSERT".to_string(), "TRUNCATE".to_string(), "DELETE".to_string()],
+            "trg",
+            "public.t",
+        );
+        assert_eq!(events, [TriggerEvent::Insert, TriggerEvent::Delete]);
+    }
+
+    #[test]
+    fn unparsable_trigger_body_falls_back_to_raise_scan() {
+        // Not valid PL/pgSQL, but the RAISE is still found.
+        let (exceptions, rel_deps, callees) = TriggerIndex::analyze_trigger_function(
+            "BEGIN this is not plpgsql; RAISE EXCEPTION SQLSTATE 'M0001' USING MESSAGE = 'x'; END",
+            &RelIndex::default(),
+            None,
+            "trigger function public.broken",
+        )
+        .unwrap();
+        assert!(exceptions
+            .iter()
+            .any(|e| matches!(e, PgException::Explicit(s) if s.code() == "M0001")));
+        assert!(rel_deps.is_empty() && callees.is_empty());
     }
 }

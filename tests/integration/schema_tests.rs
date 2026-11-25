@@ -3,7 +3,7 @@ use pgrpc::*;
 
 #[test]
 fn test_schema_introspection() {
-    with_isolated_database_and_container(|client, container, conn_string| {
+    with_isolated_database_and_container(|client, _container, conn_string| {
         // Test that we can connect and introspect the schema
         let _builder = PgrpcBuilder::new()
             .connection_string(conn_string)

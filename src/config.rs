@@ -1,8 +1,8 @@
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 
-#[derive(Deserialize, Debug)]
-#[serde(default)]
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub connection_string: Option<String>,
     pub output_path: Option<String>,
@@ -14,17 +14,21 @@ pub struct Config {
     pub infer_view_nullability: bool,
     pub disable_deserialize: Vec<String>,
     pub strict_domains: Vec<String>,
+    /// Composite types and views (as "schema.name") that also derive `bon::Builder`
+    pub builders: Vec<String>,
     pub queries: Option<QueriesConfig>,
     pub tracing: Option<TracingConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TracingConfig {
     /// Enable tracing spans around generated functions
     pub enabled: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TaskQueueConfig {
     pub schema: String,
     pub task_name_column: String,
@@ -34,12 +38,14 @@ pub struct TaskQueueConfig {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorsConfig {
     pub schema: String,
     pub raise_function: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct QueriesConfig {
     /// Glob patterns for SQL query files
     pub paths: Vec<String>,
@@ -58,6 +64,7 @@ impl Default for Config {
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
             strict_domains: Vec::new(),
+            builders: Vec::new(),
             queries: None,
             tracing: None,
         }
@@ -75,6 +82,14 @@ impl Config {
     pub fn is_strict_domain(&self, schema: &str, type_name: &str) -> bool {
         let full_name = format!("{}.{}", schema, type_name);
         self.strict_domains.contains(&full_name)
+    }
+}
+
+impl Config {
+    /// Check if a composite type or view should also derive `bon::Builder`
+    pub fn derives_builder(&self, schema: &str, type_name: &str) -> bool {
+        let full_name = format!("{}.{}", schema, type_name);
+        self.builders.contains(&full_name)
     }
 }
 

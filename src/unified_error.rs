@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::exceptions::PgException;
-use crate::ident::{sql_to_rs_ident, CaseType::Pascal};
+use crate::ident::{ident_tokens, sanitize_ident, sql_to_rs_ident, CaseType, CaseType::Pascal};
 use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
 use crate::pg_rel::PgRelKind;
@@ -11,77 +11,460 @@ use quote::{format_ident, quote};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
-/// Trait for types that can provide access to an underlying DbError
-pub trait AsDbError {
-    /// Returns a reference to the underlying DbError if this error contains one
-    fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError>;
+/// The name of a table's constraint enum, which is also the name of the
+/// variant that carries it in `PgRpcError` and in each function's and query's
+/// error enum: `{Table}Constraint`.
+///
+/// Tables of the same name in different schemas would get the same enum, so
+/// when a name is shared every table sharing it is qualified with its
+/// schema: `{Schema}{Table}Constraint`.
+pub fn constraint_enum_ident(
+    table_id: &PgId,
+    table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
+) -> TokenStream {
+    let table = table_id.name().to_pascal_case();
+    let shared = table_constraints
+        .keys()
+        .any(|other| other != table_id && other.name().to_pascal_case() == table);
+    let name = if shared {
+        format!("{}{}Constraint", table_id.schema().to_pascal_case(), table)
+    } else {
+        format!("{table}Constraint")
+    };
+    ident_tokens(&sanitize_ident(name, table_id.name(), Pascal))
 }
 
-/// Extension trait for error types that provides helper methods for PostgreSQL errors
-pub trait PgRpcErrorExt: AsDbError {
-    /// Returns the column name from the underlying PostgreSQL error, if available
-    fn column(&self) -> Option<&str> {
-        self.as_db_error().and_then(|e| e.column())
-    }
-
-    /// Returns the constraint name from the underlying PostgreSQL error, if available
-    fn constraint(&self) -> Option<&str> {
-        self.as_db_error().and_then(|e| e.constraint())
-    }
-
-    /// Returns the table name from the underlying PostgreSQL error, if available
-    fn table(&self) -> Option<&str> {
-        self.as_db_error().and_then(|e| e.table())
-    }
-
-    /// Returns the error message from the underlying PostgreSQL error, if available
-    fn message(&self) -> Option<&str> {
-        self.as_db_error().map(|e| e.message())
-    }
-
-    /// Returns the SQL state code from the underlying PostgreSQL error, if available
-    fn code(&self) -> Option<&tokio_postgres::error::SqlState> {
-        self.as_db_error().map(|e| e.code())
-    }
-
-    /// Returns the schema name from the underlying PostgreSQL error, if available
-    fn schema(&self) -> Option<&str> {
-        self.as_db_error().and_then(|e| e.schema())
-    }
-
-    /// Returns the data type name from the underlying PostgreSQL error, if available
-    fn datatype(&self) -> Option<&str> {
-        self.as_db_error().and_then(|e| e.datatype())
-    }
-
-    /// Returns the detail from the underlying PostgreSQL error, if available
-    fn detail(&self) -> Option<&str> {
-        self.as_db_error().and_then(|e| e.detail())
-    }
-
-    /// Returns the hint from the underlying PostgreSQL error, if available
-    fn hint(&self) -> Option<&str> {
-        self.as_db_error().and_then(|e| e.hint())
-    }
-
-    /// Returns the position from the underlying PostgreSQL error, if available
-    fn position(&self) -> Option<&tokio_postgres::error::ErrorPosition> {
-        self.as_db_error().and_then(|e| e.position())
-    }
-
-    /// Returns the where clause from the underlying PostgreSQL error, if available
-    fn where_(&self) -> Option<&str> {
-        self.as_db_error().and_then(|e| e.where_())
-    }
-
-    /// Returns the routine from the underlying PostgreSQL error, if available
-    fn routine(&self) -> Option<&str> {
-        self.as_db_error().and_then(|e| e.routine())
-    }
+/// The variant of a table's constraint enum for `constraint`: the constraint
+/// name in Pascal case, `PrimaryKey`, or `{Column}NotNull`. `None` for
+/// constraints that cannot be violated (defaults).
+pub fn constraint_variant_ident(constraint: &Constraint) -> Option<TokenStream> {
+    let pascal = |name: &str| {
+        let ident = sanitize_ident(name.to_pascal_case(), name, Pascal);
+        ident.strip_prefix("r#").unwrap_or(&ident).to_string()
+    };
+    let name = match constraint {
+        Constraint::PrimaryKey(_) => "PrimaryKey".to_string(),
+        Constraint::Unique(u) => pascal(&u.name),
+        Constraint::Check(c) => pascal(&c.name),
+        Constraint::ForeignKey(fk) => pascal(&fk.name),
+        Constraint::NotNull(nn) => format!("{}NotNull", pascal(&nn.column)),
+        Constraint::Domain(d) => pascal(&d.name),
+        Constraint::Exclusion(x) => pascal(&x.name),
+        Constraint::Default(_) => return None,
+    };
+    Some(ident_tokens(&name))
 }
 
-/// Blanket implementation of PgRpcErrorExt for all types that implement AsDbError
-impl<T: AsDbError> PgRpcErrorExt for T {}
+/// The SQLSTATE class a constraint violation is reported under, which decides
+/// what identifies the constraint in the `DbError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Violation {
+    /// 23505, by (schema, table, constraint).
+    Unique,
+    /// 23514 on a table, by (schema, table, constraint).
+    Check,
+    /// 23514 on a domain, by (schema, datatype, constraint): Postgres
+    /// reports the domain, not the table whose column has that type.
+    DomainCheck,
+    /// 23503, by (schema, table, constraint).
+    ForeignKey,
+    /// 23502, by (schema, table, column).
+    NotNull,
+    /// 23P01, by (schema, table, constraint).
+    Exclusion,
+}
+
+/// The arms of `match db_error.code() { .. }` that turn a constraint
+/// violation into `#error_enum::{Table}Constraint(variant, db_error)`, for the
+/// constraints in `constraints`. Shared by the function and query error
+/// enums; anything unmatched falls through to
+/// `#error_enum::Other(PgRpcError::Database(e))`.
+///
+/// A violation is matched on everything Postgres reports about it: the
+/// schema and table (or domain) as well as the constraint name, since CHECK
+/// and FOREIGN KEY names are only unique per table.
+///
+/// A constraint inherited by a partition or child table is reported with the
+/// child's table name, which is not known here. So a constraint whose name
+/// only one of the tables in `constraints` uses is also matched by name
+/// alone, after the exact matches.
+pub fn constraint_violation_arms(
+    error_enum: &TokenStream,
+    constraints: &BTreeMap<PgId, Vec<Constraint>>,
+    table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
+) -> Vec<TokenStream> {
+    // Per violation class: (constraint name, exact pattern, result).
+    let mut found: BTreeMap<Violation, Vec<(String, TokenStream, TokenStream)>> = BTreeMap::new();
+    // Two tables with a column of one domain share its CHECK; the violation
+    // does not say which table, so the first one gets the arm.
+    let mut seen: BTreeSet<(Violation, String, String, String)> = BTreeSet::new();
+
+    for (table_id, table) in constraints {
+        let table_enum = constraint_enum_ident(table_id, table_constraints);
+        for constraint in table {
+            let Some(variant) = constraint_variant_ident(constraint) else {
+                continue;
+            };
+            let (violation, schema, relation, name) = match constraint {
+                Constraint::PrimaryKey(_) | Constraint::Unique(_) => (
+                    Violation::Unique,
+                    table_id.schema().to_string(),
+                    table_id.name().to_string(),
+                    constraint.name().to_string(),
+                ),
+                Constraint::Check(_) => (
+                    Violation::Check,
+                    table_id.schema().to_string(),
+                    table_id.name().to_string(),
+                    constraint.name().to_string(),
+                ),
+                Constraint::ForeignKey(_) => (
+                    Violation::ForeignKey,
+                    table_id.schema().to_string(),
+                    table_id.name().to_string(),
+                    constraint.name().to_string(),
+                ),
+                Constraint::Exclusion(_) => (
+                    Violation::Exclusion,
+                    table_id.schema().to_string(),
+                    table_id.name().to_string(),
+                    constraint.name().to_string(),
+                ),
+                Constraint::NotNull(nn) => (
+                    Violation::NotNull,
+                    table_id.schema().to_string(),
+                    table_id.name().to_string(),
+                    nn.column.to_string(),
+                ),
+                Constraint::Domain(d) => {
+                    let (Some(domain), Some(schema)) = (&d.domain, &d.domain_schema) else {
+                        continue;
+                    };
+                    (
+                        Violation::DomainCheck,
+                        schema.clone(),
+                        domain.clone(),
+                        d.name.to_string(),
+                    )
+                }
+                Constraint::Default(_) => continue,
+            };
+            if !seen.insert((violation, schema.clone(), relation.clone(), name.clone())) {
+                continue;
+            }
+            found.entry(violation).or_default().push((
+                name.clone(),
+                quote! { (Some(#schema), Some(#relation), Some(#name)) },
+                quote! {
+                    #error_enum::#table_enum(
+                        super::errors::#table_enum::#variant,
+                        db_error.to_owned()
+                    )
+                },
+            ));
+        }
+    }
+
+    let mut arms: BTreeMap<Violation, Vec<TokenStream>> = found
+        .into_iter()
+        .map(|(violation, entries)| {
+            let exact = entries
+                .iter()
+                .map(|(_, pattern, result)| quote! { #pattern => #result });
+            // Not-null violations name a column and domain CHECKs a type;
+            // neither is reported differently for a child table.
+            let by_name_alone = entries
+                .iter()
+                .filter(|(name, _, _)| {
+                    !matches!(violation, Violation::NotNull | Violation::DomainCheck)
+                        && entries.iter().filter(|(other, _, _)| other == name).count() == 1
+                })
+                .map(|(name, _, result)| quote! { (_, _, Some(#name)) => #result });
+            (violation, exact.chain(by_name_alone).collect())
+        })
+        .collect();
+
+    let fallback = quote! { #error_enum::Other(super::errors::PgRpcError::Database(e)) };
+    let by_constraint = quote! { (db_error.schema(), db_error.table(), db_error.constraint()) };
+    let mut take = |violation: Violation| arms.remove(&violation).unwrap_or_default();
+    let mut result = Vec::new();
+
+    let unique = take(Violation::Unique);
+    if !unique.is_empty() {
+        result.push(quote! {
+            &tokio_postgres::error::SqlState::UNIQUE_VIOLATION => {
+                match #by_constraint {
+                    #(#unique,)*
+                    _ => #fallback
+                }
+            },
+        });
+    }
+
+    let check = take(Violation::Check);
+    let domain_check = take(Violation::DomainCheck);
+    if !check.is_empty() || !domain_check.is_empty() {
+        let by_domain = if domain_check.is_empty() {
+            fallback.clone()
+        } else {
+            quote! {
+                match (db_error.schema(), db_error.datatype(), db_error.constraint()) {
+                    #(#domain_check,)*
+                    _ => #fallback
+                }
+            }
+        };
+        let body = if check.is_empty() {
+            by_domain
+        } else {
+            quote! {
+                match #by_constraint {
+                    #(#check,)*
+                    _ => #by_domain
+                }
+            }
+        };
+        result.push(quote! {
+            &tokio_postgres::error::SqlState::CHECK_VIOLATION => {
+                #body
+            },
+        });
+    }
+
+    let foreign_key = take(Violation::ForeignKey);
+    if !foreign_key.is_empty() {
+        result.push(quote! {
+            &tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION => {
+                match #by_constraint {
+                    #(#foreign_key,)*
+                    _ => #fallback
+                }
+            },
+        });
+    }
+
+    let not_null = take(Violation::NotNull);
+    if !not_null.is_empty() {
+        result.push(quote! {
+            &tokio_postgres::error::SqlState::NOT_NULL_VIOLATION => {
+                match (db_error.schema(), db_error.table(), db_error.column()) {
+                    #(#not_null,)*
+                    _ => #fallback
+                }
+            },
+        });
+    }
+
+    let exclusion = take(Violation::Exclusion);
+    if !exclusion.is_empty() {
+        result.push(quote! {
+            &tokio_postgres::error::SqlState::EXCLUSION_VIOLATION => {
+                match #by_constraint {
+                    #(#exclusion,)*
+                    _ => #fallback
+                }
+            },
+        });
+    }
+
+    result
+}
+
+/// The error enum of one function or query, with its conversions: from
+/// `tokio_postgres::Error` (classifying the failure), to and from
+/// `PgRpcError`, from `DecodeError`, and `AsDbError`.
+///
+/// `constraints` are the tables whose constraints the item can violate, each
+/// a `{Table}Constraint` variant. `exceptions` are everything else it can
+/// raise; they become variants in the order given. Two exceptions that map to
+/// one variant name (the same exception listed twice, or two SQLSTATEs
+/// configured with one description) share the variant, and every such
+/// SQLSTATE is classified as it.
+pub fn generate_error_enum(
+    error_enum_name: &TokenStream,
+    constraints: &BTreeMap<PgId, Vec<Constraint>>,
+    table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
+    exceptions: &[PgException],
+    config: &Config,
+) -> TokenStream {
+    let mut error_variants = Vec::new();
+    let mut to_pgrpc_arms = Vec::new();
+    let mut as_db_error_arms = Vec::new();
+
+    for table_id in constraints.keys() {
+        let table_name_str = table_id.name();
+        let variant_name = constraint_enum_ident(table_id, table_constraints);
+
+        error_variants.push(quote! {
+            #[error("{} table constraint violation", #table_name_str)]
+            #variant_name(super::errors::#variant_name, #[source] tokio_postgres::error::DbError)
+        });
+        to_pgrpc_arms.push(quote! {
+            #error_enum_name::#variant_name(constraint, db_error) => {
+                super::errors::PgRpcError::#variant_name(constraint, db_error)
+            }
+        });
+        as_db_error_arms.push(quote! {
+            #error_enum_name::#variant_name(_, db_error) => Some(db_error)
+        });
+    }
+
+    // Arms of `match db_error.code()`: by SQLSTATE, and, inside the JSON-hint
+    // arm, by the name of a typed error (an errors-schema payload).
+    let mut sql_state_arms = Vec::new();
+    let mut typed_error_arms = Vec::new();
+
+    let mut handled_variants = BTreeSet::new();
+    let mut sql_state_variants = BTreeSet::new();
+    let mut handled_codes = BTreeSet::new();
+    for exception in exceptions {
+        let variant_name = exception.rs_name(config);
+        let is_new = handled_variants.insert(variant_name.to_string());
+        match exception {
+            PgException::Explicit(sql_state) => {
+                let code = sql_state.code();
+                if is_new {
+                    sql_state_variants.insert(variant_name.to_string());
+                    let message = match config.exceptions.get(code) {
+                        Some(description) => quote! { #[error(#description)] },
+                        None => quote! { #[error("SQL state {}", #code)] },
+                    };
+                    error_variants.push(quote! {
+                        #message
+                        #variant_name(#[source] tokio_postgres::error::DbError)
+                    });
+                    to_pgrpc_arms.push(quote! {
+                        #error_enum_name::#variant_name(db_error) => {
+                            super::errors::PgRpcError::#variant_name(db_error)
+                        }
+                    });
+                    as_db_error_arms.push(quote! {
+                        #error_enum_name::#variant_name(db_error) => Some(db_error)
+                    });
+                }
+                if sql_state_variants.contains(&variant_name.to_string())
+                    && handled_codes.insert(code.to_string())
+                {
+                    sql_state_arms.push(quote! {
+                        code if code == &tokio_postgres::error::SqlState::from_code(#code) => {
+                            #error_enum_name::#variant_name(db_error.to_owned())
+                        }
+                    });
+                }
+            }
+            PgException::CustomError(error_name) => {
+                if !is_new {
+                    continue;
+                }
+                let error_name_str = error_name.as_str();
+                error_variants.push(quote! {
+                    #[error("{}", #error_name_str)]
+                    #variant_name(super::custom_errors::#variant_name, #[source] tokio_postgres::error::DbError)
+                });
+                to_pgrpc_arms.push(quote! {
+                    #error_enum_name::#variant_name(payload, db_error) => {
+                        super::errors::PgRpcError::CustomError(
+                            super::custom_errors::CustomError::#variant_name(payload),
+                            db_error,
+                        )
+                    }
+                });
+                as_db_error_arms.push(quote! {
+                    #error_enum_name::#variant_name(_, db_error) => Some(db_error)
+                });
+                typed_error_arms.push(quote! {
+                    Some(#error_name_str) => {
+                        if let Ok(payload) = serde_json::from_value(json.clone()) {
+                            #error_enum_name::#variant_name(payload, db_error.to_owned())
+                        } else {
+                            #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    // Catch-all for everything not detected.
+    error_variants.push(quote! {
+        #[error(transparent)]
+        Other(super::errors::PgRpcError)
+    });
+
+    // Typed errors are identified by the JSON hint, not the SQLSTATE, so that
+    // arm leads: a typed error raised with a mapped SQLSTATE is still the
+    // typed error. Then constraint classes, then SQLSTATE codes.
+    let mut from_postgres_arms = Vec::new();
+    if !typed_error_arms.is_empty() {
+        from_postgres_arms.push(quote! {
+            _code if db_error.hint() == Some("application/json") => {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(db_error.message()) {
+                    match json.get("type").and_then(|t| t.as_str()) {
+                        #(#typed_error_arms,)*
+                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                    }
+                } else {
+                    #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                }
+            }
+        });
+    }
+    from_postgres_arms.extend(constraint_violation_arms(
+        error_enum_name,
+        constraints,
+        table_constraints,
+    ));
+    from_postgres_arms.extend(sql_state_arms);
+
+    quote! {
+        #[derive(Debug, thiserror::Error)]
+        pub enum #error_enum_name {
+            #(#error_variants),*
+        }
+
+        impl From<tokio_postgres::Error> for #error_enum_name {
+            fn from(e: tokio_postgres::Error) -> Self {
+                match e.as_db_error() {
+                    Some(db_error) => match db_error.code() {
+                        #(#from_postgres_arms)*
+                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                    },
+                    None => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
+                }
+            }
+        }
+
+        impl From<#error_enum_name> for super::errors::PgRpcError {
+            fn from(err: #error_enum_name) -> Self {
+                match err {
+                    #error_enum_name::Other(e) => e,
+                    #(#to_pgrpc_arms),*
+                }
+            }
+        }
+
+        impl From<super::errors::PgRpcError> for #error_enum_name {
+            fn from(err: super::errors::PgRpcError) -> Self {
+                #error_enum_name::Other(err)
+            }
+        }
+
+        impl From<super::errors::DecodeError> for #error_enum_name {
+            fn from(err: super::errors::DecodeError) -> Self {
+                #error_enum_name::Other(super::errors::PgRpcError::Decode(err))
+            }
+        }
+
+        impl super::errors::AsDbError for #error_enum_name {
+            fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError> {
+                match self {
+                    #(#as_db_error_arms,)*
+                    #error_enum_name::Other(e) => e.as_db_error(),
+                }
+            }
+        }
+    }
+}
 
 /// Collects all constraints from all tables and groups them by table
 /// Only includes constraints that will generate enum variants (excludes Default constraints)
@@ -103,7 +486,7 @@ pub fn collect_table_constraints(rel_index: &RelIndex) -> BTreeMap<PgId, Vec<Con
             .collect();
 
         if !non_default_constraints.is_empty() {
-            table_constraints.insert(rel.id.clone(), non_default_constraints);
+            table_constraints.insert(rel.id, non_default_constraints);
         }
     }
 
@@ -119,41 +502,14 @@ pub fn generate_constraint_enums(
     let mut enums = Vec::new();
 
     for (table_id, constraints) in table_constraints {
-        let table_name_str = table_id.name();
-        let table_name_pascal = table_name_str.to_pascal_case();
-        let enum_name = quote::format_ident!("{}Constraint", table_name_pascal);
+        let enum_name = constraint_enum_ident(table_id, table_constraints);
 
-        let mut variants: Vec<(proc_macro2::Ident, &Constraint)> = Vec::new();
+        let mut variants: Vec<(TokenStream, &Constraint)> = Vec::new();
         let mut seen_names = BTreeSet::new();
 
         for constraint in constraints {
-            let variant_name = match constraint {
-                Constraint::PrimaryKey(_) => quote::format_ident!("PrimaryKey"),
-                Constraint::Unique(u) => {
-                    let name = u.name.to_pascal_case();
-                    quote::format_ident!("{}", name)
-                }
-                Constraint::Check(c) => {
-                    let name = c.name.to_pascal_case();
-                    quote::format_ident!("{}", name)
-                }
-                Constraint::ForeignKey(fk) => {
-                    let name = fk.name.to_pascal_case();
-                    quote::format_ident!("{}", name)
-                }
-                Constraint::NotNull(nn) => {
-                    let col_name = nn.column.to_pascal_case();
-                    quote::format_ident!("{}NotNull", col_name)
-                }
-                Constraint::Domain(d) => {
-                    let name = d.name.to_pascal_case();
-                    quote::format_ident!("{}", name)
-                }
-                Constraint::Exclusion(x) => {
-                    let name = x.name.to_pascal_case();
-                    quote::format_ident!("{}", name)
-                }
-                Constraint::Default(_) => continue, // Skip default constraints
+            let Some(variant_name) = constraint_variant_ident(constraint) else {
+                continue; // Default constraints cannot be violated
             };
 
             // Avoid duplicate variant names
@@ -166,7 +522,7 @@ pub fn generate_constraint_enums(
             continue;
         }
 
-        let variant_idents: Vec<&proc_macro2::Ident> = variants.iter().map(|(v, _)| v).collect();
+        let variant_idents: Vec<&TokenStream> = variants.iter().map(|(v, _)| v).collect();
         let name_arms = variants.iter().map(|(v, c)| {
             let name = c.name();
             let name = name.as_str();
@@ -258,7 +614,7 @@ pub fn generate_constraint_message_lookup(
                     };
                     // A domain has no column to default to: only an explicit
                     // `@pgrpc_field(name)` attaches a field.
-                    let field = match constraint.comment().and_then(crate::annotations::parse_field) {
+                    let field = match crate::annotations::Annotations::of(constraint.comment()).field {
                         Some(Some(f)) => Some(f),
                         _ => None,
                     };
@@ -338,21 +694,19 @@ pub fn generate_unified_error(
     let mut error_variants: Vec<TokenStream> = Vec::new();
 
     // Generate variants for each table's constraints
-    for (table_id, _) in table_constraints {
+    for table_id in table_constraints.keys() {
         let table_name_str = table_id.name();
-        let table_name_pascal = table_name_str.to_pascal_case();
-        let variant_name = quote::format_ident!("{}Constraint", table_name_pascal);
-        let constraint_enum = quote::format_ident!("{}Constraint", table_name_pascal);
+        let variant_name = constraint_enum_ident(table_id, table_constraints);
 
         error_variants.push(quote! {
             #[error("{} table constraint violation", #table_name_str)]
-            #variant_name(#constraint_enum, #[source] tokio_postgres::error::DbError)
+            #variant_name(#variant_name, #[source] tokio_postgres::error::DbError)
         });
     }
 
     // Add custom SQL state exceptions from config
     let mut config_variants = BTreeSet::new();
-    for (_sql_code, description) in &config.exceptions {
+    for description in config.exceptions.values() {
         let variant_name = sql_to_rs_ident(description, Pascal);
         if config_variants.insert(variant_name.to_string()) {
             error_variants.push(quote! {
@@ -394,40 +748,27 @@ pub fn generate_unified_error(
         Decode(DecodeError)
     });
 
+    // A `:one` query that matched nothing.
+    error_variants.push(quote! {
+        /// A query declared `:one` returned no rows. `item` is the query's name.
+        #[error("{item}: query returned no rows")]
+        NoRows { item: &'static str }
+    });
+
     // Add generic database error - using transparent to show underlying SQL error
     error_variants.push(quote! {
         #[error(transparent)]
         Database(tokio_postgres::Error)
     });
 
-    // No longer need From<tokio_postgres::Error> implementation
-
-    // Build the error enum variants with proper comma separation
-    let all_error_variants = if error_variants.is_empty() {
-        quote! {}
-    } else {
-        let variants_with_commas = error_variants
-            .into_iter()
-            .map(|variant| quote! { #variant, })
-            .collect::<TokenStream>();
-        variants_with_commas
-    };
-
     let error_enum_def = quote! {
         #[derive(Debug, thiserror::Error)]
         pub enum PgRpcError {
-            #all_error_variants
+            #(#error_variants,)*
         }
     };
 
-    // From implementation removed - will be handled at function level
-
-    // No wrapper needed anymore
-
-    // Generate helper methods for the error type
-    let helper_methods = generate_helper_methods(table_constraints, custom_exceptions, config);
-
-    // Generate AsDbError implementation
+    let helper_methods = generate_helper_methods(config);
     let as_db_error_impl = generate_as_db_error_impl(table_constraints, custom_exceptions, config);
 
     quote! {
@@ -439,184 +780,14 @@ pub fn generate_unified_error(
     }
 }
 
-/// Generates the match arms for the From<tokio_postgres::Error> implementation
-/// This is now used by function-specific error enums
-/// Note: Constraint names are unique within a schema in PostgreSQL
-pub fn generate_from_impl_arms(
-    table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
-    custom_exceptions: &BTreeSet<PgException>,
-    config: &Config,
-) -> TokenStream {
-    let mut unique_arms: Vec<TokenStream> = Vec::new();
-    let mut check_arms: Vec<TokenStream> = Vec::new();
-    let mut fk_arms: Vec<TokenStream> = Vec::new();
-    let mut not_null_arms: Vec<TokenStream> = Vec::new();
-    let mut custom_arms: Vec<TokenStream> = Vec::new();
-
-    // Process constraints by table
-    for (table_id, constraints) in table_constraints {
-        let table_name_str = table_id.name();
-        let table_name_pascal = table_name_str.to_pascal_case();
-        let error_variant = quote::format_ident!("{}Constraint", table_name_pascal);
-        let constraint_enum = quote::format_ident!("{}Constraint", table_name_pascal);
-
-        for constraint in constraints {
-            match constraint {
-                Constraint::PrimaryKey(pk) => {
-                    let constraint_name = pk.name.as_str();
-                    unique_arms.push(quote! {
-                        Some(#constraint_name) => PgRpcError::#error_variant(
-                            #constraint_enum::PrimaryKey,
-                            db_error.to_owned()
-                        )
-                    });
-                }
-                Constraint::Unique(u) => {
-                    let constraint_name = u.name.as_str();
-                    let variant_name_str = u.name.to_pascal_case();
-                    let variant_name = quote::format_ident!("{}", variant_name_str);
-                    unique_arms.push(quote! {
-                        Some(#constraint_name) => PgRpcError::#error_variant(
-                            #constraint_enum::#variant_name,
-                            db_error.to_owned()
-                        )
-                    });
-                }
-                Constraint::Check(c) => {
-                    let constraint_name = c.name.as_str();
-                    let variant_name_str = c.name.to_pascal_case();
-                    let variant_name = quote::format_ident!("{}", variant_name_str);
-                    check_arms.push(quote! {
-                        Some(#constraint_name) => PgRpcError::#error_variant(
-                            #constraint_enum::#variant_name,
-                            db_error.to_owned()
-                        )
-                    });
-                }
-                Constraint::ForeignKey(fk) => {
-                    let constraint_name = fk.name.as_str();
-                    let variant_name_str = fk.name.to_pascal_case();
-                    let variant_name = quote::format_ident!("{}", variant_name_str);
-                    fk_arms.push(quote! {
-                        Some(#constraint_name) => PgRpcError::#error_variant(
-                            #constraint_enum::#variant_name,
-                            db_error.to_owned()
-                        )
-                    });
-                }
-                Constraint::NotNull(nn) => {
-                    let column_name = nn.column.as_str();
-                    let col_variant_str = nn.column.to_pascal_case();
-                    let variant_name = quote::format_ident!("{}NotNull", col_variant_str);
-                    not_null_arms.push(quote! {
-                        (Some(#table_name_str), Some(#column_name)) => PgRpcError::#error_variant(
-                            #constraint_enum::#variant_name,
-                            db_error.to_owned()
-                        )
-                    });
-                }
-                _ => {} // Skip other constraint types
-            }
-        }
-    }
-
-    // Process custom exceptions from config first
-    for (sql_code, description) in &config.exceptions {
-        let variant_name = sql_to_rs_ident(description, Pascal);
-        custom_arms.push(quote! {
-            code if code == &tokio_postgres::error::SqlState::from_code(#sql_code) => {
-                PgRpcError::#variant_name(db_error.to_owned())
-            }
-        });
-    }
-
-    // Process any additional custom exceptions not covered by config
-    for exception in custom_exceptions {
-        if let PgException::Explicit(sql_state) = exception {
-            let code = sql_state.code();
-            // Skip if already handled by config
-            if !config.exceptions.contains_key(code) {
-                let variant_name = exception.rs_name(config);
-                custom_arms.push(quote! {
-                    code if code == &tokio_postgres::error::SqlState::from_code(#code) => {
-                        PgRpcError::#variant_name(db_error.to_owned())
-                    }
-                });
-            }
-        }
-    }
-
-    // Build the complete match expression
-    let mut all_arms = Vec::new();
-
-    if !unique_arms.is_empty() {
-        all_arms.push(quote! {
-            &tokio_postgres::error::SqlState::UNIQUE_VIOLATION => {
-                match db_error.constraint() {
-                    #(#unique_arms,)*
-                    _ => PgRpcError::Database(e)
-                }
-            },
-        });
-    }
-
-    if !check_arms.is_empty() {
-        all_arms.push(quote! {
-            &tokio_postgres::error::SqlState::CHECK_VIOLATION => {
-                match db_error.constraint() {
-                    #(#check_arms,)*
-                    _ => PgRpcError::Database(e)
-                }
-            },
-        });
-    }
-
-    if !fk_arms.is_empty() {
-        all_arms.push(quote! {
-            &tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION => {
-                match db_error.constraint() {
-                    #(#fk_arms,)*
-                    _ => PgRpcError::Database(e)
-                }
-            },
-        });
-    }
-
-    if !not_null_arms.is_empty() {
-        all_arms.push(quote! {
-            &tokio_postgres::error::SqlState::NOT_NULL_VIOLATION => {
-                match (db_error.table(), db_error.column()) {
-                    #(#not_null_arms,)*
-                    _ => PgRpcError::Database(e)
-                }
-            },
-        });
-    }
-
-    if !custom_arms.is_empty() {
-        all_arms.extend(custom_arms);
-    }
-
-    // Combine all arms into a single TokenStream
-    let combined_arms = all_arms.into_iter().collect::<TokenStream>();
-
-    combined_arms
-}
-
 /// Generates helper methods for the PgRpcError enum
-fn generate_helper_methods(
-    table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
-    custom_exceptions: &BTreeSet<PgException>,
-    config: &Config,
-) -> TokenStream {
+fn generate_helper_methods(config: &Config) -> TokenStream {
     let mut methods = Vec::new();
 
     // Only generate helper methods for custom exceptions from config
-    for (_sql_code, description) in &config.exceptions {
-        let method_name = format_ident!(
-            "is_{}",
-            sql_to_rs_ident(description, crate::ident::CaseType::Snake).to_string()
-        );
+    for description in config.exceptions.values() {
+        let snake = crate::ident::sql_to_rs_string(description, CaseType::Snake);
+        let method_name = format_ident!("is_{}", snake.strip_prefix("r#").unwrap_or(&snake));
         let variant_name = sql_to_rs_ident(description, Pascal);
 
         methods.push(quote! {
@@ -645,8 +816,7 @@ pub fn generate_as_db_error_impl(
     let constraint_arms: Vec<TokenStream> = table_constraints
         .keys()
         .map(|table_id| {
-            let table_name_pascal = table_id.name().to_pascal_case();
-            let variant_name = format_ident!("{}Constraint", table_name_pascal);
+            let variant_name = constraint_enum_ident(table_id, table_constraints);
             quote! { PgRpcError::#variant_name(_, db_error) => Some(db_error) }
         })
         .collect();
@@ -655,7 +825,7 @@ pub fn generate_as_db_error_impl(
     let mut custom_variant_names = Vec::new();
 
     // Custom exceptions from config
-    for (_sql_code, description) in &config.exceptions {
+    for description in config.exceptions.values() {
         let variant_name = sql_to_rs_ident(description, Pascal);
         custom_variant_names.push(variant_name);
     }
@@ -688,6 +858,7 @@ pub fn generate_as_db_error_impl(
                     #(#constraint_arms,)*
                     #(#custom_arms,)*
                     PgRpcError::Decode(e) => e.source.downcast_ref::<tokio_postgres::Error>().and_then(|e| e.as_db_error()),
+                    PgRpcError::NoRows { .. } => None,
                     PgRpcError::Database(e) => e.as_db_error(),
                 }
             }
@@ -715,6 +886,7 @@ mod tests {
                 comment: None,
                 name: ustr("users_email_key"),
                 columns: SmallVec::from([ustr("email")]),
+                conditional: false,
             }),
             Constraint::Check(CheckConstraint {
                 comment: None,
@@ -749,6 +921,7 @@ mod tests {
             comment: None,
             name: ustr("users_email_key"),
             columns: SmallVec::from([ustr("email")]),
+            conditional: false,
         })];
 
         let users_id = PgId::new(Some(ustr("public")), ustr("users"));
@@ -798,6 +971,7 @@ mod tests {
                 comment: None,
                 name: ustr("users_email_key"),
                 columns: SmallVec::from([ustr("email")]),
+                conditional: false,
             })],
             columns: vec![ustr("id"), ustr("email"), ustr("name")],
             column_types: vec![],
@@ -812,5 +986,130 @@ mod tests {
         let users_id = PgId::new(Some(ustr("public")), ustr("users"));
         assert!(table_constraints.contains_key(&users_id));
         assert_eq!(table_constraints[&users_id].len(), 1);
+    }
+
+    fn check(name: &str) -> Constraint {
+        Constraint::Check(CheckConstraint {
+            comment: None,
+            name: ustr(name),
+            columns: SmallVec::from([ustr("qty")]),
+            check_expression: None,
+        })
+    }
+
+    #[test]
+    fn tables_sharing_a_name_get_schema_qualified_enums() {
+        let a_item = PgId::new(Some(ustr("a")), ustr("item"));
+        let b_item = PgId::new(Some(ustr("b")), ustr("item"));
+        let other = PgId::new(Some(ustr("a")), ustr("other"));
+        let table_constraints = BTreeMap::from([
+            (a_item, vec![check("positive")]),
+            (b_item, vec![check("positive")]),
+            (other, vec![check("1_positive")]),
+        ]);
+
+        let name = |id: &PgId| constraint_enum_ident(id, &table_constraints).to_string();
+        assert_eq!(name(&a_item), "AItemConstraint");
+        assert_eq!(name(&b_item), "BItemConstraint");
+        // Unshared names are unchanged.
+        assert_eq!(name(&other), "OtherConstraint");
+
+        let enums: String = generate_constraint_enums(&table_constraints)
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(enums.contains("enum AItemConstraint"));
+        assert!(enums.contains("enum BItemConstraint"));
+        // A constraint name starting with a digit is still an identifier.
+        assert!(enums.contains("_1Positive"));
+    }
+
+    #[test]
+    fn violations_match_on_schema_table_and_constraint() {
+        let a_item = PgId::new(Some(ustr("a")), ustr("item"));
+        let a_other = PgId::new(Some(ustr("a")), ustr("other"));
+        let table_constraints = BTreeMap::from([
+            (a_item, vec![check("positive"), check("only_item")]),
+            (a_other, vec![check("positive")]),
+        ]);
+
+        let arms: String = constraint_violation_arms(
+            &quote! { FooError },
+            &table_constraints,
+            &table_constraints,
+        )
+        .iter()
+        .map(|arm| arm.to_string())
+        .collect();
+
+        assert!(arms.contains("db_error . schema () , db_error . table () , db_error . constraint ()"));
+        assert!(arms.contains(r#"(Some ("a") , Some ("item") , Some ("positive")) => FooError :: ItemConstraint"#));
+        assert!(arms.contains(r#"(Some ("a") , Some ("other") , Some ("positive")) => FooError :: OtherConstraint"#));
+        // Only an unambiguous name is also matched on its own (for
+        // partitions, which report their own table name).
+        assert!(arms.contains(r#"(_ , _ , Some ("only_item")) => FooError :: ItemConstraint"#));
+        assert!(!arms.contains(r#"(_ , _ , Some ("positive"))"#));
+    }
+
+    fn error_enum(exceptions: &[PgException], descriptions: &[(&str, &str)]) -> String {
+        let config = Config {
+            exceptions: descriptions
+                .iter()
+                .map(|(code, description)| (code.to_string(), description.to_string()))
+                .collect(),
+            ..Config::default()
+        };
+        generate_error_enum(
+            &quote! { DoItError },
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            exceptions,
+            &config,
+        )
+        .to_string()
+        .replace(' ', "")
+    }
+
+    fn explicit(code: &str) -> PgException {
+        PgException::Explicit(crate::sql_state::SqlState::from_code(code))
+    }
+
+    #[test]
+    fn error_enum_variants_follow_the_exception_list() {
+        let code = error_enum(
+            &[
+                explicit("P0002"),
+                PgException::CustomError("out_of_stock".to_string()),
+                explicit("M0001"),
+            ],
+            &[],
+        );
+        let at = |needle: &str| code.find(needle).unwrap_or_else(|| panic!("{needle} in {code}"));
+        assert!(at("NoDataFound(#[source]") < at("OutOfStock(super::custom_errors::OutOfStock"));
+        assert!(at("OutOfStock(super::custom_errors::OutOfStock") < at("M0001(#[source]"));
+        // The JSON-hint arm leads the SQLSTATE arms.
+        assert!(at(r#"db_error.hint()==Some("application/json")"#) < at(r#"from_code("P0002")"#));
+    }
+
+    #[test]
+    fn exceptions_sharing_a_variant_are_emitted_once() {
+        let code = error_enum(
+            &[
+                explicit("P0001"),
+                explicit("P0002"),
+                explicit("P0001"),
+                PgException::CustomError("denied".to_string()),
+                PgException::CustomError("denied".to_string()),
+            ],
+            &[("P0001", "app error"), ("P0002", "app error")],
+        );
+        assert_eq!(code.matches("AppError(#[source]").count(), 1, "{code}");
+        assert_eq!(code.matches("DoItError::AppError(db_error)=>Some(db_error)").count(), 1);
+        assert_eq!(code.matches("PgRpcError::AppError(db_error)").count(), 1);
+        // Both SQLSTATEs are still classified as the shared variant, once each.
+        assert_eq!(code.matches(r#"from_code("P0001")"#).count(), 1);
+        assert_eq!(code.matches(r#"from_code("P0002")"#).count(), 1);
+        assert_eq!(code.matches("Denied(super::custom_errors::Denied").count(), 1);
+        assert_eq!(code.matches(r#"Some("denied")=>"#).count(), 1);
     }
 }

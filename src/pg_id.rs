@@ -1,4 +1,3 @@
-use pg_query::protobuf::RangeVar;
 use serde::Deserialize;
 use ustr::{ustr, Ustr};
 
@@ -28,24 +27,5 @@ impl From<String> for PgId {
             .unwrap_or((None, ustr(s.as_ref())));
 
         Self::new(schema, name)
-    }
-}
-
-// for pg_query
-impl From<RangeVar> for PgId {
-    fn from(r: RangeVar) -> Self {
-        Self::new(
-            (!r.schemaname.is_empty()).then_some(r.schemaname.into()),
-            r.relname.into(),
-        )
-    }
-}
-
-impl From<&RangeVar> for PgId {
-    fn from(r: &RangeVar) -> Self {
-        Self::new(
-            (!r.schemaname.is_empty()).then_some(r.schemaname.as_str().into()),
-            r.relname.as_str().into(),
-        )
     }
 }

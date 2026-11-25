@@ -50,6 +50,7 @@
 
 use super::*;
 use crate::integration::compile_helpers::{
+    regenerate_test_cargo_project,
     add_test_binary, compile_and_run_with_args, create_test_cargo_project, print_output,
     read_pretty,
 };
@@ -152,23 +153,11 @@ fn single_field_group_decodes_at_runtime() {
         std::fs::write(&sql_file, REPRO_SQL).expect("write sql");
 
         // Regenerate so the test project picks up `repro.sql`.
-        PgrpcBuilder::new()
-            .connection_string(conn_string)
-            .schema("public")
-            .output_path(project_dir.join("src/generated"))
-            .queries_config(pgrpc::QueriesConfig {
+        regenerate_test_cargo_project(project_dir, conn_string, |builder| {
+            builder.schema("public").queries_config(pgrpc::QueriesConfig {
                 paths: vec![sql_file.to_string_lossy().to_string()],
             })
-            .build()
-            .expect("regen should succeed");
-
-        // Make sure lib.rs re-exports queries.rs so the binary can call it.
-        let lib_rs = project_dir.join("src/lib.rs");
-        let mut lib = std::fs::read_to_string(&lib_rs).unwrap();
-        if !lib.contains("pub use generated::queries") {
-            lib.push_str("\n#[allow(unused_imports)] pub use generated::queries::*;\n");
-            std::fs::write(&lib_rs, lib).unwrap();
-        }
+        });
 
         let test_code = indoc! {r#"
             use std::error::Error;

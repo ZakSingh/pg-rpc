@@ -58,11 +58,11 @@ impl ToSql for OwnedRs {
         out: &mut BytesMut,
     ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
         let inner = InnerOwned {
-            id: self.id.clone(),
+            id: self.id,
             name: self.name.clone(),
             description: self.description.clone(),
             tag: self.tag.clone(),
-            count: self.count.clone(),
+            count: self.count,
             note: self.note.clone(),
             payload: self.payload.clone(),
         };

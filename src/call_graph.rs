@@ -52,7 +52,14 @@ pub fn parse_plpgsql_expr(query: &str) -> Option<ParseResult> {
 /// `pg_query::parse_plpgsql`).
 pub fn plpgsql_callees(fn_json: &Value) -> BTreeSet<CallTarget> {
     let mut out = BTreeSet::new();
-    for data in fn_json.query("$..PLpgSQL_expr.query").unwrap() {
+    let exprs = match fn_json.query("$..PLpgSQL_expr.query") {
+        Ok(exprs) => exprs,
+        Err(e) => {
+            log::warn!("Could not walk a PL/pgSQL parse tree; its calls are not followed: {e}");
+            return out;
+        }
+    };
+    for data in exprs {
         let Some(query) = data.as_str() else { continue };
         if let Some(parsed) = parse_plpgsql_expr(query) {
             out.extend(sql_callees(&parsed));
