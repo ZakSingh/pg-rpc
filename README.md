@@ -510,6 +510,11 @@ pub async fn get_user_by_email(
 ) -> Result<GetUserByEmailRow, GetUserByEmailError>
 ```
 
+**Parameter types.** A parameter compared with a column (`col = :p`, `col IN (:p, ...)`)
+takes the column's declared type, so a parameter compared with a domain column is the
+domain's Rust type rather than its base type. An explicit cast on the parameter wins over
+that: `email = :p::text` makes it a plain string, and `:p::email` makes it the domain.
+
 **Positional Parameters:** Use `$1, $2, ...` for PostgreSQL standard syntax:
 
 ```sql
