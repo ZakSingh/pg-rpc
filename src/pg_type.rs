@@ -205,6 +205,41 @@ fn composite_to_sql_impl(
     }
 }
 
+/// `row.try_get("<column>")?` for a generated `TryFrom<Row>` impl, with a
+/// failure attributed to `item` and the column as a `DecodeError`. The column
+/// is found by name; `index` is its position at generation time.
+fn row_get(item: &str, column: &str, index: usize) -> TokenStream {
+    let decode = crate::codegen::decode_err(item, column, index);
+    quote! { row.try_get(#column).map_err(#decode)? }
+}
+
+/// `impl TryFrom<Row> for #rs_name`, for a struct with one field per
+/// composite attribute: used when a function returns rows of the type.
+fn composite_try_from_row_impl(rs_name: &TokenStream, fields: &[PgField]) -> TokenStream {
+    let item = rs_name.to_string();
+    let rs_fields: Vec<TokenStream> = fields
+        .iter()
+        .map(|f| sql_to_rs_ident(&f.name, CaseType::Snake))
+        .collect();
+    let values: Vec<TokenStream> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| row_get(&item, &f.name, i))
+        .collect();
+
+    quote! {
+        impl TryFrom<tokio_postgres::Row> for #rs_name {
+            type Error = super::errors::DecodeError;
+
+            fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                Ok(Self {
+                    #(#rs_fields: #values),*
+                })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PgField {
     pub name: String,
@@ -420,6 +455,12 @@ impl PgType {
             |f, new_name| f.name = new_name,
         );
 
+        // Decode failures name the struct and the original column, at its
+        // position in the ungrouped column list.
+        let item = rs_name.to_string();
+        let index_of =
+            |column: &str| fields.iter().position(|f| f.name == column).unwrap_or(0);
+
         let mut nested_struct_defs: Vec<TokenStream> = Vec::new();
         let mut parent_fields: Vec<TokenStream> = Vec::new();
         let mut parent_extractions: Vec<TokenStream> = Vec::new();
@@ -434,8 +475,9 @@ impl PgType {
                     let rs_field_name = sql_to_rs_ident(&field.name, CaseType::Snake);
 
                     parent_fields.push(field_token);
+                    let value = row_get(&item, sql_name, index_of(sql_name));
                     parent_extractions.push(quote! {
-                        let #var_name = row.try_get(#sql_name)?;
+                        let #var_name = #value;
                     });
                     parent_assignments.push(quote! { #rs_field_name: #var_name });
                 }
@@ -474,8 +516,10 @@ impl PgType {
                                 group_name,
                                 f.name
                             );
+                            let value =
+                                row_get(&item, &original_sql_name, index_of(&original_sql_name));
                             quote! {
-                                let #var_name = row.try_get(#original_sql_name)?;
+                                let #var_name = #value;
                             }
                         })
                         .collect();
@@ -544,8 +588,13 @@ impl PgType {
                             .map(|f| {
                                 let original_sql_name = format!("{}__{}", group_name, f.name);
                                 let var_name = format_ident!("_{}_{}", group_name, f.name);
+                                let value = row_get(
+                                    &item,
+                                    &original_sql_name,
+                                    index_of(&original_sql_name),
+                                );
                                 quote! {
-                                    let #var_name = row.try_get(#original_sql_name)?;
+                                    let #var_name = #value;
                                 }
                             })
                             .collect();
@@ -559,8 +608,10 @@ impl PgType {
                             })
                             .collect();
 
+                        let sentinel_value =
+                            row_get(&item, &sentinel_sql_name, index_of(&sentinel_sql_name));
                         parent_extractions.push(quote! {
-                            let #sentinel_var: Option<serde_json::Value> = row.try_get(#sentinel_sql_name)?;
+                            let #sentinel_var: Option<serde_json::Value> = #sentinel_value;
                         });
 
                         parent_assignments.push(quote! {
@@ -973,7 +1024,7 @@ impl PgType {
             }
 
             impl TryFrom<tokio_postgres::Row> for #rs_name {
-                type Error = tokio_postgres::Error;
+                type Error = super::errors::DecodeError;
 
                 fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
                     #(#parent_extractions)*
@@ -1260,42 +1311,7 @@ impl ToRust for PgType {
                 let to_sql_impl =
                     composite_to_sql_impl(&rs_name, &quote! {}, &[name.as_str()], &sql_fields);
 
-                let field_extractions: Vec<_> = fields
-                    .iter()
-                    .map(|f| {
-                        let sql_name = &f.name;
-                        let rs_name_str = f.name.clone();
-                        let var_name = format_ident!("_{}", rs_name_str);
-
-                        quote! {
-                            let #var_name = row.try_get(#sql_name)?;
-                        }
-                    })
-                    .collect();
-
-                let field_assignments: Vec<_> = fields
-                    .into_iter()
-                    .map(|f| {
-                        let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
-                        let rs_name_str = f.name.clone();
-                        let var_name = format_ident!("_{}", rs_name_str);
-                        quote! { #rs_name: #var_name }
-                    })
-                    .collect();
-
-                let try_from_impl = quote! {
-                    impl TryFrom<tokio_postgres::Row> for #rs_name {
-                        type Error = tokio_postgres::Error;
-
-                        fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
-                            #(#field_extractions)*
-
-                            Ok(Self {
-                                #(#field_assignments),*
-                            })
-                        }
-                    }
-                };
+                let try_from_impl = composite_try_from_row_impl(&rs_name, fields);
 
                 let comment_macro = if comment.is_some() {
                     quote! { #[doc=#comment] }
@@ -1399,29 +1415,7 @@ impl ToRust for PgType {
                         let to_sql_impl =
                             composite_to_sql_impl(&rs_name, &quote! {}, &pg_names, &sql_fields);
 
-                        let field_extractions: Vec<_> = fields
-                            .iter()
-                            .map(|f| {
-                                let sql_name = &f.name;
-                                let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
-                                let rs_name_str = f.name.clone();
-                                let var_name = format_ident!("_{}", rs_name_str);
-
-                                quote! {
-                                    let #var_name = row.try_get(#sql_name)?;
-                                }
-                            })
-                            .collect();
-
-                        let field_assignments: Vec<_> = fields
-                            .into_iter()
-                            .map(|f| {
-                                let rs_name = sql_to_rs_ident(&f.name, CaseType::Snake);
-                                let rs_name_str = f.name.clone();
-                                let var_name = format_ident!("_{}", rs_name_str);
-                                quote! { #rs_name: #var_name }
-                            })
-                            .collect();
+                        let try_from_impl = composite_try_from_row_impl(&rs_name, fields);
 
                         let comment_macro = if comment.is_some() {
                             quote! { #[doc=#comment] }
@@ -1452,17 +1446,7 @@ impl ToRust for PgType {
 
                             #to_sql_impl
 
-                            impl TryFrom<tokio_postgres::Row> for #rs_name {
-                                type Error = tokio_postgres::Error;
-
-                                fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
-                                    #(#field_extractions)*
-
-                                    Ok(Self {
-                                        #(#field_assignments),*
-                                    })
-                                }
-                            }
+                            #try_from_impl
                         }
                     }
                     pg_type => {

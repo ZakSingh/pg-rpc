@@ -128,6 +128,7 @@ with recursive user_relations as (
                                              from unnest(con.conkey) k
                                                       join pg_attribute a on a.attrelid = ur.oid and a.attnum = k),
                                             'on_delete', con.confdeltype,
+                                            'on_update', con.confupdtype,
                                             'comment', obj_description(con.oid, 'pg_constraint'),
                                             'ref_table', ref_class.relname::text,
                                             'ref_table_oid', con.confrelid::bigint,

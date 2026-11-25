@@ -1697,7 +1697,7 @@ mod tests {
     /// is NOT marked as a primary key. This tests FK-based inference.
     fn rel_index_with_fk_relationship() -> RelIndex {
         use crate::pg_constraint::{ForeignKeyConstraint, PrimaryKeyConstraint};
-        use crate::pg_constraint::OnDelete;
+        use crate::pg_constraint::FkAction;
         let mut index = RelIndex::default();
 
         // Orders table with PK and FK to customers
@@ -1716,7 +1716,8 @@ mod tests {
                     ref_table_oid: None,
                     name: ustr("orders_customer_id_fkey"),
                     columns: SmallVec::from([ustr("customer_id")]),
-                    on_delete: OnDelete::NoAction,
+                    on_delete: FkAction::NoAction,
+                    on_update: FkAction::NoAction,
                     ref_table: Some("customers".to_string()),
                     ref_columns: Some(SmallVec::from([ustr("customer_id")])),
                 }),
@@ -1770,7 +1771,8 @@ mod tests {
                     ref_table_oid: None,
                     name: ustr("order_items_order_id_fkey"),
                     columns: SmallVec::from([ustr("order_id")]),
-                    on_delete: OnDelete::Cascade,
+                    on_delete: FkAction::Cascade,
+                    on_update: FkAction::NoAction,
                     ref_table: Some("orders".to_string()),
                     ref_columns: Some(SmallVec::from([ustr("order_id")])),
                 }),
@@ -1779,7 +1781,8 @@ mod tests {
                     ref_table_oid: None,
                     name: ustr("order_items_product_id_fkey"),
                     columns: SmallVec::from([ustr("product_id")]),
-                    on_delete: OnDelete::Restrict,
+                    on_delete: FkAction::Restrict,
+                    on_update: FkAction::NoAction,
                     ref_table: Some("products".to_string()),
                     ref_columns: Some(SmallVec::from([ustr("product_id")])),
                 }),

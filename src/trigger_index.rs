@@ -1,6 +1,6 @@
 use crate::codegen::OID;
 use crate::call_graph::{self, CallTarget};
-use crate::constraint_analysis::{extract_queries, get_rel_deps, RelDep};
+use crate::constraint_analysis::{extract_queries, get_rel_deps, trigger_event_for, RelDep};
 use crate::exceptions::{get_exceptions_from_deps, PgException};
 use crate::fn_index::FunctionIndex;
 use itertools::Itertools;
@@ -42,12 +42,27 @@ pub struct TriggerFunction {
     pub source: String,
     pub comment: Option<String>,
     /// Exceptions that this trigger function can raise, including those of
-    /// the functions it calls.
+    /// the functions it calls and of the triggers its DML fires.
     pub exceptions: Vec<PgException>,
-    /// DML the trigger function (and its callees) performs.
+    /// DML the trigger function performs, itself or through its callees and
+    /// the triggers that DML fires.
     pub rel_deps: Vec<RelDep>,
     /// Functions called from the trigger body, by name as written.
     pub callees: BTreeSet<CallTarget>,
+}
+
+impl TriggerFunction {
+    /// Add exceptions and DML that reach this function indirectly.
+    fn absorb(&mut self, exceptions: Vec<PgException>, rel_deps: Vec<RelDep>) {
+        if !exceptions.is_empty() {
+            self.exceptions.extend(exceptions);
+            self.exceptions = std::mem::take(&mut self.exceptions)
+                .into_iter()
+                .unique()
+                .collect();
+        }
+        self.rel_deps.extend(rel_deps);
+    }
 }
 
 /// Information about a trigger
@@ -169,6 +184,7 @@ impl TriggerIndex {
 
         let mut index = Self { triggers_by_table };
         index.follow_calls(fn_index);
+        index.follow_triggers();
         Ok(index)
     }
 
@@ -195,15 +211,56 @@ impl TriggerIndex {
                 extra_exceptions.extend(callee.exceptions.iter().cloned());
                 extra_deps.extend(callee.rel_deps.iter().cloned());
             }
-            if extra_exceptions.is_empty() && extra_deps.is_empty() {
-                continue;
+            function.absorb(extra_exceptions, extra_deps);
+        }
+    }
+
+    /// Union into each trigger function what the triggers fired by its own
+    /// DML raise and write, to any depth: a trigger that writes table B makes
+    /// B's triggers part of every statement that fires it. Runs after
+    /// [`Self::follow_calls`], so DML done through callees counts.
+    fn follow_triggers(&mut self) {
+        let by_oid: HashMap<OID, &Trigger> = self
+            .triggers_by_table
+            .values()
+            .flatten()
+            .map(|t| (t.oid, t))
+            .collect();
+        let fired_by = |trigger: &Trigger| -> Vec<OID> {
+            trigger
+                .function
+                .rel_deps
+                .iter()
+                .filter_map(|dep| trigger_event_for(&dep.cmd).map(|event| (dep.rel_oid, event)))
+                .flat_map(|(table, event)| self.get_triggers_for_event(table, &event))
+                .map(|t| t.oid)
+                .collect()
+        };
+
+        let mut additions: HashMap<OID, (Vec<PgException>, Vec<RelDep>)> = HashMap::new();
+        for trigger in by_oid.values() {
+            // Every trigger reachable from this one. `seen` starts with the
+            // trigger itself, so one that re-fires itself terminates.
+            let mut seen = BTreeSet::from([trigger.oid]);
+            let mut pending = fired_by(trigger);
+            let mut exceptions = Vec::new();
+            let mut deps = Vec::new();
+            while let Some(oid) = pending.pop() {
+                if !seen.insert(oid) {
+                    continue;
+                }
+                let nested = by_oid[&oid];
+                exceptions.extend(nested.function.exceptions.iter().cloned());
+                deps.extend(nested.function.rel_deps.iter().cloned());
+                pending.extend(fired_by(nested));
             }
-            function.exceptions.extend(extra_exceptions);
-            function.exceptions = std::mem::take(&mut function.exceptions)
-                .into_iter()
-                .unique()
-                .collect();
-            function.rel_deps.extend(extra_deps);
+            additions.insert(trigger.oid, (exceptions, deps));
+        }
+
+        for trigger in self.triggers_by_table.values_mut().flatten() {
+            if let Some((exceptions, deps)) = additions.remove(&trigger.oid) {
+                trigger.function.absorb(exceptions, deps);
+            }
         }
     }
 

@@ -37,7 +37,7 @@ fn test_procedure_with_no_parameters() {
 
         // Verify the procedure is generated with CALL
         assert!(
-            public_content.contains("CALL public.simple_procedure"),
+            public_content.contains(r#"CALL \"public\".\"simple_procedure\""#),
             "Should generate CALL statement for procedure"
         );
         assert!(
@@ -113,8 +113,8 @@ fn test_procedure_with_in_parameters() {
         );
 
         // Since procedures with void return generate execute() calls, the CALL might be inline
-        let has_call = public_content.contains("CALL public.update_user_status")
-            || public_content.contains(r#"CALL public.update_user_status"#);
+        let has_call =
+            public_content.contains(r#"CALL \"public\".\"update_user_status\""#);
 
         if !has_call {
             println!("CALL statement not found. Here's what we have:");

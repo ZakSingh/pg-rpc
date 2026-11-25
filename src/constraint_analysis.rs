@@ -5,7 +5,7 @@
 
 use crate::codegen::OID;
 use crate::exceptions::PgException;
-use crate::pg_constraint::{Constraint, OnDelete};
+use crate::pg_constraint::{Constraint, FkAction, ForeignKeyConstraint};
 use crate::pg_id::PgId;
 use crate::rel_index::RelIndex;
 use crate::trigger_index::{TriggerEvent, TriggerIndex};
@@ -129,14 +129,7 @@ pub fn trigger_rel_deps(rel_deps: &[RelDep], trigger_index: &TriggerIndex) -> Ve
 /// Populate trigger exceptions for relation dependencies
 pub fn populate_trigger_exceptions(rel_deps: &mut [RelDep], trigger_index: &TriggerIndex) {
     for rel_dep in rel_deps {
-        let trigger_event = match &rel_dep.cmd {
-            Cmd::Insert { .. } => Some(TriggerEvent::Insert),
-            Cmd::Update { .. } => Some(TriggerEvent::Update),
-            Cmd::Delete => Some(TriggerEvent::Delete),
-            _ => None,
-        };
-
-        if let Some(event) = trigger_event {
+        if let Some(event) = trigger_event_for(&rel_dep.cmd) {
             rel_dep.trigger_exceptions =
                 trigger_index.get_exceptions_for_event(rel_dep.rel_oid, &event);
         }
@@ -187,6 +180,8 @@ pub fn sql_rel_deps(
 /// DELETE cannot violate the deleted table's own constraints; what fails is a
 /// `RESTRICT` / `NO ACTION` foreign key on *another* table that still
 /// references the row, so those are returned under the referencing table.
+/// An UPDATE that changes a referenced key fails the same way, on the keys
+/// whose `ON UPDATE` action is `RESTRICT` / `NO ACTION`.
 /// `NOT NULL` is included; callers that cannot classify it drop it.
 pub fn applicable_constraints(dep: &RelDep, rel_index: &RelIndex) -> Vec<(PgId, Constraint)> {
     let Some(rel) = rel_index.get(&dep.rel_oid) else {
@@ -198,6 +193,15 @@ pub fn applicable_constraints(dep: &RelDep, rel_index: &RelIndex) -> Vec<(PgId, 
             .iter()
             .filter(|c| !matches!(c, Constraint::Default(_)) && c.contains_columns(cols))
             .map(|c| (rel.id.clone(), c.clone()))
+            .chain(referencing_foreign_keys(dep.rel_oid, rel_index, |fk| {
+                blocks(&fk.on_update)
+                    // Only a change to the referenced key can strand a row.
+                    // Without the key's columns, assume it can.
+                    && fk
+                        .ref_columns
+                        .as_ref()
+                        .is_none_or(|key| cols.iter().any(|c| key.contains(c)))
+            }))
             .collect(),
         Cmd::Insert { cols, on_conflict } => rel
             .constraints
@@ -223,22 +227,34 @@ pub fn applicable_constraints(dep: &RelDep, rel_index: &RelIndex) -> Vec<(PgId, 
             })
             .map(|c| (rel.id.clone(), c.clone()))
             .collect(),
-        Cmd::Delete => rel_index
-            .values()
-            .flat_map(|other| {
-                other.constraints.iter().filter_map(move |c| match c {
-                    Constraint::ForeignKey(fk)
-                        if fk.ref_table_oid == Some(dep.rel_oid)
-                            && matches!(fk.on_delete, OnDelete::Restrict | OnDelete::NoAction) =>
-                    {
-                        Some((other.id.clone(), c.clone()))
-                    }
-                    _ => None,
-                })
-            })
-            .collect(),
+        Cmd::Delete => {
+            referencing_foreign_keys(dep.rel_oid, rel_index, |fk| blocks(&fk.on_delete)).collect()
+        }
         Cmd::Select { .. } => Vec::new(),
     }
+}
+
+/// True for the actions that fail the statement instead of repairing the
+/// referencing rows.
+fn blocks(action: &FkAction) -> bool {
+    matches!(action, FkAction::Restrict | FkAction::NoAction)
+}
+
+/// Foreign keys on other tables that reference `rel_oid` and satisfy `keep`,
+/// each under the table that owns it.
+fn referencing_foreign_keys<'a>(
+    rel_oid: OID,
+    rel_index: &'a RelIndex,
+    keep: impl Fn(&ForeignKeyConstraint) -> bool + 'a,
+) -> impl Iterator<Item = (PgId, Constraint)> + 'a {
+    rel_index
+        .values()
+        .flat_map(|other| other.constraints.iter().map(move |c| (other, c)))
+        .filter(move |(_, c)| match c {
+            Constraint::ForeignKey(fk) => fk.ref_table_oid == Some(rel_oid) && keep(fk),
+            _ => false,
+        })
+        .map(|(other, c)| (other.id.clone(), c.clone()))
 }
 
 /// The constraints that the given relation dependencies can violate, as both

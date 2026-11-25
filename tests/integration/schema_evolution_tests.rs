@@ -25,7 +25,7 @@ use crate::integration::compile_helpers::{
 };
 use indoc::indoc;
 
-const SCHEMA_N: &str = indoc! {"
+const SCHEMA_N: &str = indoc! {r#"
     create type evo_mood as enum ('happy', 'sad');
     create type evo_contact as (phone text, email text);
     create domain evo_checked_contact as evo_contact check ((value).phone is not null);
@@ -79,7 +79,11 @@ const SCHEMA_N: &str = indoc! {"
 
     create function api.evo_greet(p_name text) returns text
         language sql as $$ select 'hello ' || p_name $$;
-"};
+
+    -- Names that only resolve when quoted, including a named argument.
+    create function api."evoShout"("pName" text, "pSuffix" text default '!') returns text
+        language sql as $$ select upper("pName") || "pSuffix" $$;
+"#};
 
 /// Query files with a star that is not last. After the migration the view
 /// behind `v.*` has one more column, which lands in the middle of the row.
@@ -216,6 +220,10 @@ fn old_client_survives_additive_schema_changes() {
                     hello.as_deref().is_some_and(|h| h.starts_with("hello ann")),
                     "[{when}] defaulted parameter: {hello:?}"
                 );
+
+                let shout = evo_shout().p_name("ann").p_suffix("?").exec(client).await
+                    .unwrap_or_else(|e| panic!("[{when}] quoted names: {e:?}"));
+                assert_eq!(shout.as_deref(), Some("ANN?"), "[{when}] quoted names");
             }
 
             /// Writes of a composite: as a value, through a domain, and as an
@@ -360,13 +368,17 @@ fn old_client_survives_additive_schema_changes() {
             public_rs.contains("allow_mismatch"),
             "generated enums should carry #[postgres(allow_mismatch)]"
         );
+        assert!(
+            !public_rs.contains("type Error = tokio_postgres::Error"),
+            "rows of a composite should decode with a DecodeError"
+        );
         let api_rs = read_pretty(project.path().join("src/generated/api.rs"));
         assert!(
             !api_rs.contains("select * from"),
             "row-returning calls should name their columns, not select *"
         );
         assert!(
-            api_rs.contains(r#"select \"id\", \"name\", \"mood\", \"contact\" from api.evo_people"#),
+            api_rs.contains(r#"select \"id\", \"name\", \"mood\", \"contact\" from \"api\".\"evo_people\""#),
             "evo_people should select the columns known at generation time. Got:\n{}",
             api_rs
         );
