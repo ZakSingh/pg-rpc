@@ -586,6 +586,43 @@ fn builtin_function_rule(name: &str) -> Option<FnRule> {
     })
 }
 
+/// True iff the join's right side is a subquery that returns exactly one row
+/// whatever the data (every output is an aggregate, with no GROUP BY, HAVING,
+/// set operation, LIMIT or OFFSET) and the join condition is the constant
+/// `true`. Such a join pairs every left row with that one row, so an outer
+/// join of this shape behaves as an inner join.
+fn joins_exactly_one_row(join: &protobuf::JoinExpr) -> bool {
+    let on_true = matches!(
+        join.quals.as_ref().and_then(|q| q.node.as_ref()),
+        Some(N::AConst(c)) if matches!(
+            &c.val,
+            Some(protobuf::a_const::Val::Boolval(b)) if b.boolval
+        )
+    );
+    if !on_true || !join.using_clause.is_empty() || join.is_natural {
+        return false;
+    }
+    let Some(N::RangeSubselect(range_sub)) = join.rarg.as_ref().and_then(|r| r.node.as_ref())
+    else {
+        return false;
+    };
+    let Some(N::SelectStmt(select)) = range_sub.subquery.as_ref().and_then(|q| q.node.as_ref())
+    else {
+        return false;
+    };
+    select.op() == protobuf::SetOperation::SetopNone
+        && select.group_clause.is_empty()
+        && select.having_clause.is_none()
+        && select.limit_count.is_none()
+        && select.limit_offset.is_none()
+        && select.values_lists.is_empty()
+        && !select.target_list.is_empty()
+        && select.target_list.iter().all(|target| match target.node.as_ref() {
+            Some(N::ResTarget(rt)) => rt.val.as_deref().is_some_and(is_aggregate_call),
+            _ => false,
+        })
+}
+
 /// True iff `node` is a plain (non-window) call to a builtin aggregate. A
 /// query whose only target is one, with no GROUP BY / HAVING, returns exactly
 /// one row — `(SELECT count(*) FROM t)`, `(SELECT max(x) FROM t)`.
@@ -2368,6 +2405,10 @@ impl<'a> ViewNullabilityAnalyzer<'a> {
 
         match join.jointype() {
             ProtoJoinType::JoinInner => JoinType::Inner,
+            // `LEFT JOIN LATERAL (SELECT count(*) ...) x ON true`: the right
+            // side is always exactly one row and always matches, so nothing
+            // is ever NULL-extended.
+            ProtoJoinType::JoinLeft if joins_exactly_one_row(join) => JoinType::Inner,
             ProtoJoinType::JoinLeft => JoinType::Left,
             ProtoJoinType::JoinRight => JoinType::Right,
             ProtoJoinType::JoinFull => JoinType::Full,
@@ -2912,6 +2953,39 @@ mod tests {
         assert_nullable(&result, "name");
         let title_cn = result.get("title").unwrap();
         assert!(title_cn.nullable_due_to_join, "title should be join-nullable");
+    }
+
+    #[test]
+    fn left_join_on_true_to_an_ungrouped_aggregate_is_not_null_extending() {
+        let rel_index = create_test_rel_index();
+        let cache = ViewNullabilityCache::new();
+        let columns = vec!["id".to_string(), "n".to_string()];
+
+        let mut analyzer = ViewNullabilityAnalyzer::new(&rel_index, &cache);
+        let result = analyzer
+            .analyze_view(
+                "SELECT u.id, c.n FROM users u
+                 LEFT JOIN LATERAL (SELECT count(*)::int AS n FROM posts p WHERE p.user_id = u.id) c ON true",
+                &columns,
+            )
+            .unwrap();
+        assert_not_null(&result, "n");
+        assert!(!result.get("n").unwrap().nullable_due_to_join);
+
+        // Each of these can leave a left row without a partner (or the
+        // subquery without a row), so the column stays join-nullable.
+        for subquery_and_condition in [
+            "(SELECT count(*)::int AS n FROM posts p WHERE p.user_id = u.id) c ON c.n > 0",
+            "(SELECT count(*)::int AS n FROM posts p WHERE p.user_id = u.id GROUP BY p.user_id) c ON true",
+            "(SELECT count(*)::int AS n FROM posts p WHERE p.user_id = u.id HAVING count(*) > 1) c ON true",
+            "(SELECT count(*)::int AS n FROM posts p WHERE p.user_id = u.id LIMIT 0) c ON true",
+            "(SELECT p.id AS n FROM posts p WHERE p.user_id = u.id) c ON true",
+        ] {
+            let mut analyzer = ViewNullabilityAnalyzer::new(&rel_index, &cache);
+            let sql = format!("SELECT u.id, c.n FROM users u LEFT JOIN LATERAL {subquery_and_condition}");
+            let result = analyzer.analyze_view(&sql, &columns).unwrap();
+            assert!(result.get("n").unwrap().nullable_due_to_join, "{sql}");
+        }
     }
 
     #[test]

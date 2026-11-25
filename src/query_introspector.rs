@@ -483,17 +483,24 @@ impl<'a> QueryIntrospector<'a> {
     ) -> HashMap<String, OID> {
         let mut result = HashMap::new();
 
-        let select = match parse_result
+        // The list that names the result columns: a SELECT's target list, or
+        // the RETURNING list of a data-modifying statement.
+        use pg_query::protobuf::node::Node;
+        let targets = match parse_result
             .stmts
             .first()
             .and_then(|s| s.stmt.as_ref())
             .and_then(|n| n.node.as_ref())
         {
-            Some(pg_query::protobuf::node::Node::SelectStmt(select)) => select,
+            Some(Node::SelectStmt(select)) => &select.target_list,
+            Some(Node::InsertStmt(insert)) => &insert.returning_list,
+            Some(Node::UpdateStmt(update)) => &update.returning_list,
+            Some(Node::DeleteStmt(delete)) => &delete.returning_list,
+            Some(Node::MergeStmt(merge)) => &merge.returning_list,
             _ => return result,
         };
 
-        for target in &select.target_list {
+        for target in targets {
             let res_target = match &target.node {
                 Some(pg_query::protobuf::node::Node::ResTarget(rt)) => rt,
                 _ => continue,
