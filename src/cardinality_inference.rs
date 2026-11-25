@@ -1266,7 +1266,7 @@ mod tests {
     use crate::pg_constraint::UniqueConstraint;
     use crate::pg_id::PgId;
     use crate::pg_rel::{PgRel, PgRelKind};
-    use smallvec::smallvec;
+    use smallvec::SmallVec;
     use ustr::ustr;
 
     fn empty_rel_index() -> RelIndex {
@@ -1284,7 +1284,7 @@ mod tests {
             constraints: vec![Constraint::Unique(UniqueConstraint {
                 comment: None,
                 name: ustr("help_center_article_section_slug_idx"),
-                columns: smallvec![ustr("section"), ustr("slug")],
+                columns: SmallVec::from([ustr("section"), ustr("slug")]),
             })],
             columns: vec![
                 ustr("id"),
@@ -1519,7 +1519,7 @@ mod tests {
             constraints: vec![Constraint::PrimaryKey(PrimaryKeyConstraint {
                 comment: None,
                 name: ustr("orders_pkey"),
-                columns: smallvec![ustr("order_id")],
+                columns: SmallVec::from([ustr("order_id")]),
             })],
             columns: vec![ustr("order_id"), ustr("customer_id"), ustr("total")],
             column_types: vec![23, 23, 1700], // int4, int4, numeric
@@ -1534,7 +1534,7 @@ mod tests {
             constraints: vec![Constraint::PrimaryKey(PrimaryKeyConstraint {
                 comment: None,
                 name: ustr("customers_pkey"),
-                columns: smallvec![ustr("customer_id")],
+                columns: SmallVec::from([ustr("customer_id")]),
             })],
             columns: vec![ustr("customer_id"), ustr("name"), ustr("email")],
             column_types: vec![23, 25, 25], // int4, text, text
@@ -1605,7 +1605,7 @@ mod tests {
             constraints: vec![Constraint::PrimaryKey(PrimaryKeyConstraint {
                 comment: None,
                 name: ustr("users_pkey"),
-                columns: smallvec![ustr("user_id")],
+                columns: SmallVec::from([ustr("user_id")]),
             })],
             columns: vec![ustr("user_id"), ustr("email"), ustr("status")],
             column_types: vec![23, 25, 25], // int4, text, text
@@ -1709,16 +1709,16 @@ mod tests {
                 Constraint::PrimaryKey(PrimaryKeyConstraint {
                     comment: None,
                     name: ustr("orders_pkey"),
-                    columns: smallvec![ustr("order_id")],
+                    columns: SmallVec::from([ustr("order_id")]),
                 }),
                 Constraint::ForeignKey(ForeignKeyConstraint {
                     comment: None,
                     ref_table_oid: None,
                     name: ustr("orders_customer_id_fkey"),
-                    columns: smallvec![ustr("customer_id")],
+                    columns: SmallVec::from([ustr("customer_id")]),
                     on_delete: OnDelete::NoAction,
                     ref_table: Some("customers".to_string()),
-                    ref_columns: Some(smallvec![ustr("customer_id")]),
+                    ref_columns: Some(SmallVec::from([ustr("customer_id")])),
                 }),
             ],
             columns: vec![ustr("order_id"), ustr("customer_id"), ustr("total")],
@@ -1747,7 +1747,7 @@ mod tests {
             constraints: vec![Constraint::PrimaryKey(PrimaryKeyConstraint {
                 comment: None,
                 name: ustr("products_pkey"),
-                columns: smallvec![ustr("product_id")],
+                columns: SmallVec::from([ustr("product_id")]),
             })],
             columns: vec![ustr("product_id"), ustr("name"), ustr("price")],
             column_types: vec![23, 25, 1700],
@@ -1763,25 +1763,25 @@ mod tests {
                 Constraint::PrimaryKey(PrimaryKeyConstraint {
                     comment: None,
                     name: ustr("order_items_pkey"),
-                    columns: smallvec![ustr("item_id")],
+                    columns: SmallVec::from([ustr("item_id")]),
                 }),
                 Constraint::ForeignKey(ForeignKeyConstraint {
                     comment: None,
                     ref_table_oid: None,
                     name: ustr("order_items_order_id_fkey"),
-                    columns: smallvec![ustr("order_id")],
+                    columns: SmallVec::from([ustr("order_id")]),
                     on_delete: OnDelete::Cascade,
                     ref_table: Some("orders".to_string()),
-                    ref_columns: Some(smallvec![ustr("order_id")]),
+                    ref_columns: Some(SmallVec::from([ustr("order_id")])),
                 }),
                 Constraint::ForeignKey(ForeignKeyConstraint {
                     comment: None,
                     ref_table_oid: None,
                     name: ustr("order_items_product_id_fkey"),
-                    columns: smallvec![ustr("product_id")],
+                    columns: SmallVec::from([ustr("product_id")]),
                     on_delete: OnDelete::Restrict,
                     ref_table: Some("products".to_string()),
-                    ref_columns: Some(smallvec![ustr("product_id")]),
+                    ref_columns: Some(SmallVec::from([ustr("product_id")])),
                 }),
             ],
             columns: vec![ustr("item_id"), ustr("order_id"), ustr("product_id"), ustr("quantity")],

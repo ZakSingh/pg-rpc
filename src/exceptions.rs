@@ -7,7 +7,7 @@ use crate::pg_constraint::Constraint;
 use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
 use crate::trigger_index::TriggerIndex;
 use itertools::Itertools;
-use jsonpath_rust::{JsonPath, JsonPathValue};
+use jsonpath_rust::JsonPath;
 use proc_macro2::TokenStream;
 use quote::ToTokens;
 use serde_json::Value;
@@ -166,11 +166,9 @@ fn get_raised_sql_states_and_custom_errors(
 /// raise helper) is dynamic and contributes nothing, since any value is
 /// possible at runtime.
 fn raised_sql_states(fn_json: &Value) -> anyhow::Result<BTreeSet<SqlState>> {
-    let raise_path = JsonPath::try_from("$..PLpgSQL_stmt_raise")?;
     let mut sql_states = BTreeSet::new();
 
-    for slice in raise_path.find_slice(fn_json) {
-        let JsonPathValue::Slice(stmt, _) = slice else { continue };
+    for stmt in fn_json.query("$..PLpgSQL_stmt_raise")? {
         // 21 is ERROR; lower levels (NOTICE, WARNING, …) don't abort the call.
         if stmt.get("elog_level").and_then(Value::as_i64) != Some(21) {
             continue;
@@ -224,10 +222,8 @@ fn json_hint_raise_types(fn_json: &Value) -> anyhow::Result<BTreeSet<String>> {
         regex::Regex::new(r#"'type'\s*,\s*'([A-Za-z_][A-Za-z0-9_]*)'"#).unwrap()
     });
 
-    let raise_path = JsonPath::try_from("$..PLpgSQL_stmt_raise")?;
     let mut names = BTreeSet::new();
-    for slice in raise_path.find_slice(fn_json) {
-        let JsonPathValue::Slice(stmt, _) = slice else { continue };
+    for stmt in fn_json.query("$..PLpgSQL_stmt_raise")? {
         if stmt.get("elog_level").and_then(Value::as_i64) != Some(21) {
             continue;
         }
@@ -272,14 +268,11 @@ fn sql_state_from_literal(s: &str) -> SqlState {
 /// `SELECT ... INTO STRICT` raises `no_data_found` (P0002) for zero rows and
 /// `too_many_rows` (P0003) for more than one.
 fn get_strict_exceptions(parsed: &Value) -> Vec<PgException> {
-    let strict_path = JsonPath::try_from("$..PLpgSQL_stmt_execsql[?(@.strict)]").unwrap();
-
-    let has_strict = strict_path.find_slice(parsed).into_iter().any(|x| match x {
-        JsonPathValue::Slice(data, _) => data
-            .get("strict")
-            .is_some_and(|s| s.as_bool().is_some_and(|b| b)),
-        _ => false,
-    });
+    let has_strict = parsed
+        .query("$..PLpgSQL_stmt_execsql")
+        .unwrap()
+        .into_iter()
+        .any(|stmt| stmt.get("strict").and_then(Value::as_bool) == Some(true));
 
     if has_strict {
         vec![

@@ -489,7 +489,241 @@ pub fn codegen_split(
         warning_ignores.to_string() + &generate_nullable_module().to_string(),
     );
 
+    // Shared by-name composite codec. Every generated `FromSql`/`ToSql` impl
+    // for a composite type goes through it, as `super::composite::*`.
+    schema_code.insert(
+        "composite".to_string(),
+        warning_ignores.to_string() + &generate_composite_module().to_string(),
+    );
+
+    // Cache invalidation for connections that outlive a schema change.
+    schema_code.insert(
+        "schema_cache".to_string(),
+        warning_ignores.to_string() + &generate_schema_cache_module().to_string(),
+    );
+
     Ok(schema_code)
+}
+
+/// Codegen for the shared `schema_cache` module.
+///
+/// A pooled connection remembers two things about the schema: tokio-postgres
+/// caches each type's definition, and deadpool caches prepared statements,
+/// which hold their own copy of the types they were prepared with. After a
+/// migration both are stale. Reads cope (see the `composite` module), but a
+/// composite is encoded from the cached attribute list, so writing one fails
+/// until the connection forgets it.
+///
+/// Generated functions only get a `GenericClient`, which exposes neither
+/// cache, so this is driven from the pool: the application calls
+/// `invalidate()` when it learns the schema changed, and the `hook()` it
+/// installed on each pool clears a connection's caches the next time that
+/// connection is checked out.
+fn generate_schema_cache_module() -> TokenStream {
+    quote! {
+        use std::sync::RwLock;
+        use std::time::Instant;
+
+        /// When the schema was last reported changed, process-wide.
+        static INVALIDATED_AT: RwLock<Option<Instant>> = RwLock::new(None);
+
+        /// Report that the database schema changed, for example on a
+        /// migration tool's "apply committed" notification.
+        ///
+        /// Every pooled connection last checked out before this call drops
+        /// its type and statement caches at its next checkout, on every pool
+        /// in the process that has [`hook`] installed. A connection that is
+        /// checked out right now keeps its caches until it is returned.
+        pub fn invalidate() {
+            *INVALIDATED_AT.write().unwrap() = Some(Instant::now());
+        }
+
+        /// Drop one connection's type and statement caches now.
+        pub fn clear(client: &deadpool_postgres::ClientWrapper) {
+            client.clear_type_cache();
+            client.statement_cache.clear();
+        }
+
+        /// A `pre_recycle` hook that applies [`invalidate`] to the connection
+        /// being checked out. Install it on every pool:
+        ///
+        /// ```ignore
+        /// let pool = config
+        ///     .builder(tls)?
+        ///     .runtime(deadpool_postgres::Runtime::Tokio1)
+        ///     .pre_recycle(schema_cache::hook())
+        ///     .build()?;
+        /// ```
+        pub fn hook() -> deadpool_postgres::Hook {
+            deadpool_postgres::Hook::sync_fn(|client, metrics| {
+                // `recycled` is this connection's previous checkout; a
+                // connection that has never been recycled dates from its
+                // creation.
+                let last_used = metrics.recycled.unwrap_or(metrics.created);
+                let stale = INVALIDATED_AT
+                    .read()
+                    .unwrap()
+                    .is_some_and(|at| last_used <= at);
+                if stale {
+                    clear(client);
+                }
+                Ok(())
+            })
+        }
+    }
+}
+
+/// Codegen for the shared `composite` module: the by-name composite codec.
+///
+/// `postgres-derive` matches a Rust struct against the live catalog type
+/// exactly, so appending an attribute to a composite makes every read and
+/// write of it fail in clients generated before the change. This codec matches
+/// attributes by name instead:
+///
+/// - `accepts` requires every attribute the client knows; extra ones are fine.
+/// - `read` hands over the attributes the connection knows by name and skips
+///   the rest. It also tolerates a value carrying more attributes than the
+///   connection's cached type definition, which is what a connection opened
+///   before the `ALTER TYPE` sees.
+/// - `write` emits every catalog attribute in catalog order, sending NULL for
+///   one the client was not generated with.
+///
+/// Removing, renaming or retyping an attribute still fails.
+fn generate_composite_module() -> TokenStream {
+    quote! {
+        use postgres_types::private::BytesMut;
+        use postgres_types::{Field, IsNull, Kind, Type};
+        use std::error::Error;
+
+        type BoxError = Box<dyn Error + Sync + Send>;
+
+        /// The attributes of composite type `ty`, looking through a domain.
+        pub fn fields(ty: &Type) -> Option<&[Field]> {
+            let ty = match ty.kind() {
+                Kind::Domain(inner) => inner,
+                _ => ty,
+            };
+            match ty.kind() {
+                Kind::Composite(fields) => Some(fields),
+                _ => None,
+            }
+        }
+
+        /// True if `ty` is a composite (or a domain over one) named one of
+        /// `names` that has every attribute in `known` with an acceptable
+        /// type. Attributes the client does not know are allowed.
+        pub fn accepts(ty: &Type, names: &[&str], known: &[(&str, fn(&Type) -> bool)]) -> bool {
+            if !names.contains(&ty.name()) {
+                return false;
+            }
+            let Some(fields) = fields(ty) else {
+                return false;
+            };
+            known.iter().all(|(name, accepts)| {
+                fields
+                    .iter()
+                    .any(|f| f.name() == *name && accepts(f.type_()))
+            })
+        }
+
+        fn read_i32(buf: &mut &[u8]) -> Result<i32, BoxError> {
+            if buf.len() < 4 {
+                return Err("invalid buffer size".into());
+            }
+            let (head, tail) = buf.split_at(4);
+            *buf = tail;
+            Ok(i32::from_be_bytes([head[0], head[1], head[2], head[3]]))
+        }
+
+        /// Decode a composite value, calling `visit` with each attribute and
+        /// its raw value (`None` for NULL).
+        ///
+        /// A value may carry more attributes than `ty` lists: the connection
+        /// caches a type's definition, so one opened before an attribute was
+        /// appended still has the shorter list. The extra values are skipped.
+        pub fn read<'a>(
+            ty: &Type,
+            mut buf: &'a [u8],
+            mut visit: impl FnMut(&Field, Option<&'a [u8]>) -> Result<(), BoxError>,
+        ) -> Result<(), BoxError> {
+            let fields = fields(ty).ok_or("not a composite type")?;
+            let count = read_i32(&mut buf)?;
+            if count < 0 || (count as usize) < fields.len() {
+                return Err(format!(
+                    "invalid field count for {}: {} vs {}",
+                    ty.name(),
+                    count,
+                    fields.len()
+                )
+                .into());
+            }
+            for i in 0..count as usize {
+                let oid = read_i32(&mut buf)? as u32;
+                let len = read_i32(&mut buf)?;
+                let raw = if len < 0 {
+                    None
+                } else {
+                    let len = len as usize;
+                    if len > buf.len() {
+                        return Err("invalid buffer size".into());
+                    }
+                    let (head, tail) = buf.split_at(len);
+                    buf = tail;
+                    Some(head)
+                };
+                if let Some(field) = fields.get(i) {
+                    if oid != field.type_().oid() {
+                        return Err(format!(
+                            "unexpected type for {}.{}: oid {} vs {}",
+                            ty.name(),
+                            field.name(),
+                            oid,
+                            field.type_().oid()
+                        )
+                        .into());
+                    }
+                    visit(field, raw)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// Encode a composite value. `visit` writes the attribute it is given
+        /// and returns `Some`, or returns `None` for an attribute the client
+        /// does not know, which is sent as NULL.
+        pub fn write(
+            ty: &Type,
+            out: &mut BytesMut,
+            mut visit: impl FnMut(&Field, &mut BytesMut) -> Option<Result<IsNull, BoxError>>,
+        ) -> Result<IsNull, BoxError> {
+            let fields = fields(ty).ok_or("not a composite type")?;
+            out.extend_from_slice(&(fields.len() as i32).to_be_bytes());
+            for field in fields {
+                out.extend_from_slice(&field.type_().oid().to_be_bytes());
+                let base = out.len();
+                out.extend_from_slice(&[0; 4]);
+                let is_null = match visit(field, out) {
+                    Some(result) => result?,
+                    None => IsNull::Yes,
+                };
+                let len = match is_null {
+                    IsNull::Yes => {
+                        out.truncate(base + 4);
+                        -1
+                    }
+                    IsNull::No => i32::try_from(out.len() - base - 4)
+                        .map_err(|_| "value too large to transmit")?,
+                };
+                out[base..base + 4].copy_from_slice(&len.to_be_bytes());
+            }
+            Ok(IsNull::No)
+        }
+
+        /// Error for an attribute the client needs that the value lacked.
+        pub fn missing(ty: &str, field: &str) -> BoxError {
+            format!("composite {} has no attribute {}", ty, field).into()
+        }
+    }
 }
 
 /// Codegen for the shared `nullable` module.

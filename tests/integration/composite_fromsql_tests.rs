@@ -57,22 +57,22 @@ fn test_composite_type_fromsql_generation() {
         println!("Generated public.rs content (first 1000 chars):");
         println!("{}", &public_content.chars().take(1000).collect::<String>());
 
-        // Verify Contact type has FromSql and ToSql derives
+        // Verify Contact has the by-name FromSql and ToSql impls
         assert!(
             public_content.contains("pub struct Contact"),
             "Should generate Contact struct"
         );
         assert!(
-            public_content.contains("postgres_types::FromSql"),
-            "Should have FromSql derive"
+            public_content.contains("impl<'a> postgres_types::FromSql<'a> for Contact"),
+            "Should have a FromSql impl"
         );
         assert!(
-            public_content.contains("postgres_types::ToSql"),
-            "Should have ToSql derive"
+            public_content.contains("impl postgres_types::ToSql for Contact"),
+            "Should have a ToSql impl"
         );
         assert!(
-            public_content.contains("#[postgres(name = \"contact\")]"),
-            "Should have postgres name attribute"
+            public_content.contains("super::composite::accepts") && public_content.contains("&[\"contact\"]"),
+            "Should accept the composite by name"
         );
 
         // Verify Person type also has the derives

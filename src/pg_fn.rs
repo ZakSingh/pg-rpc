@@ -1000,7 +1000,12 @@ impl ToRust for PgFn {
             let query_string = if self.is_procedure {
                 format!("CALL {}.{}", self.schema, self.name)
             } else if self.returns_set || (!self.is_procedure && self.out_args.len() > 1) {
-                format!("select * from {}.{}", self.schema, self.name)
+                format!(
+                    "select {} from {}.{}",
+                    self.result_column_list(types),
+                    self.schema,
+                    self.name
+                )
             } else {
                 format!("select {}.{}", self.schema, self.name)
             };
@@ -1357,6 +1362,37 @@ impl ToRust for PgFn {
 }
 
 impl PgFn {
+    /// The select list for a call that returns rows: the columns known at
+    /// generation time, by name.
+    ///
+    /// Naming them instead of `select *` keeps the statement's result type
+    /// fixed when a column is later appended to the row type. A client
+    /// generated before the change then never receives a column it does not
+    /// know, and its cached prepared statement does not fail with "cached
+    /// plan must not change result type".
+    ///
+    /// Falls back to `*` when the result is a single anonymous column.
+    fn result_column_list(&self, types: &BTreeMap<OID, PgType>) -> String {
+        let names: Vec<&str> = if !self.out_args.is_empty() {
+            self.out_args.iter().map(|a| a.name.as_str()).collect()
+        } else {
+            match types.get(&self.return_type_oid) {
+                Some(PgType::Composite { fields, .. }) => {
+                    fields.iter().map(|f| f.name.as_str()).collect()
+                }
+                _ => Vec::new(),
+            }
+        };
+        if names.is_empty() || names.iter().any(|n| n.is_empty()) {
+            return "*".to_string();
+        }
+        names
+            .iter()
+            .map(|n| format!("\"{}\"", n.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Generate a flat (non-grouped) struct for OUT parameters / RETURN TABLE
     fn generate_flat_out_struct(
         &self,

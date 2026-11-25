@@ -33,6 +33,7 @@ pub mod out_param_nullability_tests;
 pub mod postgis_tests;
 pub mod procedure_tests;
 pub mod query_tests;
+pub mod schema_evolution_tests;
 pub mod schema_tests;
 pub mod single_field_group_tests;
 pub mod sql_function_tests;
