@@ -1048,8 +1048,8 @@ fn generate_unified_errors(
         /// A row column could not be decoded into its generated Rust type.
         ///
         /// Typically the database the code was generated from and the one it
-        /// runs against disagree on a column's type or position (a `select *`
-        /// over a table whose column order differs, a widened type, …).
+        /// runs against disagree: a column was removed, renamed or retyped,
+        /// or a result now has two columns with the same name.
         #[derive(Debug, thiserror::Error)]
         #[error("{item}: failed to decode column `{column}` (index {index}): {source}")]
         pub struct DecodeError {
@@ -1057,10 +1057,13 @@ fn generate_unified_errors(
             pub item: &'static str,
             /// The SQL column name as it was at generation time.
             pub column: &'static str,
-            /// Zero-based position in the row.
+            /// Zero-based position in the row. For a column that could not
+            /// be located, its position at generation time.
             pub index: usize,
+            /// A `tokio_postgres::Error` when a value failed to convert; a
+            /// plain message when the column could not be located.
             #[source]
-            pub source: tokio_postgres::Error,
+            pub source: Box<dyn std::error::Error + Send + Sync>,
         }
 
         impl DecodeError {
@@ -1070,8 +1073,45 @@ fn generate_unified_errors(
                 column: &'static str,
                 index: usize,
             ) -> impl FnOnce(tokio_postgres::Error) -> DecodeError {
-                move |source| DecodeError { item, column, index, source }
+                move |source| DecodeError { item, column, index, source: Box::new(source) }
             }
+        }
+
+        /// Where each of `names` sits in `row`, looked up by column name.
+        ///
+        /// Query row structs decode through this instead of fixed positions,
+        /// so a column added to the result after the code was generated
+        /// (through a `*` over a table or view that gained one) is ignored
+        /// wherever it lands. A column that is missing, or that now appears
+        /// more than once, is an error: guessing would read the wrong value.
+        pub fn column_positions<const N: usize>(
+            item: &'static str,
+            names: &[&'static str; N],
+            row: &tokio_postgres::Row,
+        ) -> Result<[usize; N], DecodeError> {
+            let columns = row.columns();
+            let mut at = [0usize; N];
+            for (i, name) in names.iter().enumerate() {
+                // Usual case: nothing moved since generation.
+                let unmoved = columns.get(i).is_some_and(|c| c.name() == *name);
+                let mut matches = columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.name() == *name)
+                    .map(|(position, _)| position);
+                let located = match (matches.next(), matches.next()) {
+                    (Some(position), None) => Ok(if unmoved { i } else { position }),
+                    (None, _) => Err("the result has no column of that name"),
+                    (Some(_), Some(_)) => Err("the result has more than one column of that name"),
+                };
+                at[i] = located.map_err(|reason| DecodeError {
+                    item,
+                    column: name,
+                    index: i,
+                    source: reason.into(),
+                })?;
+            }
+            Ok(at)
         }
 
         #constraint_lookup
@@ -1418,9 +1458,7 @@ fn generate_query_code(
                         client.query(&stmt, &params).await
                             .map_err(#error_enum_name::from)
                             .and_then(|rows| {
-                                rows.into_iter()
-                                    .map(|row| row.try_into().map_err(#error_enum_name::from))
-                                    .collect()
+                                #struct_name::decode_all(rows).map_err(#error_enum_name::from)
                             })
                     };
 
@@ -2096,6 +2134,48 @@ fn generate_datetime_serde_attr(pg_type: &PgType, nullable: bool) -> Option<Toke
 ///
 /// Columns with double-underscore names (`prefix__field`) are automatically
 /// grouped into nested structs.
+/// The by-name plumbing shared by every query row struct: the column count,
+/// the associated items that locate columns and decode many rows, and the
+/// `TryFrom<Row>` impl. The struct's own `decode(row, at)` reads column `i`
+/// of the generated list from position `at[i]`.
+fn row_decode_support(
+    struct_name: &proc_macro2::Ident,
+    struct_name_str: &str,
+    columns: &[crate::query_introspector::QueryColumn],
+) -> (usize, TokenStream, TokenStream) {
+    let column_count = columns.len();
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+
+    let decode_fns = quote! {
+        /// Result columns as they were at generation time.
+        const COLUMNS: [&'static str; #column_count] = [#(#names),*];
+
+        /// Decode a whole result set, locating the columns once.
+        pub fn decode_all(
+            rows: Vec<tokio_postgres::Row>,
+        ) -> Result<Vec<Self>, super::errors::DecodeError> {
+            let Some(first) = rows.first() else {
+                return Ok(Vec::new());
+            };
+            let at = super::errors::column_positions(#struct_name_str, &Self::COLUMNS, first)?;
+            rows.iter().map(|row| Self::decode(row, &at)).collect()
+        }
+    };
+
+    let try_from_impl = quote! {
+        impl TryFrom<tokio_postgres::Row> for #struct_name {
+            type Error = super::errors::DecodeError;
+
+            fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+                let at = super::errors::column_positions(#struct_name_str, &Self::COLUMNS, &row)?;
+                Self::decode(&row, &at)
+            }
+        }
+    };
+
+    (column_count, decode_fns, try_from_impl)
+}
+
 fn generate_row_struct(
     struct_name: &proc_macro2::Ident,
     columns: &[crate::query_introspector::QueryColumn],
@@ -2170,8 +2250,8 @@ fn generate_row_struct(
                 });
 
                 parent_field_assignments.push(quote! {
-                    #field_name: row.try_get(#idx)
-                        .map_err(super::errors::DecodeError::at(#struct_name_str, #column_name, #idx))?
+                    #field_name: row.try_get(at[#idx])
+                        .map_err(super::errors::DecodeError::at(#struct_name_str, #column_name, at[#idx]))?
                 });
             }
             GroupedField::Group {
@@ -2251,8 +2331,8 @@ fn generate_row_struct(
                         );
                         let c_name = col.name.as_str();
                         quote! {
-                            #f_name: row.try_get(#idx)
-                                .map_err(super::errors::DecodeError::at(#struct_name_str, #c_name, #idx))?
+                            #f_name: row.try_get(at[#idx])
+                                .map_err(super::errors::DecodeError::at(#struct_name_str, #c_name, at[#idx]))?
                         }
                     })
                     .collect();
@@ -2283,8 +2363,8 @@ fn generate_row_struct(
                     });
 
                     parent_field_assignments.push(quote! {
-                        #group_field_name: if row.try_get::<usize, super::nullable::NullProbe>(#first_idx)
-                            .map_err(super::errors::DecodeError::at(#struct_name_str, #first_col, #first_idx))?
+                        #group_field_name: if row.try_get::<usize, super::nullable::NullProbe>(at[#first_idx])
+                            .map_err(super::errors::DecodeError::at(#struct_name_str, #first_col, at[#first_idx]))?
                             .is_null
                         {
                             None
@@ -2309,6 +2389,9 @@ fn generate_row_struct(
         }
     }
 
+    let (column_count, decode_fns, try_from_impl) =
+        row_decode_support(struct_name, &struct_name_str, columns);
+
     quote! {
         #(#nested_struct_defs)*
 
@@ -2317,15 +2400,20 @@ fn generate_row_struct(
             #(#parent_fields),*
         }
 
-        impl TryFrom<tokio_postgres::Row> for #struct_name {
-            type Error = super::errors::DecodeError;
+        impl #struct_name {
+            #decode_fns
 
-            fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+            fn decode(
+                row: &tokio_postgres::Row,
+                at: &[usize; #column_count],
+            ) -> Result<Self, super::errors::DecodeError> {
                 Ok(Self {
                     #(#parent_field_assignments),*
                 })
             }
         }
+
+        #try_from_impl
     }
 }
 
@@ -2388,6 +2476,8 @@ fn generate_row_struct_flat(
         .collect();
     let column_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     let struct_name_str = struct_name.to_string();
+    let (column_count, decode_fns, try_from_impl) =
+        row_decode_support(struct_name, &struct_name_str, columns);
 
     quote! {
         #[derive(Debug, Clone, serde::Serialize)]
@@ -2395,18 +2485,23 @@ fn generate_row_struct_flat(
             #(#fields),*
         }
 
-        impl TryFrom<tokio_postgres::Row> for #struct_name {
-            type Error = super::errors::DecodeError;
+        impl #struct_name {
+            #decode_fns
 
-            fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
+            fn decode(
+                row: &tokio_postgres::Row,
+                at: &[usize; #column_count],
+            ) -> Result<Self, super::errors::DecodeError> {
                 Ok(Self {
                     #(
-                        #field_names: row.try_get(#field_indices)
-                            .map_err(super::errors::DecodeError::at(#struct_name_str, #column_names, #field_indices))?,
+                        #field_names: row.try_get(at[#field_indices])
+                            .map_err(super::errors::DecodeError::at(#struct_name_str, #column_names, at[#field_indices]))?,
                     )*
                 })
             }
         }
+
+        #try_from_impl
     }
 }
 
