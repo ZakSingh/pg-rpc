@@ -789,11 +789,21 @@ fn test_cast_to_domain_preserves_domain_type() {
                 LEAST(o.application_fee, o.item_subtotal)::currency AS fee_capped,
                 o.item_subtotal AS plain_domain
             FROM "order" o;
+
+            -- name: CapFee :many
+            UPDATE "order" SET application_fee = item_subtotal
+            RETURNING id, LEAST(application_fee, item_subtotal)::currency AS returned_fee;
         "#};
 
         let (_dir, code) = generate_queries(conn_string, sql);
 
         assert!(code.contains("pub async fn capture_breakdown"));
+
+        // The same cast in a RETURNING list.
+        assert!(
+            code.contains("pub returned_fee: super::public::Currency"),
+            "cast to domain in RETURNING should generate the domain type. Got:\n{code}"
+        );
 
         // Plain domain column → domain type (this already worked).
         assert!(
