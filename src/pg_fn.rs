@@ -1,40 +1,38 @@
-use crate::annotations;
+use crate::annotations::{self, Annotations, Site};
 use crate::codegen::ToRust;
 use crate::codegen::{FunctionName, SchemaName, OID};
 use crate::config;
 use crate::call_graph::{self, CallTarget};
 use crate::constraint_analysis::RelDep;
-use crate::exceptions::{get_comment_exceptions, get_exceptions_from_deps, PgException};
-use crate::fn_index::FunctionId;
+use crate::exceptions::{get_exceptions_from_deps, PgException};
 use crate::ident::{
-    sql_to_rs_ident,
-    sql_to_rs_string,
-    CaseType::{self, Pascal},
+    dedupe_idents, ident_tokens, sql_to_rs_ident, sql_to_rs_string,
+    CaseType,
 };
 use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
-use crate::pg_type::PgType;
+use crate::pg_type::{unsupported_type, PgType};
 use crate::rel_index::RelIndex;
-use crate::trigger_index::TriggerIndex;
+use crate::unified_error::generate_error_enum;
 use config::Config;
-use heck::ToPascalCase;
-use itertools::{izip, Itertools};
+use itertools::Itertools;
 use log::warn;
-use pg_query::protobuf::node::Node;
-use pg_query::{parse_plpgsql, ParseResult};
+use pg_query::parse_plpgsql;
 use postgres::Row;
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use quote::quote;
 use regex::Regex;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 // Re-export constraint analysis types for backward compatibility
 pub use crate::constraint_analysis::{
-    applicable_constraints, extract_queries, get_rel_deps, populate_trigger_exceptions,
+    applicable_constraints, extract_queries, get_rel_deps,
 };
+// Typed-error detection lives with the rest of the exception analysis.
+pub use crate::exceptions::extract_custom_errors_from_queries;
 
 const VOID_TYPE_OID: u32 = 2278;
-const RECORD_TYPE_OID: u32 = 2249;
 
 #[derive(Debug)]
 pub struct PgFn {
@@ -47,10 +45,12 @@ pub struct PgFn {
     pub returns_set: bool,
     pub is_procedure: bool,
     pub has_table_params: bool,
+    /// `pg_language.lanname`: `sql` or `plpgsql`.
+    pub language: String,
     pub definition: String,
     pub comment: Option<String>,
     /// Everything this function can raise: its own `RAISE`s, constraint
-    /// violations from its DML, trigger exceptions, `@pgrpc_throws`, and (after
+    /// violations from its DML, trigger exceptions, and (after
     /// `FunctionIndex::follow_calls`) the same for every function it calls.
     pub exceptions: Vec<PgException>,
     /// Relations this function writes, including those written by the
@@ -63,88 +63,111 @@ pub struct PgFn {
 
 #[derive(Debug, Clone)]
 pub struct PgArg {
+    /// The name as declared. An argument declared without one gets the name
+    /// Postgres itself would show: `arg<n>` by input position for the Rust
+    /// parameter, `column<n>` by output position for a result column.
     pub name: String,
+    /// False when `name` was made up, in which case the argument can only be
+    /// passed by position.
+    pub named: bool,
     pub type_oid: OID,
     pub has_default: bool,
+    /// Declared `VARIADIC`: `type_oid` is the array type and the call passes
+    /// the whole array with the `VARIADIC` keyword.
+    pub variadic: bool,
+    /// The SQL type to cast this argument to in a call. Set for the
+    /// arguments of an overloaded function, so that the call resolves to the
+    /// overload the binding was generated from rather than whichever one
+    /// Postgres prefers for untyped parameters.
+    pub cast: Option<String>,
     pub nullable: bool,
+    /// For an OUT parameter of a SQL function: NULL only because it comes
+    /// from the nullable side of an outer join. A `prefix__` group whose
+    /// members all have this set becomes `Option<Struct>`.
     pub nullable_due_to_join: bool,
 }
 
-/// Parse @pgrpc_not_null(param_name) annotations from function comments
+/// The OUT parameters a function's comment lists in `@pgrpc_not_null(a, b)`
 fn parse_out_param_not_null_annotations(comment: &Option<String>) -> BTreeSet<String> {
-    comment
-        .as_ref()
-        .map(|c| annotations::parse_not_null(c))
-        .unwrap_or_default()
+    Annotations::of(comment.as_deref()).not_null
 }
 
-/// Returns whether a parameter with this type needs an additional `&` when passed to the params vector.
-///
-/// For parameters declared as reference types (like `&str`), we need to add another `&` to create
-/// the correct type for the ToSql trait. For example, a `&str` parameter becomes `&&str` in the
-/// params vector because `ToSql` is implemented for `&str`, not `str`.
-pub fn param_needs_reference(type_oid: OID, types: &BTreeMap<OID, PgType>) -> bool {
-    match types.get(&type_oid) {
-        Some(PgType::Int16) | Some(PgType::Int32) | Some(PgType::Int64)
-        | Some(PgType::Bool) => true, // Primitive types need refs
-        Some(PgType::Text) => true, // Function param is &str, need &&str for ToSql vector
-        Some(PgType::Enum { .. }) => true, // Enums are passed by value, need reference
-        Some(_) => true,            // Domain types, composite types need references for ToSql
-        None => true,               // Unknown types (like std::net::IpAddr) need references
-    }
+/// Rust identifiers for a list of SQL argument names, with the conventional
+/// `prefixes` (`p_`, `o_`) dropped for readability. A name that would then
+/// clash with another argument (`p_id` next to `id`) keeps its prefix, and
+/// whatever still clashes after case conversion gets a numeric suffix.
+fn arg_idents<'a>(names: impl IntoIterator<Item = &'a str>, prefixes: &[&str]) -> Vec<TokenStream> {
+    let names: Vec<&str> = names.into_iter().collect();
+    let stripped: Vec<String> = names
+        .iter()
+        .map(|name| sql_to_rs_string(strip_arg_prefix(name, prefixes), CaseType::Snake))
+        .collect();
+    let idents = names
+        .iter()
+        .zip(&stripped)
+        .map(|(name, ident)| {
+            let clashes = stripped.iter().filter(|other| *other == ident).count() > 1;
+            if clashes && strip_arg_prefix(name, prefixes) != *name {
+                sql_to_rs_string(name, CaseType::Snake)
+            } else {
+                ident.clone()
+            }
+        })
+        .collect();
+    dedupe_idents(idents)
+        .iter()
+        .map(|ident| ident_tokens(ident))
+        .collect()
 }
+
+/// `name` without the first of `prefixes` it starts with, unless that would
+/// leave nothing.
+fn strip_arg_prefix<'a>(name: &'a str, prefixes: &[&str]) -> &'a str {
+    prefixes
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(name)
+}
+
+/// Prefixes dropped from input argument names.
+const IN_PREFIXES: &[&str] = &["p_"];
+/// Prefixes dropped from OUT / INOUT / TABLE column names.
+const OUT_PREFIXES: &[&str] = &["o_", "p_"];
 
 impl PgArg {
-    pub fn rs_name(&self) -> TokenStream {
-        // Strip 'p_' prefix if present for cleaner Rust parameter names
-        let clean_name = if self.name.starts_with("p_") {
-            &self.name[2..]
-        } else {
-            &self.name
-        };
-        sql_to_rs_ident(clean_name, CaseType::Snake)
-    }
-
     /// Returns the Rust name for this argument when used as an OUT parameter field.
     ///
     /// Strips both `o_` (OUT-only convention) and `p_` (INOUT-as-parameter convention)
     /// prefixes so the struct field reads cleanly and matches the Rust function arg
     /// name (which also strips `p_`).
     pub fn rs_out_name(&self) -> TokenStream {
-        let clean_name = if let Some(rest) = self.name.strip_prefix("o_") {
-            rest
-        } else if let Some(rest) = self.name.strip_prefix("p_") {
-            rest
-        } else {
-            &self.name
+        sql_to_rs_ident(strip_arg_prefix(&self.name, OUT_PREFIXES), CaseType::Snake)
+    }
+
+    /// `::type` for an argument that must be cast in the call, else nothing.
+    fn cast_suffix(&self) -> String {
+        self.cast
+            .as_ref()
+            .map(|type_name| format!("::{type_name}"))
+            .unwrap_or_default()
+    }
+
+    /// The parameter type in the generated function's signature.
+    fn rs_param_type(&self, types: &BTreeMap<OID, PgType>) -> TokenStream {
+        let ty = match types.get(&self.type_oid) {
+            Some(ty) => ty.to_rust_param(types),
+            None => PgType::Unsupported { name: format!("oid {}", self.type_oid) }.to_rust_ident(types),
         };
-        sql_to_rs_ident(clean_name, CaseType::Snake)
-    }
-
-    /// Returns whether this argument needs an additional `&` when passed to the params vector
-    pub fn needs_reference(&self, types: &BTreeMap<OID, PgType>) -> bool {
-        param_needs_reference(self.type_oid, types)
-    }
-
-    /// Returns the appropriate reference for this argument in the params vector
-    pub fn param_reference(&self, types: &BTreeMap<OID, PgType>) -> TokenStream {
-        let name = self.rs_name();
-        if self.needs_reference(types) {
-            quote! { &#name }
+        if self.has_default {
+            quote! { Option<#ty> }
         } else {
-            quote! { #name }
+            ty
         }
     }
 }
 
 impl PgFn {
-    pub fn id(&self) -> FunctionId {
-        FunctionId {
-            schema: self.schema.clone(),
-            name: self.name.clone(),
-        }
-    }
-
     pub fn rs_name(&self) -> TokenStream {
         sql_to_rs_ident(&self.name, CaseType::Snake)
     }
@@ -161,213 +184,6 @@ impl PgFn {
         sql_to_rs_ident(&format!("{}_error", &self.name), CaseType::Pascal)
     }
 
-    /// Generate match arms for From<tokio_postgres::Error> implementation
-    fn generate_from_postgres_match_arms(
-        &self,
-        used_constraints: &BTreeMap<PgId, Vec<Constraint>>,
-        config: &Config,
-    ) -> TokenStream {
-        let error_enum_name = self.error_enum_name();
-        let mut unique_arms = Vec::new();
-        let mut check_arms = Vec::new();
-        let mut fk_arms = Vec::new();
-        let mut not_null_arms = Vec::new();
-        let mut custom_arms = Vec::new();
-
-        // Process constraints by table for this function
-        for (table_id, constraints) in used_constraints {
-            let table_name_str = table_id.name();
-            let table_name_pascal = table_name_str.to_pascal_case();
-            let error_variant = format_ident!("{}Constraint", table_name_pascal);
-            let constraint_enum = format_ident!("{}Constraint", table_name_pascal);
-
-            for constraint in constraints {
-                match constraint {
-                    Constraint::PrimaryKey(pk) => {
-                        // Constraint names are unique within schema, so simple name match works
-                        let constraint_name = pk.name.as_str();
-                        unique_arms.push(quote! {
-                            Some(#constraint_name) => #error_enum_name::#error_variant(
-                                super::errors::#constraint_enum::PrimaryKey,
-                                db_error.to_owned()
-                            )
-                        });
-                    }
-                    Constraint::Unique(u) => {
-                        let constraint_name = u.name.as_str();
-                        let variant_name_str = u.name.to_pascal_case();
-                        let variant_name = format_ident!("{}", variant_name_str);
-                        unique_arms.push(quote! {
-                            Some(#constraint_name) => #error_enum_name::#error_variant(
-                                super::errors::#constraint_enum::#variant_name,
-                                db_error.to_owned()
-                            )
-                        });
-                    }
-                    Constraint::Check(c) => {
-                        let constraint_name = c.name.as_str();
-                        let variant_name_str = c.name.to_pascal_case();
-                        let variant_name = format_ident!("{}", variant_name_str);
-                        check_arms.push(quote! {
-                            Some(#constraint_name) => #error_enum_name::#error_variant(
-                                super::errors::#constraint_enum::#variant_name,
-                                db_error.to_owned()
-                            )
-                        });
-                    }
-                    Constraint::ForeignKey(fk) => {
-                        let constraint_name = fk.name.as_str();
-                        let variant_name_str = fk.name.to_pascal_case();
-                        let variant_name = format_ident!("{}", variant_name_str);
-                        fk_arms.push(quote! {
-                            Some(#constraint_name) => #error_enum_name::#error_variant(
-                                super::errors::#constraint_enum::#variant_name,
-                                db_error.to_owned()
-                            )
-                        });
-                    }
-                    Constraint::NotNull(nn) => {
-                        // NOT NULL violations are reported by table and column, not constraint name
-                        let column_name = nn.column.as_str();
-                        let col_variant_str = nn.column.to_pascal_case();
-                        let variant_name = format_ident!("{}NotNull", col_variant_str);
-                        not_null_arms.push(quote! {
-                            (Some(#table_name_str), Some(#column_name)) => #error_enum_name::#error_variant(
-                                super::errors::#constraint_enum::#variant_name,
-                                db_error.to_owned()
-                            )
-                        });
-                    }
-                    _ => {} // Skip other constraint types
-                }
-            }
-        }
-
-        // Process custom exceptions from this function
-        let mut has_custom_errors = false;
-        for exception in &self.exceptions {
-            match exception {
-                PgException::Explicit(sql_state) => {
-                    let code = sql_state.code();
-                    let variant_name = if let Some(description) = config.exceptions.get(code) {
-                        sql_to_rs_ident(description, Pascal)
-                    } else {
-                        exception.rs_name(config)
-                    };
-
-                    custom_arms.push(quote! {
-                        code if code == &tokio_postgres::error::SqlState::from_code(#code) => {
-                            #error_enum_name::#variant_name(db_error.to_owned())
-                        }
-                    });
-                }
-                PgException::CustomError(_) => {
-                    has_custom_errors = true;
-                }
-                _ => {}
-            }
-        }
-
-        // Add handling for custom errors with JSON hint if we have any
-        if has_custom_errors {
-            // Collect all custom error names for this function
-            let custom_error_arms: Vec<TokenStream> = self
-                .exceptions
-                .iter()
-                .filter_map(|e| {
-                    if let PgException::CustomError(error_name) = e {
-                        let variant_name = sql_to_rs_ident(error_name, Pascal);
-                        let error_name_str = error_name.as_str();
-                        Some(quote! {
-                            Some(#error_name_str) => {
-                                if let Ok(payload) = serde_json::from_value(json.clone()) {
-                                    #error_enum_name::#variant_name(payload, db_error.to_owned())
-                                } else {
-                                    #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                                }
-                            }
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Typed errors are identified by the JSON hint, not the SQLSTATE,
-            // so this arm must come before every code-based arm: a typed
-            // error raised with a mapped SQLSTATE is still the typed error.
-            custom_arms.insert(0, quote! {
-                _code if db_error.hint() == Some("application/json") => {
-                    // Parse JSON message for custom error
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(db_error.message()) {
-                        match json.get("type").and_then(|t| t.as_str()) {
-                            #(#custom_error_arms,)*
-                            _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                        }
-                    } else {
-                        #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                    }
-                }
-            });
-        }
-
-        // Build the complete match expression. The JSON-hint arm (if any)
-        // leads, then constraint classes, then SQLSTATE codes.
-        let mut all_arms = Vec::new();
-        if has_custom_errors {
-            all_arms.push(custom_arms.remove(0));
-        }
-
-        if !unique_arms.is_empty() {
-            all_arms.push(quote! {
-                &tokio_postgres::error::SqlState::UNIQUE_VIOLATION => {
-                    match db_error.constraint() {
-                        #(#unique_arms,)*
-                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                    }
-                },
-            });
-        }
-
-        if !check_arms.is_empty() {
-            all_arms.push(quote! {
-                &tokio_postgres::error::SqlState::CHECK_VIOLATION => {
-                    match db_error.constraint() {
-                        #(#check_arms,)*
-                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                    }
-                },
-            });
-        }
-
-        if !fk_arms.is_empty() {
-            all_arms.push(quote! {
-                &tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION => {
-                    match db_error.constraint() {
-                        #(#fk_arms,)*
-                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                    }
-                },
-            });
-        }
-
-        if !not_null_arms.is_empty() {
-            all_arms.push(quote! {
-                &tokio_postgres::error::SqlState::NOT_NULL_VIOLATION => {
-                    match (db_error.table(), db_error.column()) {
-                        #(#not_null_arms,)*
-                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                    }
-                },
-            });
-        }
-
-        all_arms.extend(custom_arms);
-
-        // Combine all arms into a single TokenStream
-        all_arms.into_iter().collect()
-    }
-
     /// Generate the function-specific error enum
     pub fn generate_error_enum(
         &self,
@@ -375,17 +191,11 @@ impl PgFn {
         table_constraints: &BTreeMap<PgId, Vec<Constraint>>,
         config: &Config,
     ) -> TokenStream {
-        let error_enum_name = self.error_enum_name();
-        let mut error_variants = Vec::new();
+        // Constraints of the tables this function and everything it calls
+        // write, keyed by the table the violation is reported on (a DELETE
+        // blocked by a foreign key is reported on the referencing table).
         let mut used_constraints: BTreeMap<PgId, Vec<Constraint>> = BTreeMap::new();
-
-        // Relations written by this function and by everything it calls.
-        let rel_deps = &self.rel_deps;
-
-        // Collect constraints from tables this function touches, keyed by the
-        // table the violation is reported on (a DELETE blocked by a foreign key
-        // is reported on the referencing table).
-        for dep in rel_deps {
+        for dep in &self.rel_deps {
             for (table_id, constraint) in applicable_constraints(dep, rel_index) {
                 if !table_constraints.contains_key(&table_id) {
                     continue;
@@ -399,200 +209,13 @@ impl PgFn {
             }
         }
 
-        // Generate constraint error variants
-        for (table_id, _) in &used_constraints {
-            let table_name_str = table_id.name();
-            let table_name_pascal = table_name_str.to_pascal_case();
-            let variant_name = format_ident!("{}Constraint", table_name_pascal);
-            let constraint_enum = format_ident!("{}Constraint", table_name_pascal);
-
-            error_variants.push(quote! {
-                #[error("{} table constraint violation", #table_name_str)]
-                #variant_name(super::errors::#constraint_enum, #[source] tokio_postgres::error::DbError)
-            });
-        }
-
-        // Add variants for explicit exceptions raised by this function
-        let mut handled_exceptions = BTreeSet::new();
-        for exception in &self.exceptions {
-            match exception {
-                PgException::Explicit(sql_state) => {
-                    let code = sql_state.code();
-                    if let Some(description) = config.exceptions.get(code) {
-                        let variant_name = sql_to_rs_ident(description, Pascal);
-                        if handled_exceptions.insert(variant_name.to_string()) {
-                            error_variants.push(quote! {
-                                #[error(#description)]
-                                #variant_name(#[source] tokio_postgres::error::DbError)
-                            });
-                        }
-                    } else {
-                        let variant_name = exception.rs_name(config);
-                        if handled_exceptions.insert(variant_name.to_string()) {
-                            error_variants.push(quote! {
-                                #[error("SQL state {}", #code)]
-                                #variant_name(#[source] tokio_postgres::error::DbError)
-                            });
-                        }
-                    }
-                }
-                PgException::CustomError(error_name) => {
-                    let variant_name = sql_to_rs_ident(error_name, Pascal);
-                    if handled_exceptions.insert(variant_name.to_string()) {
-                        let struct_name = variant_name.clone();
-                        error_variants.push(quote! {
-                            #[error("{}", #error_name)]
-                            #variant_name(super::custom_errors::#struct_name, #[source] tokio_postgres::error::DbError)
-                        });
-                    }
-                }
-                _ => {} // Handle other exception types if needed
-            }
-        }
-
-        // Add catch-all variant for undetected errors
-        error_variants.push(quote! {
-            #[error(transparent)]
-            Other(super::errors::PgRpcError)
-        });
-
-        // Generate match arms for From implementations
-        let mut to_pgrpc_arms = Vec::new();
-        let mut constraint_variant_names = Vec::new();
-
-        // Generate arms for constraint variants
-        for (table_id, _) in &used_constraints {
-            let table_name_pascal = table_id.name().to_pascal_case();
-            let variant_name = format_ident!("{}Constraint", table_name_pascal);
-            constraint_variant_names.push(variant_name.clone());
-
-            to_pgrpc_arms.push(quote! {
-                #error_enum_name::#variant_name(constraint, db_error) => {
-                    super::errors::PgRpcError::#variant_name(constraint, db_error)
-                }
-            });
-        }
-
-        // Generate arms for exception variants
-        for exception in &self.exceptions {
-            match exception {
-                PgException::Explicit(sql_state) => {
-                    let variant_name =
-                        if let Some(description) = config.exceptions.get(sql_state.code()) {
-                            sql_to_rs_ident(description, Pascal)
-                        } else {
-                            exception.rs_name(config)
-                        };
-
-                    to_pgrpc_arms.push(quote! {
-                        #error_enum_name::#variant_name(db_error) => {
-                            super::errors::PgRpcError::#variant_name(db_error)
-                        }
-                    });
-                }
-                PgException::CustomError(error_name) => {
-                    let variant_name = sql_to_rs_ident(error_name, Pascal);
-                    to_pgrpc_arms.push(quote! {
-                        #error_enum_name::#variant_name(payload, db_error) => {
-                            super::errors::PgRpcError::CustomError(
-                                super::custom_errors::CustomError::#variant_name(payload),
-                                db_error,
-                            )
-                        }
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        // Generate From<tokio_postgres::Error> match arms
-        let from_postgres_arms = self.generate_from_postgres_match_arms(&used_constraints, config);
-
-        // Generate AsDbError implementation arms
-        let mut as_db_error_arms = Vec::new();
-
-        // Arms for constraint variants
-        for (table_id, _) in &used_constraints {
-            let table_name_pascal = table_id.name().to_pascal_case();
-            let variant_name = format_ident!("{}Constraint", table_name_pascal);
-            as_db_error_arms.push(quote! {
-                #error_enum_name::#variant_name(_, db_error) => Some(db_error)
-            });
-        }
-
-        // Arms for custom exception variants
-        for exception in &self.exceptions {
-            match exception {
-                PgException::Explicit(sql_state) => {
-                    let variant_name =
-                        if let Some(description) = config.exceptions.get(sql_state.code()) {
-                            sql_to_rs_ident(description, Pascal)
-                        } else {
-                            exception.rs_name(config)
-                        };
-                    as_db_error_arms.push(quote! {
-                        #error_enum_name::#variant_name(db_error) => Some(db_error)
-                    });
-                }
-                PgException::CustomError(error_name) => {
-                    let variant_name = sql_to_rs_ident(error_name, Pascal);
-                    as_db_error_arms.push(quote! {
-                        #error_enum_name::#variant_name(_, db_error) => Some(db_error)
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        // Build the complete error enum
-        quote! {
-            #[derive(Debug, thiserror::Error)]
-            pub enum #error_enum_name {
-                #(#error_variants),*
-            }
-
-            impl From<tokio_postgres::Error> for #error_enum_name {
-                fn from(e: tokio_postgres::Error) -> Self {
-                    match e.as_db_error() {
-                        Some(db_error) => match db_error.code() {
-                            #from_postgres_arms
-                            _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                        },
-                        None => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                    }
-                }
-            }
-
-            impl From<#error_enum_name> for super::errors::PgRpcError {
-                fn from(err: #error_enum_name) -> Self {
-                    match err {
-                        #error_enum_name::Other(e) => e,
-                        #(#to_pgrpc_arms),*
-                    }
-                }
-            }
-
-            impl From<super::errors::PgRpcError> for #error_enum_name {
-                fn from(err: super::errors::PgRpcError) -> Self {
-                    #error_enum_name::Other(err)
-                }
-            }
-
-            impl From<super::errors::DecodeError> for #error_enum_name {
-                fn from(err: super::errors::DecodeError) -> Self {
-                    #error_enum_name::Other(super::errors::PgRpcError::Decode(err))
-                }
-            }
-
-            impl super::errors::AsDbError for #error_enum_name {
-                fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError> {
-                    match self {
-                        #(#as_db_error_arms,)*
-                        #error_enum_name::Other(e) => e.as_db_error(),
-                    }
-                }
-            }
-        }
+        generate_error_enum(
+            &self.error_enum_name(),
+            &used_constraints,
+            table_constraints,
+            &self.exceptions,
+            config,
+        )
     }
 
     /// Get all type OIDs in the function signature (args + return type)
@@ -603,20 +226,42 @@ impl PgFn {
         oids
     }
 
-    /// True if any argument or return type is a pg pseudo-type (`anyelement`,
-    /// `internal`, etc.) that we can't generate a Rust signature for. Such
-    /// functions are intentionally skipped during codegen — they're typically
-    /// internal helpers (e.g. `core.raise_error(p_error anyelement)`) the user
-    /// doesn't expect to call from Rust.
-    pub fn has_pseudo_signature(&self, types: &BTreeMap<OID, PgType>) -> bool {
-        self.ty_oids()
-            .iter()
-            .any(|oid| matches!(types.get(oid), Some(crate::pg_type::PgType::Pseudo(_))))
+    /// Why no Rust binding can be generated for this signature, if so: an
+    /// argument or the return type is a pg pseudo-type (`anyelement`,
+    /// `internal`, …) or a type with no Rust mapping (a range, `interval`, …).
+    ///
+    /// Pseudo-typed functions are almost always internal helpers (e.g.
+    /// `core.raise_error(p_error anyelement)`) nobody expects to call from
+    /// Rust, so they are skipped quietly; an unmapped type gets a warning.
+    pub fn unrepresentable_type(&self, types: &BTreeMap<OID, PgType>) -> Option<Unrepresentable> {
+        self.ty_oids().iter().find_map(|oid| match types.get(oid) {
+            Some(PgType::Pseudo(name)) => Some(Unrepresentable::Pseudo(name.clone())),
+            _ => unsupported_type(*oid, types).map(Unrepresentable::Unsupported),
+        })
     }
 
-    /// Retrieve the body (between the `$$`); empty if no dollar quoting was found.
-    fn body(&self) -> &str {
-        fn_body(&self.definition).unwrap_or("")
+    /// What the function's comment is attached to, for checking its
+    /// annotations: bare `@pgrpc_not_null` needs a single returned value,
+    /// the list form names OUT / TABLE parameters.
+    pub fn annotation_problems(&self) -> Vec<String> {
+        let Some(comment) = &self.comment else {
+            return Vec::new();
+        };
+        let outs: Vec<&str> = self.out_args.iter().map(|a| a.name.as_str()).collect();
+        let returns_value = !self.is_procedure
+            && !self.returns_set
+            && outs.is_empty()
+            && self.return_type_oid != VOID_TYPE_OID;
+        annotations::check(comment, Site::Function { returns_value, outs: &outs })
+    }
+
+    /// The function body as SQL text; empty if none was found.
+    fn body(&self) -> Cow<'_, str> {
+        fn_body(&self.definition).unwrap_or_default()
+    }
+
+    pub fn is_sql(&self) -> bool {
+        self.language == "sql"
     }
 
     /// Infer nullability of OUT parameters for SQL language functions
@@ -628,34 +273,23 @@ impl PgFn {
         composite_index: &crate::composite_index::CompositeIndex,
     ) -> anyhow::Result<()> {
         // Only apply to SQL language functions with OUT parameters
-        if !self.definition.contains("LANGUAGE sql")
-            && !self.definition.contains("language sql")
-            && !self.definition.contains("LANGUAGE SQL") {
-            return Ok(());
-        }
-
-        if self.out_args.is_empty() {
+        if !self.is_sql() || self.out_args.is_empty() {
             return Ok(());
         }
 
         // Parse @pgrpc_not_null annotations - these take precedence over inference
         let not_null_annotations = parse_out_param_not_null_annotations(&self.comment);
 
-        // Extract the function body
-        let body = self.body();
-
-        // Parse the body as SQL
-        let parsed = match pg_query::parse(body) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!(
-                    "Failed to parse SQL function body for nullability analysis (function: {}): {}",
-                    self.name,
-                    e
-                );
-                return Ok(()); // Gracefully fall back to default nullable
-            }
-        };
+        // Extract the function body, and make sure it parses as SQL
+        let body = self.body().into_owned();
+        if let Err(e) = pg_query::parse(&body) {
+            log::warn!(
+                "Failed to parse SQL function body for nullability analysis (function: {}): {}",
+                self.name,
+                e
+            );
+            return Ok(()); // Gracefully fall back to default nullable
+        }
 
         // Create analyzer
         let mut analyzer = crate::view_nullability::ViewNullabilityAnalyzer::new(
@@ -668,7 +302,7 @@ impl PgFn {
         let column_names: Vec<String> = self.out_args.iter().map(|arg| arg.name.clone()).collect();
 
         // Analyze the query
-        match analyzer.analyze_view(body, &column_names) {
+        match analyzer.analyze_function_body(&body, &column_names) {
             Ok(nullability_map) => {
                 log::info!(
                     "Inferred nullability for SQL function {}: {:?}",
@@ -680,11 +314,24 @@ impl PgFn {
                 for out_arg in &mut self.out_args {
                     // Skip if annotation exists (annotations take precedence)
                     if not_null_annotations.contains(&out_arg.name) {
-                        log::debug!(
-                            "Function {}: OUT param {} has @pgrpc_not_null annotation, skipping inference",
-                            self.name,
-                            out_arg.name
-                        );
+                        if nullability_map
+                            .get(&out_arg.name)
+                            .is_some_and(|cn| cn.nullable_due_to_join)
+                        {
+                            log::warn!(
+                                "function {}.{}: @pgrpc_not_null on OUT param `{}`, which comes from \
+                                 the nullable side of an outer join; rows without a match will fail to decode",
+                                self.schema,
+                                self.name,
+                                out_arg.name
+                            );
+                        }
+                        if nullability_map.get(&out_arg.name).is_some_and(|cn| cn.is_not_null()) {
+                            annotations::warn_redundant(
+                                &format!("function {}.{}", self.schema, self.name),
+                                &out_arg.name,
+                            );
+                        }
                         out_arg.nullable = false;
                         continue;
                     }
@@ -692,6 +339,7 @@ impl PgFn {
                     // Apply inferred nullability
                     if let Some(cn) = nullability_map.get(&out_arg.name) {
                         out_arg.nullable = cn.is_nullable();
+                        out_arg.nullable_due_to_join = cn.nullable_due_to_join;
                         log::debug!(
                             "Function {}: OUT param {} inferred as {}",
                             self.name,
@@ -715,180 +363,66 @@ impl PgFn {
     }
 }
 
+/// Why a function gets no Rust binding (see [`PgFn::unrepresentable_type`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unrepresentable {
+    Pseudo(String),
+    Unsupported(String),
+}
+
 impl PgFn {
     pub fn from_row(
         row: Row,
         rel_index: &RelIndex,
-        trigger_index: Option<&TriggerIndex>,
         errors_config: Option<&crate::config::ErrorsConfig>,
     ) -> Result<Self, anyhow::Error> {
-        let arg_type_oids: Vec<OID> = row.try_get("arg_oids")?;
-        let arg_names: Vec<String> = row.try_get("arg_names")?;
-        let arg_defaults: Vec<bool> = row.try_get("has_defaults")?;
         let comment: Option<String> = row.try_get("comment")?;
         let language: String = row.try_get("language")?;
         let prokind: i8 = row.try_get("prokind")?;
 
-        // Get additional fields for OUT parameters
-        let arg_modes: Option<Vec<i8>> = row.try_get("arg_modes")?;
-        let all_arg_types: Option<Vec<OID>> = row.try_get("all_arg_types")?;
-        let all_arg_names: Option<Vec<String>> = row.try_get("all_arg_names")?;
+        // `proargtypes` and the defaults flags cover the input arguments
+        // only. When a function has OUT, INOUT, VARIADIC or TABLE arguments
+        // `proallargtypes`/`proargmodes` list every argument; otherwise they
+        // are NULL and every argument is IN. `proargnames` parallels
+        // whichever list applies, with an empty string for an unnamed
+        // argument, and is NULL when no argument has a name.
+        let input_types: Vec<OID> = row.try_get("arg_oids")?;
+        let arg_defaults: Vec<bool> = row.try_get("has_defaults")?;
+        let all_types: Vec<OID> = row
+            .try_get::<_, Option<Vec<OID>>>("all_arg_types")?
+            .unwrap_or(input_types);
+        let modes: Vec<i8> = row
+            .try_get::<_, Option<Vec<i8>>>("arg_modes")?
+            .unwrap_or_else(|| vec![b'i' as i8; all_types.len()]);
+        let names: Vec<String> = row
+            .try_get::<_, Option<Vec<String>>>("all_arg_names")?
+            .unwrap_or_default();
 
-        let mut args: Vec<PgArg> = Vec::new();
-        let mut out_args: Vec<PgArg> = Vec::new();
-        let mut has_table_params = false;
-        
         // Parse @pgrpc_not_null annotations for OUT parameters
         let not_null_params = parse_out_param_not_null_annotations(&comment);
 
-        // If we have arg_modes, parse IN/OUT parameters separately
-        if let (Some(modes), Some(types), Some(names)) = (arg_modes, all_arg_types, all_arg_names) {
-            for (i, ((mode, &type_oid), name)) in
-                modes.iter().zip(types.iter()).zip(names.iter()).enumerate()
-            {
-                match *mode {
-                    105 | 98 => {
-                        // 'i' (IN) or 'b' (INOUT) parameters
-                        args.push(PgArg {
-                            name: name.clone(),
-                            type_oid,
-                            has_default: arg_defaults.get(args.len()).copied().unwrap_or(false),
-                            nullable: false, // IN parameters are never nullable in function signatures
-                            nullable_due_to_join: false,
-                        });
-                    }
-                    _ => {} // Skip for now
-                }
+        let (mut args, out_args, has_table_params) =
+            parse_args(&all_types, &modes, &names, &arg_defaults, &not_null_params);
 
-                if *mode == 111 || *mode == 98 || *mode == 116 {
-                    // 'o' (OUT), 'b' (INOUT), or 't' (TABLE) parameters
-                    if *mode == 116 {
-                        has_table_params = true;
-                    }
-                    out_args.push(PgArg {
-                        name: name.clone(),
-                        type_oid,
-                        has_default: false,
-                        nullable: !not_null_params.contains(name),
-                        nullable_due_to_join: false,
-                    });
-                }
+        if row.try_get::<_, i64>("overload_count")? > 1 {
+            let type_names: Vec<String> = row.try_get("arg_type_names")?;
+            for (arg, type_name) in args.iter_mut().zip(type_names) {
+                arg.cast = Some(type_name);
             }
-        } else {
-            // Fallback to original logic if no modes
-            args = izip!(arg_type_oids, arg_names, arg_defaults)
-                .map(|(oid, name, has_default)| PgArg {
-                    name: name.clone(),
-                    type_oid: oid,
-                    has_default,
-                    nullable: false, // IN parameters are never nullable
-                    nullable_due_to_join: false,
-                })
-                .collect();
         }
 
         let definition = row.try_get::<_, String>("function_definition")?;
         let name: String = row.try_get("function_name")?;
         let schema: String = row.try_get("schema_name")?;
-        let scope = format!("{schema}.{name}");
 
-        // Analyze the body: what it can raise, which relations it writes, and
-        // which functions it calls. A body that libpg_query cannot parse is a
-        // warning, not a failure: the function still gets a binding, its error
-        // enum just has no specific variants.
-        let (exceptions, rel_deps, callees): (Vec<PgException>, Vec<RelDep>, BTreeSet<CallTarget>) =
-            match language.as_str() {
-                "plpgsql" => match parse_plpgsql(&definition) {
-                    Ok(parsed) => {
-                        let queries = extract_queries(&parsed, &scope);
-                        let mut rel_deps = get_rel_deps(&queries, rel_index, &scope);
-                        if let Some(trigger_idx) = trigger_index {
-                            populate_trigger_exceptions(&mut rel_deps, trigger_idx);
-                        }
-                        let exceptions = get_exceptions_from_deps(
-                            &parsed,
-                            &rel_deps,
-                            comment.as_ref(),
-                            rel_index,
-                            errors_config,
-                            &scope,
-                        )?;
-                        let callees = call_graph::plpgsql_callees(&parsed);
-                        (exceptions, rel_deps, callees)
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to parse PL/pgSQL function {}.{}: {}. Its error enum will only have the `Other` variant.",
-                            schema, name, e
-                        );
-                        Default::default()
-                    }
-                },
-                "sql" => match fn_body(&definition).map(pg_query::parse) {
-                    Some(Ok(parsed)) => {
-                        let callees = call_graph::sql_callees(&parsed);
-                        let queries = vec![parsed];
-                        let mut rel_deps = get_rel_deps(&queries, rel_index, &scope);
-
-                        // Populate trigger exceptions if available
-                        if let Some(trigger_idx) = trigger_index {
-                            populate_trigger_exceptions(&mut rel_deps, trigger_idx);
-                        }
-
-                        let mut exceptions: Vec<PgException> = Vec::new();
-
-                        // Collect constraint-based exceptions
-                        for dep in &rel_deps {
-                            exceptions.extend(
-                                applicable_constraints(dep, rel_index)
-                                    .into_iter()
-                                    .map(|(_, c)| PgException::Constraint(c)),
-                            );
-                        }
-
-                        // Add trigger-based exceptions if available
-                        if trigger_index.is_some() {
-                            for dep in &rel_deps {
-                                exceptions.extend(dep.trigger_exceptions.iter().cloned());
-                            }
-                        }
-
-                        // Add comment exceptions
-                        if let Some(ref comment_str) = comment {
-                            exceptions.extend(get_comment_exceptions(comment_str));
-                        }
-
-                        // Typed errors raised through the configured raise function
-                        if let Some(cfg) = errors_config {
-                            exceptions.extend(
-                                extract_custom_errors_from_queries(&queries, cfg)
-                                    .into_iter()
-                                    .map(PgException::CustomError),
-                            );
-                        }
-
-                        (exceptions, rel_deps, callees)
-                    }
-                    Some(Err(e)) => {
-                        warn!(
-                            "Failed to parse SQL function body of {}.{}: {}",
-                            schema, name, e
-                        );
-                        Default::default()
-                    }
-                    None => {
-                        warn!(
-                            "Could not find the dollar-quoted body of SQL function {}.{}",
-                            schema, name
-                        );
-                        Default::default()
-                    }
-                },
-                _ => {
-                    // Other languages not supported yet
-                    Default::default()
-                }
-            };
+        let (exceptions, rel_deps, callees) = analyze_body(
+            &schema,
+            &name,
+            &language,
+            &definition,
+            rel_index,
+            errors_config,
+        )?;
 
         Ok(Self {
             oid: row.try_get("oid")?,
@@ -898,6 +432,7 @@ impl PgFn {
             returns_set: row.try_get("returns_set")?,
             is_procedure: prokind == b'p' as i8, // 'p' for procedure, 'f' for function
             has_table_params,
+            language,
             comment,
             args,
             out_args,
@@ -909,58 +444,210 @@ impl PgFn {
     }
 }
 
-/// The dollar-quoted body of a `CREATE FUNCTION` definition.
-fn fn_body(definition: &str) -> Option<&str> {
-    let (tag, start) = quote_ind(definition)?;
-    let end = definition[start..].find(tag)? + start;
-    Some(&definition[start..end])
+/// Analyze a function body: what it can raise, which relations it writes,
+/// and which functions it calls. A body that libpg_query cannot parse is a
+/// warning, not a failure: the function still gets a binding, its error enum
+/// just has no specific variants.
+fn analyze_body(
+    schema: &str,
+    name: &str,
+    language: &str,
+    definition: &str,
+    rel_index: &RelIndex,
+    errors_config: Option<&crate::config::ErrorsConfig>,
+) -> anyhow::Result<(Vec<PgException>, Vec<RelDep>, BTreeSet<CallTarget>)> {
+    let scope = format!("{schema}.{name}");
+    Ok(match language {
+        "plpgsql" => match parse_plpgsql(definition) {
+            Ok(parsed) => {
+                let queries = extract_queries(&parsed, &scope);
+                let rel_deps = get_rel_deps(&queries, rel_index, &scope);
+                let exceptions = get_exceptions_from_deps(
+                    &parsed,
+                    &rel_deps,
+                    rel_index,
+                    errors_config,
+                    &scope,
+                )?;
+                let callees = call_graph::plpgsql_callees(&parsed);
+                (exceptions, rel_deps, callees)
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to parse PL/pgSQL function {}.{}: {}. Its error enum will only have the `Other` variant.",
+                    schema, name, e
+                );
+                Default::default()
+            }
+        },
+        "sql" => match fn_body(definition).map(|body| pg_query::parse(&body)) {
+            Some(Ok(parsed)) => {
+                let callees = call_graph::sql_callees(&parsed);
+                let queries = vec![parsed];
+                let rel_deps = get_rel_deps(&queries, rel_index, &scope);
+
+                let mut exceptions: Vec<PgException> = Vec::new();
+
+                // Typed errors raised through the configured raise function
+                if let Some(cfg) = errors_config {
+                    exceptions.extend(
+                        extract_custom_errors_from_queries(&queries, cfg)
+                            .into_iter()
+                            .map(PgException::CustomError),
+                    );
+                }
+
+                (exceptions, rel_deps, callees)
+            }
+            Some(Err(e)) => {
+                warn!(
+                    "Failed to parse SQL function body of {}.{}: {}",
+                    schema, name, e
+                );
+                Default::default()
+            }
+            None => {
+                warn!(
+                    "Could not find the body of SQL function {}.{}",
+                    schema, name
+                );
+                Default::default()
+            }
+        },
+        _ => {
+            // Other languages not supported yet
+            Default::default()
+        }
+    })
 }
 
-impl ToRust for PgArg {
-    fn to_rust(&self, types: &BTreeMap<OID, PgType>, _config: &Config) -> TokenStream {
-        // Strip 'p_' prefix if present for cleaner Rust parameter names
-        let clean_name = if self.name.starts_with("p_") {
-            &self.name[2..]
-        } else {
-            &self.name
-        };
-        let name = sql_to_rs_ident(clean_name, CaseType::Snake);
-        let ty = match types.get(&self.type_oid).unwrap() {
-            PgType::Int16 => quote! { i16 },
-            PgType::Int32 => quote! { i32 },
-            PgType::Int64 => quote! { i64 },
-            PgType::Bool => quote! { bool },
-            PgType::Text => quote! { &str },
-            t @ PgType::Enum { .. } => {
-                // Enums are passed by copy
-                let id = t.to_rust_ident(types);
-                quote! { #id }
-            }
-            t => {
-                let id = t.to_rust_ident(types);
-                quote! { &#id }
-            }
-        };
+/// Splits a function's declared arguments into its inputs (IN, INOUT,
+/// VARIADIC) and its result columns (OUT, INOUT, TABLE), and says whether it
+/// is a `RETURNS TABLE` function.
+///
+/// `types`, `modes` and `names` are parallel, one entry per declared argument
+/// (`names` may be shorter, or empty); `defaults` is per input argument.
+fn parse_args(
+    types: &[OID],
+    modes: &[i8],
+    names: &[String],
+    defaults: &[bool],
+    not_null_params: &BTreeSet<String>,
+) -> (Vec<PgArg>, Vec<PgArg>, bool) {
+    let mut args: Vec<PgArg> = Vec::new();
+    let mut out_args: Vec<PgArg> = Vec::new();
+    let mut has_table_params = false;
 
-        if self.has_default {
-            quote! {
-                #name: Option<#ty>
-            }
-        } else {
-            quote! {
-                #name: #ty
-            }
+    for (i, (&type_oid, &mode)) in types.iter().zip(modes).enumerate() {
+        let declared = names.get(i).filter(|name| !name.is_empty());
+        let mode = mode as u8;
+
+        if matches!(mode, b'i' | b'b' | b'v') {
+            let position = args.len() + 1;
+            args.push(PgArg {
+                name: declared
+                    .cloned()
+                    .unwrap_or_else(|| format!("arg{position}")),
+                named: declared.is_some(),
+                type_oid,
+                has_default: defaults.get(position - 1).copied().unwrap_or(false),
+                variadic: mode == b'v',
+                cast: None,
+                nullable: false, // IN parameters are never nullable in function signatures
+                nullable_due_to_join: false,
+            });
+        }
+
+        if matches!(mode, b'o' | b'b' | b't') {
+            has_table_params |= mode == b't';
+            // Postgres names an unnamed result column `column<n>`.
+            let name = declared
+                .cloned()
+                .unwrap_or_else(|| format!("column{}", out_args.len() + 1));
+            out_args.push(PgArg {
+                nullable: !not_null_params.contains(&name),
+                name,
+                named: declared.is_some(),
+                type_oid,
+                has_default: false,
+                variadic: false,
+                cast: None,
+                nullable_due_to_join: false,
+            });
         }
     }
+
+    // A defaulted argument is omitted by leaving it out of a call written in
+    // named notation, which an unnamed argument cannot take part in. It, and
+    // every argument before it, is therefore always passed by position.
+    if let Some(last) = args.iter().rposition(|a| a.has_default && !a.named) {
+        for arg in &mut args[..=last] {
+            arg.has_default = false;
+        }
+    }
+
+    (args, out_args, has_table_params)
+}
+
+/// The body of a function from its `pg_get_functiondef` definition, as SQL
+/// text: what is between the dollar quotes, or the statements of a
+/// SQL-standard body (`BEGIN ATOMIC ... END`, or `RETURN expr` as `SELECT expr`).
+fn fn_body(definition: &str) -> Option<Cow<'_, str>> {
+    let dollar = quote_ind(definition);
+    // `pg_get_functiondef` indents every header line after the first and
+    // starts the body at the beginning of a line.
+    let standard = ["\nBEGIN ATOMIC", "\nRETURN "]
+        .iter()
+        .filter_map(|marker| definition.find(marker))
+        .min()
+        .map(|at| at + 1);
+
+    match (dollar, standard) {
+        (Some((tag, start)), standard)
+            if standard.is_none_or(|standard| start - tag.len() < standard) =>
+        {
+            let end = definition[start..].find(tag)? + start;
+            Some(Cow::Borrowed(&definition[start..end]))
+        }
+        (_, Some(start)) => {
+            let body = definition[start..].trim();
+            if let Some(statements) = body.strip_prefix("BEGIN ATOMIC") {
+                let statements = statements.trim_end();
+                let statements = statements.strip_suffix("END").unwrap_or(statements);
+                Some(Cow::Borrowed(statements.trim()))
+            } else {
+                let expr = body.strip_prefix("RETURN")?;
+                Some(Cow::Owned(format!("SELECT {}", expr.trim())))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// How many rows a call yields, which picks the client method and the
+/// wrapper around the row type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cardinality {
+    /// Exactly one row: `T`.
+    One,
+    /// A set-returning function: `Vec<T>`.
+    Many,
 }
 
 impl ToRust for PgFn {
     fn to_rust(&self, types: &BTreeMap<OID, PgType>, config: &Config) -> TokenStream {
-        // Skip functions whose signature involves a pg pseudo-type we can't represent
-        // in Rust (anyelement, internal, etc.). These are almost always internal helpers
-        // that the user doesn't intend to expose.
-        if self.has_pseudo_signature(types) {
-            return TokenStream::new();
+        // Skip functions whose signature involves a type we can't represent
+        // in Rust.
+        match self.unrepresentable_type(types) {
+            Some(Unrepresentable::Pseudo(_)) => return TokenStream::new(),
+            Some(Unrepresentable::Unsupported(type_name)) => {
+                warn!(
+                    "Skipping function {}.{}: its signature uses `{}`, which has no Rust mapping",
+                    self.schema, self.name, type_name
+                );
+                return TokenStream::new();
+            }
+            None => {}
         }
 
         // Use function-specific error type
@@ -968,364 +655,41 @@ impl ToRust for PgFn {
         let err_type = quote! { #error_enum_name };
         let fn_name_str = &self.name;
 
-        let return_opt = self
-            .comment
-            .as_ref()
-            .is_some_and(|c| annotations::has_return_opt(c));
-        if return_opt && !self.returns_set {
-            panic!(
-                "{}: Only set-returning functions can have @pgrpc_return_opt.",
-                self.name
-            )
-        }
-
-        // Check if this is a RETURN TABLE function
-        let is_return_table = self.has_table_params;
-
-        let fn_body = {
-            let (opt_args, req_args): (Vec<PgArg>, Vec<PgArg>) =
-                self.args.iter().cloned().partition(|n| n.has_default);
-
-            // Generate required query parameters positionally ($1, $2, ..., $n)
-            let required_query_params = (1..=self.args.len() - opt_args.len())
-                .map(|i| format!("${}", i))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            let req_arg_names: Vec<TokenStream> = req_args.iter().map(|a| a.rs_name()).collect();
-            let req_arg_refs: Vec<TokenStream> =
-                req_args.iter().map(|a| a.param_reference(types)).collect();
-            let opt_arg_names: Vec<TokenStream> = opt_args.iter().map(|a| a.rs_name()).collect();
-
-            // Quoted, so a mixed-case or reserved-word name still resolves.
-            let callee = format!("{}.{}", quote_ident(&self.schema), quote_ident(&self.name));
-            let query_string = if self.is_procedure {
-                format!("CALL {callee}")
-            } else if self.returns_set || (!self.is_procedure && self.out_args.len() > 1) {
-                format!("select {} from {callee}", self.result_column_list(types))
-            } else {
-                format!("select {callee}")
-            };
-
-            // Attribution for scalar decode failures: the function, and the
-            // single OUT parameter or the (unnamed) return value.
-            let item = format!("{}.{}", self.schema, self.name);
-            let result_col = self
-                .out_args
-                .first()
-                .map(|a| a.name.clone())
-                .unwrap_or_else(|| "result".to_string());
-            let decode = crate::codegen::decode_err(&item, &result_col, 0);
-
-            let query = if self.is_procedure {
-                // Handle procedures differently
-                if self.out_args.is_empty() {
-                    // No OUT parameters - just execute
-                    quote! {
-                        client
-                            .execute(&stmt, &params)
-                            .await
-                            .map(|_| ())
-                            .map_err(#err_type::from)
-                    }
-                } else if self.out_args.len() == 1 {
-                    // Single OUT parameter - return it directly
-                    quote! {
-                        client
-                            .query_one(&stmt, &params)
-                            .await
-                            .map_err(#err_type::from)
-                            .and_then(|row| row.try_get(0).map_err(#decode).map_err(#err_type::from))
-                    }
-                } else {
-                    // Multiple OUT parameters - return as tuple or struct
-                    // For now, return as a Row that can be converted
-                    quote! {
-                        client
-                            .query_one(&stmt, &params)
-                            .await
-                            .map_err(#err_type::from)
-                            .and_then(|row| row.try_into().map_err(#err_type::from))
-                    }
-                }
-            } else if return_opt {
-                quote! {
-                    client
-                        .query_opt(&stmt, &params)
-                        .await
-                        .map_err(#err_type::from)
-                        .and_then(|opt_row| match opt_row {
-                            None => Ok(None),
-                            Some(row) => row.try_get(0).map(Some).map_err(#decode).map_err(#err_type::from),
-                        })
-                }
-            } else if self.returns_set {
-                if self.return_type_oid == VOID_TYPE_OID {
-                    // Void set-returning function - just return vec of units
-                    quote! {
-                        client
-                            .query(&stmt, &params)
-                            .await
-                            .map(|rows| vec![(); rows.len()])
-                            .map_err(#err_type::from)
-                    }
-                } else if is_return_table {
-                    // RETURN TABLE functions need row conversion
-                    quote! {
-                        client
-                            .query(&stmt, &params)
-                            .await
-                            .map_err(#err_type::from)
-                            .and_then(|rows| {
-                                rows.into_iter()
-                                    .map(|row| row.try_into().map_err(#err_type::from))
-                                    .collect()
-                            })
-                    }
-                } else {
-                    // Check if return type is composite or primitive
-                    let return_pg_type = types.get(&self.return_type_oid).unwrap();
-                    match return_pg_type {
-                        PgType::Composite { .. } => {
-                            // Composite types use TryInto
-                            quote! {
-                                client
-                                    .query(&stmt, &params)
-                                    .await
-                                    .map_err(#err_type::from)
-                                    .and_then(|rows| {
-                                        rows.into_iter()
-                                            .map(|row| row.try_into().map_err(#err_type::from))
-                                            .collect()
-                                    })
-                            }
-                        }
-                        _ => {
-                            // Primitive types use try_get(0)
-                            quote! {
-                                client
-                                    .query(&stmt, &params)
-                                    .await
-                                    .map_err(#err_type::from)
-                                    .and_then(|rows| {
-                                        rows.into_iter()
-                                            .map(|row| row.try_get(0).map_err(#decode).map_err(#err_type::from))
-                                            .collect()
-                                    })
-                            }
-                        }
-                    }
-                }
-            } else if !self.is_procedure && self.out_args.len() > 1 {
-                // Functions with multiple OUT parameters return a struct via TryFrom<Row>
-                quote! {
-                    client
-                        .query_one(&stmt, &params)
-                        .await
-                        .map_err(#err_type::from)
-                        .and_then(|r| r.try_into().map_err(#err_type::from))
-                }
-            } else if self.return_type_oid == VOID_TYPE_OID {
-                // Void returning function
-                quote! {
-                    client
-                        .execute(&stmt, &params)
-                        .await
-                        .map_err(#err_type::from)?;
-
-                    Ok(())
-                }
-            } else if is_return_table {
-                // Non-set RETURN TABLE function (single row)
-                quote! {
-                    client
-                        .query_one(&stmt, &params)
-                        .await
-                        .map_err(#err_type::from)
-                        .and_then(|r| r.try_into().map_err(#err_type::from))
-                }
-            } else {
-                // Use try_get for single return value
-                quote! {
-                    client
-                        .query_one(&stmt, &params)
-                        .await
-                        .map_err(#err_type::from)
-                        .and_then(|r| r.try_get(0).map_err(#decode).map_err(#err_type::from))
-                }
-            };
-
-            // Cache the prepared statement on the per-connection StatementCache.
-            // The SQL string is built at runtime (varies with which optional params
-            // were passed), but each distinct SQL still gets its own cache entry,
-            // so callers see prepare-once behaviour per arg-shape per connection.
-            //
-            // We use prepare_cached (untyped) rather than prepare_typed_cached:
-            // function args frequently involve user-defined composites/domains/
-            // enums whose OIDs aren't builtins, and the describe round-trip saved
-            // by prepare_typed_cached is one-time per cache miss anyway.
-            let prepare_step = quote! {
-                let stmt = client.prepare_cached(&query).await.map_err(#err_type::from)?;
-            };
-
-            if !opt_args.is_empty() {
-                // Generate code for functions with optional parameters using string building
-                let opt_param_handling: Vec<TokenStream> = opt_args.iter().enumerate().map(|(i, arg)| {
-                    let arg_name = arg.rs_name();
-                    let sql_param_name = quote_ident(&arg.name);
-                    let param_index = req_args.len() + i + 1;
-                    // We need to use as_ref() to avoid moving the value out of the Option
-                    let param_ref = if arg.needs_reference(types) {
-                        quote! { val }  // val is already a reference from as_ref()
-                    } else {
-                        quote! { *val } // Dereference to get the value
-                    };
-                    quote! {
-                        if let Some(val) = #arg_name.as_ref() {
-                            params.push(#param_ref);
-                            optional_parts.push(format!("{} := ${}", #sql_param_name, params.len()));
-                        }
-                    }
-                }).collect();
-
-                quote! {
-                    let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#req_arg_refs),*];
-                    let mut optional_parts = Vec::new();
-
-                    #(#opt_param_handling)*
-
-                    let query = if optional_parts.is_empty() {
-                        if params.is_empty() {
-                            format!("{}()", #query_string)
-                        } else {
-                            format!("{}({})", #query_string, #required_query_params)
-                        }
-                    } else {
-                        let optional_clause = optional_parts.join(", ");
-                        if params.len() == optional_parts.len() {
-                            // Only optional parameters
-                            format!("{}({})", #query_string, optional_clause)
-                        } else {
-                            // Both required and optional parameters
-                            format!("{}({}, {})", #query_string, #required_query_params, optional_clause)
-                        }
-                    };
-
-                    #prepare_step
-
-                    #query
-                }
-            } else {
-                // Simple case with only required parameters
-                quote! {
-                    let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#req_arg_refs),*];
-                    let query = format!("{}({})", #query_string, #required_query_params);
-
-                    #prepare_step
-
-                    #query
-                }
-            }
+        let cardinality = if self.is_procedure || !self.returns_set {
+            Cardinality::One
+        } else {
+            Cardinality::Many
         };
+
+        let (row_type, decode_row) = self.result_row(types, &err_type);
+
+        let return_type = match cardinality {
+            Cardinality::One => row_type,
+            Cardinality::Many => quote! { Vec<#row_type> },
+        };
+
+        let query = run_statement(cardinality, decode_row, &err_type);
+
+        let arg_names = arg_idents(self.args.iter().map(|a| a.name.as_str()), IN_PREFIXES);
+
+        let fn_body = self.call_body(types, &arg_names, &err_type, &query);
 
         // Build fn signature
         let rs_fn_name = self.rs_name();
-        let args: Vec<TokenStream> = self.args.iter().map(|a| a.to_rust(types, config)).collect();
-        let return_type = if self.is_procedure {
-            // Procedures have different return types based on OUT parameters
-            if self.out_args.is_empty() {
-                quote! { () }
-            } else if self.out_args.len() == 1 {
-                // Single OUT parameter - return its type directly
-                let out_type = types
-                    .get(&self.out_args[0].type_oid)
-                    .unwrap()
-                    .to_rust_ident(types);
-                if self.out_args[0].nullable {
-                    quote! { Option<#out_type> }
-                } else {
-                    quote! { #out_type }
-                }
-            } else {
-                // Multiple OUT parameters - use generated struct
-                let struct_name = self.out_params_struct_name();
-                quote! { #struct_name }
-            }
-        } else if self.return_type_oid == VOID_TYPE_OID {
-            quote! { () }
-        } else if is_return_table {
-            // For RETURN TABLE functions, use the generated struct
-            let struct_name = self.return_table_struct_name();
-            if self.returns_set {
-                quote! { Vec<#struct_name> }
-            } else {
-                quote! { #struct_name }
-            }
-        } else if !self.is_procedure && self.out_args.len() > 1 {
-            // Functions with multiple OUT parameters use generated struct
-            let struct_name = self.out_params_struct_name();
-            quote! { #struct_name }
-        } else {
-            let inner_ty = types
-                .get(&self.return_type_oid)
-                .unwrap()
-                .to_rust_ident(types);
+        let args: Vec<TokenStream> = self
+            .args
+            .iter()
+            .zip(&arg_names)
+            .map(|(arg, name)| {
+                let ty = arg.rs_param_type(types);
+                quote! { #name: #ty }
+            })
+            .collect();
 
-            if self.returns_set {
-                quote! { Vec<#inner_ty> }
-            } else {
-                let return_not_null = self
-                    .comment
-                    .as_ref()
-                    .is_some_and(|c| annotations::has_not_null(c));
-                if return_not_null {
-                    inner_ty
-                } else {
-                    quote! { Option<#inner_ty> }
-                }
-            }
-        };
-
-        let doc_comment = match &self.comment {
-            Some(comment) => {
-                if self.is_procedure {
-                    format!("Calls PostgreSQL procedure: {}\n\n{}", self.name, comment)
-                } else {
-                    comment.clone()
-                }
-            }
-            None => {
-                if self.is_procedure {
-                    format!("Calls PostgreSQL procedure: {}", self.name)
-                } else {
-                    format!("Calls PostgreSQL function: {}", self.name)
-                }
-            }
-        };
+        let doc_comment = self.doc_comment();
         let comment_macro = quote! { #[doc=#doc_comment] };
 
-        // Generate struct for RETURN TABLE functions or procedures/functions with multiple OUT parameters
-        let struct_def = if is_return_table || self.out_args.len() > 1 {
-            let struct_name = if is_return_table {
-                self.return_table_struct_name()
-            } else {
-                self.out_params_struct_name()
-            };
-
-            // Check if any out_args use double-underscore naming for grouping
-            let has_grouped = self.out_args.iter().any(|a| {
-                let clean = if a.name.starts_with("o_") { &a.name[2..] } else { &a.name };
-                clean.contains("__")
-            });
-
-            if has_grouped {
-                self.generate_grouped_out_struct(&struct_name, types)
-            } else {
-                self.generate_flat_out_struct(&struct_name, types)
-            }
-        } else {
-            quote! {}
-        };
+        let struct_def = self.result_struct(types);
 
         // Check if tracing is enabled
         let tracing_enabled = config.tracing.as_ref().map(|t| t.enabled).unwrap_or(false);
@@ -1355,6 +719,272 @@ impl ToRust for PgFn {
                 #fn_body
             }
         }
+    }
+}
+
+impl PgFn {
+    /// What one result row is, and how it is read (`None` when there is
+    /// nothing to read).
+    fn result_row(
+        &self,
+        types: &BTreeMap<OID, PgType>,
+        err_type: &TokenStream,
+    ) -> (TokenStream, Option<TokenStream>) {
+        // Attribution for scalar decode failures: the function, and the
+        // single OUT parameter or the (unnamed) return value.
+        let item = format!("{}.{}", self.schema, self.name);
+        let result_col = self
+            .out_args
+            .first()
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| "result".to_string());
+        let decode = crate::codegen::decode_err(&item, &result_col, 0);
+        let decode_struct = quote! { row.try_into().map_err(#err_type::from) };
+        let decode_scalar = quote! { row.try_get(0).map_err(#decode).map_err(#err_type::from) };
+
+        // What one result row is, and how it is read: nothing, a generated
+        // struct (TABLE columns, several OUT parameters, or the attributes
+        // of a composite selected as columns), or one value.
+        if self.has_table_params {
+            (self.return_table_struct_name(), Some(decode_struct))
+        } else if self.out_args.len() > 1 {
+            (self.out_params_struct_name(), Some(decode_struct))
+        } else if self.is_procedure && self.out_args.is_empty() {
+            (quote! { () }, None)
+        } else if self.is_procedure {
+            // Single OUT parameter - return its type directly
+            let out_type = crate::pg_type::rust_type_of(self.out_args[0].type_oid, types);
+            let out_type = if self.out_args[0].nullable {
+                quote! { Option<#out_type> }
+            } else {
+                out_type
+            };
+            (out_type, Some(decode_scalar))
+        } else if self.return_type_oid == VOID_TYPE_OID {
+            (quote! { () }, None)
+        } else {
+            let inner_ty = crate::pg_type::rust_type_of(self.return_type_oid, types);
+            let is_composite = matches!(
+                types.get(&self.return_type_oid),
+                Some(PgType::Composite { .. })
+            );
+            if self.returns_set {
+                // `select <attributes> from f()` spreads a composite over
+                // columns; anything else arrives as the one column.
+                let decode_row = if is_composite { decode_struct } else { decode_scalar };
+                (inner_ty, Some(decode_row))
+            } else {
+                let return_not_null = Annotations::of(self.comment.as_deref()).not_null_this;
+                let ty = if return_not_null {
+                    inner_ty
+                } else {
+                    quote! { Option<#inner_ty> }
+                };
+                (ty, Some(decode_scalar))
+            }
+        }
+    }
+
+    /// The body of the generated function: the parameter list, the call
+    /// statement, its preparation, and `query`, which runs it.
+    fn call_body(
+        &self,
+        types: &BTreeMap<OID, PgType>,
+        arg_names: &[TokenStream],
+        err_type: &TokenStream,
+        query: &TokenStream,
+    ) -> TokenStream {
+        // Arguments with defaults are optional and passed by name;
+        // the rest are passed by position, in declaration order.
+        type NamedArgs<'a> = Vec<(&'a PgArg, &'a TokenStream)>;
+        let (opt_args, req_args): (NamedArgs, NamedArgs) =
+            self.args.iter().zip(arg_names).partition(|(a, _)| a.has_default);
+
+        let required_query_params = req_args
+            .iter()
+            .enumerate()
+            .map(|(i, (arg, _))| {
+                format!(
+                    "{}${}{}",
+                    if arg.variadic { "VARIADIC " } else { "" },
+                    i + 1,
+                    arg.cast_suffix()
+                )
+            })
+            .join(", ");
+
+        let req_arg_refs: Vec<TokenStream> =
+            req_args.iter().map(|(_, name)| quote! { &#name }).collect();
+
+        // Quoted, so a mixed-case or reserved-word name still resolves.
+        let callee = format!("{}.{}", quote_ident(&self.schema), quote_ident(&self.name));
+        let query_string = if self.is_procedure {
+            format!("CALL {callee}")
+        } else if self.returns_set || self.out_args.len() > 1 {
+            format!("select {} from {callee}", self.result_column_list(types))
+        } else {
+            format!("select {callee}")
+        };
+
+        // Cache the prepared statement on the per-connection StatementCache.
+        // The SQL string is built at runtime (varies with which optional params
+        // were passed), but each distinct SQL still gets its own cache entry,
+        // so callers see prepare-once behaviour per arg-shape per connection.
+        //
+        // We use prepare_cached (untyped) rather than prepare_typed_cached:
+        // function args frequently involve user-defined composites/domains/
+        // enums whose OIDs aren't builtins, and the describe round-trip saved
+        // by prepare_typed_cached is one-time per cache miss anyway.
+        let prepare_step = quote! {
+            let stmt = client.prepare_cached(&query).await.map_err(#err_type::from)?;
+        };
+
+        if !opt_args.is_empty() {
+            // Generate code for functions with optional parameters using string building
+            let opt_param_handling: Vec<TokenStream> = opt_args
+                .iter()
+                .map(|(arg, arg_name)| {
+                    // `"name" := $n`, or `VARIADIC "name" := $n` to pass
+                    // the variadic array whole.
+                    let assignment = format!(
+                        "{}{} := $",
+                        if arg.variadic { "VARIADIC " } else { "" },
+                        quote_ident(&arg.name)
+                    );
+                    let cast = arg.cast_suffix();
+                    // as_ref() avoids moving the value out of the Option
+                    quote! {
+                        if let Some(val) = #arg_name.as_ref() {
+                            params.push(val);
+                            optional_parts.push(format!("{}{}{}", #assignment, params.len(), #cast));
+                        }
+                    }
+                })
+                .collect();
+
+            quote! {
+                let mut params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#req_arg_refs),*];
+                let mut optional_parts = Vec::new();
+
+                #(#opt_param_handling)*
+
+                let query = if optional_parts.is_empty() {
+                    if params.is_empty() {
+                        format!("{}()", #query_string)
+                    } else {
+                        format!("{}({})", #query_string, #required_query_params)
+                    }
+                } else {
+                    let optional_clause = optional_parts.join(", ");
+                    if params.len() == optional_parts.len() {
+                        // Only optional parameters
+                        format!("{}({})", #query_string, optional_clause)
+                    } else {
+                        // Both required and optional parameters
+                        format!("{}({}, {})", #query_string, #required_query_params, optional_clause)
+                    }
+                };
+
+                #prepare_step
+
+                #query
+            }
+        } else {
+            // Simple case with only required parameters
+            quote! {
+                let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![#(#req_arg_refs),*];
+                let query = format!("{}({})", #query_string, #required_query_params);
+
+                #prepare_step
+
+                #query
+            }
+        }
+    }
+
+    /// The generated function's doc comment.
+    fn doc_comment(&self) -> String {
+        match &self.comment {
+            Some(comment) => {
+                if self.is_procedure {
+                    format!("Calls PostgreSQL procedure: {}\n\n{}", self.name, comment)
+                } else {
+                    comment.clone()
+                }
+            }
+            None => {
+                if self.is_procedure {
+                    format!("Calls PostgreSQL procedure: {}", self.name)
+                } else {
+                    format!("Calls PostgreSQL function: {}", self.name)
+                }
+            }
+        }
+    }
+
+    /// The struct a row is decoded into, for a function that has one.
+    fn result_struct(&self, types: &BTreeMap<OID, PgType>) -> TokenStream {
+        // Generate struct for RETURN TABLE functions or procedures/functions with multiple OUT parameters
+        let is_return_table = self.has_table_params;
+        if is_return_table || self.out_args.len() > 1 {
+            let struct_name = if is_return_table {
+                self.return_table_struct_name()
+            } else {
+                self.out_params_struct_name()
+            };
+
+            // Check if any out_args use double-underscore naming for grouping
+            let has_grouped = self
+                .out_args
+                .iter()
+                .any(|a| a.name.strip_prefix("o_").unwrap_or(&a.name).contains("__"));
+
+            self.generate_out_struct(&struct_name, types, has_grouped)
+        } else {
+            quote! {}
+        }
+    }
+}
+
+/// Runs the prepared statement and decodes its result for the cardinality.
+fn run_statement(
+    cardinality: Cardinality,
+    decode_row: Option<TokenStream>,
+    err_type: &TokenStream,
+) -> TokenStream {
+    match (cardinality, decode_row) {
+        (Cardinality::One, None) => quote! {
+            client
+                .execute(&stmt, &params)
+                .await
+                .map(|_| ())
+                .map_err(#err_type::from)
+        },
+        (Cardinality::Many, None) => quote! {
+            client
+                .query(&stmt, &params)
+                .await
+                .map(|rows| vec![(); rows.len()])
+                .map_err(#err_type::from)
+        },
+        (Cardinality::One, Some(decode_row)) => quote! {
+            client
+                .query_one(&stmt, &params)
+                .await
+                .map_err(#err_type::from)
+                .and_then(|row| #decode_row)
+        },
+        (Cardinality::Many, Some(decode_row)) => quote! {
+            client
+                .query(&stmt, &params)
+                .await
+                .map_err(#err_type::from)
+                .and_then(|rows| {
+                    rows.into_iter()
+                        .map(|row| #decode_row)
+                        .collect()
+                })
+        },
     }
 }
 
@@ -1392,422 +1022,110 @@ impl PgFn {
         names.iter().map(|n| quote_ident(n)).join(", ")
     }
 
-    /// Generate a flat (non-grouped) struct for OUT parameters / RETURN TABLE
-    fn generate_flat_out_struct(
+    /// The struct for OUT parameters / RETURN TABLE columns, read by position.
+    ///
+    /// With `grouped`, `prefix__field` columns become nested structs. The
+    /// `o_`/`p_` prefixes are SQL-side conventions for OUT/INOUT parameters
+    /// and leak into neither the Rust field names nor the serde JSON names.
+    fn generate_out_struct(
         &self,
         struct_name: &TokenStream,
         types: &BTreeMap<OID, PgType>,
+        grouped: bool,
     ) -> TokenStream {
-        let field_tokens: Vec<TokenStream> = self
-            .out_args
+        use crate::row_struct::{flat_layout, grouped_layout, Decode, FieldParts, RowShape};
+
+        let args = &self.out_args;
+        let clean: Vec<&str> = args
             .iter()
-            .map(|arg| {
-                let field_name = arg.rs_out_name();
-                // Strip `o_`/`p_` prefixes from the serde rename target too — the
-                // generated struct is the public-facing shape, so JSON field names
-                // should not leak the SQL-side OUT/INOUT naming convention.
-                let clean_name: &str = arg
-                    .name
-                    .strip_prefix("o_")
-                    .or_else(|| arg.name.strip_prefix("p_"))
-                    .unwrap_or(&arg.name);
-                let rs_name_str = arg.rs_out_name().to_string();
-                let needs_rename = rs_name_str != clean_name;
+            .map(|a| strip_arg_prefix(&a.name, OUT_PREFIXES))
+            .collect();
+        // What a field is called when nothing forces another name. A grouped
+        // struct's own fields have the prefix stripped once more.
+        let natural = |place: crate::row_struct::Place| match place.member {
+            Some(member) => sql_to_rs_string(member, CaseType::Snake),
+            None if grouped => sql_to_rs_string(
+                strip_arg_prefix(clean[place.index], OUT_PREFIXES),
+                CaseType::Snake,
+            ),
+            None => sql_to_rs_string(clean[place.index], CaseType::Snake),
+        };
+        let flat_idents = arg_idents(args.iter().map(|a| a.name.as_str()), OUT_PREFIXES);
 
-                let base_type = Self::arg_base_type(arg, types);
-                let field_type = if arg.nullable {
-                    quote! { Option<#base_type> }
+        let layout = if grouped {
+            grouped_layout(
+                clean
+                    .iter()
+                    .zip(args)
+                    .map(|(name, arg)| (*name, arg.nullable_due_to_join)),
+            )
+        } else {
+            flat_layout(args.len())
+        };
+
+        let shape = RowShape::build(
+            struct_name.clone(),
+            &struct_name.to_string(),
+            layout,
+            |place| {
+                if grouped {
+                    natural(place)
                 } else {
-                    base_type
-                };
+                    // A name that would clash once stripped keeps its prefix.
+                    flat_idents[place.index].to_string()
+                }
+            },
+            |place, ident| {
+                let arg = &args[place.index];
+                let sql_name = place.member.unwrap_or(clean[place.index]);
+                // Inside a group a field has its natural nullability: on the
+                // base column or because of the join.
+                let nullable =
+                    arg.nullable || (place.member.is_some() && arg.nullable_due_to_join);
 
-                let serde_attr = match (needs_rename, arg.nullable) {
-                    (true, true) => quote! { #[serde(rename = #clean_name, default)] },
-                    (true, false) => quote! { #[serde(rename = #clean_name)] },
+                // A field that kept its prefix or got a suffix to stay
+                // distinct serializes under its Rust name.
+                let rs_name = ident.to_string();
+                let needs_rename = rs_name != sql_name && rs_name == natural(place);
+                let attrs = match (needs_rename, nullable) {
+                    (true, true) => quote! { #[serde(rename = #sql_name, default)] },
+                    (true, false) => quote! { #[serde(rename = #sql_name)] },
                     (false, true) => quote! { #[serde(default)] },
                     (false, false) => quote! {},
                 };
 
-                quote! {
-                    #serde_attr
-                    pub #field_name: #field_type
-                }
-            })
-            .collect();
-
-        let field_names: Vec<TokenStream> = self
-            .out_args
-            .iter()
-            .map(|arg| arg.rs_out_name())
-            .collect();
-        let field_indices: Vec<usize> = (0..self.out_args.len()).collect();
-        let column_names: Vec<&str> = self.out_args.iter().map(|a| a.name.as_str()).collect();
-        let struct_name_str = struct_name.to_string();
-
-        quote! {
-            #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-            pub struct #struct_name {
-                #(#field_tokens),*
-            }
-
-            impl TryFrom<tokio_postgres::Row> for #struct_name {
-                type Error = super::errors::DecodeError;
-
-                fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
-                    Ok(Self {
-                        #(
-                            #field_names: row.try_get(#field_indices)
-                                .map_err(super::errors::DecodeError::at(#struct_name_str, #column_names, #field_indices))?,
-                        )*
-                    })
-                }
-            }
-        }
-    }
-
-    /// Generate a grouped struct for OUT parameters / RETURN TABLE when `__` columns are present
-    fn generate_grouped_out_struct(
-        &self,
-        struct_name: &TokenStream,
-        types: &BTreeMap<OID, PgType>,
-    ) -> TokenStream {
-        let struct_name_str = struct_name.to_string();
-        use crate::column_grouping::{group_by_double_underscore, GroupedField};
-
-        // Build indexed args with clean names (strip o_/p_ prefix). These prefixes
-        // are SQL-side conventions for OUT/INOUT parameters and shouldn't leak into
-        // either the Rust field names or the serde JSON names.
-        let indexed_args: Vec<(usize, PgArg)> = self
-            .out_args
-            .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                let mut arg = a.clone();
-                if let Some(rest) = arg.name.strip_prefix("o_") {
-                    arg.name = rest.to_string();
-                } else if let Some(rest) = arg.name.strip_prefix("p_") {
-                    arg.name = rest.to_string();
-                }
-                (i, arg)
-            })
-            .collect();
-
-        let grouped = group_by_double_underscore(
-            indexed_args,
-            |(_i, a)| &a.name,
-            |(_i, a)| a.nullable_due_to_join,
-            |(_, a), new_name| a.name = new_name,
-        );
-
-        let mut nested_struct_defs: Vec<TokenStream> = Vec::new();
-        let mut parent_fields: Vec<TokenStream> = Vec::new();
-        let mut parent_field_assignments: Vec<TokenStream> = Vec::new();
-
-        for grouped_field in &grouped {
-            match grouped_field {
-                GroupedField::Plain((idx, arg)) => {
-                    // Match the prefix-stripping that flat OUT structs use in
-                    // `rs_out_name` so the two paths produce the same Rust field name.
-                    let field_name = arg.rs_out_name();
-                    let sql_name: &str = &arg.name;
-                    let rs_name_str = arg.rs_out_name().to_string();
-                    let needs_rename = rs_name_str != sql_name;
-
-                    let base_type = Self::arg_base_type(arg, types);
-                    let field_type = if arg.nullable {
+                let base_type = crate::pg_type::rust_type_of(arg.type_oid, types);
+                FieldParts {
+                    column: arg.name.clone(),
+                    label: if grouped { sql_name.to_string() } else { arg.name.clone() },
+                    ty: if nullable {
                         quote! { Option<#base_type> }
                     } else {
                         base_type
-                    };
-
-                    let serde_attr = match (needs_rename, arg.nullable) {
-                        (true, true) => quote! { #[serde(rename = #sql_name, default)] },
-                        (true, false) => quote! { #[serde(rename = #sql_name)] },
-                        (false, true) => quote! { #[serde(default)] },
-                        (false, false) => quote! {},
-                    };
-
-                    parent_fields.push(quote! {
-                        #serde_attr
-                        pub #field_name: #field_type
-                    });
-                    parent_field_assignments.push(quote! {
-                        #field_name: row.try_get(#idx)
-                            .map_err(super::errors::DecodeError::at(#struct_name_str, #sql_name, #idx))?
-                    });
+                    },
+                    attrs,
                 }
-                GroupedField::Group {
-                    group_name,
-                    fields,
-                    optional,
-                } => {
-                    let nested_struct_name = format_ident!(
-                        "{}{}",
-                        struct_name.to_string(),
-                        sql_to_rs_ident(group_name, CaseType::Pascal).to_string()
-                    );
-                    let group_field_name = sql_to_rs_ident(group_name, CaseType::Snake);
+            },
+        );
 
-                    // Generate nested struct fields
-                    let nested_fields: Vec<TokenStream> = fields
-                        .iter()
-                        .map(|(_idx, arg)| {
-                            // Nested struct fields use their natural nullability:
-                            // nullable on base OR nullable due to join.
-                            let inner_nullable = arg.nullable || arg.nullable_due_to_join;
-
-                            let f_name = sql_to_rs_ident(&arg.name, CaseType::Snake);
-                            let col_name = &arg.name;
-                            let rs_name_str = sql_to_rs_string(col_name, CaseType::Snake);
-                            let needs_rename = rs_name_str != *col_name;
-
-                            let base_type = Self::arg_base_type(arg, types);
-                            let field_type = if inner_nullable {
-                                quote! { Option<#base_type> }
-                            } else {
-                                base_type
-                            };
-
-                            let serde_attr = match (needs_rename, inner_nullable) {
-                                (true, true) => {
-                                    quote! { #[serde(rename = #col_name, default)] }
-                                }
-                                (true, false) => quote! { #[serde(rename = #col_name)] },
-                                (false, true) => quote! { #[serde(default)] },
-                                (false, false) => quote! {},
-                            };
-
-                            quote! {
-                                #serde_attr
-                                pub #f_name: #field_type
-                            }
-                        })
-                        .collect();
-
-                    // Generate nested struct field assignments from row indices
-                    let nested_assignments: Vec<TokenStream> = fields
-                        .iter()
-                        .map(|(idx, arg)| {
-                            let f_name = sql_to_rs_ident(&arg.name, CaseType::Snake);
-                            let c_name = arg.name.as_str();
-                            quote! {
-                                #f_name: row.try_get(#idx)
-                                    .map_err(super::errors::DecodeError::at(#struct_name_str, #c_name, #idx))?
-                            }
-                        })
-                        .collect();
-
-                    nested_struct_defs.push(quote! {
-                        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-                        pub struct #nested_struct_name {
-                            #(#nested_fields),*
-                        }
-                    });
-
-                    if *optional {
-                        // See codegen.rs for the rationale — `NullProbe`
-                        // accepts every Postgres type, so the probe never
-                        // trips tokio-postgres's type-compatibility check.
-                        let first_idx = fields[0].0;
-                        let first_col = fields[0].1.name.as_str();
-                        let group_type = quote! { Option<#nested_struct_name> };
-
-                        parent_fields.push(quote! {
-                            pub #group_field_name: #group_type
-                        });
-
-                        parent_field_assignments.push(quote! {
-                            #group_field_name: if row.try_get::<usize, super::nullable::NullProbe>(#first_idx)
-                                .map_err(super::errors::DecodeError::at(#struct_name_str, #first_col, #first_idx))?
-                                .is_null
-                            {
-                                None
-                            } else {
-                                Some(#nested_struct_name {
-                                    #(#nested_assignments),*
-                                })
-                            }
-                        });
-                    } else {
-                        parent_fields.push(quote! {
-                            pub #group_field_name: #nested_struct_name
-                        });
-
-                        parent_field_assignments.push(quote! {
-                            #group_field_name: #nested_struct_name {
-                                #(#nested_assignments),*
-                            }
-                        });
-                    }
-                }
-            }
-        }
-
+        let derives = quote! { #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)] };
+        let structs = shape.emit_structs(&derives, &derives);
+        let decoder = shape.emit_decoder(Decode::Position);
         quote! {
-            #(#nested_struct_defs)*
+            #structs
 
-            #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-            pub struct #struct_name {
-                #(#parent_fields),*
-            }
-
-            impl TryFrom<tokio_postgres::Row> for #struct_name {
-                type Error = super::errors::DecodeError;
-
-                fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
-                    Ok(Self {
-                        #(#parent_field_assignments),*
-                    })
-                }
-            }
-        }
-    }
-
-    /// Get the Rust base type for a PgArg
-    fn arg_base_type(arg: &PgArg, types: &BTreeMap<OID, PgType>) -> TokenStream {
-        match types.get(&arg.type_oid).unwrap() {
-            PgType::Int16 => quote! { i16 },
-            PgType::Int32 => quote! { i32 },
-            PgType::Int64 => quote! { i64 },
-            PgType::Bool => quote! { bool },
-            PgType::Text => quote! { String },
-            t => {
-                let id = t.to_rust_ident(types);
-                quote! { #id }
-            }
+            #decoder
         }
     }
 }
 
-
-
-/// Extract custom error types from parsed queries by looking for calls to the raise_error function
-/// Returns a set of error type names and optionally their SQLSTATEs
-pub fn extract_custom_errors_from_queries(
-    queries: &[ParseResult],
-    errors_config: &crate::config::ErrorsConfig,
-) -> BTreeSet<String> {
-    let mut custom_errors = BTreeSet::new();
-    let raise_function = errors_config.get_raise_function();
-    let errors_schema = &errors_config.schema;
-
-    for query in queries {
-        for (node, _, _, _) in query.protobuf.nodes() {
-            match node.to_enum() {
-                // Handle CALL statements
-                Node::CallStmt(stmt) => {
-                    if let Some(funccall) = &stmt.funccall {
-                        if is_raise_error_call(&funccall.funcname, raise_function) {
-                            // First argument should be the error type cast
-                            if let Some(first_arg) = funccall.args.first() {
-                                if let Some(error_type) =
-                                    extract_error_type_from_node(first_arg, errors_schema)
-                                {
-                                    custom_errors.insert(error_type);
-
-                                    // Check for optional second argument (SQLSTATE)
-                                    // We don't need to track the SQLSTATE here since we're using HINT-based detection
-                                    // But we could extract it for future use
-                                }
-                            }
-                        }
-                    }
-                }
-                // Handle SELECT statements (from PERFORM)
-                Node::SelectStmt(stmt) => {
-                    // Look for function calls in the target list
-                    for target in &stmt.target_list {
-                        if let Some(Node::ResTarget(res_target)) = &target.node {
-                            if let Some(Node::FuncCall(funccall)) =
-                                &res_target.val.as_ref().and_then(|v| v.node.as_ref())
-                            {
-                                if is_raise_error_call(&funccall.funcname, raise_function) {
-                                    // First argument should be the error type cast
-                                    if let Some(first_arg) = funccall.args.first() {
-                                        if let Some(error_type) =
-                                            extract_error_type_from_node(first_arg, errors_schema)
-                                        {
-                                            custom_errors.insert(error_type);
-
-                                            // Check for optional second argument (SQLSTATE)
-                                            // We don't need to track the SQLSTATE here since we're using HINT-based detection
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    custom_errors
-}
-
-/// Check if a function name matches the raise_error function
-fn is_raise_error_call(funcname: &[pg_query::protobuf::Node], expected: &str) -> bool {
-    let parts: Vec<String> = funcname
-        .iter()
-        .filter_map(|n| {
-            if let Some(Node::String(s)) = &n.node {
-                Some(s.sval.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let full_name = parts.join(".");
-    full_name == expected
-}
-
-/// Extract error type name from a node if it contains a type cast to errors schema
-fn extract_error_type_from_node(
-    node: &pg_query::protobuf::Node,
-    errors_schema: &str,
-) -> Option<String> {
-    // Look for TypeCast nodes
-    if let Some(Node::TypeCast(type_cast)) = &node.node {
-        if let Some(type_name) = &type_cast.type_name {
-            // Extract the type name parts
-            let type_parts: Vec<String> = type_name
-                .names
-                .iter()
-                .filter_map(|n| {
-                    if let Some(Node::String(s)) = &n.node {
-                        Some(s.sval.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Check if it's a type from the errors schema
-            if type_parts.len() == 2 && type_parts[0] == errors_schema {
-                return Some(type_parts[1].clone());
-            }
-        }
-    }
-
-    // Also check nested nodes (e.g., for ROW(...) expressions)
-    None
-}
-
-
-
-/// Get the position of the first `$...$` tag
+/// The first dollar-quote tag (`$$`, `$function$`) and where the text after
+/// it starts. Only what Postgres accepts as a tag matches, so a `$user` in a
+/// `SET search_path` clause is not mistaken for one.
 fn quote_ind(src: &str) -> Option<(&str, usize)> {
-    let re = Regex::new(r"\$.*?\$").unwrap();
-
-    // Find the first match
-    if let Some(matched) = re.find(src) {
-        let s = matched.as_str();
-        Some((s, matched.end()))
-    } else {
-        None
-    }
+    static TAG: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$").unwrap());
+    TAG.find(src).map(|tag| (tag.as_str(), tag.end()))
 }
 
 #[cfg(test)]
@@ -1882,6 +1200,7 @@ mod test {
             returns_set: true,
             is_procedure: false,
             has_table_params: false,
+            language: "sql".to_string(),
             return_type_oid: 25, // TEXT OID
             comment: None,
             definition: "".to_string(),
@@ -1906,6 +1225,7 @@ mod test {
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
             strict_domains: Vec::new(),
+            builders: Vec::new(),
             queries: None,
             tracing: None,
         };
@@ -1943,6 +1263,7 @@ mod test {
             returns_set: true,
             is_procedure: false,
             has_table_params: false,
+            language: "sql".to_string(),
             return_type_oid: 1000, // Custom composite type OID
             comment: None,
             definition: "".to_string(),
@@ -1994,6 +1315,7 @@ mod test {
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
             strict_domains: Vec::new(),
+            builders: Vec::new(),
             queries: None,
             tracing: None,
         };
@@ -2029,6 +1351,7 @@ mod test {
             returns_set: false,
             is_procedure: false,
             has_table_params: false,
+            language: "sql".to_string(),
             return_type_oid: 25, // TEXT OID
             comment: None,
             definition: "".to_string(),
@@ -2052,6 +1375,7 @@ mod test {
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
             strict_domains: Vec::new(),
+            builders: Vec::new(),
             queries: None,
             tracing: Some(TracingConfig {
                 enabled: true,
@@ -2098,6 +1422,7 @@ mod test {
             returns_set: false,
             is_procedure: false,
             has_table_params: false,
+            language: "sql".to_string(),
             return_type_oid: 25, // TEXT OID
             comment: None,
             definition: "".to_string(),
@@ -2121,6 +1446,7 @@ mod test {
             infer_view_nullability: true,
             disable_deserialize: Vec::new(),
             strict_domains: Vec::new(),
+            builders: Vec::new(),
             queries: None,
             tracing: None,
         };
@@ -2134,5 +1460,95 @@ mod test {
             !generated_str.contains("tracing :: instrument"),
             "Generated code should NOT contain tracing::instrument when disabled"
         );
+    }
+
+    #[test]
+    fn unnamed_arguments_get_positional_names() {
+        use super::parse_args;
+        let none = Default::default();
+
+        // f(int, text): proargnames is NULL, no modes.
+        let (args, out_args, table) =
+            parse_args(&[23, 25], &[b'i' as i8; 2], &[], &[false, false], &none);
+        let names: Vec<&str> = args.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["arg1", "arg2"]);
+        assert!(args.iter().all(|a| !a.named && !a.has_default));
+        assert!(out_args.is_empty() && !table);
+
+        // f(p_a int, int, OUT int, OUT o_b text): partly named.
+        let modes = [b'i', b'i', b'o', b'o'].map(|m| m as i8);
+        let arg_names = ["p_a", "", "", "o_b"].map(String::from);
+        let (args, out_args, _) =
+            parse_args(&[23, 23, 23, 25], &modes, &arg_names, &[false, false], &none);
+        let names: Vec<&str> = args.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["p_a", "arg2"]);
+        let out_names: Vec<&str> = out_args.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(out_names, ["column1", "o_b"]);
+    }
+
+    #[test]
+    fn variadic_and_unnamed_defaults() {
+        use super::parse_args;
+        let none = Default::default();
+
+        // f(p_a int, VARIADIC p_rest int[] DEFAULT '{}')
+        let modes = [b'i', b'v'].map(|m| m as i8);
+        let arg_names = ["p_a", "p_rest"].map(String::from);
+        let (args, _, _) = parse_args(&[23, 1007], &modes, &arg_names, &[false, true], &none);
+        assert!(!args[0].variadic && args[1].variadic);
+        assert!(args[1].has_default);
+
+        // f(p_a int DEFAULT 1, int DEFAULT 2, p_c int DEFAULT 3): the unnamed
+        // default cannot be skipped by name, so it and `p_a` before it are
+        // required; `p_c` stays optional.
+        let arg_names = ["p_a", "", "p_c"].map(String::from);
+        let (args, _, _) = parse_args(
+            &[23, 23, 23],
+            &[b'i' as i8; 3],
+            &arg_names,
+            &[true, true, true],
+            &none,
+        );
+        let defaults: Vec<bool> = args.iter().map(|a| a.has_default).collect();
+        assert_eq!(defaults, [false, false, true]);
+    }
+
+    #[test]
+    fn argument_idents_stay_distinct() {
+        use super::{arg_idents, IN_PREFIXES, OUT_PREFIXES};
+        let idents = |names: &[&str], prefixes: &[&str]| -> Vec<String> {
+            arg_idents(names.iter().copied(), prefixes)
+                .iter()
+                .map(|t| t.to_string())
+                .collect()
+        };
+        assert_eq!(idents(&["p_id", "p_name"], IN_PREFIXES), ["id", "name"]);
+        assert_eq!(idents(&["p_id", "id"], IN_PREFIXES), ["p_id", "id"]);
+        assert_eq!(idents(&["p_", "self", "type"], IN_PREFIXES), ["p", "self_", "r#type"]);
+        assert_eq!(idents(&["o_id", "p_id", "id"], OUT_PREFIXES), ["o_id", "p_id", "id"]);
+        assert_eq!(idents(&["a-b", "a_b"], IN_PREFIXES), ["a_b", "a_b2"]);
+    }
+
+    #[test]
+    fn function_bodies_dollar_quoted_and_sql_standard() {
+        use super::fn_body;
+
+        let dollar = "CREATE OR REPLACE FUNCTION public.f(a integer)\n RETURNS integer\n LANGUAGE sql\n SET search_path TO \"$user\", 'public'\nAS $function$ select a + 1 $function$\n";
+        assert_eq!(fn_body(dollar).as_deref(), Some(" select a + 1 "));
+
+        let atomic = "CREATE OR REPLACE FUNCTION public.f(a integer)\n RETURNS integer\n LANGUAGE sql\nBEGIN ATOMIC\n INSERT INTO t (x) VALUES (a);\n SELECT $$END$$;\nEND\n";
+        assert_eq!(
+            fn_body(atomic).as_deref(),
+            Some("INSERT INTO t (x) VALUES (a);\n SELECT $$END$$;")
+        );
+
+        let ret = "CREATE OR REPLACE FUNCTION public.f(a integer)\n RETURNS integer\n LANGUAGE sql\nRETURN (a + 1)\n";
+        assert_eq!(fn_body(ret).as_deref(), Some("SELECT (a + 1)"));
+
+        // A plpgsql body is not mistaken for a SQL-standard one.
+        let plpgsql = "CREATE OR REPLACE FUNCTION public.f()\n RETURNS integer\n LANGUAGE plpgsql\nAS $function$\nBEGIN\nRETURN 1;\nEND $function$\n";
+        assert_eq!(fn_body(plpgsql).as_deref(), Some("\nBEGIN\nRETURN 1;\nEND "));
+
+        assert_eq!(fn_body("CREATE FUNCTION f() RETURNS int LANGUAGE c"), None);
     }
 }

@@ -227,7 +227,7 @@ fn test_incremental_schema_changes() {
             .build()
             .expect("Updated code generation should succeed");
 
-        let updated_content = if output_path.join("public.rs").exists() {
+        let _updated_content = if output_path.join("public.rs").exists() {
             read_pretty(output_path.join("public.rs"))
         } else {
             read_pretty(output_path.join("mod.rs"))

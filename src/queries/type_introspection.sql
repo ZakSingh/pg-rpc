@@ -7,12 +7,9 @@ with recursive type_tree as (
            t.typelem                                                                                              as array_element_type,
            t.typcategory                                                                                          as type_category,
            t.typbasetype                                                                                          as domain_base_type,
-           case when t.typtype = 'd' then ( select array_agg(pg_get_constraintdef(c.oid))
+           case when t.typtype = 'd' then ( select array_agg(pg_get_constraintdef(c.oid) order by c.conname)
                                             from pg_constraint c
                                             where c.contypid = t.oid ) end                                        as domain_composite_constraints,
-           case when t.typtype = 'd' then ( select array_agg(c.conname)
-                                            from pg_constraint c
-                                            where c.contypid = t.oid ) end                                        as domain_constraint_names,
            case when t.typtype = 'e' then ( select array_agg(enumlabel order by enumsortorder)
                                             from pg_enum
                                             where enumtypid = t.oid ) end                                         as enum_variants,
@@ -35,23 +32,31 @@ with recursive type_tree as (
            -- Get type comments with different behavior for each type
            case when t.typtype = 'd' then (
                -- Domains: Only get direct comments, never inherit
-               select description from pg_description where objoid = t.oid and objsubid = 0 )
+               select description
+               from pg_description
+               where objoid = t.oid and classoid = 'pg_type'::regclass and objsubid = 0 )
                 when t.typtype = 'c' then (
-                    -- Composite types: Get direct comment or inherit from table/view
+                    -- Composite types: Get direct comment or inherit from table/view.
+                    -- pg_description is keyed by (classoid, objoid): an OID alone
+                    -- can belong to an unrelated object in another catalog.
                     select description
                     from pg_description
-                    where objoid in (t.oid, t.typrelid) and objsubid = 0
+                    where objsubid = 0
+                      and ((classoid = 'pg_type'::regclass and objoid = t.oid)
+                        or (classoid = 'pg_class'::regclass and objoid = t.typrelid))
+                    order by classoid = 'pg_type'::regclass desc
                     limit 1 )
                 else (
                     -- Other types: Get direct comments
                     select description
                     from pg_description
                     where objoid = t.oid
+                      and classoid = 'pg_type'::regclass
                       and objsubid = 0 ) end                                                                      as type_comment,
            -- Get comments on the composite type columns
            case when t.typtype = 'c' then ( select array_agg(d.description order by a.attnum)
                                             from pg_attribute a
-                                                     left join pg_description d on d.objoid = t.typrelid and d.objsubid = a.attnum
+                                                     left join pg_description d on d.objoid = t.typrelid and d.classoid = 'pg_class'::regclass and d.objsubid = a.attnum
                                             where a.attrelid = t.typrelid
                                               and a.attnum > 0
                                               and not attisdropped ) end                                          as composite_field_comments,
@@ -90,12 +95,9 @@ with recursive type_tree as (
            t.typelem                                                                                              as array_element_type,
            t.typcategory                                                                                          as type_category,
            t.typbasetype                                                                                          as domain_base_type,
-           case when t.typtype = 'd' then ( select array_agg(pg_get_constraintdef(c.oid))
+           case when t.typtype = 'd' then ( select array_agg(pg_get_constraintdef(c.oid) order by c.conname)
                                             from pg_constraint c
                                             where c.contypid = t.oid ) end                                        as domain_composite_constraints,
-           case when t.typtype = 'd' then ( select array_agg(c.conname)
-                                            from pg_constraint c
-                                            where c.contypid = t.oid ) end                                        as domain_constraint_names,
            case when t.typtype = 'e' then ( select array_agg(enumlabel order by enumsortorder)
                                             from pg_enum
                                             where enumtypid = t.oid ) end                                         as enum_variants,
@@ -118,23 +120,31 @@ with recursive type_tree as (
            -- Get type comments with different behavior for each type
            case when t.typtype = 'd' then (
                -- Domains: Only get direct comments, never inherit
-               select description from pg_description where objoid = t.oid and objsubid = 0 )
+               select description
+               from pg_description
+               where objoid = t.oid and classoid = 'pg_type'::regclass and objsubid = 0 )
                 when t.typtype = 'c' then (
-                    -- Composite types: Get direct comment or inherit from table/view
+                    -- Composite types: Get direct comment or inherit from table/view.
+                    -- pg_description is keyed by (classoid, objoid): an OID alone
+                    -- can belong to an unrelated object in another catalog.
                     select description
                     from pg_description
-                    where objoid in (t.oid, t.typrelid) and objsubid = 0
+                    where objsubid = 0
+                      and ((classoid = 'pg_type'::regclass and objoid = t.oid)
+                        or (classoid = 'pg_class'::regclass and objoid = t.typrelid))
+                    order by classoid = 'pg_type'::regclass desc
                     limit 1 )
                 else (
                     -- Other types: Get direct comments
                     select description
                     from pg_description
                     where objoid = t.oid
+                      and classoid = 'pg_type'::regclass
                       and objsubid = 0 ) end                                                                      as type_comment,
            -- Get comments on the composite type columns
            case when t.typtype = 'c' then ( select array_agg(d.description order by a.attnum)
                                             from pg_attribute a
-                                                     left join pg_description d on d.objoid = t.typrelid and d.objsubid = a.attnum
+                                                     left join pg_description d on d.objoid = t.typrelid and d.classoid = 'pg_class'::regclass and d.objsubid = a.attnum
                                             where a.attrelid = t.typrelid
                                               and a.attnum > 0
                                               and not attisdropped ) end                                          as composite_field_comments,
@@ -184,7 +194,6 @@ select distinct on (oid) oid,
                          type_category,
                          domain_base_type,
                          domain_composite_constraints,
-                         domain_constraint_names,
                          enum_variants,
                          composite_field_names,
                          composite_field_types,

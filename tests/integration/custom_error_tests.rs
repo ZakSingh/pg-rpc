@@ -399,3 +399,119 @@ fn test_custom_error_json_deserialization() {
         println!("Custom error JSON deserialization test completed successfully!");
     });
 }
+
+/// The raise helper is recognised when called unqualified (resolved through
+/// `search_path`) and when nested inside an expression, and the payload
+/// structs honour `@pgrpc_not_null`, come out in name order, and are built
+/// only from standalone composite types.
+#[test]
+fn test_raise_helper_detection_and_payload_struct_shape() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        execute_sql(
+            client,
+            r#"
+            CREATE SCHEMA core;
+            CREATE SCHEMA errors;
+            CREATE SCHEMA app;
+
+            -- Declared out of name order.
+            CREATE TYPE errors.zz_last AS (reason TEXT);
+            CREATE TYPE errors.not_found AS (resource TEXT, id INTEGER, detail TEXT);
+            COMMENT ON TYPE errors.not_found IS '@pgrpc_not_null(resource)';
+            COMMENT ON COLUMN errors.not_found.id IS 'The missing id @pgrpc_not_null';
+            CREATE TYPE errors.forbidden AS (who TEXT);
+            CREATE TYPE errors.in_assignment AS (n INTEGER);
+            -- A type with no fields is still an error type.
+            CREATE TYPE errors.aa_first AS ();
+            -- A table's row type is not.
+            CREATE TABLE errors.error_log (id INTEGER, note TEXT);
+
+            CREATE FUNCTION core.raise_error(p_error ANYELEMENT, p_sqlstate TEXT DEFAULT 'P0001')
+            RETURNS BOOLEAN
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION USING
+                    ERRCODE = p_sqlstate,
+                    HINT = 'application/json',
+                    MESSAGE = (to_jsonb(p_error)
+                        || jsonb_build_object('type', (pg_typeof(p_error)::regtype)::text))::text;
+            END $$;
+
+            CREATE FUNCTION app.find_thing(p_id INTEGER) RETURNS INTEGER
+            LANGUAGE plpgsql SET search_path = core, public AS $$
+            DECLARE v_ok BOOLEAN;
+            BEGIN
+                -- Unqualified: resolved through search_path.
+                IF p_id < 0 THEN
+                    PERFORM raise_error(ROW('thing', p_id, NULL)::errors.not_found);
+                END IF;
+                -- Nested in a WHERE clause, not a top-level select target.
+                PERFORM 1 WHERE p_id = 0 AND core.raise_error(ROW('nobody')::errors.forbidden);
+                -- In an assignment, which is not standalone SQL.
+                v_ok := p_id > 100 AND core.raise_error(ROW(p_id)::errors.in_assignment);
+                RETURN p_id;
+            END $$;
+        "#,
+        )
+        .expect("setup");
+
+        let temp_dir = TempDir::new().expect("Should create temp directory");
+        let output_path = temp_dir.path();
+        pgrpc::PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("app")
+            .enable_errors("errors")
+            .output_path(output_path)
+            .build()
+            .expect("Should generate code");
+
+        let app = read_pretty(output_path.join("app.rs"));
+        let start = app.find("pub enum FindThingError {").expect("FindThingError");
+        let block = &app[start..];
+        let block = &block[..block.find("\n}\n").unwrap()];
+        for variant in ["NotFound(", "Forbidden(", "InAssignment("] {
+            assert!(block.contains(variant), "{variant} missing: {block}");
+        }
+
+        let custom_errors = read_pretty(output_path.join("custom_errors.rs"));
+
+        // Structs in name order, whatever order the catalog returned them in.
+        let positions: Vec<usize> = [
+            "pub struct AaFirst",
+            "pub struct Forbidden",
+            "pub struct InAssignment",
+            "pub struct NotFound",
+            "pub struct ZzLast",
+        ]
+        .iter()
+        .map(|s| custom_errors.find(s).unwrap_or_else(|| panic!("{s} missing")))
+        .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "structs out of order: {positions:?}\n{custom_errors}"
+        );
+
+        // Only standalone composites are error types.
+        assert!(!custom_errors.contains("ErrorLog"), "{custom_errors}");
+
+        // @pgrpc_not_null on the type (resource) and on the column (id);
+        // `detail` stays optional.
+        let compacted = compact(&custom_errors);
+        assert!(compacted.contains("pubresource:String"), "{custom_errors}");
+        assert!(compacted.contains("pubid:i32"), "{custom_errors}");
+        assert!(compacted.contains("pubdetail:Option<String>"), "{custom_errors}");
+
+        // A payload that does not match its struct can be told apart from
+        // "not a typed error".
+        assert!(
+            compacted.contains(
+                "pubfntry_from_json(json:&serde_json::Value)->Result<Option<Self>,serde_json::Error>"
+            ),
+            "{custom_errors}"
+        );
+        assert!(
+            compacted.contains("pubfnfrom_json(json:&serde_json::Value)->Option<Self>"),
+            "{custom_errors}"
+        );
+    });
+}

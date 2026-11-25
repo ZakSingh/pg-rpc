@@ -13,7 +13,7 @@ use rayon::prelude::IntoParallelIterator;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
 
-const FUNCTION_INTROSPECTION_QUERY: &'static str =
+const FUNCTION_INTROSPECTION_QUERY: &str =
     include_str!("./queries/function_introspection.sql");
 
 /// Every PL/pgSQL and SQL function in every user schema, keyed by OID.
@@ -67,13 +67,37 @@ impl FunctionIndex {
             .query(FUNCTION_INTROSPECTION_QUERY, &[])
             .context("Function introspection query failed")?;
 
+        // The query keeps one function per (schema, name). Say which, and
+        // how many overloads were passed over.
+        for row in &fn_rows {
+            let overloads: i64 = row.try_get("overload_count")?;
+            if overloads <= 1 {
+                continue;
+            }
+            let schema: String = row.try_get("schema_name")?;
+            let name: String = row.try_get("function_name")?;
+            let kept: String = row.try_get("identity_args")?;
+            let message = format!(
+                "{schema}.{name} has {overloads} overloads; only {schema}.{name}({kept}) is used, \
+                 the other {} skipped (overloads are not supported)",
+                overloads - 1
+            );
+            // Outside the codegen schemas the function only matters for
+            // following calls, which is not worth a warning.
+            if codegen_schemas.contains(&schema) {
+                log::warn!("{message}");
+            } else {
+                log::debug!("{message}");
+            }
+        }
+
         let fns = fn_rows
             .into_par_iter()
             .map(|row| {
                 let oid: OID = row.get("oid");
                 let schema: String = row.get("schema_name");
                 let name: String = row.get("function_name");
-                PgFn::from_row(row, rel_index, None, errors_config)
+                PgFn::from_row(row, rel_index, errors_config)
                     .map(|f| (oid, f))
                     .with_context(|| format!("Failed to index function {schema}.{name}"))
             })
@@ -273,15 +297,7 @@ impl FunctionIndex {
 
         for pg_fn in self.codegen_fns_mut() {
             // Only analyze SQL language functions with OUT parameters
-            if pg_fn.out_args.is_empty() {
-                continue;
-            }
-
-            let is_sql_function = pg_fn.definition.contains("LANGUAGE sql")
-                || pg_fn.definition.contains("language sql")
-                || pg_fn.definition.contains("LANGUAGE SQL");
-
-            if !is_sql_function {
+            if pg_fn.out_args.is_empty() || !pg_fn.is_sql() {
                 continue;
             }
 
@@ -327,27 +343,5 @@ fn target_display(target: &CallTarget) -> String {
     match &target.schema {
         Some(schema) => format!("{}.{}", schema, target.name),
         None => target.name.clone(),
-    }
-}
-
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct FunctionId {
-    pub schema: String,
-    pub name: String,
-}
-
-impl FunctionId {
-    pub fn new(name: &str) -> Self {
-        if let Some((schema, name)) = name.split_once('.') {
-            Self {
-                schema: schema.to_string(),
-                name: name.to_string(),
-            }
-        } else {
-            Self {
-                schema: "public".to_string(),
-                name: name.to_string(),
-            }
-        }
     }
 }

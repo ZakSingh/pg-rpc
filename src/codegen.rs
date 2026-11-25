@@ -1,13 +1,16 @@
+use crate::annotations::{self, Site};
 use crate::config::Config;
 use crate::exceptions::PgException;
 use crate::fn_index::FunctionIndex;
-use crate::pg_fn::{param_needs_reference, PgFn};
-use crate::pg_type::PgType;
+use crate::ident::schema_mod_ident;
+use crate::pg_fn::PgFn;
+use crate::pg_type::{field_serde_attrs, unsupported_type, PgType};
 use crate::rel_index::RelIndex;
 use crate::ty_index::TypeIndex;
 use crate::unified_error;
 /// Postgres object ID
 /// Uniquely identifies database objects
+#[allow(clippy::upper_case_acronyms)] // spelled as Postgres spells it
 pub type OID = u32;
 
 /// Postgres schema identifier
@@ -25,8 +28,24 @@ pub trait ToRust {
     fn to_rust(&self, types: &BTreeMap<OID, PgType>, config: &Config) -> TokenStream;
 }
 
-/// Generate the date_serde module for serializing time::Date types
-pub fn generate_date_serde_module() -> TokenStream {
+/// Module of the shared serde codecs for date and timestamp fields.
+pub const DATETIME_SERDE_MODULE: &str = "datetime_serde";
+/// Module of the shared `TsVector` / `TsQuery` types.
+pub const TSVECTOR_MODULE: &str = "tsvector";
+
+/// `pub use` of the shared `date_serde` and `timestamp_serde` codecs, for a
+/// generated module whose fields name them in `#[serde(with = "date_serde")]`.
+/// They used to be defined in each such module, so this also keeps
+/// `<module>::date_serde` resolving.
+pub fn datetime_serde_reexport() -> TokenStream {
+    quote! {
+        pub use super::datetime_serde::{date_serde, timestamp_serde};
+    }
+}
+
+/// Codegen for the shared `datetime_serde` module: the `date_serde` and
+/// `timestamp_serde` codecs for `time::Date` and `time::PrimitiveDateTime`.
+fn generate_datetime_serde_module() -> TokenStream {
     quote! {
         /// Custom serde module for time::Date using YYYY-MM-DD format
         pub mod date_serde {
@@ -79,13 +98,157 @@ pub fn generate_date_serde_module() -> TokenStream {
                 }
             }
         }
+
+        /// Custom serde module for time::PrimitiveDateTime (`timestamp`
+        /// without time zone): ISO 8601 without an offset,
+        /// `YYYY-MM-DDTHH:MM:SS.fff`. Fractional seconds are optional on input.
+        pub mod timestamp_serde {
+            use serde::{self, Deserialize, Deserializer, Serializer};
+            use time::PrimitiveDateTime;
+
+            const FORMAT: &[time::format_description::FormatItem] = time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]");
+            const WHOLE_SECONDS: &[time::format_description::FormatItem] = time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+
+            fn parse<E: serde::de::Error>(s: &str) -> Result<PrimitiveDateTime, E> {
+                PrimitiveDateTime::parse(s, &FORMAT)
+                    .or_else(|_| PrimitiveDateTime::parse(s, &WHOLE_SECONDS))
+                    .map_err(E::custom)
+            }
+
+            pub fn serialize<S>(value: &PrimitiveDateTime, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                let s = value.format(&FORMAT).map_err(serde::ser::Error::custom)?;
+                serializer.serialize_str(&s)
+            }
+
+            pub fn deserialize<'de, D>(deserializer: D) -> Result<PrimitiveDateTime, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let s = String::deserialize(deserializer)?;
+                parse(&s)
+            }
+
+            pub mod option {
+                use serde::{Deserialize, Deserializer, Serializer};
+                use time::PrimitiveDateTime;
+
+                pub fn serialize<S>(value: &Option<PrimitiveDateTime>, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: Serializer,
+                {
+                    match value {
+                        Some(v) => {
+                            let s = v.format(&super::FORMAT).map_err(serde::ser::Error::custom)?;
+                            serializer.serialize_some(&s)
+                        }
+                        None => serializer.serialize_none(),
+                    }
+                }
+
+                pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<PrimitiveDateTime>, D::Error>
+                where
+                    D: Deserializer<'de>,
+                {
+                    let opt = Option::<String>::deserialize(deserializer)?;
+                    opt.map(|s| super::parse(&s)).transpose()
+                }
+            }
+        }
     }
+}
+
+/// Codegen for the shared `tsvector` module. It is this crate's own
+/// `tsvector` module, verbatim (minus its tests), so the two cannot drift.
+fn generate_tsvector_module() -> TokenStream {
+    let source = include_str!("tsvector.rs");
+    let source = source.split("#[cfg(test)]").next().unwrap_or(source);
+    source.parse().expect("src/tsvector.rs is valid Rust")
 }
 
 /// `super::errors::DecodeError::at(item, column, index)`: the `map_err`
 /// closure that attributes a `try_get` failure to one column.
 pub(crate) fn decode_err(item: &str, column: &str, index: usize) -> TokenStream {
     quote! { super::errors::DecodeError::at(#item, #column, #index) }
+}
+
+/// Lint suppressions prepended to every file `codegen_split` generates.
+const WARNING_IGNORES: &str = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n#![allow(non_snake_case)]\n\n";
+
+/// Check every `@pgrpc_*` annotation the run has read: on all indexed
+/// functions (codegen schema or not, so a stray tag on a helper is caught),
+/// on the types being generated and their columns, and on constraints.
+fn check_annotations(
+    fn_index: &FunctionIndex,
+    ty_index: &TypeIndex,
+    rel_index: &RelIndex,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let mut problems: Vec<String> = Vec::new();
+
+    for pg_fn in fn_index.values() {
+        for problem in pg_fn.annotation_problems() {
+            problems.push(format!("function {}.{}: {}", pg_fn.schema, pg_fn.name, problem));
+        }
+    }
+
+    let errors_schema = config.errors.as_ref().map(|e| e.schema.as_str());
+    for pg_type in ty_index.values() {
+        match pg_type {
+            PgType::Composite { schema, name, fields, comment, relkind, .. } => {
+                let children: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+                if let Some(comment) = comment {
+                    let site = Site::Type {
+                        children: &children,
+                        // A standalone composite type: nothing to infer from.
+                        all: relkind.as_deref().is_none_or(|k| k == "c"),
+                        message: errors_schema == Some(schema.as_str()),
+                    };
+                    for problem in annotations::check(comment, site) {
+                        problems.push(format!("{schema}.{name}: {problem}"));
+                    }
+                }
+                for field in fields {
+                    if let Some(comment) = &field.comment {
+                        for problem in annotations::check(comment, Site::Column) {
+                            problems.push(format!("column {schema}.{name}.{}: {problem}", field.name));
+                        }
+                    }
+                }
+            }
+            PgType::Domain { schema, name, comment: Some(comment), .. } => {
+                for problem in annotations::check(comment, Site::Other("a domain")) {
+                    problems.push(format!("domain {schema}.{name}: {problem}"));
+                }
+            }
+            PgType::Enum { schema, name, comment: Some(comment), .. } => {
+                for problem in annotations::check(comment, Site::Other("an enum")) {
+                    problems.push(format!("enum {schema}.{name}: {problem}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for rel in rel_index.values() {
+        for constraint in &rel.constraints {
+            if let Some(comment) = constraint.comment() {
+                for problem in annotations::check(comment, Site::Constraint) {
+                    problems.push(format!(
+                        "constraint {} on {}.{}: {}",
+                        constraint.name(),
+                        rel.id.schema(),
+                        rel.id.name(),
+                        problem
+                    ));
+                }
+            }
+        }
+    }
+
+    annotations::fail_on(problems)
 }
 
 /// Generate code split by schema
@@ -95,24 +258,21 @@ pub fn codegen_split(
     rel_index: &RelIndex,
     config: &Config,
 ) -> anyhow::Result<BTreeMap<SchemaName, String>> {
-    let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n#![allow(non_snake_case)]\n\n";
+    // An annotation that is unknown, malformed or on the wrong kind of
+    // object fails the run, naming where it is.
+    check_annotations(fn_index, ty_index, rel_index, config)?;
 
-    // Generate unified error types
-    let (error_types_code, all_exceptions) = generate_unified_errors(fn_index, rel_index, config);
-
-    // Collect table constraints for function error generation
+    // Constraints per table: the constraint enums, and the arms that map a
+    // violation to them in every function's error enum.
     let table_constraints = unified_error::collect_table_constraints(rel_index);
 
+    // Generate unified error types
+    let error_types_code = generate_unified_errors(fn_index, &table_constraints, config);
+
     // Generate types and collect referenced schemas
-    let (type_def_code, type_schema_refs) = codegen_types_with_refs(&ty_index, config);
-    let (fn_code, fn_schema_refs) = codegen_fns_with_refs(
-        &fn_index,
-        &ty_index,
-        &rel_index,
-        &table_constraints,
-        config,
-        &all_exceptions,
-    );
+    let (type_def_code, type_schema_refs) = codegen_types_with_refs(ty_index, config);
+    let (fn_code, fn_schema_refs) =
+        codegen_fns_with_refs(fn_index, ty_index, rel_index, &table_constraints, config);
 
     // Merge schema references
     let mut all_schema_refs: BTreeMap<SchemaName, BTreeSet<SchemaName>> = BTreeMap::new();
@@ -123,7 +283,6 @@ pub fn codegen_split(
         all_schema_refs.entry(schema).or_default().extend(refs);
     }
 
-    // Add error types to a common module.
     // Concatenate via `TokenStream::extend` rather than `quote! { #acc #ts }`,
     // which would re-tokenize the accumulator on every step (O(n²) in tokens).
     let mut schema_code: BTreeMap<SchemaName, String> = type_def_code
@@ -136,373 +295,79 @@ pub fn codegen_split(
         })
         .iter()
         .map(|(schema, tokens)| {
-            // Get referenced schemas for this schema
             let referenced_schemas = all_schema_refs.get(schema).cloned().unwrap_or_default();
-
-            // Generate use statements for referenced schemas
-            let schema_imports: Vec<TokenStream> = referenced_schemas
-                .into_iter()
-                .filter(|s| s != schema) // Don't import self
-                .map(|s| {
-                    let schema_ident = quote::format_ident!("{}", s);
-                    quote! { use super::#schema_ident; }
-                })
-                .collect();
-
-            let date_serde_module = generate_date_serde_module();
-
-            let code = quote! {
-                    #(#schema_imports)*
-
-                    use postgres_types::private::BytesMut;
-                    use postgres_types::{IsNull, ToSql, Type};
-                    use rust_decimal::Decimal;
-                    use bon::builder;
-                    use postgis_butmaintained::ewkb;
-
-                    #date_serde_module
-
-                    /// PostgreSQL full-text search types with proper binary protocol support.
-                    pub mod tsvector {
-                        use postgres_types::private::BytesMut;
-                        use postgres_types::{FromSql, IsNull, ToSql, Type};
-                        use std::error::Error;
-
-                        /// PostgreSQL tsvector type - a sorted list of distinct lexemes with optional positions/weights.
-                        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-                        pub struct TsVector(pub String);
-
-                        /// PostgreSQL tsquery type - a search query for full-text search.
-                        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-                        pub struct TsQuery(pub String);
-
-                        impl<'a> FromSql<'a> for TsVector {
-                            fn from_sql(_ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
-                                Ok(TsVector(parse_tsvector_binary(raw)?))
-                            }
-
-                            fn accepts(ty: &Type) -> bool {
-                                ty.name() == "tsvector"
-                            }
-                        }
-
-                        impl<'a> FromSql<'a> for TsQuery {
-                            fn from_sql(_ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
-                                Ok(TsQuery(parse_tsquery_binary(raw)?))
-                            }
-
-                            fn accepts(ty: &Type) -> bool {
-                                ty.name() == "tsquery"
-                            }
-                        }
-
-                        impl ToSql for TsVector {
-                            fn to_sql(
-                                &self,
-                                _ty: &Type,
-                                out: &mut BytesMut,
-                            ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
-                                out.extend_from_slice(self.0.as_bytes());
-                                Ok(IsNull::No)
-                            }
-
-                            fn accepts(ty: &Type) -> bool {
-                                ty.name() == "tsvector"
-                            }
-
-                            postgres_types::to_sql_checked!();
-                        }
-
-                        impl ToSql for TsQuery {
-                            fn to_sql(
-                                &self,
-                                _ty: &Type,
-                                out: &mut BytesMut,
-                            ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
-                                out.extend_from_slice(self.0.as_bytes());
-                                Ok(IsNull::No)
-                            }
-
-                            fn accepts(ty: &Type) -> bool {
-                                ty.name() == "tsquery"
-                            }
-
-                            postgres_types::to_sql_checked!();
-                        }
-
-                        impl std::fmt::Display for TsVector {
-                            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                                write!(f, "{}", self.0)
-                            }
-                        }
-
-                        impl std::fmt::Display for TsQuery {
-                            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                                write!(f, "{}", self.0)
-                            }
-                        }
-
-                        impl From<String> for TsVector {
-                            fn from(s: String) -> Self {
-                                TsVector(s)
-                            }
-                        }
-
-                        impl From<&str> for TsVector {
-                            fn from(s: &str) -> Self {
-                                TsVector(s.to_string())
-                            }
-                        }
-
-                        impl From<String> for TsQuery {
-                            fn from(s: String) -> Self {
-                                TsQuery(s)
-                            }
-                        }
-
-                        impl From<&str> for TsQuery {
-                            fn from(s: &str) -> Self {
-                                TsQuery(s.to_string())
-                            }
-                        }
-
-                        /// Parse PostgreSQL tsvector binary format.
-                        fn parse_tsvector_binary(raw: &[u8]) -> Result<String, Box<dyn Error + Sync + Send>> {
-                            if raw.len() < 4 {
-                                return Err("tsvector binary data too short".into());
-                            }
-
-                            let num_lexemes = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-                            let mut pos = 4;
-                            let mut lexemes = Vec::with_capacity(num_lexemes);
-
-                            for _ in 0..num_lexemes {
-                                let lexeme_start = pos;
-                                while pos < raw.len() && raw[pos] != 0 {
-                                    pos += 1;
-                                }
-                                if pos >= raw.len() {
-                                    return Err("tsvector binary data truncated in lexeme".into());
-                                }
-
-                                let lexeme = std::str::from_utf8(&raw[lexeme_start..pos])
-                                    .map_err(|e| format!("invalid UTF-8 in tsvector lexeme: {}", e))?;
-                                pos += 1;
-
-                                if pos + 2 > raw.len() {
-                                    return Err("tsvector binary data truncated in position count".into());
-                                }
-                                let num_positions = u16::from_be_bytes([raw[pos], raw[pos + 1]]) as usize;
-                                pos += 2;
-
-                                let mut positions = Vec::with_capacity(num_positions);
-                                for _ in 0..num_positions {
-                                    if pos + 2 > raw.len() {
-                                        return Err("tsvector binary data truncated in positions".into());
-                                    }
-                                    let pos_weight = u16::from_be_bytes([raw[pos], raw[pos + 1]]);
-                                    pos += 2;
-
-                                    let position = pos_weight & 0x3FFF;
-                                    let weight = (pos_weight >> 14) & 0x03;
-
-                                    let weight_char = match weight {
-                                        3 => "A",
-                                        2 => "B",
-                                        1 => "C",
-                                        _ => "",
-                                    };
-
-                                    if weight_char.is_empty() {
-                                        positions.push(format!("{}", position));
-                                    } else {
-                                        positions.push(format!("{}{}", position, weight_char));
-                                    }
-                                }
-
-                                if positions.is_empty() {
-                                    lexemes.push(format!("'{}'", lexeme));
-                                } else {
-                                    lexemes.push(format!("'{}':{}",lexeme, positions.join(",")));
-                                }
-                            }
-
-                            Ok(lexemes.join(" "))
-                        }
-
-                        /// Parse PostgreSQL tsquery binary format.
-                        fn parse_tsquery_binary(raw: &[u8]) -> Result<String, Box<dyn Error + Sync + Send>> {
-                            if raw.len() < 4 {
-                                return Err("tsquery binary data too short".into());
-                            }
-
-                            let num_items = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-
-                            if num_items == 0 {
-                                return Ok(String::new());
-                            }
-
-                            let mut pos = 4;
-                            let mut stack: Vec<String> = Vec::new();
-
-                            for _ in 0..num_items {
-                                if pos >= raw.len() {
-                                    return Err("tsquery binary data truncated".into());
-                                }
-
-                                let item_type = raw[pos];
-                                pos += 1;
-
-                                match item_type {
-                                    1 => {
-                                        if pos + 2 > raw.len() {
-                                            return Err("tsquery binary data truncated in VAL".into());
-                                        }
-
-                                        let weight = raw[pos];
-                                        let prefix = raw[pos + 1];
-                                        pos += 2;
-
-                                        let lexeme_start = pos;
-                                        while pos < raw.len() && raw[pos] != 0 {
-                                            pos += 1;
-                                        }
-                                        if pos >= raw.len() {
-                                            return Err("tsquery binary data truncated in lexeme".into());
-                                        }
-
-                                        let lexeme = std::str::from_utf8(&raw[lexeme_start..pos])
-                                            .map_err(|e| format!("invalid UTF-8 in tsquery lexeme: {}", e))?;
-                                        pos += 1;
-
-                                        let mut lexeme_str = format!("'{}'", lexeme);
-
-                                        if prefix != 0 {
-                                            lexeme_str.push_str(":*");
-                                        }
-
-                                        if weight != 0 && weight != 0x0F {
-                                            let mut weights = String::new();
-                                            if weight & 0x08 != 0 {
-                                                weights.push('A');
-                                            }
-                                            if weight & 0x04 != 0 {
-                                                weights.push('B');
-                                            }
-                                            if weight & 0x02 != 0 {
-                                                weights.push('C');
-                                            }
-                                            if weight & 0x01 != 0 {
-                                                weights.push('D');
-                                            }
-                                            if !weights.is_empty() {
-                                                if prefix != 0 {
-                                                    lexeme_str = format!("'{}':{}", lexeme, weights);
-                                                    lexeme_str.push('*');
-                                                } else {
-                                                    lexeme_str = format!("'{}':{}", lexeme, weights);
-                                                }
-                                            }
-                                        }
-
-                                        stack.push(lexeme_str);
-                                    }
-                                    2 => {
-                                        if pos >= raw.len() {
-                                            return Err("tsquery binary data truncated in OPR".into());
-                                        }
-
-                                        let oper = raw[pos];
-                                        pos += 1;
-
-                                        match oper {
-                                            1 => {
-                                                if let Some(operand) = stack.pop() {
-                                                    stack.push(format!("!{}", operand));
-                                                }
-                                            }
-                                            2 => {
-                                                if stack.len() >= 2 {
-                                                    let right = stack.pop().unwrap();
-                                                    let left = stack.pop().unwrap();
-                                                    stack.push(format!("{} & {}", left, right));
-                                                }
-                                            }
-                                            3 => {
-                                                if stack.len() >= 2 {
-                                                    let right = stack.pop().unwrap();
-                                                    let left = stack.pop().unwrap();
-                                                    stack.push(format!("( {} | {} )", left, right));
-                                                }
-                                            }
-                                            4 => {
-                                                if pos + 2 > raw.len() {
-                                                    return Err("tsquery binary data truncated in PHRASE distance".into());
-                                                }
-                                                let distance = u16::from_be_bytes([raw[pos], raw[pos + 1]]);
-                                                pos += 2;
-
-                                                if stack.len() >= 2 {
-                                                    let right = stack.pop().unwrap();
-                                                    let left = stack.pop().unwrap();
-                                                    if distance == 1 {
-                                                        stack.push(format!("{} <-> {}", left, right));
-                                                    } else {
-                                                        stack.push(format!("{} <{}> {}", left, distance, right));
-                                                    }
-                                                }
-                                            }
-                                            _ => {
-                                                return Err(format!("unknown tsquery operator: {}", oper).into());
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        return Err(format!("unknown tsquery item type: {}", item_type).into());
-                                    }
-                                }
-                            }
-
-                            Ok(stack.pop().unwrap_or_default())
-                        }
-                    }
-
-                    #tokens
-                }.to_string();
-            (schema.clone(), warning_ignores.to_string() + &code)
+            (schema.clone(), schema_file(schema, referenced_schemas, tokens))
         })
         .collect();
 
-    // Add the error types as a separate module
-    let error_module_code = error_types_code.to_string();
-    schema_code.insert(
-        "errors".to_string(),
-        warning_ignores.to_string() + &error_module_code,
-    );
-
-    // Shared null-probe helper. Used by the optional-group row decoder to
-    // detect whether a LEFT JOIN'd group should be `None` without committing
-    // to a concrete `FromSql` type for the sentinel column. Emitted once here
-    // and referenced from row-struct codegen as `super::nullable::NullProbe`.
-    schema_code.insert(
-        "nullable".to_string(),
-        warning_ignores.to_string() + &generate_nullable_module().to_string(),
-    );
-
-    // Shared by-name composite codec. Every generated `FromSql`/`ToSql` impl
-    // for a composite type goes through it, as `super::composite::*`.
-    schema_code.insert(
-        "composite".to_string(),
-        warning_ignores.to_string() + &generate_composite_module().to_string(),
-    );
-
-    // Cache invalidation for connections that outlive a schema change.
-    schema_code.insert(
-        "schema_cache".to_string(),
-        warning_ignores.to_string() + &generate_schema_cache_module().to_string(),
-    );
+    for (module, code) in shared_modules(error_types_code) {
+        schema_code.insert(module.to_string(), WARNING_IGNORES.to_string() + &code.to_string());
+    }
 
     Ok(schema_code)
+}
+
+/// The file for one schema module: imports of the schema modules it refers
+/// to, the shared runtime modules, then its types and functions.
+fn schema_file(
+    schema: &SchemaName,
+    referenced_schemas: BTreeSet<SchemaName>,
+    tokens: &TokenStream,
+) -> String {
+    // Generate use statements for referenced schemas
+    let schema_imports: Vec<TokenStream> = referenced_schemas
+        .into_iter()
+        .filter(|s| s != schema) // Don't import self
+        .map(|s| {
+            let schema_ident = schema_mod_ident(&s);
+            quote! { use super::#schema_ident; }
+        })
+        .collect();
+
+    // The shared runtime modules that used to be defined in every
+    // schema module, still reachable under their old paths.
+    let datetime_serde = datetime_serde_reexport();
+
+    let code = quote! {
+            #(#schema_imports)*
+
+            use postgres_types::private::BytesMut;
+            use postgres_types::{IsNull, ToSql, Type};
+            use rust_decimal::Decimal;
+            use bon::builder;
+            use postgis_butmaintained::ewkb;
+
+            #datetime_serde
+            pub use super::tsvector;
+
+            #tokens
+        }.to_string();
+    WARNING_IGNORES.to_string() + &code
+}
+
+/// The modules generated once and shared by every schema module, `queries`,
+/// `tasks` and `custom_errors`, by module name.
+fn shared_modules(error_types_code: TokenStream) -> Vec<(&'static str, TokenStream)> {
+    vec![
+        // The unified error types.
+        ("errors", error_types_code),
+        // Null-probe helper. Used by the optional-group row decoder to
+        // detect whether a LEFT JOIN'd group should be `None` without
+        // committing to a concrete `FromSql` type for the sentinel column:
+        // `super::nullable::NullProbe`.
+        ("nullable", generate_nullable_module()),
+        // By-name composite codec. Every generated `FromSql`/`ToSql` impl
+        // for a composite type goes through it, as `super::composite::*`.
+        ("composite", generate_composite_module()),
+        // Cache invalidation for connections that outlive a schema change.
+        ("schema_cache", generate_schema_cache_module()),
+        // Serde codecs for date and timestamp fields, named by
+        // `#[serde(with = ...)]` in every module that has such a field.
+        (DATETIME_SERDE_MODULE, generate_datetime_serde_module()),
+        // `TsVector` / `TsQuery`, one definition for all schemas:
+        // `super::tsvector::TsVector`.
+        (TSVECTOR_MODULE, generate_tsvector_module()),
+    ]
 }
 
 /// Codegen for the shared `schema_cache` module.
@@ -763,25 +628,6 @@ fn generate_nullable_module() -> TokenStream {
     }
 }
 
-fn codegen_types(type_index: &TypeIndex, config: &Config) -> BTreeMap<SchemaName, TokenStream> {
-    type_index
-        .deref()
-        .values()
-        .map(|t| (t.schema(), t.to_rust(type_index, config)))
-        .filter(|(_, tokens)| !tokens.is_empty())
-        .into_group_map()
-        .into_iter()
-        .map(|(schema, token_streams)| {
-            (
-                schema,
-                quote! {
-                    #(#token_streams)*
-                },
-            )
-        })
-        .collect()
-}
-
 /// Generate type definitions and collect referenced schemas
 fn codegen_types_with_refs(
     type_index: &TypeIndex,
@@ -884,21 +730,18 @@ fn get_type_schema(pg_type: &PgType) -> Option<String> {
 /// Generate unified error types for all functions
 fn generate_unified_errors(
     fn_index: &FunctionIndex,
-    rel_index: &RelIndex,
+    table_constraints: &BTreeMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
     config: &Config,
-) -> (TokenStream, BTreeSet<PgException>) {
-    // Collect all constraints from tables
-    let table_constraints = unified_error::collect_table_constraints(rel_index);
-
+) -> TokenStream {
     // Collect all custom exceptions from functions
-    let mut all_exceptions = BTreeSet::new();
+    let mut all_exceptions: BTreeSet<PgException> = BTreeSet::new();
     for pg_fn in fn_index.codegen_fns() {
         all_exceptions.extend(pg_fn.exceptions.iter().cloned());
     }
 
     // Generate constraint enums and the name-keyed message lookup
-    let constraint_enums = unified_error::generate_constraint_enums(&table_constraints);
-    let constraint_lookup = unified_error::generate_constraint_message_lookup(&table_constraints);
+    let constraint_enums = unified_error::generate_constraint_enums(table_constraints);
+    let constraint_lookup = unified_error::generate_constraint_message_lookup(table_constraints);
     // Typed-error messages live in custom_errors.rs, which only exists when
     // an errors schema is configured.
     let typed_message_lookup = if config.errors.is_some() {
@@ -912,9 +755,9 @@ fn generate_unified_errors(
 
     // Generate the unified error type
     let error_enum =
-        unified_error::generate_unified_error(&table_constraints, &all_exceptions, config);
+        unified_error::generate_unified_error(table_constraints, &all_exceptions, config);
 
-    let error_types_code = quote! {
+    quote! {
         /// Trait for types that can provide access to an underlying DbError
         pub trait AsDbError {
             /// Returns a reference to the underlying DbError if this error contains one
@@ -1117,32 +960,7 @@ fn generate_unified_errors(
         #(#constraint_enums)*
 
         #error_enum
-    };
-
-    (error_types_code, all_exceptions)
-}
-
-/// Returns map of schema to token stream containing all fn definitions for that schema
-fn codegen_fns(
-    fns: &FunctionIndex,
-    types: &TypeIndex,
-    config: &Config,
-    _all_exceptions: &BTreeSet<PgException>,
-) -> BTreeMap<SchemaName, TokenStream> {
-    let schemas: BTreeMap<&str, Vec<&PgFn>> = fns
-        .codegen_fns()
-        .into_group_map_by(|f| f.schema.as_str())
-        .into_iter()
-        .collect();
-
-    schemas
-        .into_iter()
-        .map(|(schema, fns)| {
-            let fns_rs: Vec<TokenStream> =
-                fns.into_iter().map(|f| f.to_rust(&types, config)).collect();
-            (schema.to_string(), quote! { #(#fns_rs)* })
-        })
-        .collect()
+    }
 }
 
 /// Generate function definitions and collect referenced schemas
@@ -1152,7 +970,6 @@ fn codegen_fns_with_refs(
     rel_index: &RelIndex,
     table_constraints: &BTreeMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
     config: &Config,
-    _all_exceptions: &BTreeSet<PgException>,
 ) -> (
     BTreeMap<SchemaName, TokenStream>,
     BTreeMap<SchemaName, BTreeSet<SchemaName>>,
@@ -1183,7 +1000,7 @@ fn codegen_fns_with_refs(
                 .map(|f| {
                     // Generate error enum for this function
                     let error_enum = f.generate_error_enum(rel_index, table_constraints, config);
-                    let fn_impl = f.to_rust(&types, config);
+                    let fn_impl = f.to_rust(types, config);
                     quote! {
                         #error_enum
 
@@ -1226,14 +1043,22 @@ fn collect_fn_refs(pg_fn: &PgFn, types: &TypeIndex) -> BTreeSet<String> {
     refs
 }
 
+/// The most parameters of one query that may fall back to the column
+/// DEFAULT. Each combination of given/omitted needs its own SQL text, so the
+/// generated function carries `2^n` of them.
+const MAX_DEFAULT_PARAMS: usize = 8;
+
 /// Given a set of param positions to replace with DEFAULT,
 /// rewrite SQL and return the new SQL string.
 /// Parameters are renumbered after DEFAULT replacements.
+///
+/// Only real parameter tokens are touched: a `$1` inside a string literal,
+/// a quoted identifier or a comment is text, and stays as written.
 fn rewrite_sql_for_defaults(
     sql: &str,
     total_params: usize,
     default_positions: &[usize], // 1-indexed positions to replace with DEFAULT
-) -> String {
+) -> anyhow::Result<String> {
     // Build mapping: old position -> new position (or None if DEFAULT)
     let mut new_positions: Vec<Option<usize>> = Vec::with_capacity(total_params);
     let mut next_pos = 1usize;
@@ -1247,23 +1072,35 @@ fn rewrite_sql_for_defaults(
         }
     }
 
-    // Use regex to find and replace parameter markers
-    // This ensures we match whole parameter markers (e.g., $1 not matching inside $10)
-    let re = regex::Regex::new(r"\$(\d+)").unwrap();
+    let scanned = pg_query::scan(sql)
+        .map_err(|e| anyhow::anyhow!("could not tokenize query to rewrite its parameters: {e}"))?;
+    let param_token = pg_query::protobuf::Token::Param as i32;
 
-    re.replace_all(sql, |caps: &regex::Captures| {
-        let param_num: usize = caps[1].parse().unwrap();
-        if param_num >= 1 && param_num <= total_params {
-            match new_positions[param_num - 1] {
-                Some(new_pos) => format!("${}", new_pos),
-                None => "DEFAULT".to_string(),
-            }
-        } else {
-            // Keep unchanged if out of range
-            caps[0].to_string()
+    let mut rewritten = String::with_capacity(sql.len());
+    let mut copied_to = 0usize;
+    for token in scanned.tokens.iter().filter(|t| t.token == param_token) {
+        let (start, end) = (token.start as usize, token.end as usize);
+        // `$` followed by the parameter number.
+        let Some(param_num) = sql
+            .get(start + 1..end)
+            .and_then(|digits| digits.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        // Keep unchanged if out of range
+        let Some(new_position) = param_num.checked_sub(1).and_then(|i| new_positions.get(i))
+        else {
+            continue;
+        };
+        rewritten.push_str(&sql[copied_to..start]);
+        match new_position {
+            Some(new_pos) => rewritten.push_str(&format!("${new_pos}")),
+            None => rewritten.push_str("DEFAULT"),
         }
-    })
-    .to_string()
+        copied_to = end;
+    }
+    rewritten.push_str(&sql[copied_to..]);
+    Ok(rewritten)
 }
 
 /// Build the `&[postgres_types::Type]` slice expression for `prepare_typed_cached`,
@@ -1280,10 +1117,11 @@ fn build_prepared_types_slice(
     // postgres-types' Type::from_oid only knows builtin OIDs, and the prepared statement
     // itself was created with the resolved types anyway.
     let oids: Vec<OID> = params.iter().map(|p| p.postgres_type_oid).collect();
-    for &oid in &oids {
-        if postgres_types::Type::from_oid(oid).is_none() {
-            return None;
-        }
+    if oids
+        .iter()
+        .any(|&oid| postgres_types::Type::from_oid(oid).is_none())
+    {
+        return None;
     }
     let lits: Vec<TokenStream> = oids.iter().map(|oid| quote! { #oid }).collect();
     Some(quote! {
@@ -1297,22 +1135,58 @@ pub fn codegen_queries(
     type_index: &TypeIndex,
     rel_index: &RelIndex,
     config: &Config,
-) -> TokenStream {
-    use crate::query_introspector::IntrospectedQuery;
-
+) -> anyhow::Result<TokenStream> {
     // Collect table constraints for error generation
     let table_constraints = unified_error::collect_table_constraints(rel_index);
 
-    let queries: Vec<&IntrospectedQuery> = query_index.values().collect();
-
-    let query_code: Vec<TokenStream> = queries
-        .iter()
+    let query_code: Vec<TokenStream> = query_index
+        .values()
         .map(|query| generate_query_code(query, type_index, &table_constraints, config))
-        .collect();
+        .collect::<anyhow::Result<_>>()?;
 
-    quote! {
+    Ok(quote! {
         #(#query_code)*
+    })
+}
+
+/// Reports the types of a query's parameters and result columns that codegen
+/// cannot do right by. Returns true if the query has to be left out: one of
+/// them has no Rust mapping at all. A type that was simply not introspected
+/// only gets a warning, and degrades to `serde_json::Value` (a column) or
+/// `&dyn ToSql` (a parameter).
+fn query_uses_unsupported_type(
+    query: &crate::query_introspector::IntrospectedQuery,
+    type_index: &TypeIndex,
+) -> bool {
+    let params = query.params.iter().map(|p| ("parameter", &p.name, p.type_oid));
+    let columns = query
+        .return_columns
+        .iter()
+        .flatten()
+        .map(|c| ("column", &c.name, c.type_oid));
+
+    let mut skip = false;
+    for (kind, name, type_oid) in params.chain(columns) {
+        if let Some(type_name) = unsupported_type(type_oid, type_index) {
+            log::warn!(
+                "Skipping query `{}` ({}:{}): {} `{}` has type `{}`, which has no Rust mapping",
+                query.name, query.file_path, query.line_number, kind, name, type_name
+            );
+            skip = true;
+        } else if type_index.get(&type_oid).is_none() {
+            log::warn!(
+                "Query `{}` ({}:{}): the type of {} `{}` (oid {}) is unknown; it is generated as {}",
+                query.name,
+                query.file_path,
+                query.line_number,
+                kind,
+                name,
+                type_oid,
+                if kind == "column" { "serde_json::Value" } else { "&dyn ToSql" }
+            );
+        }
     }
+    skip
 }
 
 /// Generate code for a single query
@@ -1321,15 +1195,21 @@ fn generate_query_code(
     type_index: &TypeIndex,
     table_constraints: &BTreeMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
     config: &Config,
-) -> TokenStream {
+) -> anyhow::Result<TokenStream> {
     use crate::ident::{sql_to_rs_ident, CaseType};
+    use crate::sql_parser::QueryType;
+
+    if query_uses_unsupported_type(query, type_index) {
+        return Ok(TokenStream::new());
+    }
 
     let fn_name = sql_to_rs_ident(&query.name, CaseType::Snake);
     let sql = &query.sql;
+    let item = query.name.as_str();
 
     // Generate error enum for this query
     let error_enum = generate_query_error_enum(query, table_constraints, config);
-    let error_enum_name = quote::format_ident!("{}Error", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
+    let error_enum_name = query_error_enum_ident(query);
 
     // Generate parameter list
     let params: Vec<TokenStream> = query
@@ -1343,151 +1223,106 @@ fn generate_query_code(
         .collect();
 
     // Generate return type and query execution code
-    let (return_type, query_execution, row_struct) = match &query.query_type {
-        crate::sql_parser::QueryType::One => {
-            if let Some(columns) = &query.return_columns {
-                // For single-column queries, return the scalar type directly
-                if columns.len() == 1 {
-                    let scalar_type = get_column_type(&columns[0], type_index);
-                    let return_type = quote! { Result<#scalar_type, #error_enum_name> };
-                    let decode = decode_err(&query.name, &columns[0].name, 0);
-                    let execution = quote! {
-                        client.query_opt(&stmt, &params).await
-                            .map_err(#error_enum_name::from)
-                            .and_then(|opt_row| {
-                                let row = opt_row.expect("query returned no rows");
-                                row.try_get(0).map_err(#decode).map_err(#error_enum_name::from)
-                            })
-                    };
-                    (return_type, execution, quote! {})
-                } else {
-                    let struct_name_str = format!("{}Row", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
-                    let struct_name = quote::format_ident!("{}", struct_name_str);
-                    let row_struct = generate_row_struct(&struct_name, columns, type_index);
-
-                    let return_type = quote! { Result<#struct_name, #error_enum_name> };
-                    let execution = quote! {
-                        client.query_opt(&stmt, &params).await
-                            .map_err(#error_enum_name::from)
-                            .and_then(|opt_row| {
-                                let row = opt_row.expect("query returned no rows");
-                                row.try_into().map_err(#error_enum_name::from)
-                            })
-                    };
-
-                    (return_type, execution, row_struct)
-                }
-            } else {
-                // Should not happen for :one queries
-                let return_type = quote! { Result<(), #error_enum_name> };
-                let execution = quote! {
-                    client.execute(&stmt, &params).await?;
-                    Ok(())
+    let (return_type, query_execution, row_struct) = match (&query.query_type, &query.return_columns) {
+        (QueryType::One | QueryType::Opt | QueryType::Many, Some(columns)) => {
+            // What one row is, how `row` is read, and how all `rows` are: a
+            // single column is returned bare, several as a generated struct.
+            let (row_type, row_struct, decode_row, decode_rows) = if columns.len() == 1 {
+                let scalar_type = get_column_type(&columns[0], type_index);
+                let decode = decode_err(&query.name, &columns[0].name, 0);
+                let decode_row = quote! {
+                    row.try_get(0).map_err(#decode).map_err(#error_enum_name::from)
                 };
-                (return_type, execution, quote! {})
-            }
-        }
-        crate::sql_parser::QueryType::Opt => {
-            if let Some(columns) = &query.return_columns {
-                // For single-column queries, return the scalar type directly
-                if columns.len() == 1 {
-                    let scalar_type = get_column_type(&columns[0], type_index);
-                    let return_type = quote! { Result<Option<#scalar_type>, #error_enum_name> };
-                    let decode = decode_err(&query.name, &columns[0].name, 0);
-                    let execution = quote! {
-                        client.query_opt(&stmt, &params).await
-                            .map_err(#error_enum_name::from)
-                            .and_then(|row| match row {
-                                Some(row) => row.try_get(0).map(Some).map_err(#decode).map_err(#error_enum_name::from),
-                                None => Ok(None),
-                            })
-                    };
-                    (return_type, execution, quote! {})
-                } else {
-                    let struct_name_str = format!("{}Row", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
-                    let struct_name = quote::format_ident!("{}", struct_name_str);
-                    let row_struct = generate_row_struct(&struct_name, columns, type_index);
-
-                    let return_type = quote! { Result<Option<#struct_name>, #error_enum_name> };
-                    let execution = quote! {
-                        client.query_opt(&stmt, &params).await
-                            .map_err(#error_enum_name::from)
-                            .and_then(|row| match row {
-                                Some(row) => row.try_into().map(Some).map_err(#error_enum_name::from),
-                                None => Ok(None),
-                            })
-                    };
-
-                    (return_type, execution, row_struct)
-                }
-            } else {
-                let return_type = quote! { Result<Option<()>, #error_enum_name> };
-                let execution = quote! {
-                    client.execute(&stmt, &params).await?;
-                    Ok(Some(()))
+                let decode_rows = quote! {
+                    rows.into_iter().map(|row| #decode_row).collect()
                 };
-                (return_type, execution, quote! {})
-            }
-        }
-        crate::sql_parser::QueryType::Many => {
-            if let Some(columns) = &query.return_columns {
-                // For single-column queries, return a Vec of scalar type directly
-                if columns.len() == 1 {
-                    let scalar_type = get_column_type(&columns[0], type_index);
-                    let return_type = quote! { Result<Vec<#scalar_type>, #error_enum_name> };
-                    let decode = decode_err(&query.name, &columns[0].name, 0);
-                    let execution = quote! {
-                        client.query(&stmt, &params).await
-                            .map_err(#error_enum_name::from)
-                            .and_then(|rows| {
-                                rows.into_iter()
-                                    .map(|row| row.try_get(0).map_err(#decode).map_err(#error_enum_name::from))
-                                    .collect()
-                            })
-                    };
-                    (return_type, execution, quote! {})
-                } else {
-                    let struct_name_str = format!("{}Row", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
-                    let struct_name = quote::format_ident!("{}", struct_name_str);
-                    let row_struct = generate_row_struct(&struct_name, columns, type_index);
-
-                    let return_type = quote! { Result<Vec<#struct_name>, #error_enum_name> };
-                    let execution = quote! {
-                        client.query(&stmt, &params).await
-                            .map_err(#error_enum_name::from)
-                            .and_then(|rows| {
-                                #struct_name::decode_all(rows).map_err(#error_enum_name::from)
-                            })
-                    };
-
-                    (return_type, execution, row_struct)
-                }
+                (scalar_type, quote! {}, decode_row, decode_rows)
             } else {
-                // Should not happen for :many queries
-                let return_type = quote! { Result<Vec<()>, #error_enum_name> };
-                let execution = quote! {
-                    let rows = client.query(&stmt, &params).await?;
-                    Ok(vec![(); rows.len()])
-                };
-                (return_type, execution, quote! {})
-            }
+                let struct_name = quote::format_ident!(
+                    "{}Row",
+                    crate::ident::sql_to_rs_string(&query.name, CaseType::Pascal)
+                        .trim_start_matches("r#")
+                );
+                let row_struct = generate_row_struct(&struct_name, columns, type_index);
+                (
+                    quote! { #struct_name },
+                    row_struct,
+                    quote! { #struct_name::try_from(row).map_err(#error_enum_name::from) },
+                    quote! { #struct_name::decode_all(rows).map_err(#error_enum_name::from) },
+                )
+            };
+
+            let (return_type, execution) = match query.query_type {
+                QueryType::One => (
+                    quote! { Result<#row_type, #error_enum_name> },
+                    quote! {
+                        let row = client.query_opt(&stmt, &params).await
+                            .map_err(#error_enum_name::from)?
+                            .ok_or(super::errors::PgRpcError::NoRows { item: #item })?;
+                        #decode_row
+                    },
+                ),
+                QueryType::Opt => (
+                    quote! { Result<Option<#row_type>, #error_enum_name> },
+                    quote! {
+                        client.query_opt(&stmt, &params).await
+                            .map_err(#error_enum_name::from)?
+                            .map(|row| #decode_row)
+                            .transpose()
+                    },
+                ),
+                _ => (
+                    quote! { Result<Vec<#row_type>, #error_enum_name> },
+                    quote! {
+                        let rows = client.query(&stmt, &params).await
+                            .map_err(#error_enum_name::from)?;
+                        #decode_rows
+                    },
+                ),
+            };
+            (return_type, execution, row_struct)
         }
-        crate::sql_parser::QueryType::Exec => {
-            let return_type = quote! { Result<(), #error_enum_name> };
-            let execution = quote! {
+        // A row-returning query without result columns should not happen.
+        (QueryType::One, None) => (
+            quote! { Result<(), #error_enum_name> },
+            quote! {
                 client.execute(&stmt, &params).await?;
                 Ok(())
-            };
-            (return_type, execution, quote! {})
-        }
-        crate::sql_parser::QueryType::ExecRows => {
-            let return_type = quote! { Result<u64, #error_enum_name> };
-            let execution = quote! {
+            },
+            quote! {},
+        ),
+        (QueryType::Opt, None) => (
+            quote! { Result<Option<()>, #error_enum_name> },
+            quote! {
+                client.execute(&stmt, &params).await?;
+                Ok(Some(()))
+            },
+            quote! {},
+        ),
+        (QueryType::Many, None) => (
+            quote! { Result<Vec<()>, #error_enum_name> },
+            quote! {
+                let rows = client.query(&stmt, &params).await?;
+                Ok(vec![(); rows.len()])
+            },
+            quote! {},
+        ),
+        (QueryType::Exec, _) => (
+            quote! { Result<(), #error_enum_name> },
+            quote! {
+                client.execute(&stmt, &params).await?;
+                Ok(())
+            },
+            quote! {},
+        ),
+        (QueryType::ExecRows, _) => (
+            quote! { Result<u64, #error_enum_name> },
+            quote! {
                 let rows_affected = client.execute(&stmt, &params).await?;
                 Ok(rows_affected)
-            };
-            (return_type, execution, quote! {})
-        }
+            },
+            quote! {},
+        ),
     };
 
     // Identify default-eligible params: nullable params where the column is NOT NULL but has DEFAULT
@@ -1498,6 +1333,20 @@ fn generate_query_code(
         .enumerate()
         .filter(|(_, p)| p.nullable && p.has_default)
         .collect();
+    if default_eligible_params.len() > MAX_DEFAULT_PARAMS {
+        anyhow::bail!(
+            "query `{}` ({}:{}) has {} optional parameters that fall back to a column DEFAULT ({}). \
+             Each combination needs its own statement, {} in all; the limit is {} such parameters. \
+             Split the query, or pass some of the values explicitly (e.g. `coalesce(:name, <default>)`).",
+            query.name,
+            query.file_path,
+            query.line_number,
+            default_eligible_params.len(),
+            default_eligible_params.iter().map(|(_, p)| p.name.as_str()).join(", "),
+            1u128 << default_eligible_params.len(),
+            MAX_DEFAULT_PARAMS,
+        );
+    }
 
     // Generate doc comment with SQL
     let doc_comment = format!("Query: {}\n\nSQL:\n```sql\n{}\n```", query.name, sql);
@@ -1547,6 +1396,7 @@ fn generate_query_code(
     } else {
         // Generate match arms for all 2^N combinations of default-eligible params
         generate_default_match_arms(query, &default_eligible_params, sql, type_index)
+            .map_err(|e| e.context(format!("query `{}` ({}:{})", query.name, query.file_path, query.line_number)))?
     };
 
     // Prepare the statement using the per-connection cache.
@@ -1568,7 +1418,7 @@ fn generate_query_code(
         },
     };
 
-    quote! {
+    Ok(quote! {
         #row_struct
 
         #error_enum
@@ -1585,7 +1435,16 @@ fn generate_query_code(
 
             #query_execution
         }
-    }
+    })
+}
+
+/// `{QueryName}Error`, the query's error enum.
+fn query_error_enum_ident(query: &crate::query_introspector::IntrospectedQuery) -> proc_macro2::Ident {
+    use crate::ident::{sql_to_rs_string, CaseType};
+    quote::format_ident!(
+        "{}Error",
+        sql_to_rs_string(&query.name, CaseType::Pascal).trim_start_matches("r#")
+    )
 }
 
 /// Chain of `.as_inner()` calls that peels `depth` domain layers.
@@ -1596,7 +1455,10 @@ fn domain_unwrap_chain(depth: usize) -> TokenStream {
     (0..depth).map(|_| quote! { .as_inner() }).collect()
 }
 
-/// Generate a parameter reference for query execution
+/// The expression that passes `param` in a query's parameter list: a
+/// reference to it, with domain layers peeled down to the type Postgres
+/// expects. A nullable domain needs a binding for the peeled `Option`, which
+/// is pushed to `nullable_domain_bindings`.
 fn generate_param_ref(
     param: &crate::query_introspector::QueryParam,
     type_index: &TypeIndex,
@@ -1613,35 +1475,25 @@ fn generate_param_ref(
         param.postgres_type_oid,
         type_index,
     );
+    if unwrap_depth == 0 {
+        // `Option<T>` implements ToSql too, so a reference always works.
+        return quote! { &#param_name };
+    }
 
+    let unwrap_chain = domain_unwrap_chain(unwrap_depth);
     if param.nullable {
-        if unwrap_depth > 0 {
-            // For nullable domain: create a let binding to unwrap, then reference it
-            use heck::ToSnakeCase;
-            let unwrapped_name_str = format!("{}_unwrapped", param.name.to_snake_case());
-            let unwrapped_name = sql_to_rs_ident(&unwrapped_name_str, CaseType::Snake);
+        // For nullable domain: create a let binding to unwrap, then reference it
+        use heck::ToSnakeCase;
+        let unwrapped_name_str = format!("{}_unwrapped", param.name.to_snake_case());
+        let unwrapped_name = sql_to_rs_ident(&unwrapped_name_str, CaseType::Snake);
 
-            // Generate chained .as_inner() calls for nested domains
-            let unwrap_chain = domain_unwrap_chain(unwrap_depth);
-
-            nullable_domain_bindings.push(
-                quote! { let #unwrapped_name = #param_name.as_ref().map(|v| v #unwrap_chain); }
-            );
-            quote! { &#unwrapped_name }
-        } else {
-            // For nullable parameters, Option<T> implements ToSql, so always use reference
-            quote! { &#param_name }
-        }
+        nullable_domain_bindings.push(
+            quote! { let #unwrapped_name = #param_name.as_ref().map(|v| v #unwrap_chain); }
+        );
+        quote! { &#unwrapped_name }
     } else {
-        if unwrap_depth > 0 {
-            // For non-nullable domain: pass param.as_inner().as_inner()... (depth times)
-            let unwrap_chain = domain_unwrap_chain(unwrap_depth);
-            quote! { #param_name #unwrap_chain }
-        } else if param_needs_reference(param.type_oid, type_index) {
-            quote! { &#param_name }
-        } else {
-            quote! { #param_name }
-        }
+        // For non-nullable domain: pass param.as_inner().as_inner()... (depth times)
+        quote! { #param_name #unwrap_chain }
     }
 }
 
@@ -1651,16 +1503,17 @@ fn generate_default_match_arms(
     default_eligible_params: &[(usize, &crate::query_introspector::QueryParam)],
     sql: &str,
     type_index: &TypeIndex,
-) -> TokenStream {
+) -> anyhow::Result<TokenStream> {
     use crate::ident::{sql_to_rs_string, CaseType};
 
     let n = default_eligible_params.len();
-    let total_combinations = 1usize << n; // 2^n
+    let total_combinations = 1usize << n; // 2^n, bounded by MAX_DEFAULT_PARAMS
+    let as_dyn = quote! { as &(dyn postgres_types::ToSql + Sync) };
 
     // Get param names for match tuple
-    let match_param_names: Vec<proc_macro2::Ident> = default_eligible_params
+    let match_param_names: Vec<TokenStream> = default_eligible_params
         .iter()
-        .map(|(_, p)| quote::format_ident!("{}", sql_to_rs_string(&p.name, CaseType::Snake)))
+        .map(|(_, p)| crate::ident::sql_to_rs_ident(&p.name, CaseType::Snake))
         .collect();
 
     let mut match_arms: Vec<TokenStream> = Vec::with_capacity(total_combinations);
@@ -1675,7 +1528,10 @@ fn generate_default_match_arms(
             let is_some = (combination >> bit_index) & 1 == 1;
             if is_some {
                 // This param is Some - use a binding
-                let val_name = quote::format_ident!("{}_val", sql_to_rs_string(&param.name, CaseType::Snake));
+                let val_name = quote::format_ident!(
+                    "{}_val",
+                    sql_to_rs_string(&param.name, CaseType::Snake).trim_start_matches("r#")
+                );
                 pattern_parts.push(quote! { Some(#val_name) });
                 some_val_names.push((*param_index, val_name));
             } else {
@@ -1686,7 +1542,7 @@ fn generate_default_match_arms(
         }
 
         // Generate the rewritten SQL for this combination
-        let rewritten_sql = rewrite_sql_for_defaults(sql, query.params.len(), &default_positions);
+        let rewritten_sql = rewrite_sql_for_defaults(sql, query.params.len(), &default_positions)?;
 
         // Generate params vec for this combination
         // Include all non-default-eligible params plus the Some values from default-eligible params
@@ -1694,32 +1550,25 @@ fn generate_default_match_arms(
         let mut nullable_domain_bindings: Vec<TokenStream> = Vec::new();
 
         for (param_index, param) in query.params.iter().enumerate() {
-            // Check if this is a default-eligible param
-            if let Some((bit_index, _)) = default_eligible_params.iter().enumerate().find(|(_, (idx, _))| *idx == param_index) {
-                let is_some = (combination >> bit_index) & 1 == 1;
-                if is_some {
-                    // Find the val_name for this param
-                    let val_name = some_val_names.iter().find(|(idx, _)| *idx == param_index).map(|(_, name)| name).unwrap();
+            // A default-eligible param that is Some here is bound in the
+            // pattern; one that is None is DEFAULT in the SQL and not passed.
+            if default_eligible_params.iter().any(|(idx, _)| *idx == param_index) {
+                let Some((_, val_name)) = some_val_names.iter().find(|(idx, _)| *idx == param_index)
+                else {
+                    continue;
+                };
 
-                    // Handle domain unwrapping for the Some value
-                    let unwrap_depth = compute_domain_unwrap_depth(
-                        param.type_oid,
-                        param.postgres_type_oid,
-                        type_index,
-                    );
-
-                    if unwrap_depth > 0 {
-                        let unwrap_chain = domain_unwrap_chain(unwrap_depth);
-                        param_refs.push(quote! { #val_name #unwrap_chain as &(dyn postgres_types::ToSql + Sync) });
-                    } else {
-                        param_refs.push(quote! { #val_name as &(dyn postgres_types::ToSql + Sync) });
-                    }
-                }
-                // If None, don't add to params (it's DEFAULT in the SQL)
+                // Handle domain unwrapping for the Some value
+                let unwrap_chain = domain_unwrap_chain(compute_domain_unwrap_depth(
+                    param.type_oid,
+                    param.postgres_type_oid,
+                    type_index,
+                ));
+                param_refs.push(quote! { #val_name #unwrap_chain #as_dyn });
             } else {
                 // Regular param (not default-eligible)
-                let param_ref = generate_param_ref_for_match(param, type_index, &mut nullable_domain_bindings);
-                param_refs.push(param_ref);
+                let param_ref = generate_param_ref(param, type_index, &mut nullable_domain_bindings);
+                param_refs.push(quote! { #param_ref #as_dyn });
             }
         }
 
@@ -1746,54 +1595,11 @@ fn generate_default_match_arms(
         quote! { (#(&#match_param_names),*) }
     };
 
-    quote! {
+    Ok(quote! {
         let (query, params): (&str, Vec<&(dyn postgres_types::ToSql + Sync)>) = match #match_expr {
             #(#match_arms),*
         };
-    }
-}
-
-/// Generate a parameter reference for use inside match arms (slightly different from normal)
-fn generate_param_ref_for_match(
-    param: &crate::query_introspector::QueryParam,
-    type_index: &TypeIndex,
-    nullable_domain_bindings: &mut Vec<TokenStream>,
-) -> TokenStream {
-    use crate::ident::{sql_to_rs_ident, CaseType};
-
-    let param_name = sql_to_rs_ident(&param.name, CaseType::Snake);
-
-    let unwrap_depth = compute_domain_unwrap_depth(
-        param.type_oid,
-        param.postgres_type_oid,
-        type_index,
-    );
-
-    if param.nullable {
-        if unwrap_depth > 0 {
-            use heck::ToSnakeCase;
-            let unwrapped_name_str = format!("{}_unwrapped", param.name.to_snake_case());
-            let unwrapped_name = sql_to_rs_ident(&unwrapped_name_str, CaseType::Snake);
-
-            let unwrap_chain = domain_unwrap_chain(unwrap_depth);
-
-            nullable_domain_bindings.push(
-                quote! { let #unwrapped_name = #param_name.as_ref().map(|v| v #unwrap_chain); }
-            );
-            quote! { &#unwrapped_name as &(dyn postgres_types::ToSql + Sync) }
-        } else {
-            quote! { &#param_name as &(dyn postgres_types::ToSql + Sync) }
-        }
-    } else {
-        if unwrap_depth > 0 {
-            let unwrap_chain = domain_unwrap_chain(unwrap_depth);
-            quote! { #param_name #unwrap_chain as &(dyn postgres_types::ToSql + Sync) }
-        } else if param_needs_reference(param.type_oid, type_index) {
-            quote! { &#param_name as &(dyn postgres_types::ToSql + Sync) }
-        } else {
-            quote! { #param_name as &(dyn postgres_types::ToSql + Sync) }
-        }
-    }
+    })
 }
 
 /// Generate error enum for a single query
@@ -1802,375 +1608,27 @@ fn generate_query_error_enum(
     table_constraints: &BTreeMap<crate::pg_id::PgId, Vec<crate::pg_constraint::Constraint>>,
     config: &Config,
 ) -> TokenStream {
-    use crate::exceptions::PgException;
-    use crate::ident::{sql_to_rs_ident, CaseType};
-    use crate::pg_constraint::Constraint;
-    use heck::ToPascalCase;
+    let error_enum_name = query_error_enum_ident(query);
 
-    let error_enum_name = quote::format_ident!("{}Error", sql_to_rs_ident(&query.name, CaseType::Pascal).to_string());
-    let mut error_variants = Vec::new();
-    let mut unique_arms = Vec::new();
-    let mut check_arms = Vec::new();
-    let mut fk_arms = Vec::new();
-    let mut not_null_arms = Vec::new();
-    let mut custom_arms = Vec::new();
-    let mut to_pgrpc_arms = Vec::new();
-    let mut as_db_error_arms = Vec::new();
-    let mut handled_exceptions = BTreeSet::new();
+    // SQLSTATEs first, then the typed
+    // errors raised by functions the query calls.
+    let (sql_states, typed): (Vec<PgException>, Vec<PgException>) = query
+        .exceptions
+        .iter()
+        .cloned()
+        .partition(|e| matches!(e, PgException::Explicit(_)));
+    let exceptions = [sql_states, typed].concat();
 
-    // Process table dependencies that were collected during introspection
-    for (table_id, constraints) in &query.table_dependencies {
-        let table_name_str = table_id.name();
-        let table_name_pascal = table_name_str.to_pascal_case();
-        let variant_name = quote::format_ident!("{}Constraint", table_name_pascal);
-        let constraint_enum = quote::format_ident!("{}Constraint", table_name_pascal);
-
-        // Add error variant for this table's constraints
-        error_variants.push(quote! {
-            #[error("{} table constraint violation", #table_name_str)]
-            #variant_name(super::errors::#constraint_enum, #[source] tokio_postgres::error::DbError)
-        });
-
-        // Add conversion arm to PgRpcError
-        to_pgrpc_arms.push(quote! {
-            #error_enum_name::#variant_name(constraint, db_error) => {
-                super::errors::PgRpcError::#variant_name(constraint, db_error)
-            }
-        });
-
-        // Add AsDbError arm
-        as_db_error_arms.push(quote! {
-            #error_enum_name::#variant_name(_, db_error) => Some(db_error)
-        });
-
-        // Generate match arms for From<tokio_postgres::Error>
-        for constraint in constraints {
-            match constraint {
-                Constraint::PrimaryKey(pk) => {
-                    let constraint_name = pk.name.as_str();
-                    unique_arms.push(quote! {
-                        Some(#constraint_name) => #error_enum_name::#variant_name(
-                            super::errors::#constraint_enum::PrimaryKey,
-                            db_error.to_owned()
-                        )
-                    });
-                }
-                Constraint::Unique(u) => {
-                    let constraint_name = u.name.as_str();
-                    let u_variant_name_str = u.name.to_pascal_case();
-                    let u_variant_name = quote::format_ident!("{}", u_variant_name_str);
-                    unique_arms.push(quote! {
-                        Some(#constraint_name) => #error_enum_name::#variant_name(
-                            super::errors::#constraint_enum::#u_variant_name,
-                            db_error.to_owned()
-                        )
-                    });
-                }
-                Constraint::Check(c) => {
-                    let constraint_name = c.name.as_str();
-                    let c_variant_name_str = c.name.to_pascal_case();
-                    let c_variant_name = quote::format_ident!("{}", c_variant_name_str);
-                    check_arms.push(quote! {
-                        Some(#constraint_name) => #error_enum_name::#variant_name(
-                            super::errors::#constraint_enum::#c_variant_name,
-                            db_error.to_owned()
-                        )
-                    });
-                }
-                Constraint::ForeignKey(fk) => {
-                    let constraint_name = fk.name.as_str();
-                    let fk_variant_name_str = fk.name.to_pascal_case();
-                    let fk_variant_name = quote::format_ident!("{}", fk_variant_name_str);
-                    fk_arms.push(quote! {
-                        Some(#constraint_name) => #error_enum_name::#variant_name(
-                            super::errors::#constraint_enum::#fk_variant_name,
-                            db_error.to_owned()
-                        )
-                    });
-                }
-                Constraint::NotNull(nn) => {
-                    let column_name = nn.column.as_str();
-                    let col_variant_str = nn.column.to_pascal_case();
-                    let nn_variant_name = quote::format_ident!("{}NotNull", col_variant_str);
-                    not_null_arms.push(quote! {
-                        (Some(#table_name_str), Some(#column_name)) => #error_enum_name::#variant_name(
-                            super::errors::#constraint_enum::#nn_variant_name,
-                            db_error.to_owned()
-                        )
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Process exceptions (including from @pgrpc_throws annotations)
-    for exception in &query.exceptions {
-        if let PgException::Explicit(sql_state) = exception {
-            let code = sql_state.code();
-            let ex_variant_name = if let Some(description) = config.exceptions.get(code) {
-                sql_to_rs_ident(description, CaseType::Pascal)
-            } else {
-                exception.rs_name(config)
-            };
-
-            if handled_exceptions.insert(ex_variant_name.to_string()) {
-                if let Some(description) = config.exceptions.get(code) {
-                    error_variants.push(quote! {
-                        #[error(#description)]
-                        #ex_variant_name(#[source] tokio_postgres::error::DbError)
-                    });
-                } else {
-                    error_variants.push(quote! {
-                        #[error("SQL state {}", #code)]
-                        #ex_variant_name(#[source] tokio_postgres::error::DbError)
-                    });
-                }
-
-                to_pgrpc_arms.push(quote! {
-                    #error_enum_name::#ex_variant_name(db_error) => {
-                        super::errors::PgRpcError::#ex_variant_name(db_error)
-                    }
-                });
-
-                as_db_error_arms.push(quote! {
-                    #error_enum_name::#ex_variant_name(db_error) => Some(db_error)
-                });
-
-                custom_arms.push(quote! {
-                    code if code == &tokio_postgres::error::SqlState::from_code(#code) => {
-                        #error_enum_name::#ex_variant_name(db_error.to_owned())
-                    }
-                });
-            }
-        }
-    }
-
-    // Typed errors (errors-schema payloads) raised by functions this query calls.
-    let mut custom_error_arms = Vec::new();
-    for exception in &query.exceptions {
-        let PgException::CustomError(error_name) = exception else { continue };
-        let variant_name = sql_to_rs_ident(error_name, CaseType::Pascal);
-        if !handled_exceptions.insert(variant_name.to_string()) {
-            continue;
-        }
-        let struct_name = variant_name.clone();
-        let error_name_str = error_name.as_str();
-
-        error_variants.push(quote! {
-            #[error("{}", #error_name_str)]
-            #variant_name(super::custom_errors::#struct_name, #[source] tokio_postgres::error::DbError)
-        });
-        to_pgrpc_arms.push(quote! {
-            #error_enum_name::#variant_name(payload, db_error) => {
-                super::errors::PgRpcError::CustomError(
-                    super::custom_errors::CustomError::#variant_name(payload),
-                    db_error,
-                )
-            }
-        });
-        as_db_error_arms.push(quote! {
-            #error_enum_name::#variant_name(_, db_error) => Some(db_error)
-        });
-        custom_error_arms.push(quote! {
-            Some(#error_name_str) => {
-                if let Ok(payload) = serde_json::from_value(json.clone()) {
-                    #error_enum_name::#variant_name(payload, db_error.to_owned())
-                } else {
-                    #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                }
-            }
-        });
-    }
-
-    // Add catch-all Other variant
-    error_variants.push(quote! {
-        #[error(transparent)]
-        Other(super::errors::PgRpcError)
-    });
-
-    // Build match arms for From<tokio_postgres::Error>. The JSON-hint arm
-    // leads: a typed error is identified by its hint regardless of SQLSTATE.
-    let mut all_from_arms = Vec::new();
-
-    if !custom_error_arms.is_empty() {
-        all_from_arms.push(quote! {
-            _code if db_error.hint() == Some("application/json") => {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(db_error.message()) {
-                    match json.get("type").and_then(|t| t.as_str()) {
-                        #(#custom_error_arms,)*
-                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                    }
-                } else {
-                    #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                }
-            },
-        });
-    }
-
-    if !unique_arms.is_empty() {
-        all_from_arms.push(quote! {
-            &tokio_postgres::error::SqlState::UNIQUE_VIOLATION => {
-                match db_error.constraint() {
-                    #(#unique_arms,)*
-                    _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                }
-            },
-        });
-    }
-
-    if !check_arms.is_empty() {
-        all_from_arms.push(quote! {
-            &tokio_postgres::error::SqlState::CHECK_VIOLATION => {
-                match db_error.constraint() {
-                    #(#check_arms,)*
-                    _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                }
-            },
-        });
-    }
-
-    if !fk_arms.is_empty() {
-        all_from_arms.push(quote! {
-            &tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION => {
-                match db_error.constraint() {
-                    #(#fk_arms,)*
-                    _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                }
-            },
-        });
-    }
-
-    if !not_null_arms.is_empty() {
-        all_from_arms.push(quote! {
-            &tokio_postgres::error::SqlState::NOT_NULL_VIOLATION => {
-                match (db_error.table(), db_error.column()) {
-                    #(#not_null_arms,)*
-                    _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                }
-            },
-        });
-    }
-
-    all_from_arms.extend(custom_arms);
-
-    let from_postgres_arms: TokenStream = all_from_arms.into_iter().collect();
-
-    // Build the complete error enum
-    quote! {
-        #[derive(Debug, thiserror::Error)]
-        pub enum #error_enum_name {
-            #(#error_variants),*
-        }
-
-        impl From<tokio_postgres::Error> for #error_enum_name {
-            fn from(e: tokio_postgres::Error) -> Self {
-                match e.as_db_error() {
-                    Some(db_error) => match db_error.code() {
-                        #from_postgres_arms
-                        _ => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                    },
-                    None => #error_enum_name::Other(super::errors::PgRpcError::Database(e))
-                }
-            }
-        }
-
-        impl From<#error_enum_name> for super::errors::PgRpcError {
-            fn from(err: #error_enum_name) -> Self {
-                match err {
-                    #error_enum_name::Other(e) => e,
-                    #(#to_pgrpc_arms),*
-                }
-            }
-        }
-
-        impl From<super::errors::PgRpcError> for #error_enum_name {
-            fn from(err: super::errors::PgRpcError) -> Self {
-                #error_enum_name::Other(err)
-            }
-        }
-
-        impl From<super::errors::DecodeError> for #error_enum_name {
-            fn from(err: super::errors::DecodeError) -> Self {
-                #error_enum_name::Other(super::errors::PgRpcError::Decode(err))
-            }
-        }
-
-        impl super::errors::AsDbError for #error_enum_name {
-            fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError> {
-                match self {
-                    #(#as_db_error_arms,)*
-                    #error_enum_name::Other(e) => e.as_db_error(),
-                }
-            }
-        }
-    }
+    unified_error::generate_error_enum(
+        &quote! { #error_enum_name },
+        &query.table_dependencies,
+        table_constraints,
+        &exceptions,
+        config,
+    )
 }
 
-/// Generate serde annotation for datetime types that need special serialization
-fn generate_datetime_serde_attr(pg_type: &PgType, nullable: bool) -> Option<TokenStream> {
-    match pg_type {
-        PgType::Timestamptz => {
-            if nullable {
-                Some(quote! { #[serde(with = "time::serde::rfc3339::option")] })
-            } else {
-                Some(quote! { #[serde(with = "time::serde::rfc3339")] })
-            }
-        }
-        PgType::Date => {
-            if nullable {
-                Some(quote! { #[serde(with = "date_serde::option")] })
-            } else {
-                Some(quote! { #[serde(with = "date_serde")] })
-            }
-        }
-        _ => None,
-    }
-}
-
-/// The by-name plumbing shared by every query row struct: the column count,
-/// the associated items that locate columns and decode many rows, and the
-/// `TryFrom<Row>` impl. The struct's own `decode(row, at)` reads column `i`
-/// of the generated list from position `at[i]`.
-fn row_decode_support(
-    struct_name: &proc_macro2::Ident,
-    struct_name_str: &str,
-    columns: &[crate::query_introspector::QueryColumn],
-) -> (usize, TokenStream, TokenStream) {
-    let column_count = columns.len();
-    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-
-    let decode_fns = quote! {
-        /// Result columns as they were at generation time.
-        const COLUMNS: [&'static str; #column_count] = [#(#names),*];
-
-        /// Decode a whole result set, locating the columns once.
-        pub fn decode_all(
-            rows: Vec<tokio_postgres::Row>,
-        ) -> Result<Vec<Self>, super::errors::DecodeError> {
-            let Some(first) = rows.first() else {
-                return Ok(Vec::new());
-            };
-            let at = super::errors::column_positions(#struct_name_str, &Self::COLUMNS, first)?;
-            rows.iter().map(|row| Self::decode(row, &at)).collect()
-        }
-    };
-
-    let try_from_impl = quote! {
-        impl TryFrom<tokio_postgres::Row> for #struct_name {
-            type Error = super::errors::DecodeError;
-
-            fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {
-                let at = super::errors::column_positions(#struct_name_str, &Self::COLUMNS, &row)?;
-                Self::decode(&row, &at)
-            }
-        }
-    };
-
-    (column_count, decode_fns, try_from_impl)
-}
-
-/// Generate a row struct for query results.
+/// Generate a row struct for query results, decoded by column name.
 ///
 /// Columns with double-underscore names (`prefix__field`) are automatically
 /// grouped into nested structs.
@@ -2179,353 +1637,58 @@ fn generate_row_struct(
     columns: &[crate::query_introspector::QueryColumn],
     type_index: &TypeIndex,
 ) -> TokenStream {
-    let struct_name_str = struct_name.to_string();
-    use crate::column_grouping::{group_by_double_underscore, GroupedField};
-    use crate::ident::{sql_to_rs_ident, CaseType};
-    use crate::query_introspector::QueryColumn;
+    use crate::ident::{sql_to_rs_string, CaseType};
+    use crate::row_struct::{grouped_layout, Decode, FieldParts, RowShape};
 
-    // Track original indices before grouping (needed for TryFrom<Row>)
-    let indexed_columns: Vec<(usize, QueryColumn)> = columns
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (i, c.clone()))
-        .collect();
-
-    let grouped = group_by_double_underscore(
-        indexed_columns,
-        |(_i, c)| &c.name,
-        |(_i, c)| c.nullable_due_to_join,
-        |(_, c), new_name| c.name = new_name,
+    let layout = grouped_layout(
+        columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.nullable_due_to_join)),
+    );
+    let shape = RowShape::build(
+        quote! { #struct_name },
+        &struct_name.to_string(),
+        layout,
+        |place| {
+            let name = place.member.unwrap_or(&columns[place.index].name);
+            sql_to_rs_string(name, CaseType::Snake)
+        },
+        |place, _| {
+            let col = &columns[place.index];
+            // A field keeps the column's name, less the group prefix. Inside
+            // a group it has its natural nullability: on the base column or
+            // because of the join.
+            let name = place.member.unwrap_or(&col.name);
+            let nullable = col.nullable || (place.member.is_some() && col.nullable_due_to_join);
+            FieldParts {
+                column: col.name.clone(),
+                label: name.to_string(),
+                ty: column_type(col.type_oid, nullable, type_index),
+                attrs: field_serde_attrs(type_index.get(&col.type_oid), nullable, Some(name)),
+            }
+        },
     );
 
-    // Check if any grouping actually happened
-    let has_groups = grouped.iter().any(|g| matches!(g, GroupedField::Group { .. }));
-
-    if !has_groups {
-        // No double-underscore columns — use original flat codegen
-        return generate_row_struct_flat(struct_name, columns, type_index);
-    }
-
-    // Generate nested structs and parent fields
-    let mut nested_struct_defs: Vec<TokenStream> = Vec::new();
-    let mut parent_fields: Vec<TokenStream> = Vec::new();
-    let mut parent_field_assignments: Vec<TokenStream> = Vec::new();
-
-    for grouped_field in &grouped {
-        match grouped_field {
-            GroupedField::Plain((idx, col)) => {
-                let field_name = quote::format_ident!(
-                    "{}",
-                    sql_to_rs_ident(&col.name, CaseType::Snake).to_string()
-                );
-                let field_type = get_column_type(col, type_index);
-                let column_name = &col.name;
-
-                let datetime_serde_attr = type_index
-                    .get(&col.type_oid)
-                    .and_then(|pt| generate_datetime_serde_attr(pt, col.nullable));
-
-                let serde_attr = match (datetime_serde_attr, col.nullable) {
-                    (Some(attr), true) => quote! {
-                        #[serde(rename = #column_name, default)]
-                        #attr
-                    },
-                    (Some(attr), false) => quote! {
-                        #[serde(rename = #column_name)]
-                        #attr
-                    },
-                    (None, true) => quote! {
-                        #[serde(rename = #column_name, default)]
-                    },
-                    (None, false) => quote! {
-                        #[serde(rename = #column_name)]
-                    },
-                };
-
-                parent_fields.push(quote! {
-                    #serde_attr
-                    pub #field_name: #field_type
-                });
-
-                parent_field_assignments.push(quote! {
-                    #field_name: row.try_get(at[#idx])
-                        .map_err(super::errors::DecodeError::at(#struct_name_str, #column_name, at[#idx]))?
-                });
-            }
-            GroupedField::Group {
-                group_name,
-                fields,
-                optional,
-            } => {
-                let nested_struct_name = quote::format_ident!(
-                    "{}{}",
-                    struct_name,
-                    sql_to_rs_ident(group_name, CaseType::Pascal).to_string()
-                );
-                let group_field_name = quote::format_ident!(
-                    "{}",
-                    sql_to_rs_ident(group_name, CaseType::Snake).to_string()
-                );
-
-                // Generate nested struct fields.
-                // When the group is optional, inner field nullability uses base-only
-                // (strip join-nullability).
-                let nested_fields: Vec<TokenStream> = fields
-                    .iter()
-                    .map(|(_idx, col)| {
-                        // Nested struct fields use their natural nullability:
-                        // nullable on base OR nullable due to join.
-                        let inner_nullable = col.nullable || col.nullable_due_to_join;
-
-                        let inner_col = QueryColumn {
-                            name: col.name.clone(),
-                            type_oid: col.type_oid,
-                            nullable: inner_nullable,
-                            nullable_due_to_join: false,
-                        };
-
-                        let f_name = quote::format_ident!(
-                            "{}",
-                            sql_to_rs_ident(&col.name, CaseType::Snake).to_string()
-                        );
-                        let f_type = get_column_type(&inner_col, type_index);
-                        let col_name = &col.name;
-
-                        let datetime_serde_attr = type_index
-                            .get(&col.type_oid)
-                            .and_then(|pt| generate_datetime_serde_attr(pt, inner_nullable));
-
-                        let serde_attr = match (datetime_serde_attr, inner_nullable) {
-                            (Some(attr), true) => quote! {
-                                #[serde(rename = #col_name, default)]
-                                #attr
-                            },
-                            (Some(attr), false) => quote! {
-                                #[serde(rename = #col_name)]
-                                #attr
-                            },
-                            (None, true) => quote! {
-                                #[serde(rename = #col_name, default)]
-                            },
-                            (None, false) => quote! {
-                                #[serde(rename = #col_name)]
-                            },
-                        };
-
-                        quote! {
-                            #serde_attr
-                            pub #f_name: #f_type
-                        }
-                    })
-                    .collect();
-
-                // Generate the nested struct's field assignments from row indices
-                let nested_assignments: Vec<TokenStream> = fields
-                    .iter()
-                    .map(|(idx, col)| {
-                        let f_name = quote::format_ident!(
-                            "{}",
-                            sql_to_rs_ident(&col.name, CaseType::Snake).to_string()
-                        );
-                        let c_name = col.name.as_str();
-                        quote! {
-                            #f_name: row.try_get(at[#idx])
-                                .map_err(super::errors::DecodeError::at(#struct_name_str, #c_name, at[#idx]))?
-                        }
-                    })
-                    .collect();
-
-                nested_struct_defs.push(quote! {
-                    #[derive(Debug, Clone, serde::Serialize)]
-                    pub struct #nested_struct_name {
-                        #(#nested_fields),*
-                    }
-                });
-
-                if *optional {
-                    // For optional groups: probe the first column to see if
-                    // it's NULL. Since every member of an optional group is
-                    // `nullable_due_to_join` from the same LEFT JOIN'd table,
-                    // they're all NULL together — so one probe is enough.
-                    //
-                    // `NullProbe`'s `FromSql::accepts` returns true for every
-                    // Postgres type, sidestepping the type-compatibility check
-                    // that a typed sentinel would trip.
-                    let first_idx = fields[0].0;
-                    let first_col = fields[0].1.name.as_str();
-
-                    let group_type = quote! { Option<#nested_struct_name> };
-
-                    parent_fields.push(quote! {
-                        pub #group_field_name: #group_type
-                    });
-
-                    parent_field_assignments.push(quote! {
-                        #group_field_name: if row.try_get::<usize, super::nullable::NullProbe>(at[#first_idx])
-                            .map_err(super::errors::DecodeError::at(#struct_name_str, #first_col, at[#first_idx]))?
-                            .is_null
-                        {
-                            None
-                        } else {
-                            Some(#nested_struct_name {
-                                #(#nested_assignments),*
-                            })
-                        }
-                    });
-                } else {
-                    parent_fields.push(quote! {
-                        pub #group_field_name: #nested_struct_name
-                    });
-
-                    parent_field_assignments.push(quote! {
-                        #group_field_name: #nested_struct_name {
-                            #(#nested_assignments),*
-                        }
-                    });
-                }
-            }
-        }
-    }
-
-    let (column_count, decode_fns, try_from_impl) =
-        row_decode_support(struct_name, &struct_name_str, columns);
-
+    let derives = quote! { #[derive(Debug, Clone, serde::Serialize)] };
+    let structs = shape.emit_structs(&derives, &derives);
+    let decoder = shape.emit_decoder(Decode::ResolvedName);
     quote! {
-        #(#nested_struct_defs)*
+        #structs
 
-        #[derive(Debug, Clone, serde::Serialize)]
-        pub struct #struct_name {
-            #(#parent_fields),*
-        }
-
-        impl #struct_name {
-            #decode_fns
-
-            fn decode(
-                row: &tokio_postgres::Row,
-                at: &[usize; #column_count],
-            ) -> Result<Self, super::errors::DecodeError> {
-                Ok(Self {
-                    #(#parent_field_assignments),*
-                })
-            }
-        }
-
-        #try_from_impl
-    }
-}
-
-/// Generate a flat row struct (no double-underscore grouping).
-/// This is the original implementation, used when no grouping is needed.
-fn generate_row_struct_flat(
-    struct_name: &proc_macro2::Ident,
-    columns: &[crate::query_introspector::QueryColumn],
-    type_index: &TypeIndex,
-) -> TokenStream {
-    use crate::ident::{sql_to_rs_ident, CaseType};
-
-    let fields: Vec<TokenStream> = columns
-        .iter()
-        .map(|col| {
-            let field_name = quote::format_ident!(
-                "{}",
-                sql_to_rs_ident(&col.name, CaseType::Snake).to_string()
-            );
-            let field_type = get_column_type(col, type_index);
-            let column_name = &col.name;
-
-            let datetime_serde_attr = type_index
-                .get(&col.type_oid)
-                .and_then(|pt| generate_datetime_serde_attr(pt, col.nullable));
-
-            let serde_attr = match (datetime_serde_attr, col.nullable) {
-                (Some(attr), true) => quote! {
-                    #[serde(rename = #column_name, default)]
-                    #attr
-                },
-                (Some(attr), false) => quote! {
-                    #[serde(rename = #column_name)]
-                    #attr
-                },
-                (None, true) => quote! {
-                    #[serde(rename = #column_name, default)]
-                },
-                (None, false) => quote! {
-                    #[serde(rename = #column_name)]
-                },
-            };
-
-            quote! {
-                #serde_attr
-                pub #field_name: #field_type
-            }
-        })
-        .collect();
-
-    let field_indices: Vec<usize> = (0..columns.len()).collect();
-    let field_names: Vec<proc_macro2::Ident> = columns
-        .iter()
-        .map(|col| {
-            quote::format_ident!(
-                "{}",
-                sql_to_rs_ident(&col.name, CaseType::Snake).to_string()
-            )
-        })
-        .collect();
-    let column_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-    let struct_name_str = struct_name.to_string();
-    let (column_count, decode_fns, try_from_impl) =
-        row_decode_support(struct_name, &struct_name_str, columns);
-
-    quote! {
-        #[derive(Debug, Clone, serde::Serialize)]
-        pub struct #struct_name {
-            #(#fields),*
-        }
-
-        impl #struct_name {
-            #decode_fns
-
-            fn decode(
-                row: &tokio_postgres::Row,
-                at: &[usize; #column_count],
-            ) -> Result<Self, super::errors::DecodeError> {
-                Ok(Self {
-                    #(
-                        #field_names: row.try_get(at[#field_indices])
-                            .map_err(super::errors::DecodeError::at(#struct_name_str, #column_names, at[#field_indices]))?,
-                    )*
-                })
-            }
-        }
-
-        #try_from_impl
+        #decoder
     }
 }
 
 /// Get Rust type for a parameter
 fn get_param_type(type_oid: OID, type_index: &TypeIndex, nullable: bool) -> TokenStream {
-    let base_type = if let Some(pg_type) = type_index.get(&type_oid) {
-        match pg_type {
-            PgType::Int16 => quote! { i16 },
-            PgType::Int32 => quote! { i32 },
-            PgType::Int64 => quote! { i64 },
-            PgType::Float32 => quote! { f32 },
-            PgType::Float64 => quote! { f64 },
-            PgType::Bool => quote! { bool },
-            PgType::Text => quote! { &str },
-            PgType::Enum { .. } => {
-                let type_ident = pg_type.to_rust_ident(type_index);
-                quote! { #type_ident }
-            }
-            _ => {
-                let type_ident = pg_type.to_rust_ident(type_index);
-                quote! { &#type_ident }
-            }
-        }
-    } else {
-        // Fallback for unknown types
-        quote! { &dyn postgres_types::ToSql }
+    let base_type = match type_index.get(&type_oid) {
+        // Query parameters take floats by value; function arguments have
+        // always taken them by reference.
+        Some(PgType::Float32) => quote! { f32 },
+        Some(PgType::Float64) => quote! { f64 },
+        Some(pg_type) => pg_type.to_rust_param(type_index),
+        // Unknown type; `generate_query_code` has warned about it.
+        None => quote! { &(dyn postgres_types::ToSql + Sync) },
     };
 
     if nullable {
@@ -2584,31 +1747,21 @@ fn get_column_type(
     column: &crate::query_introspector::QueryColumn,
     type_index: &TypeIndex,
 ) -> TokenStream {
-    if let Some(pg_type) = type_index.get(&column.type_oid) {
-        let base_type = match pg_type {
-            PgType::Int16 => quote! { i16 },
-            PgType::Int32 => quote! { i32 },
-            PgType::Int64 => quote! { i64 },
-            PgType::Bool => quote! { bool },
-            PgType::Text => quote! { String },
-            _ => {
-                let type_ident = pg_type.to_rust_ident(type_index);
-                quote! { #type_ident }
-            }
-        };
+    column_type(column.type_oid, column.nullable, type_index)
+}
 
-        if column.nullable {
-            quote! { Option<#base_type> }
-        } else {
-            base_type
-        }
+/// The Rust type of a result column of type `type_oid`.
+fn column_type(type_oid: OID, nullable: bool, type_index: &TypeIndex) -> TokenStream {
+    let base_type = match type_index.get(&type_oid) {
+        Some(pg_type) => pg_type.to_rust_ident(type_index),
+        // Unknown type; `generate_query_code` has warned about it.
+        None => quote! { serde_json::Value },
+    };
+
+    if nullable {
+        quote! { Option<#base_type> }
     } else {
-        // Fallback for unknown types
-        if column.nullable {
-            quote! { Option<serde_json::Value> }
-        } else {
-            quote! { serde_json::Value }
-        }
+        base_type
     }
 }
 
@@ -2619,7 +1772,7 @@ mod tests {
     #[test]
     fn test_rewrite_sql_for_defaults_no_defaults() {
         let sql = "INSERT INTO t (a, b, c) VALUES ($1, $2, $3)";
-        let result = rewrite_sql_for_defaults(sql, 3, &[]);
+        let result = rewrite_sql_for_defaults(sql, 3, &[]).unwrap();
         assert_eq!(result, "INSERT INTO t (a, b, c) VALUES ($1, $2, $3)");
     }
 
@@ -2627,7 +1780,7 @@ mod tests {
     fn test_rewrite_sql_for_defaults_single_default() {
         let sql = "INSERT INTO t (a, b) VALUES ($1, $2)";
         // Replace $2 with DEFAULT
-        let result = rewrite_sql_for_defaults(sql, 2, &[2]);
+        let result = rewrite_sql_for_defaults(sql, 2, &[2]).unwrap();
         assert_eq!(result, "INSERT INTO t (a, b) VALUES ($1, DEFAULT)");
     }
 
@@ -2635,7 +1788,7 @@ mod tests {
     fn test_rewrite_sql_for_defaults_first_param() {
         let sql = "INSERT INTO t (a, b) VALUES ($1, $2)";
         // Replace $1 with DEFAULT, $2 becomes $1
-        let result = rewrite_sql_for_defaults(sql, 2, &[1]);
+        let result = rewrite_sql_for_defaults(sql, 2, &[1]).unwrap();
         assert_eq!(result, "INSERT INTO t (a, b) VALUES (DEFAULT, $1)");
     }
 
@@ -2643,7 +1796,7 @@ mod tests {
     fn test_rewrite_sql_for_defaults_multiple_defaults() {
         let sql = "INSERT INTO t (a, b, c) VALUES ($1, $2, $3)";
         // Replace $2 and $3 with DEFAULT
-        let result = rewrite_sql_for_defaults(sql, 3, &[2, 3]);
+        let result = rewrite_sql_for_defaults(sql, 3, &[2, 3]).unwrap();
         assert_eq!(result, "INSERT INTO t (a, b, c) VALUES ($1, DEFAULT, DEFAULT)");
     }
 
@@ -2651,7 +1804,7 @@ mod tests {
     fn test_rewrite_sql_for_defaults_middle_param() {
         let sql = "INSERT INTO t (a, b, c) VALUES ($1, $2, $3)";
         // Replace $2 with DEFAULT, $3 becomes $2
-        let result = rewrite_sql_for_defaults(sql, 3, &[2]);
+        let result = rewrite_sql_for_defaults(sql, 3, &[2]).unwrap();
         assert_eq!(result, "INSERT INTO t (a, b, c) VALUES ($1, DEFAULT, $2)");
     }
 
@@ -2659,7 +1812,7 @@ mod tests {
     fn test_rewrite_sql_for_defaults_all_params() {
         let sql = "INSERT INTO t (a, b) VALUES ($1, $2)";
         // Replace all with DEFAULT
-        let result = rewrite_sql_for_defaults(sql, 2, &[1, 2]);
+        let result = rewrite_sql_for_defaults(sql, 2, &[1, 2]).unwrap();
         assert_eq!(result, "INSERT INTO t (a, b) VALUES (DEFAULT, DEFAULT)");
     }
 
@@ -2667,7 +1820,73 @@ mod tests {
     fn test_rewrite_sql_for_defaults_preserves_double_digit_params() {
         let sql = "SELECT * FROM t WHERE a = $1 AND b = $10 AND c = $11";
         // Replace $10 with DEFAULT, $11 becomes $10
-        let result = rewrite_sql_for_defaults(sql, 11, &[10]);
+        let result = rewrite_sql_for_defaults(sql, 11, &[10]).unwrap();
         assert_eq!(result, "SELECT * FROM t WHERE a = $1 AND b = DEFAULT AND c = $10");
+    }
+
+    #[test]
+    fn test_rewrite_sql_for_defaults_leaves_literals_and_comments_alone() {
+        let sql = "INSERT INTO t (a, b, c) -- $2 is the price\n\
+                   VALUES ($1, $2, 'costs $2') /* not $1 */ RETURNING \"$1\", $tag$ $1 $tag$";
+        let result = rewrite_sql_for_defaults(sql, 2, &[1]).unwrap();
+        assert_eq!(
+            result,
+            "INSERT INTO t (a, b, c) -- $2 is the price\n\
+             VALUES (DEFAULT, $1, 'costs $2') /* not $1 */ RETURNING \"$1\", $tag$ $1 $tag$"
+        );
+    }
+
+    /// A query with `n` parameters that each fall back to a column DEFAULT.
+    fn query_with_default_params(n: usize) -> crate::query_introspector::IntrospectedQuery {
+        let placeholders: Vec<String> = (1..=n).map(|i| format!("${i}")).collect();
+        crate::query_introspector::IntrospectedQuery {
+            name: "insert_wide".to_string(),
+            query_type: crate::sql_parser::QueryType::Exec,
+            sql: format!("INSERT INTO t VALUES ({})", placeholders.join(", ")),
+            params: (1..=n)
+                .map(|i| crate::query_introspector::QueryParam {
+                    name: format!("c{i}"),
+                    type_oid: 23,
+                    postgres_type_oid: 23,
+                    position: i,
+                    nullable: true,
+                    has_default: true,
+                })
+                .collect(),
+            return_columns: None,
+            file_path: "queries.sql".to_string(),
+            line_number: 1,
+            exceptions: vec![],
+            table_dependencies: BTreeMap::new(),
+        }
+    }
+
+    fn int_types() -> TypeIndex {
+        TypeIndex::from_types(BTreeMap::from([(23, PgType::Int32)]))
+    }
+
+    #[test]
+    fn default_params_up_to_the_cap_generate_every_combination() {
+        let query = query_with_default_params(MAX_DEFAULT_PARAMS);
+        let code = generate_query_code(&query, &int_types(), &BTreeMap::new(), &Config::default())
+            .expect("the cap itself is allowed")
+            .to_string();
+        assert_eq!(
+            code.matches("INSERT INTO t VALUES").count(),
+            // One statement per combination, and the doc comment.
+            (1 << MAX_DEFAULT_PARAMS) + 1
+        );
+    }
+
+    #[test]
+    fn too_many_default_params_is_an_error_not_an_explosion() {
+        let query = query_with_default_params(MAX_DEFAULT_PARAMS + 1);
+        let err = generate_query_code(&query, &int_types(), &BTreeMap::new(), &Config::default())
+            .expect_err("more than the cap must fail");
+        let message = format!("{err:#}");
+        assert!(message.contains("insert_wide"), "{message}");
+        assert!(message.contains("queries.sql:1"), "{message}");
+        assert!(message.contains("9 optional parameters"), "{message}");
+        assert!(message.contains("512"), "{message}");
     }
 }

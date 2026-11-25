@@ -1,10 +1,11 @@
-use crate::codegen::{codegen_split, generate_date_serde_module};
+use crate::codegen::{codegen_split, datetime_serde_reexport};
 use crate::config::Config;
 use crate::db::Db;
 use crate::fn_index::FunctionIndex;
 use crate::rel_index::RelIndex;
 use crate::task_index::{generate_task_enum, TaskIndex};
 use crate::ty_index::TypeIndex;
+use anyhow::Context;
 use proc_macro2::TokenStream;
 use quote::quote;
 use std::collections::{BTreeMap, HashMap};
@@ -18,6 +19,7 @@ pub use crate::config::{ErrorsConfig, QueriesConfig, TaskQueueConfig, TracingCon
 pub mod annotations;
 pub mod call_graph;
 pub mod cardinality_inference;
+mod check_expr;
 mod codegen;
 mod column_grouping;
 mod config;
@@ -41,6 +43,7 @@ mod pg_type;
 pub mod query_index;
 pub mod query_introspector;
 pub mod rel_index;
+mod row_struct;
 pub mod sql_parser;
 mod sql_state;
 pub(crate) mod task_index;
@@ -54,61 +57,33 @@ pub mod view_nullability;
 pub use tsvector::{TsQuery, TsVector};
 
 /// Builder for configuring and running pgrpc code generation
+#[derive(Default)]
 pub struct PgrpcBuilder {
-    connection_string: Option<String>,
-    schemas: Vec<String>,
-    types: HashMap<String, String>,
-    exceptions: BTreeMap<String, String>,
+    config: Config,
     output_path: Option<PathBuf>,
-    task_queue: Option<TaskQueueConfig>,
-    errors: Option<config::ErrorsConfig>,
-    infer_view_nullability: bool,
-    disable_deserialize: Vec<String>,
-    strict_domains: Vec<String>,
-    queries: Option<config::QueriesConfig>,
-    tracing: Option<config::TracingConfig>,
-}
-
-impl Default for PgrpcBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl PgrpcBuilder {
     /// Create a new PgrpcBuilder
     pub fn new() -> Self {
-        Self {
-            connection_string: None,
-            schemas: Vec::new(),
-            types: HashMap::new(),
-            exceptions: BTreeMap::new(),
-            output_path: None,
-            task_queue: None,
-            errors: None,
-            infer_view_nullability: true,
-            disable_deserialize: Vec::new(),
-            strict_domains: Vec::new(),
-            queries: None,
-            tracing: None,
-        }
+        Self::default()
     }
 
     /// Set the connection string
     pub fn connection_string(mut self, connection_string: impl Into<String>) -> Self {
-        self.connection_string = Some(connection_string.into());
+        self.config.connection_string = Some(connection_string.into());
         self
     }
 
     /// Add a schema to generate code for
     pub fn schema(mut self, schema: impl Into<String>) -> Self {
-        self.schemas.push(schema.into());
+        self.config.schemas.push(schema.into());
         self
     }
 
     /// Add multiple schemas to generate code for
     pub fn schemas(mut self, schemas: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.schemas.extend(schemas.into_iter().map(Into::into));
+        self.config.schemas.extend(schemas.into_iter().map(Into::into));
         self
     }
 
@@ -118,13 +93,13 @@ impl PgrpcBuilder {
         pg_type: impl Into<String>,
         rust_type: impl Into<String>,
     ) -> Self {
-        self.types.insert(pg_type.into(), rust_type.into());
+        self.config.types.insert(pg_type.into(), rust_type.into());
         self
     }
 
     /// Add a custom exception mapping
     pub fn exception(mut self, sql_state: impl Into<String>, message: impl Into<String>) -> Self {
-        self.exceptions.insert(sql_state.into(), message.into());
+        self.config.exceptions.insert(sql_state.into(), message.into());
         self
     }
 
@@ -136,7 +111,7 @@ impl PgrpcBuilder {
 
     /// Enable task queue generation with default configuration
     pub fn enable_task_queue(mut self, schema: impl Into<String>) -> Self {
-        self.task_queue = Some(TaskQueueConfig {
+        self.config.task_queue = Some(TaskQueueConfig {
             schema: schema.into(),
             task_name_column: "task_name".to_string(),
             payload_column: "payload".to_string(),
@@ -148,41 +123,41 @@ impl PgrpcBuilder {
 
     /// Configure the task queue table schema (defaults to "mq")
     pub fn task_queue_table_schema(mut self, schema: impl Into<String>) -> Self {
-        let task_config = self.task_queue.get_or_insert(TaskQueueConfig::default());
+        let task_config = self.config.task_queue.get_or_insert_with(TaskQueueConfig::default);
         task_config.table_schema = Some(schema.into());
         self
     }
 
     /// Configure the task queue table name (defaults to "task")
     pub fn task_queue_table_name(mut self, name: impl Into<String>) -> Self {
-        let task_config = self.task_queue.get_or_insert(TaskQueueConfig::default());
+        let task_config = self.config.task_queue.get_or_insert_with(TaskQueueConfig::default);
         task_config.table_name = Some(name.into());
         self
     }
 
     /// Configure the task name column (defaults to "task_name")
     pub fn task_queue_task_name_column(mut self, column: impl Into<String>) -> Self {
-        let task_config = self.task_queue.get_or_insert(TaskQueueConfig::default());
+        let task_config = self.config.task_queue.get_or_insert_with(TaskQueueConfig::default);
         task_config.task_name_column = column.into();
         self
     }
 
     /// Configure the payload column (defaults to "payload")
     pub fn task_queue_payload_column(mut self, column: impl Into<String>) -> Self {
-        let task_config = self.task_queue.get_or_insert(TaskQueueConfig::default());
+        let task_config = self.config.task_queue.get_or_insert_with(TaskQueueConfig::default);
         task_config.payload_column = column.into();
         self
     }
 
     /// Configure the complete task queue settings at once
     pub fn task_queue(mut self, config: TaskQueueConfig) -> Self {
-        self.task_queue = Some(config);
+        self.config.task_queue = Some(config);
         self
     }
 
     /// Enable custom error types with default configuration
     pub fn enable_errors(mut self, schema: impl Into<String>) -> Self {
-        self.errors = Some(config::ErrorsConfig {
+        self.config.errors = Some(config::ErrorsConfig {
             schema: schema.into(),
             raise_function: Some("core.raise_error".to_string()),
         });
@@ -191,52 +166,64 @@ impl PgrpcBuilder {
 
     /// Configure the errors schema
     pub fn errors_schema(mut self, schema: impl Into<String>) -> Self {
-        let errors_config = self.errors.get_or_insert(config::ErrorsConfig::default());
+        let errors_config = self.config.errors.get_or_insert_with(config::ErrorsConfig::default);
         errors_config.schema = schema.into();
         self
     }
 
     /// Configure the complete errors settings at once
     pub fn errors(mut self, config: config::ErrorsConfig) -> Self {
-        self.errors = Some(config);
+        self.config.errors = Some(config);
         self
     }
 
     /// Enable or disable automatic view nullability inference (defaults to true)
     pub fn infer_view_nullability(mut self, infer: bool) -> Self {
-        self.infer_view_nullability = infer;
+        self.config.infer_view_nullability = infer;
         self
     }
 
     /// Add a type that should not have Deserialize derived
     pub fn disable_deserialize(mut self, type_name: impl Into<String>) -> Self {
-        self.disable_deserialize.push(type_name.into());
+        self.config.disable_deserialize.push(type_name.into());
         self
     }
 
     /// Add multiple types that should not have Deserialize derived
     pub fn disable_deserialize_types(mut self, types: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.disable_deserialize.extend(types.into_iter().map(Into::into));
+        self.config.disable_deserialize.extend(types.into_iter().map(Into::into));
         self
     }
 
     /// Mark a domain (as "schema.name") as strict: the generated newtype gets a
     /// private inner field and deserialization is routed through a user-provided
-    /// `TryFrom<Inner>` impl. Equivalent to `COMMENT ON DOMAIN ... IS '@pgrpc_strict'`.
+    /// `TryFrom<Inner>` impl.
     pub fn strict_domain(mut self, type_name: impl Into<String>) -> Self {
-        self.strict_domains.push(type_name.into());
+        self.config.strict_domains.push(type_name.into());
         self
     }
 
     /// Mark multiple domains (as "schema.name") as strict
     pub fn strict_domains(mut self, types: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.strict_domains.extend(types.into_iter().map(Into::into));
+        self.config.strict_domains.extend(types.into_iter().map(Into::into));
+        self
+    }
+
+    /// Also derive `bon::Builder` for a composite type or view (as "schema.name")
+    pub fn builder_type(mut self, type_name: impl Into<String>) -> Self {
+        self.config.builders.push(type_name.into());
+        self
+    }
+
+    /// Also derive `bon::Builder` for several composite types or views
+    pub fn builder_types(mut self, types: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.config.builders.extend(types.into_iter().map(Into::into));
         self
     }
 
     /// Configure SQL query files for code generation
     pub fn queries_config(mut self, config: config::QueriesConfig) -> Self {
-        self.queries = Some(config);
+        self.config.queries = Some(config);
         self
     }
 
@@ -258,7 +245,7 @@ impl PgrpcBuilder {
     ///     .expect("Failed to generate code");
     /// ```
     pub fn query_path(mut self, path: impl Into<String>) -> Self {
-        let queries_config = self.queries.get_or_insert_with(|| config::QueriesConfig {
+        let queries_config = self.config.queries.get_or_insert_with(|| config::QueriesConfig {
             paths: Vec::new(),
         });
         queries_config.paths.push(path.into());
@@ -277,7 +264,7 @@ impl PgrpcBuilder {
     ///
     /// Users must add `tracing = "0.1"` to their Cargo.toml when this is enabled.
     pub fn enable_tracing(mut self, enabled: bool) -> Self {
-        let tracing_config = self.tracing.get_or_insert(config::TracingConfig::default());
+        let tracing_config = self.config.tracing.get_or_insert_with(config::TracingConfig::default);
         tracing_config.enabled = enabled;
         self
     }
@@ -286,20 +273,11 @@ impl PgrpcBuilder {
     pub fn from_config_file(config_path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let conf_str = fs::read_to_string(config_path)?;
         let config: Config = toml::from_str(&conf_str)?;
+        let output_path = config.output_path.as_ref().map(PathBuf::from);
 
         Ok(Self {
-            connection_string: config.connection_string,
-            schemas: config.schemas,
-            types: config.types,
-            exceptions: config.exceptions,
-            output_path: config.output_path.map(PathBuf::from),
-            task_queue: config.task_queue,
-            errors: config.errors,
-            infer_view_nullability: config.infer_view_nullability,
-            disable_deserialize: config.disable_deserialize,
-            strict_domains: config.strict_domains,
-            queries: config.queries,
-            tracing: config.tracing,
+            config,
+            output_path,
         })
     }
 
@@ -316,7 +294,7 @@ impl PgrpcBuilder {
 
         let start = Instant::now();
 
-        let connection_string = if let Some(conn_str) = &self.connection_string {
+        let connection_string = if let Some(conn_str) = &self.config.connection_string {
             conn_str.clone()
         } else if let Ok(env_conn_str) = std::env::var("DATABASE_URL") {
             env_conn_str
@@ -324,24 +302,12 @@ impl PgrpcBuilder {
             return Err(anyhow::anyhow!("Connection string is required. Provide it via config file, builder method, or DATABASE_URL environment variable"));
         };
 
-        if self.schemas.is_empty() {
+        if self.config.schemas.is_empty() {
             return Err(anyhow::anyhow!("At least one schema must be specified"));
         }
+        check_reserved_modules(&self.config)?;
 
-        let config = Config {
-            connection_string: Some(connection_string.clone()),
-            output_path: None, // Not used in internal Config creation
-            schemas: self.schemas.clone(),
-            types: self.types.clone(),
-            exceptions: self.exceptions.clone(),
-            task_queue: self.task_queue.clone(),
-            errors: self.errors.clone(),
-            infer_view_nullability: self.infer_view_nullability,
-            disable_deserialize: self.disable_deserialize.clone(),
-            strict_domains: self.strict_domains.clone(),
-            queries: self.queries.clone(),
-            tracing: self.tracing.clone(),
-        };
+        let config = &self.config;
 
         let mut db = Db::new(&connection_string)?;
         let rel_index = RelIndex::new(&mut db.client)?;
@@ -432,7 +398,12 @@ impl PgrpcBuilder {
         log::info!("Found {} CHECK-inferred enum types", check_enums.len());
 
         let mut ty_index =
-            TypeIndex::new_with_check_enums(&mut db.client, type_oids.as_slice(), &check_enums)?;
+            TypeIndex::new_with_check_enums(
+            &mut db.client,
+            type_oids.as_slice(),
+            &check_enums,
+            &config.types,
+        )?;
 
         // Apply view nullability inference using the pre-built cache
         if config.infer_view_nullability {
@@ -448,102 +419,73 @@ impl PgrpcBuilder {
             )?;
         }
 
-        let schema_files = codegen_split(&fn_index, &ty_index, &rel_index, &config)?;
+        let schema_files = codegen_split(&fn_index, &ty_index, &rel_index, config)?;
 
-        // Create output directory if it doesn't exist
+        // Every generated module, keyed by module name, in the order mod.rs
+        // declares them. Schema modules first; the optional extras follow.
+        let mut modules: BTreeMap<String, String> = schema_files
+            .into_iter()
+            .map(|(schema, code)| (module_name(&schema), code))
+            .collect();
+
+        if let Some(task_config) = &config.task_queue {
+            let task_code = generate_task_code(&mut db.client, task_config, &ty_index, config)
+                .context("failed to generate task queue types")?;
+            if let Some(task_code) = task_code {
+                modules.insert(TASKS_MODULE.to_string(), task_code);
+            }
+        }
+
+        if let Some(errors_config) = &config.errors {
+            let error_code = generate_error_code(&mut db.client, errors_config, &ty_index, config)
+                .context("failed to generate custom error types")?;
+            modules.insert(CUSTOM_ERRORS_MODULE.to_string(), error_code);
+        }
+
+        if let Some(query_index) = &query_index_opt {
+            if !query_index.is_empty() {
+                let query_code = generate_query_code(query_index, &ty_index, &rel_index, config)
+                    .context("failed to generate query code")?;
+                modules.insert(QUERIES_MODULE.to_string(), query_code);
+            }
+        }
+
         fs::create_dir_all(output_path)?;
 
-        // Track how many files were written vs unchanged
         let mut files_written = 0;
         let mut files_unchanged = 0;
-
-        // Write each schema file
-        for (schema, code) in &schema_files {
-            let schema_name =
-                crate::ident::sql_to_rs_ident(schema, crate::ident::CaseType::Snake).to_string();
-            let file_path = output_path.join(format!("{}.rs", schema_name));
-            if write_if_changed(&file_path, code)? {
+        let mut write = |file_name: String, content: &str| -> std::io::Result<()> {
+            if write_if_changed(&output_path.join(file_name), content)? {
                 files_written += 1;
             } else {
                 files_unchanged += 1;
             }
-        }
+            Ok(())
+        };
 
-        // Generate task enum if task queue is configured
-        let mut final_schema_files = schema_files.clone();
-        if let Some(task_config) = &config.task_queue {
-            match generate_task_code(&mut db.client, task_config, &ty_index, &config) {
-                Ok(Some(task_code)) => {
-                    let task_file_path = output_path.join("tasks.rs");
-                    if write_if_changed(&task_file_path, &task_code)? {
-                        files_written += 1;
-                    } else {
-                        files_unchanged += 1;
-                    }
-                    final_schema_files.insert("tasks".to_string(), task_code);
-                }
-                Ok(None) => {
-                    // No task types found, skip task generation
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to generate task queue types: {}", e);
-                }
+        for (module, code) in &modules {
+            write(format!("{module}.rs"), code)?;
+        }
+        write("mod.rs".to_string(), &generate_mod_file(&modules))?;
+
+        // Not worth a line each in a build log, but worth knowing about.
+        let redundant = annotations::redundant_count();
+        if redundant > 0 {
+            let note = format!(
+                "pgrpc: {redundant} @pgrpc_not_null annotation(s) are redundant \
+                 (already inferred); run with RUST_LOG=pgrpc=warn to list them"
+            );
+            // `OUT_DIR` is set for build scripts, where stderr is hidden.
+            if std::env::var_os("OUT_DIR").is_some() {
+                println!("cargo:warning={note}");
+            } else {
+                eprintln!("{note}");
             }
-        }
-
-        // Generate error types if errors are configured
-        if let Some(errors_config) = &config.errors {
-            match generate_error_code(&mut db.client, errors_config, &ty_index) {
-                Ok(Some(error_code)) => {
-                    let error_file_path = output_path.join("custom_errors.rs");
-                    if write_if_changed(&error_file_path, &error_code)? {
-                        files_written += 1;
-                    } else {
-                        files_unchanged += 1;
-                    }
-                    final_schema_files.insert("custom_errors".to_string(), error_code);
-                }
-                Ok(None) => {
-                    // No error types found, skip error generation
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to generate custom error types: {}", e);
-                }
-            }
-        }
-
-        // Generate queries if configured
-        if let Some(query_index) = &query_index_opt {
-            if !query_index.is_empty() {
-                match generate_query_code(query_index, &ty_index, &rel_index, &config) {
-                    Ok(query_code) => {
-                        let query_file_path = output_path.join("queries.rs");
-                        if write_if_changed(&query_file_path, &query_code)? {
-                            files_written += 1;
-                        } else {
-                            files_unchanged += 1;
-                        }
-                        final_schema_files.insert("queries".to_string(), query_code);
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to generate query code: {}", e);
-                    }
-                }
-            }
-        }
-
-        // Generate and write mod.rs
-        let mod_content = generate_mod_file(&final_schema_files);
-        if write_if_changed(&output_path.join("mod.rs"), &mod_content)? {
-            files_written += 1;
-        } else {
-            files_unchanged += 1;
         }
 
         let duration = start.elapsed().as_secs_f64();
         let total_files = files_written + files_unchanged;
 
-        // Create a detailed message based on what was updated
         let update_message = if files_unchanged == 0 {
             format!("{} files written", files_written)
         } else if files_written == 0 {
@@ -564,6 +506,61 @@ impl PgrpcBuilder {
     }
 }
 
+/// Lint suppressions prepended to every generated file.
+const WARNING_IGNORES: &str = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
+
+const TASKS_MODULE: &str = "tasks";
+const CUSTOM_ERRORS_MODULE: &str = "custom_errors";
+const QUERIES_MODULE: &str = "queries";
+
+/// Rust module (and file) name for a schema.
+fn module_name(schema: &str) -> String {
+    crate::ident::sql_to_rs_ident(schema, crate::ident::CaseType::Snake).to_string()
+}
+
+/// Generated support modules live next to the per-schema modules, so a schema
+/// whose module name matches one of them would be silently overwritten. Two
+/// schemas that map to the same module name collide the same way.
+fn check_reserved_modules(config: &Config) -> anyhow::Result<()> {
+    let mut reserved = vec![
+        "errors",
+        "nullable",
+        "composite",
+        "schema_cache",
+        codegen::DATETIME_SERDE_MODULE,
+        codegen::TSVECTOR_MODULE,
+        "mod",
+    ];
+    if config.task_queue.is_some() {
+        reserved.push(TASKS_MODULE);
+    }
+    if config.errors.is_some() {
+        reserved.push(CUSTOM_ERRORS_MODULE);
+    }
+    if config.queries.is_some() {
+        reserved.push(QUERIES_MODULE);
+    }
+
+    let mut seen: HashMap<String, &str> = HashMap::new();
+    for schema in &config.schemas {
+        let module = module_name(schema);
+        if reserved.contains(&module.as_str()) {
+            anyhow::bail!(
+                "schema \"{schema}\" cannot be generated: its module name `{module}` is reserved \
+                 for a module pgrpc generates itself"
+            );
+        }
+        if let Some(other) = seen.insert(module.clone(), schema) {
+            if other != schema {
+                anyhow::bail!(
+                    "schemas \"{other}\" and \"{schema}\" both map to the module name `{module}`"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Generate task queue code if task types are found
 fn generate_task_code(
     db_client: &mut postgres::Client,
@@ -578,18 +575,17 @@ fn generate_task_code(
     }
 
     let (task_enum_code, referenced_schemas) = generate_task_enum(&task_index, ty_index, config);
-    let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
 
     // Generate use statements for referenced schemas
     let schema_imports: Vec<TokenStream> = referenced_schemas
         .into_iter()
         .map(|schema| {
-            let schema_ident = quote::format_ident!("{}", schema);
+            let schema_ident = quote::format_ident!("{}", module_name(&schema));
             quote! { use super::#schema_ident; }
         })
         .collect();
 
-    let date_serde_module = generate_date_serde_module();
+    let date_serde_module = datetime_serde_reexport();
 
     let task_code = quote::quote! {
             #(#schema_imports)*
@@ -605,38 +601,41 @@ fn generate_task_code(
             #task_enum_code
         }.to_string();
 
-    Ok(Some(warning_ignores.to_string() + &task_code))
+    Ok(Some(WARNING_IGNORES.to_string() + &task_code))
 }
 
-/// Generate custom error type code if error types are found
+/// Generate the custom error module.
+///
+/// Always emitted when errors are configured: `errors.rs` refers to this
+/// module (`PgRpcError::CustomError`, `custom_error_message`) even when the
+/// errors schema has no types yet.
 fn generate_error_code(
     db_client: &mut postgres::Client,
     errors_config: &config::ErrorsConfig,
     ty_index: &TypeIndex,
-) -> anyhow::Result<Option<String>> {
-    // Always emitted when errors are configured: `errors.rs` refers to this
-    // module (`PgRpcError::CustomError`, `custom_error_message`) even when the
-    // errors schema has no types yet.
+    config: &Config,
+) -> anyhow::Result<String> {
     let error_index = error_type_index::ErrorTypeIndex::new(db_client, errors_config)?;
 
-    let config = crate::config::Config {
-        errors: Some(errors_config.clone()),
-        ..Default::default()
+    // Error payloads are decoded from the JSON hint, so `disable_deserialize`
+    // must not reach them: the generated `from_json` needs the derive.
+    let config = &Config {
+        disable_deserialize: Vec::new(),
+        ..config.clone()
     };
+
     let (payload_structs, referenced_schemas) =
-        error_type_index::generate_error_payload_structs(&error_index, ty_index, &config);
+        error_type_index::generate_error_payload_structs(&error_index, ty_index, config);
     let error_enum = error_type_index::generate_error_type_enum(&error_index);
     let message_lookup = error_type_index::generate_custom_error_message_lookup(&error_index);
     let schema_imports: Vec<TokenStream> = referenced_schemas
         .iter()
         .filter(|s: &&String| s.as_str() != "custom_errors")
         .map(|s| {
-            let ident = quote::format_ident!("{}", crate::ident::sql_to_rs_ident(s, crate::ident::CaseType::Snake).to_string());
+            let ident = quote::format_ident!("{}", module_name(s));
             quote::quote! { use super::#ident; }
         })
         .collect();
-
-    let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
 
     let error_code = quote::quote! {
             use serde::{Deserialize, Serialize};
@@ -654,21 +653,14 @@ fn generate_error_code(
             #message_lookup
         }.to_string();
 
-    Ok(Some(warning_ignores.to_string() + &error_code))
+    Ok(WARNING_IGNORES.to_string() + &error_code)
 }
 
-fn generate_mod_file(schema_files: &BTreeMap<String, String>) -> String {
-    // BTreeMap is already sorted by key, so no need to sort
-    let mod_declarations: Vec<String> = schema_files
+fn generate_mod_file(modules: &BTreeMap<String, String>) -> String {
+    modules
         .keys()
-        .map(|schema| {
-            let schema_name =
-                crate::ident::sql_to_rs_ident(schema, crate::ident::CaseType::Snake).to_string();
-            format!("pub mod {};", schema_name)
-        })
-        .collect();
-
-    mod_declarations.join("\n") + "\n"
+        .map(|module| format!("pub mod {module};\n"))
+        .collect()
 }
 
 /// Build view nullability cache by analyzing all views in the database
@@ -689,7 +681,8 @@ fn build_view_nullability_cache(
             n.nspname as schema,
             c.relname as view_name,
             pg_get_viewdef(c.oid) as view_definition,
-            array_agg(a.attname ORDER BY a.attnum) as column_names
+            array_agg(a.attname ORDER BY a.attnum) as column_names,
+            c.oid as oid
         FROM pg_class c
         JOIN pg_namespace n ON c.relnamespace = n.oid
         JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
@@ -701,7 +694,10 @@ fn build_view_nullability_cache(
 
     // Collect all views. Ordered so that graph construction — and therefore
     // the topological sort's tie-breaking — is the same on every run.
-    let mut views: BTreeMap<(Option<String>, String), (String, Vec<String>)> = BTreeMap::new();
+    let mut views: BTreeMap<(String, String), (String, Vec<String>)> = BTreeMap::new();
+    // The cache and the dependency extraction identify a view by relation OID.
+    let mut view_oids: HashMap<(String, String), u32> = HashMap::new();
+    let mut views_by_oid: HashMap<u32, (String, String)> = HashMap::new();
 
     for row in rows {
         let schema: String = row.get(0);
@@ -709,13 +705,12 @@ fn build_view_nullability_cache(
         let view_def: String = row.get(2);
         let column_names: Vec<String> = row.get(3);
 
-        let schema_opt = if schema == "public" {
-            None
-        } else {
-            Some(schema)
-        };
+        let oid: u32 = row.get(4);
 
-        views.insert((schema_opt, view_name), (view_def, column_names));
+        let view_key = (schema, view_name);
+        view_oids.insert(view_key.clone(), oid);
+        views_by_oid.insert(oid, view_key.clone());
+        views.insert(view_key, (view_def, column_names));
     }
 
     log::info!("Found {} views to analyze", views.len());
@@ -726,8 +721,8 @@ fn build_view_nullability_cache(
 
     // Build dependency graph
     let mut graph = DiGraph::new();
-    let mut node_map: HashMap<(Option<String>, String), NodeIndex> = HashMap::new();
-    let mut node_to_view: HashMap<NodeIndex, (Option<String>, String)> = HashMap::new();
+    let mut node_map: HashMap<(String, String), NodeIndex> = HashMap::new();
+    let mut node_to_view: HashMap<NodeIndex, (String, String)> = HashMap::new();
 
     // Add nodes
     for view_key in views.keys() {
@@ -748,7 +743,7 @@ fn build_view_nullability_cache(
             // Filter to only include views that exist in our set
             let deps: HashSet<_> = raw_deps
                 .into_iter()
-                .filter(|dep| views.contains_key(dep))
+                .filter_map(|dep| views_by_oid.get(&dep).cloned())
                 .collect();
 
             log::debug!("View {:?} depends on: {:?}", view_key, deps);
@@ -795,7 +790,12 @@ fn build_view_nullability_cache(
                         );
 
                         // Store in cache for dependent views
-                        nullability_cache.insert(view_key.clone(), nullability_map);
+                        nullability_cache.insert(
+                            view_oids[view_key],
+                            &view_key.0,
+                            &view_key.1,
+                            nullability_map,
+                        );
                     }
                     Err(e) => {
                         log::warn!(
@@ -824,10 +824,8 @@ fn generate_query_code(
     rel_index: &rel_index::RelIndex,
     config: &Config,
 ) -> anyhow::Result<String> {
-    let warning_ignores = "#![allow(dead_code)]\n#![allow(unused_variables)]\n#![allow(unused_imports)]\n#![allow(unused_mut)]\n\n";
-
-    let query_code_tokens = codegen::codegen_queries(query_index, ty_index, rel_index, config);
-    let date_serde_module = generate_date_serde_module();
+    let query_code_tokens = codegen::codegen_queries(query_index, ty_index, rel_index, config)?;
+    let date_serde_module = datetime_serde_reexport();
 
     let query_code = quote! {
             use postgres_types::private::BytesMut;
@@ -839,7 +837,7 @@ fn generate_query_code(
             #query_code_tokens
         }.to_string();
 
-    Ok(warning_ignores.to_string() + &query_code)
+    Ok(WARNING_IGNORES.to_string() + &query_code)
 }
 
 /// Write content to a file only if it has changed

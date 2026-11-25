@@ -8,10 +8,13 @@ use crate::exceptions::PgException;
 use crate::pg_constraint::Constraint;
 use crate::pg_id::PgId;
 use crate::rel_index::RelIndex;
+use crate::pg_rel::PgRel;
 use crate::sql_parser::{ParameterSpec, ParsedQuery, QueryType};
 use crate::trigger_index::TriggerIndex;
-use crate::view_nullability::ViewNullabilityAnalyzer;
+use crate::view_nullability::{StatementAnalysis, ViewNullabilityAnalyzer};
 use anyhow::{Context, Result};
+use pg_query::protobuf as pb;
+use pg_query::protobuf::node::Node as N;
 use postgres::Client;
 use std::collections::{BTreeMap, HashMap};
 
@@ -95,33 +98,30 @@ impl<'a> QueryIntrospector<'a> {
     fn analyze_errors(
         &self,
         query_name: &str,
-        sql: &str,
+        parsed: Option<&pg_query::ParseResult>,
     ) -> (Vec<PgException>, BTreeMap<PgId, Vec<Constraint>>) {
-        let parsed = match pg_query::parse(sql) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!(
-                    "Query {}: failed to parse SQL for error analysis: {}",
-                    query_name,
-                    e
-                );
-                return (Vec::new(), BTreeMap::new());
-            }
+        let mut exceptions: Vec<PgException> = Vec::new();
+
+        let Some(parsed) = parsed else {
+            log::warn!(
+                "Query {}: SQL did not parse; skipping error analysis",
+                query_name
+            );
+            return (exceptions, BTreeMap::new());
         };
 
-        let mut rel_deps = sql_rel_deps(&parsed, self.rel_index, self.trigger_index, query_name);
-        let mut exceptions = Vec::new();
+        let mut rel_deps = sql_rel_deps(parsed, self.rel_index, self.trigger_index, query_name);
 
         if let Some(cfg) = self.errors_config {
             exceptions.extend(
-                crate::pg_fn::extract_custom_errors_from_queries(std::slice::from_ref(&parsed), cfg)
+                crate::pg_fn::extract_custom_errors_from_queries(std::slice::from_ref(parsed), cfg)
                     .into_iter()
                     .map(PgException::CustomError),
             );
         }
 
         if let Some(fn_index) = self.fn_index {
-            for target in call_graph::sql_callees(&parsed) {
+            for target in call_graph::sql_callees(parsed) {
                 // Query files have no schema of their own; unqualified names
                 // resolve along the connection's search path.
                 let Some(callee) = fn_index.resolve(&target, None) else { continue };
@@ -157,6 +157,22 @@ impl<'a> QueryIntrospector<'a> {
             parsed.line_number
         );
 
+        // Parse once; every analysis below shares this AST. A query the
+        // parser rejects will also fail to prepare, which reports the error.
+        let ast = match pg_query::parse(&parsed.postgres_sql) {
+            Ok(ast) => Some(ast),
+            Err(e) => {
+                log::debug!("Query '{}': pg_query could not parse SQL: {}", parsed.name, e);
+                None
+            }
+        };
+        let ast = ast.as_ref();
+
+        // Name resolution for the whole statement, shared by everything that
+        // asks what a column reference or an output column is.
+        let analysis = ast.and_then(|ast| self.analyze_statement(&parsed.name, ast));
+        let analysis = analysis.as_ref();
+
         // Determine the final query type: use explicit if specified, otherwise infer
         let final_query_type = match &parsed.explicit_query_type {
             Some(explicit) => {
@@ -169,8 +185,13 @@ impl<'a> QueryIntrospector<'a> {
             }
             None => {
                 // Infer cardinality from SQL structure and database constraints
-                let analyzer = CardinalityAnalyzer::new(self.rel_index);
-                match analyzer.infer(&parsed.postgres_sql) {
+                let analyzer =
+                    CardinalityAnalyzer::new(self.rel_index).with_fn_index(self.fn_index);
+                let inferred = match ast {
+                    Some(ast) => analyzer.infer_parsed(&ast.protobuf),
+                    None => Err(anyhow::anyhow!("SQL did not parse")),
+                };
+                match inferred {
                     Ok(inference) => {
                         log::info!(
                             "Inferred {:?} for '{}': {:?} (confidence: {:?})",
@@ -214,9 +235,10 @@ impl<'a> QueryIntrospector<'a> {
         // The inferred types preserve domain types by looking up the actual column type
         let param_info = self.determine_parameter_info(
             &parsed.parameters,
-            &parsed.postgres_sql,
+            ast,
+            analysis,
             postgres_param_types.len(),
-        )?;
+        );
 
         // Build parameter list, preferring inferred column types (preserves domains)
         // over PostgreSQL's resolved types
@@ -246,18 +268,41 @@ impl<'a> QueryIntrospector<'a> {
         // Get return columns using statement metadata
         let return_columns = match final_query_type {
             QueryType::One | QueryType::Opt | QueryType::Many => {
-                let mut cols = self.introspect_return_columns_from_stmt(&parsed.name, &stmt, &parsed.postgres_sql)?;
+                let mut cols =
+                    self.introspect_return_columns_from_stmt(&parsed.name, &stmt, ast, analysis);
                 // `-- @pgrpc_not_null(col1, col2)` lets the user assert NOT NULL
                 // on columns whose nullability we couldn't (or won't) prove —
                 // unnest output, jsonb_to_recordset values, lateral subqueries,
                 // anywhere the user's invariants are stronger than the SQL.
                 if !parsed.not_null_annotations.is_empty() {
+                    for name in &parsed.not_null_annotations {
+                        if !cols.iter().any(|col| &col.name == name) {
+                            anyhow::bail!(
+                                "query {}: @pgrpc_not_null names `{}`, which is not a result column",
+                                parsed.name,
+                                name
+                            );
+                        }
+                    }
                     for col in &mut cols {
                         if parsed.not_null_annotations.contains(&col.name) {
-                            log::info!(
-                                "[ANNOTATION] Forcing column '{}' NOT NULL via @pgrpc_not_null",
-                                col.name
-                            );
+                            if !col.nullable {
+                                crate::annotations::warn_redundant(
+                                    &format!("query {}", parsed.name),
+                                    &col.name,
+                                );
+                            }
+                            // An outer join is the one cause of NULL the
+                            // analysis can prove; asserting NOT NULL against
+                            // it will fail at decode time.
+                            if col.nullable_due_to_join {
+                                log::warn!(
+                                    "query {}: @pgrpc_not_null on `{}`, which comes from the nullable \
+                                     side of an outer join; rows without a match will fail to decode",
+                                    parsed.name,
+                                    col.name
+                                );
+                            }
                             col.nullable = false;
                             col.nullable_due_to_join = false;
                         }
@@ -270,7 +315,7 @@ impl<'a> QueryIntrospector<'a> {
 
         // Analyze exceptions and table dependencies, following function calls
         let (exceptions, table_dependencies) =
-            self.analyze_errors(&parsed.name, &parsed.postgres_sql);
+            self.analyze_errors(&parsed.name, ast);
 
         // No need to DEALLOCATE - Statement is dropped automatically
 
@@ -287,13 +332,35 @@ impl<'a> QueryIntrospector<'a> {
         })
     }
 
+    /// Resolve the names in a statement: one analysis, by the same engine and
+    /// the same rules as view nullability, that answers both "what is this
+    /// output column" and "which column does this reference mean".
+    fn analyze_statement(
+        &self,
+        query_name: &str,
+        ast: &pg_query::ParseResult,
+    ) -> Option<StatementAnalysis> {
+        let mut analyzer = ViewNullabilityAnalyzer::new(self.rel_index, self.view_nullability_cache)
+            .with_composite_index(self.composite_index);
+        match analyzer.analyze_parsed(&ast.protobuf) {
+            Ok(analysis) => Some(analysis),
+            Err(e) => {
+                log::warn!(
+                    "Query {query_name}: could not apply nullability analysis, columns stay nullable: {e}"
+                );
+                None
+            }
+        }
+    }
+
     /// Introspect return columns using the prepared statement metadata
     fn introspect_return_columns_from_stmt(
         &self,
         query_name: &str,
         stmt: &postgres::Statement,
-        sql: &str,
-    ) -> Result<Vec<QueryColumn>> {
+        ast: Option<&pg_query::ParseResult>,
+        analysis: Option<&StatementAnalysis>,
+    ) -> Vec<QueryColumn> {
         // Get column info directly from the prepared statement
         let columns: Vec<QueryColumn> = stmt
             .columns()
@@ -306,14 +373,6 @@ impl<'a> QueryIntrospector<'a> {
             })
             .collect();
 
-        if columns.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        log::debug!(
-            "[INTROSPECT] Statement returned {} columns",
-            columns.len()
-        );
         for col in &columns {
             log::debug!(
                 "[INTROSPECT] Column from statement: {} (OID: {})",
@@ -322,259 +381,88 @@ impl<'a> QueryIntrospector<'a> {
             );
         }
 
-        // Apply nullability analysis
-        if let Some(refined_columns) = self.refine_nullability(query_name, sql, &columns)? {
-            log::debug!(
-                "[INTROSPECT] After refine_nullability: {} columns",
-                refined_columns.len()
-            );
-            Ok(refined_columns)
-        } else {
-            log::debug!(
-                "[INTROSPECT] No refinement applied, returning {} columns",
-                columns.len()
-            );
-            Ok(columns)
-        }
+        self.refine_columns(query_name, ast, analysis, columns)
     }
 
-    /// Refine column nullability and types using ViewNullabilityAnalyzer or DML table analysis.
-    /// Also looks up actual column types from the table schema to preserve domain types.
-    fn refine_nullability(&self, query_name: &str, sql: &str, columns: &[QueryColumn]) -> Result<Option<Vec<QueryColumn>>> {
-        log::info!("[REFINE] Starting nullability refinement for query: {}", sql);
-        log::info!("[REFINE] Input columns:");
-        for col in columns {
-            log::info!("[REFINE]   {} -> nullable={}", col.name, col.nullable);
-        }
-
-        // First, try to refine using DML target table (for INSERT/UPDATE/DELETE with RETURNING)
-        if let Some(refined) = self.refine_nullability_from_dml_target(query_name, sql, columns)? {
-            log::info!("[REFINE] DML target analysis succeeded");
-            return Ok(Some(refined));
-        }
-
-        // Fall back to view nullability analysis (for SELECT queries)
-        let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-
-        let mut analyzer = ViewNullabilityAnalyzer::new(self.rel_index, self.view_nullability_cache)
-            .with_composite_index(self.composite_index);
-
-        match analyzer.analyze_view(sql, &column_names) {
-            Ok(nullability_map) => {
-                log::info!("[REFINE] ViewNullabilityAnalyzer results:");
-                for (name, cn) in &nullability_map {
-                    log::info!("[REFINE]   {} -> is_not_null={} (nullable={}, join_nullable={})",
-                        name, cn.is_not_null(), cn.is_nullable(), cn.nullable_due_to_join);
-                }
-
-                // Parse once and share the AST across the column-type and
-                // cast-domain walks below (avoids re-parsing the same SQL).
-                let parsed_ast = pg_query::parse(sql).ok();
-
-                // Build a map of column name -> (table_name, inferred_type_oid) from the query
-                let column_type_map = self.infer_column_types_from_query(sql);
-
-                // Build a map of output column name -> domain OID for `expr::domain`
-                // casts. Prepared-statement metadata reports the domain's *base*
-                // type for a cast expression, so without this a `least(...)::currency`
-                // column would generate the base composite (`_currency`) instead of
-                // the `currency` domain that `pg_typeof` reports. Only domain casts
-                // are recorded — for non-domain casts (`::int4`, `::text`) the
-                // prepared-statement type is already authoritative.
-                let cast_domain_map = parsed_ast
-                    .as_ref()
-                    .map(|ast| self.infer_cast_domain_types(&ast.protobuf))
-                    .unwrap_or_default();
-
-                let refined_columns = columns
-                    .iter()
-                    .map(|col| {
-                        let cn = nullability_map.get(&col.name).copied().unwrap_or(
-                            crate::view_nullability::ColumnNullability {
-                                nullable_due_to_join: false,
-                                nullable_on_base: true,
-                            },
-                        );
-                        let new_nullable = cn.is_nullable();
-
-                        // Try to get the actual column type from the table schema (preserves domains).
-                        // The map is keyed by the *output* name (which may be an alias from
-                        // `col as alias`), and its value carries the *source* column name to
-                        // look up in rel_index. Using col.name here would miss aliased columns
-                        // and silently fall back to the base type reported by prepared-statement
-                        // metadata, dropping the domain wrapper.
-                        // A cast to a domain wins: it names the result type
-                        // directly, overriding the base type the prepared
-                        // statement reported. Otherwise fall back to the
-                        // source column's type (preserves domains on plain
-                        // refs), then to the prepared-statement type.
-                        let refined_type_oid = cast_domain_map
-                            .get(&col.name)
-                            .copied()
-                            .or_else(|| {
-                                column_type_map.get(&col.name).and_then(|(schema, table, source_col)| {
-                                    self.rel_index.get_column_type_in_schema(
-                                        schema.as_deref(),
-                                        table,
-                                        source_col,
-                                    )
-                                })
-                            })
-                            .unwrap_or(col.type_oid);
-
-                        log::info!("[REFINE] Column '{}': nullable={}, type_oid={} -> {}",
-                            col.name, new_nullable, col.type_oid, refined_type_oid);
-                        QueryColumn {
-                            name: col.name.clone(),
-                            type_oid: refined_type_oid,
-                            nullable: new_nullable,
-                            nullable_due_to_join: cn.nullable_due_to_join,
-                        }
-                    })
-                    .collect();
-
-                log::info!("[REFINE] Refinement succeeded, returning refined columns");
-                Ok(Some(refined_columns))
-            }
-            Err(e) => {
-                log::warn!("Query {query_name}: could not apply nullability analysis, columns stay nullable: {}", e);
-                Ok(None)
-            }
-        }
-    }
-
-    /// Infer which table each selected column comes from by parsing the query.
-    /// Returns a map of output column name -> (schema, source table, source column),
-    /// where `schema` is `Some` only when the FROM clause qualifies the table
-    /// (e.g. `core.widget`) — letting the type lookup disambiguate same-named
-    /// tables across schemas instead of guessing by catalog OID order.
-    fn infer_column_types_from_query(
+    /// Refine the nullability and types of a statement's result columns — a
+    /// SELECT's target list or a DML statement's RETURNING list — from its
+    /// analysis.
+    ///
+    /// Columns are matched by position. Each takes the nullability the
+    /// expression engine inferred. Its type is, in order: the domain it is
+    /// cast to; the declared type of the catalog column it is a plain
+    /// reference to (prepared-statement metadata reports a domain's base
+    /// type); the type the prepared statement reported.
+    ///
+    /// Without an analysis, or when its column count differs from the
+    /// statement's (we misread the query), every column stays nullable with
+    /// its reported type.
+    fn refine_columns(
         &self,
-        sql: &str,
-    ) -> HashMap<String, (Option<String>, String, String)> {
-        let mut result = HashMap::new();
-
-        let parse_result = match pg_query::parse(sql) {
-            Ok(r) => r,
-            Err(_) => return result,
+        query_name: &str,
+        ast: Option<&pg_query::ParseResult>,
+        analysis: Option<&StatementAnalysis>,
+        columns: Vec<QueryColumn>,
+    ) -> Vec<QueryColumn> {
+        if columns.is_empty() {
+            return columns;
+        }
+        if let Some(target) = ast.and_then(dml_target) {
+            if self.rel_index.resolve_range_var(target).is_none() {
+                log::warn!(
+                    "Query {query_name}: DML target table '{}' not found in the relation index \
+                     or on the search path; RETURNING columns stay nullable",
+                    target.relname
+                );
+            }
+        }
+        let Some(outputs) = analysis
+            .and_then(|a| a.columns.as_deref())
+            .filter(|outputs| outputs.len() == columns.len())
+        else {
+            log::debug!("[REFINE] {query_name}: output shape unknown, columns stay nullable");
+            return columns;
         };
 
-        // Build alias map first
-        let alias_map = self.build_alias_map(sql);
-        // Map of resolved table name -> its schema (when the FROM clause names one).
-        let schema_map = self.build_table_schema_map(sql);
-        // The set of tables actually referenced in the FROM clause. Unqualified
-        // result columns may only bind to one of these — never to an arbitrary
-        // catalog relation that happens to share a column name. The alias map's
-        // values are exactly the resolved FROM-clause table names.
-        let from_tables: std::collections::HashSet<String> =
-            alias_map.values().cloned().collect();
+        // Output column name -> domain OID for `expr::domain` casts.
+        // Prepared-statement metadata reports the domain's *base* type for a
+        // cast expression, so without this a `least(...)::currency` column
+        // would generate the base composite (`_currency`) instead of the
+        // `currency` domain that `pg_typeof` reports. Only domain casts are
+        // recorded — for non-domain casts (`::int4`, `::text`) the
+        // prepared-statement type is already authoritative.
+        let cast_domain_map = ast
+            .map(|ast| self.infer_cast_domain_types(&ast.protobuf))
+            .unwrap_or_default();
 
-        // Extract the SELECT statement
-        if let Some(stmt) = parse_result.protobuf.stmts.first() {
-            if let Some(node) = &stmt.stmt {
-                if let Some(pg_query::protobuf::node::Node::SelectStmt(select)) = &node.node {
-                    for target in &select.target_list {
-                        if let Some(pg_query::protobuf::node::Node::ResTarget(res_target)) = &target.node {
-                            // Handle star expressions (`*` and `t.*`) by expanding them through
-                            // the FROM-clause relation in rel_index. Without this, queries like
-                            // `select * from some_view` yield an empty type map and fall back to
-                            // tokio_postgres' result-column metadata, which always reports the
-                            // domain's base type — dropping the domain wrapper for view columns.
-                            if let Some(val) = &res_target.val {
-                                if let Some(expansions) = self.expand_star_target(val, &alias_map) {
-                                    for (output_name, table_name, col_name) in expansions {
-                                        let schema = schema_map.get(&table_name).cloned().flatten();
-                                        result.insert(output_name, (schema, table_name, col_name));
-                                    }
-                                    continue;
-                                }
-                            }
-
-                            // Get the output column name
-                            let output_name = if !res_target.name.is_empty() {
-                                res_target.name.clone()
-                            } else if let Some(val) = &res_target.val {
-                                self.extract_column_name_from_node(val).unwrap_or_default()
-                            } else {
-                                continue;
-                            };
-
-                            // Try to extract table.column from the expression
-                            if let Some(val) = &res_target.val {
-                                if let Some((table_or_alias, col_name)) = self.extract_table_column_from_node(val, &from_tables) {
-                                    // Resolve alias to actual table name
-                                    let table_name = alias_map
-                                        .get(&table_or_alias)
-                                        .cloned()
-                                        .unwrap_or(table_or_alias);
-                                    let schema = schema_map.get(&table_name).cloned().flatten();
-                                    result.insert(output_name, (schema, table_name, col_name));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Build a map of (resolved) table name -> its schema, for every relation in
-    /// the FROM clause that is written schema-qualified (`schema.table`). Tables
-    /// without an explicit schema are absent (value resolved as `None`). Used to
-    /// disambiguate same-named tables in different schemas during type lookup.
-    fn build_table_schema_map(&self, sql: &str) -> HashMap<String, Option<String>> {
-        let mut map = HashMap::new();
-        if let Ok(parse_result) = pg_query::parse(sql) {
-            if let Some(stmt) = parse_result.protobuf.stmts.first() {
-                if let Some(node) = &stmt.stmt {
-                    self.collect_table_schemas_from_node(node, &mut map);
-                }
-            }
-        }
-        map
-    }
-
-    /// Recursively collect `relname -> Some(schemaname)` for schema-qualified
-    /// range vars in a statement's table references.
-    fn collect_table_schemas_from_node(
-        &self,
-        node: &pg_query::protobuf::Node,
-        map: &mut HashMap<String, Option<String>>,
-    ) {
-        use pg_query::protobuf::node::Node;
-
-        match &node.node {
-            Some(Node::SelectStmt(select)) => {
-                for from_item in &select.from_clause {
-                    self.collect_table_schemas_from_node(from_item, map);
-                }
-            }
-            Some(Node::RangeVar(range_var)) => {
-                let schema = (!range_var.schemaname.is_empty())
-                    .then(|| range_var.schemaname.clone());
-                // Only record a qualifying schema; never overwrite a known
-                // schema with `None` from a later unqualified reference.
-                map.entry(range_var.relname.clone())
-                    .and_modify(|e| {
-                        if e.is_none() {
-                            *e = schema.clone();
-                        }
+        columns
+            .into_iter()
+            .zip(outputs)
+            .map(|(col, output)| {
+                let type_oid = cast_domain_map
+                    .get(&col.name)
+                    .copied()
+                    .or_else(|| {
+                        let source = output.source?;
+                        self.rel_index.column_type(source.rel_oid, &source.column)
                     })
-                    .or_insert(schema);
-            }
-            Some(Node::JoinExpr(join)) => {
-                if let Some(larg) = &join.larg {
-                    self.collect_table_schemas_from_node(larg, map);
+                    .unwrap_or(col.type_oid);
+                log::debug!(
+                    "[REFINE] Column '{}': nullable={} (join_nullable={}), type_oid={} -> {}",
+                    col.name,
+                    output.nullability.is_nullable(),
+                    output.nullability.nullable_due_to_join,
+                    col.type_oid,
+                    type_oid
+                );
+                QueryColumn {
+                    name: col.name,
+                    type_oid,
+                    nullable: output.nullability.is_nullable(),
+                    nullable_due_to_join: output.nullability.nullable_due_to_join,
                 }
-                if let Some(rarg) = &join.rarg {
-                    self.collect_table_schemas_from_node(rarg, map);
-                }
-            }
-            _ => {}
-        }
+            })
+            .collect()
     }
 
     /// Find SELECT columns that are casts to a domain type (`expr::domain`) and
@@ -681,223 +569,6 @@ impl<'a> QueryIntrospector<'a> {
         None
     }
 
-    /// If `node` is a star expression (`*` or `t.*`), expand it into a list of
-    /// `(output_column_name, source_table_name, source_column_name)` tuples by
-    /// consulting `rel_index`. Returns `None` when the node is not a star
-    /// expression (so the caller can fall back to scalar handling).
-    fn expand_star_target(
-        &self,
-        node: &pg_query::protobuf::Node,
-        alias_map: &HashMap<String, String>,
-    ) -> Option<Vec<(String, String, String)>> {
-        let col_ref = match &node.node {
-            Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) => col_ref,
-            _ => return None,
-        };
-
-        // A star expression's last field is an A_Star node. Bail out otherwise.
-        let last = col_ref.fields.last()?;
-        match &last.node {
-            Some(pg_query::protobuf::node::Node::AStar(_)) => {}
-            _ => return None,
-        }
-
-        // Determine which table to expand from. For `*` with one or zero qualifying
-        // names, walk every relation referenced in the FROM clause. For `t.*`,
-        // resolve `t` through the alias map.
-        let qualifier: Option<String> = if col_ref.fields.len() >= 2 {
-            // `schema.t.*` is also possible; the qualifier we care about is the
-            // last String field before the A_Star.
-            col_ref
-                .fields
-                .iter()
-                .rev()
-                .skip(1)
-                .find_map(|f| match &f.node {
-                    Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
-                    _ => None,
-                })
-        } else {
-            None
-        };
-
-        let mut expansions = Vec::new();
-
-        let push_columns = |table_name: &str, out: &mut Vec<(String, String, String)>| {
-            if let Some(rel) = self.rel_index.values().find(|r| r.id.name() == table_name) {
-                for col in &rel.columns {
-                    let col_str = col.as_str().to_string();
-                    out.push((col_str.clone(), table_name.to_string(), col_str));
-                }
-            }
-        };
-
-        match qualifier {
-            Some(q) => {
-                let resolved = alias_map.get(&q).cloned().unwrap_or(q);
-                push_columns(&resolved, &mut expansions);
-            }
-            None => {
-                // Plain `*`: expand every distinct relation present in FROM. The alias
-                // map carries both alias->table and table->table entries; dedupe by
-                // resolved table name to avoid emitting columns twice for self-joins.
-                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for table in alias_map.values() {
-                    if seen.insert(table.clone()) {
-                        push_columns(table, &mut expansions);
-                    }
-                }
-            }
-        }
-
-        if expansions.is_empty() {
-            None
-        } else {
-            Some(expansions)
-        }
-    }
-
-    /// Extract (table_or_alias, column_name) from a column reference node.
-    ///
-    /// `from_tables` is the set of relation names actually referenced in the
-    /// query's FROM clause (resolved through the alias map). An **unqualified**
-    /// column must bind only to one of those tables — never to an arbitrary
-    /// catalog relation that merely happens to have a column of the same name.
-    /// Otherwise a bare `name` could resolve to e.g. pgTAP's `tap_funky` view
-    /// (whose `name` column is the built-in `name` type), overriding the
-    /// authoritative prepared-statement OID with the wrong type. When no
-    /// FROM-clause table has the column, return `None` so the prepared-statement
-    /// type (which Postgres reports correctly) stands.
-    fn extract_table_column_from_node(
-        &self,
-        node: &pg_query::protobuf::Node,
-        from_tables: &std::collections::HashSet<String>,
-    ) -> Option<(String, String)> {
-        if let Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) = &node.node {
-            let fields: Vec<_> = col_ref.fields.iter()
-                .filter_map(|f| {
-                    if let Some(pg_query::protobuf::node::Node::String(s)) = &f.node {
-                        Some(s.sval.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            match fields.len() {
-                1 => {
-                    // Unqualified column: bind only to a FROM-clause table that
-                    // actually has this column. Never scan the whole catalog.
-                    let col_name = &fields[0];
-                    for table_name in from_tables {
-                        if self.rel_index.get_column_type(table_name, col_name).is_some() {
-                            return Some((table_name.clone(), col_name.clone()));
-                        }
-                    }
-                    None
-                }
-                2 => {
-                    // Qualified: table.column or alias.column
-                    Some((fields[0].clone(), fields[1].clone()))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Refine nullability and types for INSERT/UPDATE/DELETE RETURNING by looking at the target table
-    fn refine_nullability_from_dml_target(
-        &self,
-        query_name: &str,
-        sql: &str,
-        columns: &[QueryColumn],
-    ) -> Result<Option<Vec<QueryColumn>>> {
-        use crate::pg_constraint::Constraint;
-
-        // Try to extract the target table from a DML statement
-        let target_table = match self.extract_dml_target_table(sql) {
-            Some(table) => table,
-            None => return Ok(None), // Not a DML statement
-        };
-
-        log::info!("[REFINE-DML] Found DML target table: {}", target_table);
-
-        // Find the table in rel_index
-        let table_rel = self.rel_index.values().find(|rel| rel.id.name() == target_table);
-
-        let table_rel = match table_rel {
-            Some(rel) => rel,
-            None => {
-                log::warn!("Query {query_name}: DML target table '{}' not found in relation index", target_table);
-                return Ok(None);
-            }
-        };
-
-        // Refine nullability and type based on table schema
-        let refined_columns: Vec<QueryColumn> = columns
-            .iter()
-            .map(|col| {
-                // Check if this column has a NOT NULL constraint
-                let is_not_null = table_rel.constraints.iter().any(|c| {
-                    matches!(c, Constraint::NotNull(n) if n.column.as_str() == col.name)
-                });
-                let nullable = !is_not_null;
-
-                // Look up the actual column type from the table (preserves domain types)
-                let refined_type_oid = self.rel_index
-                    .get_column_type(&target_table, &col.name)
-                    .unwrap_or(col.type_oid);
-
-                log::info!(
-                    "[REFINE-DML] Column '{}': is_not_null={}, nullable={}, type_oid={} -> {}",
-                    col.name,
-                    is_not_null,
-                    nullable,
-                    col.type_oid,
-                    refined_type_oid
-                );
-                QueryColumn {
-                    name: col.name.clone(),
-                    type_oid: refined_type_oid,
-                    nullable,
-                    nullable_due_to_join: false, // DML targets a single table, no joins
-                }
-            })
-            .collect();
-
-        Ok(Some(refined_columns))
-    }
-
-    /// Extract target table name from INSERT/UPDATE/DELETE statement
-    fn extract_dml_target_table(&self, sql: &str) -> Option<String> {
-        let parse_result = pg_query::parse(sql).ok()?;
-
-        if let Some(stmt) = parse_result.protobuf.stmts.first() {
-            if let Some(node) = &stmt.stmt {
-                let relation = match &node.node {
-                    Some(pg_query::protobuf::node::Node::InsertStmt(insert)) => {
-                        insert.relation.as_ref()
-                    }
-                    Some(pg_query::protobuf::node::Node::UpdateStmt(update)) => {
-                        update.relation.as_ref()
-                    }
-                    Some(pg_query::protobuf::node::Node::DeleteStmt(delete)) => {
-                        delete.relation.as_ref()
-                    }
-                    _ => None,
-                };
-
-                if let Some(range_var) = relation {
-                    return Some(range_var.relname.clone());
-                }
-            }
-        }
-
-        None
-    }
-
     /// Determine parameter names, nullable flags, inferred type OIDs, and has_default from specs, inference, or fallback.
     /// Returns Vec of (name, nullable, Option<inferred_type_oid>, has_default).
     /// The inferred type OID comes from looking up the actual column type in RelIndex,
@@ -905,709 +576,1538 @@ impl<'a> QueryIntrospector<'a> {
     fn determine_parameter_info(
         &self,
         param_specs: &[ParameterSpec],
-        sql: &str,
+        parse_result: Option<&pg_query::ParseResult>,
+        analysis: Option<&StatementAnalysis>,
         param_count: usize,
-    ) -> Result<Vec<(String, bool, Option<OID>, bool)>> {
-        // Parse SQL once and share across all sub-analyses
-        let parse_result = pg_query::parse(sql).ok();
-
-        // Build alias-to-table map from FROM clause for resolving qualified column references
-        let alias_map = self.build_alias_map_from_ast(parse_result.as_ref());
-
+    ) -> Vec<(String, bool, Option<OID>, bool)> {
         // Infer nullability from expression context (COALESCE, IS NULL, etc.)
-        let context_nullability = self.infer_parameter_nullability_from_ast(parse_result.as_ref(), param_count);
+        let context_nullability = infer_parameter_nullability_from_ast(parse_result, param_count);
 
-        // Get column mapping for column-based nullability/default inference (INSERT or UPDATE)
-        let param_columns = self.extract_param_columns_from_ast(parse_result.as_ref());
+        // Columns each parameter is compared with (`col = $N`), for names and types
+        let compared = parse_result.map(compared_columns).unwrap_or_default();
+
+        // Columns each parameter is written to (INSERT or UPDATE), for
+        // column-based nullability/default inference
+        let targets = parse_result.map(extract_param_targets).unwrap_or_default();
 
         let mut param_info = Vec::new();
+        // Whether each name was written by the author (`:name`) or inferred.
+        let mut inferred_name = Vec::new();
 
         for i in 0..param_count {
             let position = i + 1;
 
-            // Try to infer column info (table_name, column_name) from AST
-            let column_info = self.infer_column_info_from_ast(sql, position, &alias_map);
+            // The column this parameter is compared with
+            let compared_column = compared.get(&position);
 
-            // Look up the actual column type from RelIndex (preserves domain types)
-            let inferred_type = column_info.as_ref().and_then(|(table, column)| {
-                self.rel_index.get_column_type(table, column)
-            });
+            // The declared type of that column (preserves domain types),
+            // when the reference resolves — in the scope it is written in —
+            // to a catalog column. Not for `col = ANY($N)`: the parameter is
+            // an array there.
+            let inferred_type = compared_column
+                .filter(|compared| compared.same_type)
+                .and_then(|compared| analysis?.column_ref_source(compared.location))
+                .and_then(|source| self.rel_index.column_type(source.rel_oid, &source.column));
 
             // Get context-inferred nullability for this parameter
             let context_nullable = context_nullability.get(i).copied().unwrap_or(false);
 
-            // Check if this parameter maps to a nullable column (in INSERT or UPDATE)
-            let column_nullable = param_columns
-                .get(&position)
-                .map(|(table, col)| self.is_column_nullable(table, col))
-                .unwrap_or(false);
+            // A parameter written to columns (in INSERT or UPDATE) may be NULL
+            // if every one of them accepts it; and may be replaced by DEFAULT
+            // if every one of them has a default.
+            let param_targets = targets.get(&position);
+            let has_default = param_targets
+                .is_some_and(|t| t.default_capable && t.columns.iter().all(|c| self.column_has_default(c)));
+            let column_nullable = param_targets.is_some_and(|t| {
+                t.columns.iter().all(|c| {
+                    self.column_allows_null(c)
+                        || (t.default_capable && self.column_has_default(c))
+                })
+            });
 
-            // Check if this parameter maps to a column with DEFAULT constraint
-            let has_default = param_columns
-                .get(&position)
-                .map(|(table, col)| self.column_has_default(table, col))
-                .unwrap_or(false);
+            let nullable = context_nullable || column_nullable;
 
-            // Priority 1: Check for explicit @name or @name?
-            if let Some(param_spec) = param_specs.iter().find(|s| match s {
+            // Priority 1: an explicit spec (`:name`, `$N`, `$N?`)
+            let spec = param_specs.iter().find(|s| match s {
                 ParameterSpec::Named { position: pos, .. } => *pos == position,
                 ParameterSpec::Positional { position: pos, .. } => *pos == position,
-            }) {
-                let (name, explicit_nullable) = match param_spec {
-                    ParameterSpec::Named { name, nullable, .. } => (name.clone(), *nullable),
-                    ParameterSpec::Positional { nullable, .. } => {
-                        // For positional, try to infer name from column info, otherwise use fallback
-                        let inferred_name = column_info
-                            .as_ref()
-                            .map(|(_, col)| col.clone())
-                            .unwrap_or_else(|| format!("param_{}", position));
-                        (inferred_name, *nullable)
-                    }
-                };
-                // Combine all nullability sources
-                let nullable = explicit_nullable || context_nullable || column_nullable;
-                param_info.push((name, nullable, inferred_type, has_default));
-                continue;
-            }
+            });
+            let (name, explicit_nullable, inferred) = match spec {
+                Some(ParameterSpec::Named { name, nullable, .. }) => (Some(name.clone()), *nullable, false),
+                Some(ParameterSpec::Positional { nullable, .. }) => (None, *nullable, true),
+                None => (None, false, true),
+            };
 
-            // Priority 2: Try AST inference (no spec found)
-            if let Some((_, column_name)) = column_info {
-                let nullable = context_nullable || column_nullable;
-                param_info.push((column_name, nullable, inferred_type, has_default));
-                continue;
-            }
+            // Priority 2: the compared column's name. Priority 3: a fallback.
+            let has_column = compared_column.is_some();
+            let name = name
+                .or_else(|| compared_column.map(|compared| compared.column.clone()))
+                .unwrap_or_else(|| format!("param_{}", position));
 
-            // Priority 3: Fallback
-            let nullable = context_nullable || column_nullable;
-            param_info.push((format!("param_{}", position), nullable, None, false));
+            // (Kept from the original behavior: with neither a spec nor a
+            // compared column, a parameter gets no default handling.)
+            let has_default = has_default && (spec.is_some() || has_column);
+
+            param_info.push((name, explicit_nullable || nullable, inferred_type, has_default));
+            inferred_name.push(inferred);
         }
 
-        Ok(param_info)
-    }
-
-    /// For INSERT/UPDATE statements (including those in CTEs), returns a map of
-    /// parameter_position -> (table_name, column_name).
-    /// This maps each parameter in VALUES/SET clauses to its target column.
-    fn extract_param_columns(&self, sql: &str) -> HashMap<usize, (String, String)> {
-        let parse_result = match pg_query::parse(sql) {
-            Ok(r) => r,
-            Err(_) => return HashMap::new(),
-        };
-        self.extract_param_columns_from_ast(Some(&parse_result))
-    }
-
-    /// Extract param columns from a pre-parsed AST (avoids re-parsing)
-    fn extract_param_columns_from_ast(&self, parse_result: Option<&pg_query::ParseResult>) -> HashMap<usize, (String, String)> {
-        let mut result = HashMap::new();
-        if let Some(pr) = parse_result {
-            for raw_stmt in &pr.protobuf.stmts {
-                if let Some(stmt) = &raw_stmt.stmt {
-                    self.extract_param_columns_from_node(stmt, &mut result);
-                }
-            }
-        }
-        result
-    }
-
-    /// Recursively extract param columns from any node, handling CTEs
-    fn extract_param_columns_from_node(
-        &self,
-        node: &pg_query::protobuf::Node,
-        result: &mut HashMap<usize, (String, String)>,
-    ) {
-        use pg_query::protobuf::node::Node;
-
-        match &node.node {
-            Some(Node::InsertStmt(insert)) => {
-                // Process the INSERT statement
-                let insert_result = self.extract_insert_param_columns_from_stmt(insert);
-                result.extend(insert_result);
-
-                // Also check for CTEs within the INSERT
-                if let Some(with_clause) = &insert.with_clause {
-                    self.extract_param_columns_from_ctes(with_clause, result);
-                }
-            }
-            Some(Node::UpdateStmt(update)) => {
-                // Process the UPDATE statement
-                let update_result = self.extract_update_param_columns_from_stmt(update);
-                result.extend(update_result);
-
-                // Also check for CTEs within the UPDATE
-                if let Some(with_clause) = &update.with_clause {
-                    self.extract_param_columns_from_ctes(with_clause, result);
-                }
-            }
-            Some(Node::SelectStmt(select)) => {
-                // Check for CTEs in the SELECT's WITH clause
-                if let Some(with_clause) = &select.with_clause {
-                    self.extract_param_columns_from_ctes(with_clause, result);
-                }
-                // Note: We don't need to recurse into subqueries in FROM/WHERE
-                // as those wouldn't affect parameter optionality for INSERT/UPDATE
-            }
-            Some(Node::DeleteStmt(delete)) => {
-                // Check for CTEs in DELETE
-                if let Some(with_clause) = &delete.with_clause {
-                    self.extract_param_columns_from_ctes(with_clause, result);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Extract param columns from CTEs in a WITH clause
-    fn extract_param_columns_from_ctes(
-        &self,
-        with_clause: &pg_query::protobuf::WithClause,
-        result: &mut HashMap<usize, (String, String)>,
-    ) {
-        for cte_node in &with_clause.ctes {
-            if let Some(pg_query::protobuf::node::Node::CommonTableExpr(cte)) = &cte_node.node {
-                if let Some(ctequery) = &cte.ctequery {
-                    self.extract_param_columns_from_node(ctequery, result);
-                }
-            }
-        }
-    }
-
-    /// Extract param columns from a parsed InsertStmt
-    fn extract_insert_param_columns_from_stmt(
-        &self,
-        insert: &pg_query::protobuf::InsertStmt,
-    ) -> HashMap<usize, (String, String)> {
-        let table_name = match &insert.relation {
-            Some(r) => r.relname.clone(),
-            None => return HashMap::new(),
-        };
-
-        // Extract column names from INSERT column list (stmt.cols)
-        let columns: Vec<String> = insert
-            .cols
+        // Two parameters compared with the same column (`a > $1 AND a < $2`,
+        // `a IN ($1, $2)`) would both be named after it. Names the author
+        // wrote are kept; inferred duplicates get their position appended.
+        let mut used: std::collections::HashSet<String> = param_info
             .iter()
-            .filter_map(|n| match &n.node {
-                Some(pg_query::protobuf::node::Node::ResTarget(t)) => Some(t.name.clone()),
-                _ => None,
-            })
+            .zip(&inferred_name)
+            .filter(|(_, inferred)| !**inferred)
+            .map(|(info, _)| info.0.clone())
             .collect();
-
-        // If no explicit columns, we can't map parameters to columns
-        if columns.is_empty() {
-            return HashMap::new();
-        }
-
-        let mut result = HashMap::new();
-
-        // Extract ParamRef positions from VALUES clause
-        if let Some(select) = &insert.select_stmt {
-            if let Some(pg_query::protobuf::node::Node::SelectStmt(s)) = &select.node {
-                if let Some(first_values) = s.values_lists.first() {
-                    if let Some(pg_query::protobuf::node::Node::List(list)) = &first_values.node {
-                        for (i, item) in list.items.iter().enumerate() {
-                            if let Some(pos) = self.extract_param_position(item) {
-                                if i < columns.len() {
-                                    result.insert(pos, (table_name.clone(), columns[i].clone()));
-                                }
-                            }
-                        }
-                    }
-                }
+        for (i, info) in param_info.iter_mut().enumerate() {
+            if !inferred_name[i] {
+                continue;
             }
+            if used.contains(&info.0) {
+                let mut candidate = format!("{}_{}", info.0, i + 1);
+                while used.contains(&candidate) {
+                    candidate.push('_');
+                }
+                info.0 = candidate;
+            }
+            used.insert(info.0.clone());
         }
 
-        result
+        param_info
     }
 
-    /// Extract param columns from a parsed UpdateStmt
-    fn extract_update_param_columns_from_stmt(
-        &self,
-        update: &pg_query::protobuf::UpdateStmt,
-    ) -> HashMap<usize, (String, String)> {
-        let table_name = match &update.relation {
-            Some(r) => r.relname.clone(),
-            None => return HashMap::new(),
-        };
-
-        let mut result = HashMap::new();
-
-        // Extract column = $N mappings from SET clause (target_list)
-        for target in &update.target_list {
-            if let Some(pg_query::protobuf::node::Node::ResTarget(res_target)) = &target.node {
-                let column_name = &res_target.name;
-                if column_name.is_empty() {
-                    continue;
-                }
-
-                if let Some(val) = &res_target.val {
-                    if let Some(pos) = self.extract_param_position(val) {
-                        result.insert(pos, (table_name.clone(), column_name.clone()));
-                    }
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Extract ParamRef position from a node (handles TypeCast wrapping)
-    fn extract_param_position(&self, node: &pg_query::protobuf::Node) -> Option<usize> {
-        match &node.node {
-            Some(pg_query::protobuf::node::Node::ParamRef(p)) => Some(p.number as usize),
-            Some(pg_query::protobuf::node::Node::TypeCast(tc)) => {
-                tc.arg.as_ref().and_then(|a| self.extract_param_position(a))
-            }
-            _ => None,
-        }
+    /// The relation a written-to column belongs to.
+    fn target_rel(&self, column: &TargetColumn) -> Option<&PgRel> {
+        self.rel_index
+            .resolve(column.schema.as_deref(), &column.table)
     }
 
     /// Check if a column has a DEFAULT constraint.
-    fn column_has_default(&self, table: &str, column: &str) -> bool {
-        let table_rel = self.rel_index.values().find(|rel| rel.id.name() == table);
-
-        match table_rel {
-            Some(rel) => rel.constraints.iter().any(|c| {
-                matches!(c, Constraint::Default(d) if d.column.as_str() == column)
-            }),
-            None => false,
-        }
+    fn column_has_default(&self, column: &TargetColumn) -> bool {
+        self.target_rel(column).is_some_and(|rel| {
+            rel.constraints.iter().any(
+                |c| matches!(c, Constraint::Default(d) if d.column.as_str() == column.column),
+            )
+        })
     }
 
-    /// Check if a column allows NULL/omission in INSERT statements.
-    /// A parameter is nullable/optional if:
-    /// - The column does NOT have a NOT NULL constraint, OR
-    /// - The column has a DEFAULT value (can be omitted, letting DB use the default)
-    fn is_column_nullable(&self, table: &str, column: &str) -> bool {
-        // Find the table in rel_index
-        let table_rel = self.rel_index.values().find(|rel| rel.id.name() == table);
+    /// Check if a column accepts NULL (has no NOT NULL constraint).
+    /// Conservative: if the table can't be found, assume it does not.
+    fn column_allows_null(&self, column: &TargetColumn) -> bool {
+        self.target_rel(column).is_some_and(|rel| {
+            !rel.constraints.iter().any(
+                |c| matches!(c, Constraint::NotNull(n) if n.column.as_str() == column.column),
+            )
+        })
+    }
 
-        match table_rel {
-            Some(rel) => {
-                // Check if column has a DEFAULT constraint (can omit parameter)
-                let has_default = rel.constraints.iter().any(|c| {
-                    matches!(c, Constraint::Default(d) if d.column.as_str() == column)
-                });
+}
 
-                // Check if column allows NULL (no NOT NULL constraint)
-                let allows_null = !rel.constraints.iter().any(|c| {
-                    matches!(c, Constraint::NotNull(n) if n.column.as_str() == column)
-                });
+/// The target relation of a top-level INSERT / UPDATE / DELETE / MERGE.
+fn dml_target(ast: &pg_query::ParseResult) -> Option<&pb::RangeVar> {
+    match ast.protobuf.stmts.first()?.stmt.as_ref()?.node.as_ref()? {
+        N::InsertStmt(stmt) => stmt.relation.as_ref(),
+        N::UpdateStmt(stmt) => stmt.relation.as_ref(),
+        N::DeleteStmt(stmt) => stmt.relation.as_ref(),
+        N::MergeStmt(stmt) => stmt.relation.as_ref(),
+        _ => None,
+    }
+}
 
-                // Parameter is optional if column has default OR allows null
-                has_default || allows_null
+/// A column a parameter is compared with: `col = $N`, `$N = col`,
+/// `col IN ($N, ...)`, `col = ANY($N)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComparedColumn {
+    /// Table name or alias the column was qualified with, if any
+    qualifier: Option<String>,
+    column: String,
+    /// `location` of the `ColumnRef`, which identifies it in the statement's
+    /// analysis.
+    location: i32,
+    /// Whether the parameter has the column's type. False for
+    /// `col = ANY($N)`, where the parameter is an array of it.
+    same_type: bool,
+}
+
+/// A column a parameter is written to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetColumn {
+    /// Schema the target table was qualified with, if any
+    schema: Option<String>,
+    table: String,
+    column: String,
+}
+
+/// Where a parameter is written: `INSERT ... VALUES ($N)`,
+/// `INSERT ... SELECT $N`, `UPDATE ... SET col = $N`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ParamTargets {
+    columns: Vec<TargetColumn>,
+    /// Whether the parameter can be swapped for the keyword `DEFAULT`: every
+    /// place it appears in the statement is a bare VALUES item or SET value.
+    /// (`SELECT DEFAULT`, `DEFAULT::int` and `WHERE x = DEFAULT` are errors.)
+    default_capable: bool,
+}
+
+/// Extract ParamRef position from a node (handles TypeCast wrapping)
+fn extract_param_position(node: &pb::Node) -> Option<usize> {
+    match &node.node {
+        Some(N::ParamRef(p)) => Some(p.number as usize),
+        Some(N::TypeCast(tc)) => tc.arg.as_ref().and_then(|a| extract_param_position(a)),
+        _ => None,
+    }
+}
+
+/// A comparison operator: `=`, `<>`, `!=`, `<`, `>`, `<=`, `>=`.
+fn is_comparison_op(name: &[pb::Node]) -> bool {
+    match name.last().and_then(|n| n.node.as_ref()) {
+        Some(N::String(s)) => {
+            !s.sval.is_empty() && s.sval.chars().all(|c| matches!(c, '=' | '<' | '>' | '!'))
+        }
+        _ => false,
+    }
+}
+
+/// A plain column reference as (qualifier, column, location).
+fn plain_column_ref(node: &pb::Node) -> Option<(Option<String>, String, i32)> {
+    let Some(N::ColumnRef(col_ref)) = &node.node else {
+        return None;
+    };
+    let fields: Vec<&str> = col_ref
+        .fields
+        .iter()
+        .map(|f| match &f.node {
+            Some(N::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    match fields.as_slice() {
+        [column] => Some((None, (*column).to_string(), col_ref.location)),
+        [.., qualifier, column] => Some((
+            Some((*qualifier).to_string()),
+            (*column).to_string(),
+            col_ref.location,
+        )),
+        [] => None,
+    }
+}
+
+/// For each parameter, the column it is compared with, found on the AST:
+/// `col = $N` and `$N = col` (any comparison operator, the parameter
+/// optionally cast), `col IN ($N, ...)`, and `col = ANY($N)`.
+///
+/// When a parameter is compared with several columns, the first comparison in
+/// the query text wins.
+fn compared_columns(parse_result: &pg_query::ParseResult) -> HashMap<usize, ComparedColumn> {
+    // position -> (location of the comparison, column)
+    let mut found: HashMap<usize, (i32, ComparedColumn)> = HashMap::new();
+    let mut record = |position: usize, location: i32, column: ComparedColumn| {
+        match found.get(&position) {
+            Some((existing, _)) if *existing <= location => {}
+            _ => {
+                found.insert(position, (location, column));
             }
-            None => false, // Conservative: if we can't find the table, assume not nullable
         }
-    }
+    };
 
-    /// Build a map of table aliases to actual table names from the FROM clause.
-    /// This helps resolve qualified column references like `u.id` to `users.id`.
-    fn build_alias_map(&self, sql: &str) -> HashMap<String, String> {
-        let mut alias_map = HashMap::new();
+    walk_statements(parse_result, &mut |node| {
+        let N::AExpr(a_expr) = node else { return };
+        let (Some(lexpr), Some(rexpr)) = (a_expr.lexpr.as_deref(), a_expr.rexpr.as_deref()) else {
+            return;
+        };
+        let column = |side: &pb::Node, same_type: bool| {
+            plain_column_ref(side).map(|(qualifier, column, location)| ComparedColumn {
+                qualifier,
+                column,
+                location,
+                same_type,
+            })
+        };
+        match a_expr.kind() {
+            pb::AExprKind::AexprOp if is_comparison_op(&a_expr.name) => {
+                for (column_side, param_side) in [(lexpr, rexpr), (rexpr, lexpr)] {
+                    if let (Some(column), Some(position)) =
+                        (column(column_side, true), extract_param_position(param_side))
+                    {
+                        record(position, a_expr.location, column);
+                    }
+                }
+            }
+            pb::AExprKind::AexprIn => {
+                if let (Some(column), Some(N::List(list))) = (column(lexpr, true), &rexpr.node) {
+                    for position in list.items.iter().filter_map(extract_param_position) {
+                        record(position, a_expr.location, column.clone());
+                    }
+                }
+            }
+            pb::AExprKind::AexprOpAny if is_comparison_op(&a_expr.name) => {
+                if let (Some(column), Some(position)) =
+                    (column(lexpr, false), extract_param_position(rexpr))
+                {
+                    record(position, a_expr.location, column);
+                }
+            }
+            _ => {}
+        }
+    });
 
-        let parse_result = match pg_query::parse(sql) {
-            Ok(result) => result,
-            Err(_) => return alias_map,
+    found
+        .into_iter()
+        .map(|(position, (_, column))| (position, column))
+        .collect()
+}
+
+/// For INSERT/UPDATE statements anywhere in the query (including in CTEs),
+/// the columns each parameter is written to.
+///
+/// - `INSERT INTO t (a, b) VALUES ($1, $2), ($3, $4)`: every row.
+/// - `INSERT INTO t (a, b) SELECT $1, $2 ...`: the select list, by position.
+/// - `UPDATE t SET a = $1`, and the same in `ON CONFLICT DO UPDATE SET`.
+fn extract_param_targets(parse_result: &pg_query::ParseResult) -> HashMap<usize, ParamTargets> {
+    // (position, column, whether this occurrence may become DEFAULT)
+    let mut writes: Vec<(usize, TargetColumn, bool)> = Vec::new();
+    // How often each parameter appears in the statement at all.
+    let mut occurrences: HashMap<usize, usize> = HashMap::new();
+
+    let mut record = |value: &pb::Node, relation: &pb::RangeVar, column: &str, in_values: bool| {
+        if let Some(position) = extract_param_position(value) {
+            let bare = matches!(value.node, Some(N::ParamRef(_)));
+            writes.push((
+                position,
+                TargetColumn {
+                    schema: (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+                    table: relation.relname.clone(),
+                    column: column.to_string(),
+                },
+                in_values && bare,
+            ));
+        }
+    };
+    // `SET col = value` items; `col[1] = ...` and `col.field = ...` write
+    // part of the column, and `(a, b) = (...)` is not a plain value.
+    let record_set_list =
+        |target_list: &[pb::Node], relation: &pb::RangeVar, record: &mut dyn FnMut(&pb::Node, &pb::RangeVar, &str, bool)| {
+            for target in target_list {
+                if let Some(N::ResTarget(res_target)) = &target.node {
+                    if res_target.name.is_empty() || !res_target.indirection.is_empty() {
+                        continue;
+                    }
+                    if let Some(value) = &res_target.val {
+                        record(value, relation, &res_target.name, true);
+                    }
+                }
+            }
         };
 
-        // Extract table references from the parsed query
-        if let Some(stmt) = parse_result.protobuf.stmts.first() {
-            if let Some(node) = &stmt.stmt {
-                self.extract_table_aliases_from_node(node, &mut alias_map);
-            }
-        }
+    walk_statements(parse_result, &mut |node| match node {
+        N::ParamRef(p) => *occurrences.entry(p.number as usize).or_default() += 1,
+        N::InsertStmt(insert) => {
+            let Some(relation) = &insert.relation else { return };
 
-        alias_map
-    }
+            if let Some(on_conflict) = &insert.on_conflict_clause {
+                record_set_list(&on_conflict.target_list, relation, &mut record);
+            }
 
-    /// Build alias map from a pre-parsed AST (avoids re-parsing)
-    fn build_alias_map_from_ast(&self, parse_result: Option<&pg_query::ParseResult>) -> HashMap<String, String> {
-        let mut alias_map = HashMap::new();
-        if let Some(pr) = parse_result {
-            if let Some(stmt) = pr.protobuf.stmts.first() {
-                if let Some(node) = &stmt.stmt {
-                    self.extract_table_aliases_from_node(node, &mut alias_map);
-                }
-            }
-        }
-        alias_map
-    }
+            // Without an explicit column list, parameters can't be mapped to columns
+            let columns: Vec<&str> = insert
+                .cols
+                .iter()
+                .filter_map(|n| match &n.node {
+                    Some(N::ResTarget(t)) => Some(t.name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let Some(N::SelectStmt(select)) =
+                insert.select_stmt.as_deref().and_then(|s| s.node.as_ref())
+            else {
+                return;
+            };
 
-    /// Recursively extract table aliases from a query node
-    fn extract_table_aliases_from_node(
-        &self,
-        node: &pg_query::protobuf::Node,
-        alias_map: &mut HashMap<String, String>,
-    ) {
-        use pg_query::protobuf::node::Node;
-
-        match &node.node {
-            Some(Node::SelectStmt(select)) => {
-                // Process FROM clause
-                for from_item in &select.from_clause {
-                    self.extract_table_aliases_from_node(from_item, alias_map);
-                }
-            }
-            Some(Node::RangeVar(range_var)) => {
-                let table_name = &range_var.relname;
-                // If there's an alias, map alias -> table
-                // If no alias, map table -> table (for unqualified references)
-                if let Some(alias) = &range_var.alias {
-                    alias_map.insert(alias.aliasname.clone(), table_name.clone());
-                }
-                // Always map the table name to itself for direct references
-                alias_map.insert(table_name.clone(), table_name.clone());
-            }
-            Some(Node::JoinExpr(join)) => {
-                if let Some(larg) = &join.larg {
-                    self.extract_table_aliases_from_node(larg, alias_map);
-                }
-                if let Some(rarg) = &join.rarg {
-                    self.extract_table_aliases_from_node(rarg, alias_map);
-                }
-            }
-            Some(Node::UpdateStmt(update)) => {
-                if let Some(relation) = &update.relation {
-                    let table_name = &relation.relname;
-                    if let Some(alias) = &relation.alias {
-                        alias_map.insert(alias.aliasname.clone(), table_name.clone());
+            if !select.values_lists.is_empty() {
+                // VALUES: every row maps onto the column list
+                for row in &select.values_lists {
+                    if let Some(N::List(list)) = &row.node {
+                        for (item, column) in list.items.iter().zip(&columns) {
+                            record(item, relation, column, true);
+                        }
                     }
-                    alias_map.insert(table_name.clone(), table_name.clone());
                 }
-                for from_item in &update.from_clause {
-                    self.extract_table_aliases_from_node(from_item, alias_map);
-                }
-            }
-            Some(Node::DeleteStmt(delete)) => {
-                if let Some(relation) = &delete.relation {
-                    let table_name = &relation.relname;
-                    if let Some(alias) = &relation.alias {
-                        alias_map.insert(alias.aliasname.clone(), table_name.clone());
-                    }
-                    alias_map.insert(table_name.clone(), table_name.clone());
-                }
-            }
-            Some(Node::InsertStmt(insert)) => {
-                if let Some(relation) = &insert.relation {
-                    let table_name = &relation.relname;
-                    alias_map.insert(table_name.clone(), table_name.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Infer column info (table_name, column_name) from SQL AST by finding column = $N patterns.
-    /// Returns the actual table name (resolved from alias if needed) and column name.
-    fn infer_column_info_from_ast(
-        &self,
-        sql: &str,
-        position: usize,
-        alias_map: &HashMap<String, String>,
-    ) -> Option<(String, String)> {
-        let param_marker = format!("${}", position);
-
-        // Find the parameter in the SQL text
-        let param_pos = sql.find(&param_marker)?;
-        let before = &sql[..param_pos];
-
-        // Try to extract qualified column reference: "table.column = $N" or "alias.column = $N"
-        static RE_QUALIFIED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"(\w+)\.(\w+)\s*[=<>!]+\s*$").unwrap()
-        });
-        if let Some(captures) = RE_QUALIFIED.captures(before) {
-            let table_or_alias = captures.get(1)?.as_str();
-            let column_name = captures.get(2)?.as_str();
-
-            // Resolve alias to actual table name
-            let table_name = alias_map
-                .get(table_or_alias)
-                .cloned()
-                .unwrap_or_else(|| table_or_alias.to_string());
-
-            return Some((table_name, column_name.to_string()));
-        }
-
-        // Try to extract unqualified column reference: "column = $N"
-        static RE_UNQUALIFIED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"(\w+)\s*[=<>!]+\s*$").unwrap()
-        });
-        if let Some(captures) = RE_UNQUALIFIED.captures(before) {
-            let column_name = captures.get(1)?.as_str();
-
-            // Avoid SQL keywords
-            if Self::is_sql_keyword(column_name) {
-                return None;
-            }
-
-            // For unqualified columns, try to find which table this column belongs to
-            // by checking all tables in the alias map
-            for table_name in alias_map.values() {
-                if self.rel_index.get_column_type(table_name, column_name).is_some() {
-                    return Some((table_name.clone(), column_name.to_string()));
-                }
-            }
-
-            // If we can't find the table, return just the column name with empty table
-            // The type lookup will fail but we still have the column name for the parameter
-            return Some((String::new(), column_name.to_string()));
-        }
-
-        None
-    }
-
-    /// Check if a string is a SQL keyword (simple heuristic)
-    fn is_sql_keyword(s: &str) -> bool {
-        matches!(
-            s.to_uppercase().as_str(),
-            "SELECT" | "FROM" | "WHERE" | "AND" | "OR" | "IN" | "NOT" | "NULL" | "IS" | "AS"
-        )
-    }
-
-    /// Infer parameter nullability from SQL expression context.
-    /// Parameters are considered nullable when they appear in contexts that expect NULL values:
-    /// - First argument of COALESCE($N, fallback) - COALESCE exists to handle NULL
-    /// - Argument of IS NULL / IS NOT NULL tests
-    /// - NULLIF($N, value) - first argument may be NULL
-    fn infer_parameter_nullability_from_context(&self, sql: &str, param_count: usize) -> Vec<bool> {
-        let parse_result = pg_query::parse(sql).ok();
-        self.infer_parameter_nullability_from_ast(parse_result.as_ref(), param_count)
-    }
-
-    /// Infer parameter nullability from a pre-parsed AST (avoids re-parsing)
-    fn infer_parameter_nullability_from_ast(&self, parse_result: Option<&pg_query::ParseResult>, param_count: usize) -> Vec<bool> {
-        let mut nullable = vec![false; param_count];
-        if let Some(pr) = parse_result {
-            if let Some(stmt) = pr.protobuf.stmts.first() {
-                if let Some(node) = &stmt.stmt {
-                    self.check_param_nullability_in_node(node, &mut nullable);
-                }
-            }
-        }
-        nullable
-    }
-
-    /// Recursively check for parameters in nullable-implying expression contexts
-    fn check_param_nullability_in_node(
-        &self,
-        node: &pg_query::protobuf::Node,
-        nullable: &mut Vec<bool>,
-    ) {
-        use pg_query::protobuf::node::Node;
-
-        match &node.node {
-            Some(Node::CoalesceExpr(coalesce)) => {
-                // All arguments to COALESCE except the last are expected to potentially be NULL
-                // (if they couldn't be NULL, there'd be no need for the fallback)
-                for arg in coalesce.args.iter().take(coalesce.args.len().saturating_sub(1)) {
-                    self.mark_params_nullable_in_expr(arg, nullable);
-                }
-                // Recurse into all arguments for nested expressions
-                for arg in &coalesce.args {
-                    self.check_param_nullability_in_node(arg, nullable);
-                }
-            }
-            Some(Node::NullTest(null_test)) => {
-                // Parameter in IS NULL / IS NOT NULL should be nullable
-                if let Some(arg) = &null_test.arg {
-                    self.mark_params_nullable_in_expr(arg, nullable);
-                    self.check_param_nullability_in_node(arg, nullable);
-                }
-            }
-            Some(Node::FuncCall(func_call)) => {
-                // Check for NULLIF and similar functions
-                let func_name = func_call
-                    .funcname
+            } else if select.op() == pb::SetOperation::SetopNone {
+                // INSERT ... SELECT: the select list maps onto the column
+                // list -- unless a `*` makes the positions unknowable.
+                let values: Option<Vec<&pb::Node>> = select
+                    .target_list
                     .iter()
-                    .filter_map(|n| {
-                        if let Some(Node::String(s)) = &n.node {
-                            Some(s.sval.to_lowercase())
-                        } else {
-                            None
-                        }
+                    .map(|target| match &target.node {
+                        Some(N::ResTarget(t)) => t.val.as_deref().filter(|v| !is_star(v)),
+                        _ => None,
                     })
-                    .last();
+                    .collect();
+                for (value, column) in values.iter().flatten().zip(&columns) {
+                    record(value, relation, column, false);
+                }
+            }
+        }
+        N::UpdateStmt(update) => {
+            if let Some(relation) = &update.relation {
+                record_set_list(&update.target_list, relation, &mut record);
+            }
+        }
+        _ => {}
+    });
 
-                if let Some(name) = func_name {
-                    match name.as_str() {
-                        "nullif" => {
-                            // First argument to NULLIF may be NULL
-                            if let Some(first_arg) = func_call.args.first() {
-                                self.mark_params_nullable_in_expr(first_arg, nullable);
-                            }
-                        }
-                        "coalesce" => {
-                            // COALESCE can also appear as a FuncCall
-                            for arg in func_call.args.iter().take(func_call.args.len().saturating_sub(1)) {
-                                self.mark_params_nullable_in_expr(arg, nullable);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                // Recurse into arguments
-                for arg in &func_call.args {
-                    self.check_param_nullability_in_node(arg, nullable);
-                }
+    let mut result: HashMap<usize, ParamTargets> = HashMap::new();
+    let mut capable_occurrences: HashMap<usize, usize> = HashMap::new();
+    for (position, column, capable) in writes {
+        let targets = result.entry(position).or_default();
+        if !targets.columns.contains(&column) {
+            targets.columns.push(column);
+        }
+        if capable {
+            *capable_occurrences.entry(position).or_default() += 1;
+        }
+    }
+    for (position, targets) in &mut result {
+        targets.default_capable = capable_occurrences.get(position).copied().unwrap_or(0)
+            == occurrences.get(position).copied().unwrap_or(0);
+    }
+    result
+}
+
+/// `*` or `t.*`
+fn is_star(node: &pb::Node) -> bool {
+    match &node.node {
+        Some(N::ColumnRef(col_ref)) => col_ref
+            .fields
+            .iter()
+            .any(|f| matches!(f.node, Some(N::AStar(_)))),
+        _ => false,
+    }
+}
+
+/// Infer parameter nullability from SQL expression context.
+/// Parameters are considered nullable when they appear in contexts that expect NULL values:
+/// - Any argument but the last of COALESCE($N, fallback) - COALESCE exists to handle NULL
+/// - Argument of IS NULL / IS NOT NULL tests
+/// - NULLIF($N, value) - first argument may be NULL
+///
+/// These are found anywhere in the statement: CTEs, subqueries, ON CONFLICT,
+/// RETURNING, ORDER BY / LIMIT, FILTER, and so on.
+fn infer_parameter_nullability_from_ast(
+    parse_result: Option<&pg_query::ParseResult>,
+    param_count: usize,
+) -> Vec<bool> {
+    let mut nullable = vec![false; param_count];
+    let Some(parse_result) = parse_result else {
+        return nullable;
+    };
+    walk_statements(parse_result, &mut |node| match node {
+        N::CoalesceExpr(coalesce) => {
+            // All arguments to COALESCE except the last are expected to potentially be NULL
+            // (if they couldn't be NULL, there'd be no need for the fallback)
+            for arg in coalesce.args.iter().take(coalesce.args.len().saturating_sub(1)) {
+                mark_params_nullable_in_expr(arg, &mut nullable);
             }
-            // Recurse into various statement and expression types
-            Some(Node::SelectStmt(select)) => {
-                for target in &select.target_list {
-                    self.check_param_nullability_in_node(target, nullable);
-                }
-                if let Some(where_clause) = &select.where_clause {
-                    self.check_param_nullability_in_node(where_clause, nullable);
-                }
-                for from_item in &select.from_clause {
-                    self.check_param_nullability_in_node(from_item, nullable);
-                }
-                for group_item in &select.group_clause {
-                    self.check_param_nullability_in_node(group_item, nullable);
-                }
-                if let Some(having) = &select.having_clause {
-                    self.check_param_nullability_in_node(having, nullable);
-                }
-                // Handle VALUES clause (used in INSERT ... VALUES (...))
-                for values_list in &select.values_lists {
-                    self.check_param_nullability_in_node(values_list, nullable);
-                }
+        }
+        N::NullTest(null_test) => {
+            // Parameter in IS NULL / IS NOT NULL should be nullable
+            if let Some(arg) = &null_test.arg {
+                mark_params_nullable_in_expr(arg, &mut nullable);
             }
-            Some(Node::InsertStmt(insert)) => {
-                if let Some(select) = &insert.select_stmt {
-                    self.check_param_nullability_in_node(select, nullable);
-                }
-                for col in &insert.returning_list {
-                    self.check_param_nullability_in_node(col, nullable);
-                }
+        }
+        // `NULLIF(a, b)` parses as an operator expression, not a function call.
+        N::AExpr(a_expr) if a_expr.kind() == pb::AExprKind::AexprNullif => {
+            if let Some(first_arg) = &a_expr.lexpr {
+                mark_params_nullable_in_expr(first_arg, &mut nullable);
             }
-            Some(Node::UpdateStmt(update)) => {
-                for target in &update.target_list {
-                    self.check_param_nullability_in_node(target, nullable);
-                }
-                if let Some(where_clause) = &update.where_clause {
-                    self.check_param_nullability_in_node(where_clause, nullable);
-                }
-                for col in &update.returning_list {
-                    self.check_param_nullability_in_node(col, nullable);
-                }
+        }
+        _ => {}
+    });
+    nullable
+}
+
+/// Mark any ParamRef nodes in this expression as nullable
+fn mark_params_nullable_in_expr(node: &pb::Node, nullable: &mut [bool]) {
+    match &node.node {
+        Some(N::ParamRef(param)) => {
+            let idx = param.number as usize;
+            if idx > 0 && idx <= nullable.len() {
+                log::debug!(
+                    "[PARAM-NULLABILITY] Marking parameter ${} as nullable from expression context",
+                    idx
+                );
+                nullable[idx - 1] = true;
             }
-            Some(Node::DeleteStmt(delete)) => {
-                if let Some(where_clause) = &delete.where_clause {
-                    self.check_param_nullability_in_node(where_clause, nullable);
-                }
-                for col in &delete.returning_list {
-                    self.check_param_nullability_in_node(col, nullable);
-                }
+        }
+        Some(N::TypeCast(type_cast)) => {
+            // Handle casted parameters like $1::text
+            if let Some(arg) = &type_cast.arg {
+                mark_params_nullable_in_expr(arg, nullable);
             }
-            Some(Node::ResTarget(res_target)) => {
-                if let Some(val) = &res_target.val {
-                    self.check_param_nullability_in_node(val, nullable);
-                }
+        }
+        Some(N::AExpr(aexpr)) => {
+            // Handle expressions containing parameters
+            if let Some(lexpr) = &aexpr.lexpr {
+                mark_params_nullable_in_expr(lexpr, nullable);
             }
-            Some(Node::AExpr(aexpr)) => {
-                if let Some(lexpr) = &aexpr.lexpr {
-                    self.check_param_nullability_in_node(lexpr, nullable);
-                }
-                if let Some(rexpr) = &aexpr.rexpr {
-                    self.check_param_nullability_in_node(rexpr, nullable);
-                }
+            if let Some(rexpr) = &aexpr.rexpr {
+                mark_params_nullable_in_expr(rexpr, nullable);
             }
-            Some(Node::BoolExpr(bool_expr)) => {
-                for arg in &bool_expr.args {
-                    self.check_param_nullability_in_node(arg, nullable);
-                }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AST traversal
+// ---------------------------------------------------------------------------
+
+/// Call `visit` on every node of every statement, parents before children.
+///
+/// pg_query's own `nodes()` skips several clauses (RETURNING, ON CONFLICT,
+/// LIMIT/OFFSET, FILTER, window definitions, array constructors, ...), so the
+/// query-shaped part of the tree is walked here by hand. Node kinds not listed
+/// fall back to `nodes()`, which is better than not looking at all.
+/// Visit every node of every statement, at any depth.
+fn walk_statements(parse_result: &pg_query::ParseResult, visit: &mut dyn FnMut(&N)) {
+    for raw_stmt in &parse_result.protobuf.stmts {
+        if let Some(inner) = raw_stmt.stmt.as_deref().and_then(|n| n.node.as_ref()) {
+            visit(inner);
+            walk_children(inner, visit);
+        }
+    }
+}
+
+/// Visit every descendant of `node`.
+fn walk_children(node: &N, visit: &mut dyn FnMut(&N)) {
+    let known = for_each_child(node, &mut |child| {
+        visit(child);
+        walk_children(child, visit);
+    });
+    if !known {
+        // Whatever pg_query's generic traversal reaches.
+        for (descendant, _, _, _) in node.nodes() {
+            visit(&descendant.to_enum());
+        }
+    }
+}
+
+// The helpers below report *direct* children only; recursion is the
+// caller's (see `walk_children`).
+
+fn walk_opt(node: Option<&pb::Node>, visit: &mut dyn FnMut(&N)) {
+    if let Some(inner) = node.and_then(|n| n.node.as_ref()) {
+        visit(inner);
+    }
+}
+
+fn walk_all(nodes: &[pb::Node], visit: &mut dyn FnMut(&N)) {
+    for node in nodes {
+        walk_opt(Some(node), visit);
+    }
+}
+
+fn walk_with(with_clause: Option<&pb::WithClause>, visit: &mut dyn FnMut(&N)) {
+    if let Some(with_clause) = with_clause {
+        walk_all(&with_clause.ctes, visit);
+    }
+}
+
+fn walk_window(window: &pb::WindowDef, visit: &mut dyn FnMut(&N)) {
+    walk_all(&window.partition_clause, visit);
+    walk_all(&window.order_clause, visit);
+    walk_opt(window.start_offset.as_deref(), visit);
+    walk_opt(window.end_offset.as_deref(), visit);
+}
+
+fn walk_select(select: &pb::SelectStmt, visit: &mut dyn FnMut(&N)) {
+    walk_with(select.with_clause.as_ref(), visit);
+    walk_all(&select.distinct_clause, visit);
+    walk_all(&select.target_list, visit);
+    walk_all(&select.from_clause, visit);
+    walk_opt(select.where_clause.as_deref(), visit);
+    walk_all(&select.group_clause, visit);
+    walk_opt(select.having_clause.as_deref(), visit);
+    walk_all(&select.window_clause, visit);
+    walk_all(&select.values_lists, visit);
+    walk_all(&select.sort_clause, visit);
+    walk_opt(select.limit_offset.as_deref(), visit);
+    walk_opt(select.limit_count.as_deref(), visit);
+    // UNION / INTERSECT / EXCEPT arms
+    for arm in [&select.larg, &select.rarg].into_iter().flatten() {
+        walk_select(arm, visit);
+    }
+}
+
+fn walk_on_conflict(on_conflict: &pb::OnConflictClause, visit: &mut dyn FnMut(&N)) {
+    if let Some(infer) = &on_conflict.infer {
+        walk_all(&infer.index_elems, visit);
+        walk_opt(infer.where_clause.as_deref(), visit);
+    }
+    walk_all(&on_conflict.target_list, visit);
+    walk_opt(on_conflict.where_clause.as_deref(), visit);
+}
+
+fn walk_json_value(value: Option<&pb::JsonValueExpr>, visit: &mut dyn FnMut(&N)) {
+    if let Some(value) = value {
+        walk_opt(value.raw_expr.as_deref(), visit);
+    }
+}
+
+/// Call `visit` on each direct child of `node` (the arms of a set operation
+/// count as part of their `SelectStmt`, so their children are reported too).
+/// Returns `false`, having visited nothing, for a node kind whose children
+/// are not enumerated here.
+pub(crate) fn for_each_child(node: &N, visit: &mut dyn FnMut(&N)) -> bool {
+    match node {
+        // Leaves
+        N::ColumnRef(_)
+        | N::ParamRef(_)
+        | N::AConst(_)
+        | N::AStar(_)
+        | N::String(_)
+        | N::Integer(_)
+        | N::Float(_)
+        | N::Boolean(_)
+        | N::BitString(_)
+        | N::RangeVar(_)
+        | N::TypeName(_)
+        | N::ColumnDef(_)
+        | N::SqlvalueFunction(_)
+        | N::SetToDefault(_)
+        | N::CurrentOfExpr(_)
+        | N::LockingClause(_) => {}
+
+        // Statements
+        N::SelectStmt(select) => walk_select(select, visit),
+        N::InsertStmt(insert) => {
+            walk_with(insert.with_clause.as_ref(), visit);
+            walk_opt(insert.select_stmt.as_deref(), visit);
+            if let Some(on_conflict) = &insert.on_conflict_clause {
+                walk_on_conflict(on_conflict, visit);
             }
-            Some(Node::SubLink(sublink)) => {
-                if let Some(subselect) = &sublink.subselect {
-                    self.check_param_nullability_in_node(subselect, nullable);
-                }
-                if let Some(testexpr) = &sublink.testexpr {
-                    self.check_param_nullability_in_node(testexpr, nullable);
-                }
+            walk_all(&insert.returning_list, visit);
+        }
+        N::UpdateStmt(update) => {
+            walk_with(update.with_clause.as_ref(), visit);
+            walk_all(&update.target_list, visit);
+            walk_all(&update.from_clause, visit);
+            walk_opt(update.where_clause.as_deref(), visit);
+            walk_all(&update.returning_list, visit);
+        }
+        N::DeleteStmt(delete) => {
+            walk_with(delete.with_clause.as_ref(), visit);
+            walk_all(&delete.using_clause, visit);
+            walk_opt(delete.where_clause.as_deref(), visit);
+            walk_all(&delete.returning_list, visit);
+        }
+        N::MergeStmt(merge) => {
+            walk_with(merge.with_clause.as_ref(), visit);
+            walk_opt(merge.source_relation.as_deref(), visit);
+            walk_opt(merge.join_condition.as_deref(), visit);
+            walk_all(&merge.merge_when_clauses, visit);
+            walk_all(&merge.returning_list, visit);
+        }
+        N::MergeWhenClause(when) => {
+            walk_opt(when.condition.as_deref(), visit);
+            walk_all(&when.target_list, visit);
+            walk_all(&when.values, visit);
+        }
+        N::WithClause(with_clause) => walk_all(&with_clause.ctes, visit),
+        N::CommonTableExpr(cte) => walk_opt(cte.ctequery.as_deref(), visit),
+        N::OnConflictClause(on_conflict) => walk_on_conflict(on_conflict, visit),
+
+        // FROM items
+        N::JoinExpr(join) => {
+            walk_opt(join.larg.as_deref(), visit);
+            walk_opt(join.rarg.as_deref(), visit);
+            walk_opt(join.quals.as_deref(), visit);
+        }
+        N::RangeSubselect(range) => walk_opt(range.subquery.as_deref(), visit),
+        N::RangeFunction(range) => walk_all(&range.functions, visit),
+        N::RangeTableSample(sample) => {
+            walk_opt(sample.relation.as_deref(), visit);
+            walk_all(&sample.args, visit);
+            walk_opt(sample.repeatable.as_deref(), visit);
+        }
+
+        // Expressions
+        N::ResTarget(target) => {
+            walk_all(&target.indirection, visit);
+            walk_opt(target.val.as_deref(), visit);
+        }
+        N::AExpr(a_expr) => {
+            walk_opt(a_expr.lexpr.as_deref(), visit);
+            walk_opt(a_expr.rexpr.as_deref(), visit);
+        }
+        N::BoolExpr(bool_expr) => walk_all(&bool_expr.args, visit),
+        N::FuncCall(func_call) => {
+            walk_all(&func_call.args, visit);
+            walk_all(&func_call.agg_order, visit);
+            walk_opt(func_call.agg_filter.as_deref(), visit);
+            if let Some(over) = &func_call.over {
+                walk_window(over, visit);
             }
-            Some(Node::CaseExpr(case_expr)) => {
-                if let Some(arg) = &case_expr.arg {
-                    self.check_param_nullability_in_node(arg, nullable);
-                }
-                for when in &case_expr.args {
-                    self.check_param_nullability_in_node(when, nullable);
-                }
-                if let Some(defresult) = &case_expr.defresult {
-                    self.check_param_nullability_in_node(defresult, nullable);
-                }
+        }
+        N::WindowDef(window) => walk_window(window, visit),
+        N::NamedArgExpr(arg) => walk_opt(arg.arg.as_deref(), visit),
+        N::NullTest(test) => walk_opt(test.arg.as_deref(), visit),
+        N::BooleanTest(test) => walk_opt(test.arg.as_deref(), visit),
+        N::CoalesceExpr(coalesce) => walk_all(&coalesce.args, visit),
+        N::MinMaxExpr(min_max) => walk_all(&min_max.args, visit),
+        N::CaseExpr(case_expr) => {
+            walk_opt(case_expr.arg.as_deref(), visit);
+            walk_all(&case_expr.args, visit);
+            walk_opt(case_expr.defresult.as_deref(), visit);
+        }
+        N::CaseWhen(case_when) => {
+            walk_opt(case_when.expr.as_deref(), visit);
+            walk_opt(case_when.result.as_deref(), visit);
+        }
+        N::TypeCast(type_cast) => walk_opt(type_cast.arg.as_deref(), visit),
+        N::CollateClause(collate) => walk_opt(collate.arg.as_deref(), visit),
+        N::SubLink(sublink) => {
+            walk_opt(sublink.testexpr.as_deref(), visit);
+            walk_opt(sublink.subselect.as_deref(), visit);
+        }
+        N::AIndirection(indirection) => {
+            walk_opt(indirection.arg.as_deref(), visit);
+            walk_all(&indirection.indirection, visit);
+        }
+        N::AIndices(indices) => {
+            walk_opt(indices.lidx.as_deref(), visit);
+            walk_opt(indices.uidx.as_deref(), visit);
+        }
+        N::AArrayExpr(array) => walk_all(&array.elements, visit),
+        N::RowExpr(row) => walk_all(&row.args, visit),
+        N::List(list) => walk_all(&list.items, visit),
+        N::SortBy(sort_by) => walk_opt(sort_by.node.as_deref(), visit),
+        N::GroupingSet(set) => walk_all(&set.content, visit),
+        N::GroupingFunc(func) => walk_all(&func.args, visit),
+        N::MultiAssignRef(multi) => walk_opt(multi.source.as_deref(), visit),
+        N::XmlExpr(xml) => {
+            walk_all(&xml.named_args, visit);
+            walk_all(&xml.args, visit);
+        }
+        N::XmlSerialize(xml) => walk_opt(xml.expr.as_deref(), visit),
+        N::JsonObjectConstructor(json) => walk_all(&json.exprs, visit),
+        N::JsonArrayConstructor(json) => walk_all(&json.exprs, visit),
+        N::JsonKeyValue(pair) => {
+            walk_opt(pair.key.as_deref(), visit);
+            walk_json_value(pair.value.as_deref(), visit);
+        }
+        N::JsonValueExpr(value) => walk_json_value(Some(value), visit),
+
+        _ => return false,
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pg_constraint::{DefaultConstraint, NotNullConstraint};
+    use crate::pg_rel::PgRelKind;
+    use ustr::ustr;
+
+    fn parse(sql: &str) -> pg_query::ParseResult {
+        pg_query::parse(sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+
+    /// A table whose columns are given as (name, type oid, not null, has default).
+    fn table(oid: OID, schema: &str, name: &str, cols: &[(&str, OID, bool, bool)]) -> PgRel {
+        let mut constraints = Vec::new();
+        for (col, _, not_null, has_default) in cols {
+            if *not_null {
+                constraints.push(Constraint::NotNull(NotNullConstraint {
+                    name: ustr(&format!("{name}_{col}_not_null")),
+                    column: ustr(col),
+                }));
             }
-            Some(Node::CaseWhen(case_when)) => {
-                if let Some(expr) = &case_when.expr {
-                    self.check_param_nullability_in_node(expr, nullable);
-                }
-                if let Some(result) = &case_when.result {
-                    self.check_param_nullability_in_node(result, nullable);
-                }
+            if *has_default {
+                constraints.push(Constraint::Default(DefaultConstraint {
+                    name: ustr(&format!("{name}_{col}_default")),
+                    column: ustr(col),
+                }));
             }
-            Some(Node::TypeCast(type_cast)) => {
-                if let Some(arg) = &type_cast.arg {
-                    self.check_param_nullability_in_node(arg, nullable);
-                }
-            }
-            Some(Node::JoinExpr(join)) => {
-                if let Some(larg) = &join.larg {
-                    self.check_param_nullability_in_node(larg, nullable);
-                }
-                if let Some(rarg) = &join.rarg {
-                    self.check_param_nullability_in_node(rarg, nullable);
-                }
-                if let Some(quals) = &join.quals {
-                    self.check_param_nullability_in_node(quals, nullable);
-                }
-            }
-            Some(Node::RangeSubselect(range_subselect)) => {
-                if let Some(subquery) = &range_subselect.subquery {
-                    self.check_param_nullability_in_node(subquery, nullable);
-                }
-            }
-            Some(Node::List(list)) => {
-                for item in &list.items {
-                    self.check_param_nullability_in_node(item, nullable);
-                }
-            }
-            _ => {}
+        }
+        PgRel {
+            oid,
+            id: PgId::new(Some(ustr(schema)), ustr(name)),
+            kind: PgRelKind::Table,
+            constraints,
+            columns: cols.iter().map(|(c, ..)| ustr(c)).collect(),
+            column_types: cols.iter().map(|(_, t, ..)| *t).collect(),
         }
     }
 
-    /// Mark any ParamRef nodes in this expression as nullable
-    fn mark_params_nullable_in_expr(
-        &self,
-        node: &pg_query::protobuf::Node,
-        nullable: &mut Vec<bool>,
-    ) {
-        use pg_query::protobuf::node::Node;
+    const INT: OID = 23;
+    const TEXT: OID = 25;
+    /// Stand-in for a domain over text.
+    const EMAIL: OID = 90001;
 
-        match &node.node {
-            Some(Node::ParamRef(param)) => {
-                let idx = param.number as usize;
-                if idx > 0 && idx <= nullable.len() {
-                    log::debug!(
-                        "[PARAM-NULLABILITY] Marking parameter ${} as nullable from expression context",
-                        idx
-                    );
-                    nullable[idx - 1] = true;
-                }
-            }
-            Some(Node::TypeCast(type_cast)) => {
-                // Handle casted parameters like $1::text
-                if let Some(arg) = &type_cast.arg {
-                    self.mark_params_nullable_in_expr(arg, nullable);
-                }
-            }
-            Some(Node::AExpr(aexpr)) => {
-                // Handle expressions containing parameters
-                if let Some(lexpr) = &aexpr.lexpr {
-                    self.mark_params_nullable_in_expr(lexpr, nullable);
-                }
-                if let Some(rexpr) = &aexpr.rexpr {
-                    self.mark_params_nullable_in_expr(rexpr, nullable);
-                }
-            }
-            _ => {}
+    fn test_rel_index() -> RelIndex {
+        let mut index = RelIndex::default();
+        for rel in [
+            table(
+                1,
+                "public",
+                "users",
+                &[
+                    ("id", INT, true, true),
+                    ("email", EMAIL, true, false),
+                    ("name", TEXT, true, false),
+                    ("bio", TEXT, false, false),
+                    ("status", TEXT, true, true),
+                ],
+            ),
+            table(
+                2,
+                "public",
+                "teams",
+                &[("id", INT, true, true), ("name", TEXT, false, false), ("slug", TEXT, false, false)],
+            ),
+            // Same name in two schemas, with opposite nullability and a
+            // `code` column of different types.
+            table(
+                3,
+                "core",
+                "widget",
+                &[("id", INT, true, false), ("label", TEXT, true, false), ("code", INT, true, false)],
+            ),
+            table(
+                4,
+                "audit",
+                "widget",
+                &[("id", INT, false, false), ("label", TEXT, false, false), ("code", TEXT, false, false)],
+            ),
+            // Shares `email` with `users`, as plain text.
+            table(
+                5,
+                "public",
+                "invites",
+                &[("id", INT, true, true), ("team_id", INT, true, false), ("email", TEXT, false, false)],
+            ),
+        ] {
+            index.insert(rel.oid, rel);
         }
+        index
+    }
+
+    struct Fixture {
+        rel_index: RelIndex,
+        cache: crate::view_nullability::ViewNullabilityCache,
+        domains: crate::domain_index::DomainIndex,
+        composites: crate::composite_index::CompositeIndex,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self::with_search_path(&["public"])
+        }
+
+        fn with_search_path(search_path: &[&str]) -> Self {
+            Self {
+                rel_index: test_rel_index().with_search_path(search_path),
+                cache: Default::default(),
+                domains: crate::domain_index::DomainIndex::empty(),
+                composites: Default::default(),
+            }
+        }
+
+        fn introspector(&self) -> QueryIntrospector<'_> {
+            QueryIntrospector::new(
+                &self.rel_index,
+                &self.cache,
+                None,
+                &self.domains,
+                &self.composites,
+                None,
+                None,
+            )
+        }
+    }
+
+    fn nullable_params(sql: &str, count: usize) -> Vec<bool> {
+        infer_parameter_nullability_from_ast(Some(&parse(sql)), count)
+    }
+
+    #[test]
+    fn nullif_and_coalesce_mark_params_nullable() {
+        // Both parse as dedicated nodes, never as FuncCall.
+        assert_eq!(nullable_params("SELECT nullif($1, '')", 1), vec![true]);
+        assert_eq!(nullable_params("SELECT nullif($1::text, $2)", 2), vec![true, false]);
+        assert_eq!(nullable_params("SELECT coalesce($1, $2, $3)", 3), vec![true, true, false]);
+        assert_eq!(nullable_params("SELECT coalesce($1::int + 1, 0)", 1), vec![true]);
+        assert_eq!(nullable_params("SELECT $1 IS NULL, $2::int IS NOT NULL, $3", 3), vec![true, true, false]);
+        // A function call does not imply anything.
+        assert_eq!(nullable_params("SELECT lower($1), greatest($2, 1)", 2), vec![false, false]);
+    }
+
+    #[test]
+    fn param_nullability_is_found_in_every_clause() {
+        for sql in [
+            // WITH on each statement kind
+            "WITH c AS (SELECT coalesce($1, 1)) SELECT * FROM c",
+            "WITH c AS (SELECT coalesce($1, 1)) INSERT INTO t (a) SELECT * FROM c",
+            "WITH c AS (SELECT coalesce($1, 1)) UPDATE t SET a = 1",
+            "WITH c AS (SELECT coalesce($1, 1)) DELETE FROM t",
+            // A data-modifying CTE
+            "WITH c AS (UPDATE t SET a = coalesce($1, a) RETURNING a) SELECT * FROM c",
+            // INSERT
+            "INSERT INTO t (a) VALUES (coalesce($1, 2))",
+            "INSERT INTO t (a) VALUES (1), (coalesce($1, 2))",
+            "INSERT INTO t (a) SELECT coalesce($1, 2)",
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = coalesce($1, 2)",
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2 WHERE $1 IS NULL",
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) WHERE coalesce($1, true) DO NOTHING",
+            "INSERT INTO t (a) VALUES (1) RETURNING coalesce($1, a)",
+            // UPDATE
+            "UPDATE t SET a = coalesce($1, a)",
+            "UPDATE t SET a = 1 FROM (SELECT coalesce($1, 1) AS x) u WHERE t.a = u.x",
+            "UPDATE t SET a = 1 FROM u WHERE coalesce($1, true)",
+            "UPDATE t SET a = 1 RETURNING nullif($1, a)",
+            // DELETE
+            "DELETE FROM t USING (SELECT coalesce($1, 1) AS x) u WHERE t.a = u.x",
+            "DELETE FROM t WHERE $1 IS NULL OR a = $1",
+            "DELETE FROM t RETURNING coalesce($1, a)",
+            // SELECT clauses
+            "SELECT a FROM t ORDER BY coalesce($1, a)",
+            "SELECT a FROM t LIMIT coalesce($1, 10)",
+            "SELECT a FROM t OFFSET coalesce($1, 0)",
+            "SELECT a FROM t GROUP BY a HAVING coalesce($1, true)",
+            "SELECT DISTINCT ON (coalesce($1, a)) a FROM t",
+            "SELECT count(*) FILTER (WHERE $1 IS NULL OR a = $1) FROM t",
+            "SELECT array_agg(a ORDER BY coalesce($1, a)) FROM t",
+            "SELECT sum(a) OVER (PARTITION BY coalesce($1, a)) FROM t",
+            "SELECT sum(a) OVER w FROM t WINDOW w AS (ORDER BY coalesce($1, a))",
+            "SELECT 1 UNION ALL SELECT coalesce($1, 2)",
+            "SELECT * FROM t JOIN u ON coalesce($1, true)",
+            "SELECT * FROM (VALUES (coalesce($1, 1))) v",
+            "SELECT * FROM t WHERE a IN (SELECT coalesce($1, 1))",
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 WHERE $1 IS NULL)",
+            // Expression forms
+            "SELECT greatest(coalesce($1, 1), 2)",
+            "SELECT least(1, nullif($1, 0))",
+            "SELECT ROW(coalesce($1, 1), 2)",
+            "SELECT ARRAY[coalesce($1, 1), 2]",
+            "SELECT (ARRAY[1, 2])[coalesce($1, 1)]",
+            "SELECT CASE WHEN $1 IS NULL THEN 1 ELSE 2 END",
+            "SELECT f(x => coalesce($1, 1))",
+            "SELECT (coalesce($1, 1))::text",
+            "SELECT a FROM t WHERE b = ANY(coalesce($1, '{}'))",
+            // Functions in FROM
+            "SELECT * FROM generate_series(1, coalesce($1, 10))",
+            "SELECT * FROM ROWS FROM (generate_series(1, coalesce($1, 10))) x",
+            "SELECT * FROM t, LATERAL unnest(coalesce($1, t.tags)) u",
+        ] {
+            assert_eq!(nullable_params(sql, 1), vec![true], "{sql}");
+        }
+    }
+
+    fn targets(sql: &str) -> HashMap<usize, ParamTargets> {
+        extract_param_targets(&parse(sql))
+    }
+
+    fn target_columns(sql: &str, position: usize) -> Vec<String> {
+        targets(sql)
+            .get(&position)
+            .map(|t| t.columns.iter().map(|c| c.column.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn insert_param_targets_cover_every_values_row() {
+        let sql = "INSERT INTO users (name, bio) VALUES ($1, $2), ($3, $4::text), ('x', $5)";
+        assert_eq!(target_columns(sql, 1), vec!["name"]);
+        assert_eq!(target_columns(sql, 2), vec!["bio"]);
+        assert_eq!(target_columns(sql, 3), vec!["name"]);
+        assert_eq!(target_columns(sql, 4), vec!["bio"]);
+        assert_eq!(target_columns(sql, 5), vec!["bio"]);
+
+        let t = targets(sql);
+        assert!(t[&1].default_capable);
+        // `DEFAULT::text` is not valid SQL.
+        assert!(!t[&4].default_capable);
+    }
+
+    #[test]
+    fn insert_select_param_targets() {
+        let sql = "INSERT INTO core.widget (id, label) SELECT $1, $2::text FROM users WHERE id = $3";
+        let t = targets(sql);
+        assert_eq!(
+            t[&1].columns,
+            vec![TargetColumn {
+                schema: Some("core".into()),
+                table: "widget".into(),
+                column: "id".into()
+            }]
+        );
+        assert_eq!(target_columns(sql, 2), vec!["label"]);
+        assert!(!t.contains_key(&3));
+        // `SELECT DEFAULT` is not valid SQL.
+        assert!(!t[&1].default_capable);
+
+        // A star makes the positions unknowable.
+        assert!(targets("INSERT INTO users (name, bio) SELECT u.*, $1 FROM users u").is_empty());
+        // No column list, no mapping.
+        assert!(targets("INSERT INTO users VALUES ($1, $2)").is_empty());
+    }
+
+    #[test]
+    fn update_and_upsert_param_targets() {
+        let sql = "INSERT INTO users (email, name) VALUES ($1, $2) \
+                   ON CONFLICT (email) DO UPDATE SET name = $2, bio = $3";
+        assert_eq!(target_columns(sql, 2), vec!["name"]);
+        assert_eq!(target_columns(sql, 3), vec!["bio"]);
+        // $2 is a bare VALUES item and a bare SET value: DEFAULT works in both.
+        assert!(targets(sql)[&2].default_capable);
+
+        let sql = "WITH up AS (UPDATE users SET bio = $1, tags[1] = $2 WHERE id = $3 RETURNING id) \
+                   SELECT * FROM up";
+        assert_eq!(target_columns(sql, 1), vec!["bio"]);
+        // A subscripted assignment writes an element, not the column.
+        assert!(target_columns(sql, 2).is_empty());
+        assert!(target_columns(sql, 3).is_empty());
+
+        // Used again outside a VALUES/SET position: DEFAULT would break it.
+        let sql = "UPDATE users SET bio = $1 WHERE bio IS DISTINCT FROM $1";
+        assert!(!targets(sql)[&1].default_capable);
+    }
+
+    fn compared(sql: &str) -> HashMap<usize, (Option<String>, String, bool)> {
+        compared_columns(&parse(sql))
+            .into_iter()
+            .map(|(pos, c)| (pos, (c.qualifier, c.column, c.same_type)))
+            .collect()
+    }
+
+    #[test]
+    fn compared_columns_come_from_the_ast() {
+        let c = compared(
+            "SELECT * FROM users u WHERE u.id = $1 AND $2 = name AND bio > $3::text \
+             AND status IN ($4, $5) AND u.email = ANY($6) AND lower(name) = $7",
+        );
+        assert_eq!(c[&1], (Some("u".into()), "id".into(), true));
+        assert_eq!(c[&2], (None, "name".into(), true));
+        assert_eq!(c[&3], (None, "bio".into(), true));
+        assert_eq!(c[&4], (None, "status".into(), true));
+        assert_eq!(c[&5], (None, "status".into(), true));
+        // An array of the column's type, not the column's type.
+        assert_eq!(c[&6], (Some("u".into()), "email".into(), false));
+        // Compared with an expression, not a column.
+        assert!(!c.contains_key(&7));
+    }
+
+    #[test]
+    fn compared_columns_ignore_text_that_only_looks_like_a_comparison() {
+        // The old text search found `$1` inside `$10`, in string literals and
+        // in comments, then read whatever word preceded it.
+        let c = compared(
+            "SELECT 'id = $2' AS note /* name = $3 */ FROM users \
+             WHERE a = $10 AND b = $1 -- c = $4\n AND d::text = $5 AND e = f($6)",
+        );
+        assert_eq!(c[&10], (None, "a".into(), true));
+        assert_eq!(c[&1], (None, "b".into(), true));
+        for position in [2, 3, 4, 5, 6] {
+            assert!(!c.contains_key(&position), "${position}");
+        }
+    }
+
+    #[test]
+    fn first_comparison_in_the_text_wins() {
+        let c = compared("SELECT * FROM users WHERE name = $1 OR email = $1");
+        assert_eq!(c[&1].1, "name");
+        let c = compared("SELECT * FROM users WHERE id IN (SELECT id FROM teams WHERE slug = $1) AND name = $1");
+        assert_eq!(c[&1].1, "slug");
+    }
+
+    fn param_info(sql: &str, specs: &[ParameterSpec], count: usize) -> Vec<(String, bool, Option<OID>, bool)> {
+        param_info_in(&Fixture::new(), sql, specs, count)
+    }
+
+    fn param_info_in(
+        fixture: &Fixture,
+        sql: &str,
+        specs: &[ParameterSpec],
+        count: usize,
+    ) -> Vec<(String, bool, Option<OID>, bool)> {
+        let ast = parse(sql);
+        let introspector = fixture.introspector();
+        let analysis = introspector.analyze_statement("test", &ast);
+        introspector.determine_parameter_info(specs, Some(&ast), analysis.as_ref(), count)
+    }
+
+    /// The type each parameter takes from the column it is compared with.
+    fn param_types(sql: &str, count: usize) -> Vec<Option<OID>> {
+        param_info(sql, &[], count).into_iter().map(|i| i.2).collect()
+    }
+
+    /// A parameter compared with a column inside a CTE or subquery binds to
+    /// the column that name means *there* — never to a same-named column of
+    /// a table in the outer query.
+    #[test]
+    fn compared_columns_resolve_in_the_scope_they_are_written_in() {
+        // `email` is `invites.email` (text), not the outer `users.email`.
+        assert_eq!(
+            param_types("SELECT * FROM users WHERE id IN (SELECT id FROM invites WHERE email = $1)", 1),
+            [Some(TEXT)]
+        );
+        assert_eq!(
+            param_types(
+                "WITH i AS (SELECT team_id FROM invites WHERE email = $1) \
+                 SELECT * FROM users u JOIN i ON i.team_id = u.id WHERE u.email = $2",
+                2
+            ),
+            [Some(TEXT), Some(EMAIL)]
+        );
+        assert_eq!(
+            param_types(
+                "SELECT * FROM users u, LATERAL (SELECT 1 FROM invites i WHERE i.email = $1 AND i.id = u.id) x",
+                1
+            ),
+            [Some(TEXT)]
+        );
+        assert_eq!(
+            param_types("SELECT * FROM users u JOIN (SELECT * FROM invites WHERE email = $1) i ON i.id = u.id", 1),
+            [Some(TEXT)]
+        );
+        // The inner query's own table wins over the outer one...
+        assert_eq!(
+            param_types(
+                "SELECT 1 FROM invites i WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = i.id AND email = $1)",
+                1
+            ),
+            [Some(EMAIL)]
+        );
+        // ...and a name the inner query does not have is a correlated
+        // reference to the outer one.
+        assert_eq!(
+            param_types(
+                "SELECT 1 FROM users u WHERE EXISTS (SELECT 1 FROM teams t WHERE t.id = u.id AND email = $1 AND u.bio = $2)",
+                2
+            ),
+            [Some(EMAIL), Some(TEXT)]
+        );
+        // A scalar subquery in the target list, and one in a join condition.
+        assert_eq!(
+            param_types("SELECT (SELECT count(*) FROM invites WHERE email = $1) FROM users", 1),
+            [Some(TEXT)]
+        );
+        assert_eq!(
+            param_types(
+                "SELECT 1 FROM users u JOIN teams t ON t.id = (SELECT team_id FROM invites WHERE email = $1)",
+                1
+            ),
+            [Some(TEXT)]
+        );
+        // Set-operation arms are scopes of their own.
+        assert_eq!(
+            param_types(
+                "SELECT id FROM users WHERE email = $1 UNION ALL SELECT id FROM invites WHERE email = $2",
+                2
+            ),
+            [Some(EMAIL), Some(TEXT)]
+        );
+    }
+
+    #[test]
+    fn compared_columns_resolve_through_ctes_and_subqueries() {
+        // A CTE column that is a plain column keeps that column's type.
+        assert_eq!(
+            param_types("WITH c AS (SELECT email AS e FROM users) SELECT 1 FROM c WHERE e = $1", 1),
+            [Some(EMAIL)]
+        );
+        assert_eq!(
+            param_types("SELECT 1 FROM (SELECT email FROM users) s WHERE s.email = $1", 1),
+            [Some(EMAIL)]
+        );
+        // A computed one has no column behind it.
+        assert_eq!(
+            param_types("WITH c AS (SELECT lower(email) AS e FROM users) SELECT 1 FROM c WHERE e = $1", 1),
+            [None]
+        );
+        // A CTE named like a table is not that table.
+        let info = param_info("WITH users AS (SELECT 'x'::text AS email) SELECT 1 FROM users WHERE email = $1", &[], 1);
+        assert_eq!(info[0], ("email".to_string(), false, None, false));
+        // Unresolvable relation: named after the column, no type.
+        let info = param_info("SELECT 1 FROM nowhere WHERE email = $1", &[], 1);
+        assert_eq!(info[0], ("email".to_string(), false, None, false));
+    }
+
+    #[test]
+    fn compared_columns_resolve_in_dml() {
+        assert_eq!(
+            param_types("UPDATE users SET bio = $1 WHERE email = $2", 2),
+            [None, Some(EMAIL)]
+        );
+        assert_eq!(
+            param_types("UPDATE users u SET bio = i.email FROM invites i WHERE i.email = $1 AND u.email = $2", 2),
+            [Some(TEXT), Some(EMAIL)]
+        );
+        // Both `users` and `invites` have `email`: ambiguous, no type.
+        assert_eq!(
+            param_types("UPDATE users u SET bio = 'x' FROM invites i WHERE email = $1", 1),
+            [None]
+        );
+        assert_eq!(
+            param_types("DELETE FROM users u USING invites i WHERE i.email = $1 AND u.email = $2", 2),
+            [Some(TEXT), Some(EMAIL)]
+        );
+        // INSERT ... SELECT: the SELECT's tables, not the target.
+        assert_eq!(
+            param_types("INSERT INTO users (name) SELECT email FROM invites WHERE email = $1", 1),
+            [Some(TEXT)]
+        );
+        assert_eq!(
+            param_types(
+                "INSERT INTO users (id, email) VALUES (1, 'a') \
+                 ON CONFLICT (id) DO UPDATE SET bio = 'x' WHERE users.email = $1 AND excluded.email = $2",
+                2
+            ),
+            [Some(EMAIL), Some(EMAIL)]
+        );
+        // A data-modifying CTE.
+        assert_eq!(
+            param_types(
+                "WITH gone AS (DELETE FROM invites WHERE email = $1 RETURNING email, team_id) \
+                 SELECT 1 FROM users u JOIN gone g ON g.team_id = u.id WHERE g.email = $2 AND u.email = $3",
+                3
+            ),
+            [Some(TEXT), Some(TEXT), Some(EMAIL)]
+        );
+        assert_eq!(
+            param_types(
+                "MERGE INTO users u USING invites i ON i.id = u.id AND i.email = $1 \
+                 WHEN MATCHED AND u.email = $2 THEN DELETE",
+                2
+            ),
+            [Some(TEXT), Some(EMAIL)]
+        );
+    }
+
+    #[test]
+    fn compared_columns_follow_the_search_path() {
+        let sql = "SELECT 1 FROM widget WHERE code = $1";
+        let types = |path: &[&str], sql: &str| -> Option<OID> {
+            param_info_in(&Fixture::with_search_path(path), sql, &[], 1)[0].2
+        };
+        assert_eq!(types(&["core", "audit"], sql), Some(INT));
+        assert_eq!(types(&["audit", "core"], sql), Some(TEXT));
+        // Not on the path: unresolved, however unique the column.
+        assert_eq!(types(&["public"], sql), None);
+        assert_eq!(types(&["public"], "SELECT 1 FROM audit.widget WHERE code = $1"), Some(TEXT));
+    }
+
+    #[test]
+    fn parameter_names_and_types_from_compared_columns() {
+        let info = param_info(
+            "SELECT * FROM users u WHERE u.email = $1 AND bio = $2 AND u.email = ANY($3)",
+            &[],
+            3,
+        );
+        // The column's declared (domain) type, not the base type.
+        assert_eq!(info[0], ("email".to_string(), false, Some(EMAIL), false));
+        assert_eq!(info[1], ("bio".to_string(), false, Some(TEXT), false));
+        // Named after the column, but an array: no type taken from it.
+        assert_eq!(info[2], ("email_3".to_string(), false, None, false));
+    }
+
+    #[test]
+    fn inferred_parameter_names_are_made_distinct() {
+        let info = param_info("SELECT * FROM users WHERE id > $1 AND id < $2 AND id IN ($3, $4)", &[], 4);
+        let names: Vec<&str> = info.iter().map(|i| i.0.as_str()).collect();
+        assert_eq!(names, vec!["id", "id_2", "id_3", "id_4"]);
+
+        // A name the author wrote is never renamed; the inferred one yields.
+        let specs = [ParameterSpec::Named {
+            name: "id".to_string(),
+            position: 2,
+            nullable: false,
+        }];
+        let info = param_info("SELECT * FROM users WHERE id > $1 AND name = $2", &specs, 2);
+        let names: Vec<&str> = info.iter().map(|i| i.0.as_str()).collect();
+        assert_eq!(names, vec!["id_1", "id"]);
+    }
+
+    #[test]
+    fn ambiguous_unqualified_column_gets_a_name_but_no_type() {
+        // Both `users` and `teams` have `name`.
+        let info = param_info("SELECT 1 FROM users u JOIN teams t ON t.id = u.id WHERE name = $1", &[], 1);
+        assert_eq!(info[0], ("name".to_string(), false, None, false));
+    }
+
+    #[test]
+    fn insert_param_nullability_and_defaults() {
+        // id: NOT NULL DEFAULT; name: NOT NULL; bio: nullable; status: NOT NULL DEFAULT
+        let specs: Vec<ParameterSpec> = (1..=8)
+            .map(|position| ParameterSpec::Positional {
+                position,
+                nullable: false,
+            })
+            .collect();
+        let info = param_info(
+            "INSERT INTO users (id, name, bio, status) VALUES ($1, $2, $3, $4), ($5, $6, $7, $8::text)",
+            &specs,
+            8,
+        );
+        let flags: Vec<(bool, bool)> = info.iter().map(|i| (i.1, i.3)).collect();
+        assert_eq!(
+            flags,
+            vec![
+                (true, true),   // id: DEFAULT can stand in
+                (false, false), // name: required
+                (true, false),  // bio: nullable column
+                (true, true),   // status
+                // The second row is mapped too.
+                (true, true),
+                (false, false),
+                (true, false),
+                // Cast: DEFAULT can't stand in, and the column is NOT NULL.
+                (false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_select_params_are_never_default_eligible() {
+        let specs: Vec<ParameterSpec> = (1..=3)
+            .map(|position| ParameterSpec::Positional {
+                position,
+                nullable: false,
+            })
+            .collect();
+        let info = param_info("INSERT INTO users (id, name, bio) SELECT $1, $2, $3", &specs, 3);
+        let flags: Vec<(bool, bool)> = info.iter().map(|i| (i.1, i.3)).collect();
+        // id is NOT NULL: without DEFAULT, NULL would violate it.
+        assert_eq!(flags, vec![(false, false), (false, false), (true, false)]);
+    }
+
+    #[test]
+    fn param_written_to_several_columns_needs_all_of_them_nullable() {
+        let specs = [ParameterSpec::Positional {
+            position: 1,
+            nullable: false,
+        }];
+        let info = param_info("INSERT INTO users (name, bio) VALUES ($1, $1)", &specs, 1);
+        assert!(!info[0].1, "name is NOT NULL");
+        let info = param_info("INSERT INTO teams (name, slug) VALUES ($1, $1)", &specs, 1);
+        assert!(info[0].1);
+    }
+
+    #[test]
+    fn write_targets_resolve_by_schema() {
+        let specs = [ParameterSpec::Positional {
+            position: 1,
+            nullable: false,
+        }];
+        // audit.widget.label is nullable, core.widget.label is not.
+        assert!(param_info("INSERT INTO audit.widget (label) VALUES ($1)", &specs, 1)[0].1);
+        assert!(!param_info("INSERT INTO core.widget (label) VALUES ($1)", &specs, 1)[0].1);
+        // Unqualified and on no schema of the search path: assume nothing.
+        assert!(!param_info("INSERT INTO widget (label) VALUES ($1)", &specs, 1)[0].1);
+        assert!(!param_info("UPDATE widget SET label = $1", &specs, 1)[0].1);
+
+        // Unqualified: the first schema on the search path that has it.
+        let audit_first = Fixture::with_search_path(&["audit", "core"]);
+        let core_first = Fixture::with_search_path(&["core", "audit"]);
+        for sql in ["INSERT INTO widget (label) VALUES ($1)", "UPDATE widget SET label = $1"] {
+            assert!(param_info_in(&audit_first, sql, &specs, 1)[0].1, "{sql}");
+            assert!(!param_info_in(&core_first, sql, &specs, 1)[0].1, "{sql}");
+        }
+    }
+
+    /// Result columns of `sql` as (name, nullable, type), given the names the
+    /// prepared statement would report; every column is reported as `text`.
+    fn result_columns(sql: &str, names: &[&str]) -> Vec<(String, bool, OID)> {
+        result_columns_in(&Fixture::new(), sql, names)
+    }
+
+    fn result_columns_in(fixture: &Fixture, sql: &str, names: &[&str]) -> Vec<(String, bool, OID)> {
+        let columns: Vec<QueryColumn> = names
+            .iter()
+            .map(|name| QueryColumn {
+                name: name.to_string(),
+                type_oid: TEXT,
+                nullable: true,
+                nullable_due_to_join: false,
+            })
+            .collect();
+        let ast = parse(sql);
+        let introspector = fixture.introspector();
+        let analysis = introspector.analyze_statement("test", &ast);
+        introspector
+            .refine_columns("test", Some(&ast), analysis.as_ref(), columns)
+            .into_iter()
+            .map(|c| (c.name, c.nullable, c.type_oid))
+            .collect()
+    }
+
+    fn nullable_flags(columns: &[(String, bool, OID)]) -> Vec<bool> {
+        columns.iter().map(|c| c.1).collect()
+    }
+
+    fn types(columns: &[(String, bool, OID)]) -> Vec<OID> {
+        columns.iter().map(|c| c.2).collect()
+    }
+
+    #[test]
+    fn returning_plain_target_columns_take_the_columns_nullability_and_type() {
+        let cols = result_columns(
+            "INSERT INTO users (email, name) VALUES ($1, $2) RETURNING id, email, bio, name AS display",
+            &["id", "email", "bio", "display"],
+        );
+        assert_eq!(
+            cols,
+            vec![
+                ("id".to_string(), false, INT),
+                ("email".to_string(), false, EMAIL),
+                ("bio".to_string(), true, TEXT),
+                // Aliased: still the `name` column.
+                ("display".to_string(), false, TEXT),
+            ]
+        );
+
+        let cols = result_columns(
+            "UPDATE users u SET bio = $1 RETURNING u.id, u.*",
+            &["id", "id", "email", "name", "bio", "status"],
+        );
+        assert_eq!(nullable_flags(&cols), vec![false, false, false, false, true, false]);
+        assert_eq!(types(&cols), vec![INT, INT, EMAIL, TEXT, TEXT, TEXT]);
+
+        let cols = result_columns(
+            "DELETE FROM users WHERE id = $1 RETURNING *",
+            &["id", "email", "name", "bio", "status"],
+        );
+        assert_eq!(nullable_flags(&cols), vec![false, false, false, true, false]);
+        assert_eq!(types(&cols), vec![INT, EMAIL, TEXT, TEXT, TEXT]);
+
+        let cols = result_columns(
+            "MERGE INTO users u USING invites i ON i.id = u.id WHEN MATCHED THEN DELETE \
+             RETURNING u.email, i.email AS invite_email",
+            &["email", "invite_email"],
+        );
+        assert_eq!(cols[0], ("email".to_string(), false, EMAIL));
+        assert!(cols[1].1);
+    }
+
+    #[test]
+    fn returning_expressions_follow_the_expression_rules_not_their_names() {
+        // Each output is *named* like a NOT NULL column of `users`, but none
+        // of the first three is that column.
+        let cols = result_columns(
+            "UPDATE users SET bio = $1 FROM teams t WHERE t.id = users.id \
+             RETURNING (SELECT max(id) FROM teams WHERE false) AS id, t.name, \
+                       nullif(users.email, '') AS email, users.status, \
+                       lower(users.email) AS name, t.id AS team_id",
+            &["id", "name", "email", "status", "name", "team_id"],
+        );
+        assert_eq!(
+            cols,
+            vec![
+                ("id".to_string(), true, TEXT),      // subquery
+                ("name".to_string(), true, TEXT),    // teams.name, which is nullable
+                ("email".to_string(), true, TEXT),   // expression: type as prepared
+                ("status".to_string(), false, TEXT), // the target's own column
+                // A strict function of a NOT NULL column; its type is its own.
+                ("name".to_string(), false, TEXT),
+                // A NOT NULL column of the FROM item, with its declared type.
+                ("team_id".to_string(), false, INT),
+            ]
+        );
+
+        // Once aliased, the bare table name is not the target's qualifier.
+        let cols = result_columns("UPDATE users u SET bio = $1 FROM teams users RETURNING users.name", &["name"]);
+        assert!(cols[0].1);
+        // `old` / `new` (PostgreSQL 18) are not the target's name either.
+        let cols = result_columns("UPDATE users SET bio = $1 RETURNING old.name", &["name"]);
+        assert!(cols[0].1);
+        // A column count that does not match the statement's: conclude nothing.
+        let cols = result_columns("DELETE FROM users RETURNING *", &["id", "bio"]);
+        assert_eq!(nullable_flags(&cols), vec![true, true]);
+        assert_eq!(types(&cols), vec![TEXT, TEXT]);
+    }
+
+    #[test]
+    fn returning_resolves_the_target_by_schema() {
+        let insert = |target: &str| format!("INSERT INTO {target} (id, label) VALUES ($1, $2) RETURNING label, code");
+        let cols = result_columns(&insert("core.widget"), &["label", "code"]);
+        assert_eq!((cols[0].1, cols[1].2), (false, INT));
+        let cols = result_columns(&insert("audit.widget"), &["label", "code"]);
+        assert_eq!((cols[0].1, cols[1].2), (true, TEXT));
+        // Unqualified and on no schema of the search path: nothing is known.
+        let cols = result_columns(&insert("widget"), &["label", "code"]);
+        assert_eq!((cols[0].1, cols[1].2), (true, TEXT));
+        // Unqualified: the first schema on the search path that has it.
+        let cols = result_columns_in(&Fixture::with_search_path(&["core", "audit"]), &insert("widget"), &["label", "code"]);
+        assert_eq!((cols[0].1, cols[1].2), (false, INT));
+        let cols = result_columns_in(&Fixture::with_search_path(&["audit", "core"]), &insert("widget"), &["label", "code"]);
+        assert_eq!((cols[0].1, cols[1].2), (true, TEXT));
+    }
+
+    /// A result column that is a plain column reference takes the column's
+    /// declared type, through aliases, CTEs, subqueries and `*`.
+    #[test]
+    fn select_columns_take_declared_types_through_ctes_and_subqueries() {
+        let cols = result_columns(
+            "SELECT u.email, u.email AS e, t.name, email::text AS cast_email, lower(u.email) AS lowered \
+             FROM users u LEFT JOIN teams t ON t.id = u.id",
+            &["email", "e", "name", "cast_email", "lowered"],
+        );
+        assert_eq!(types(&cols), vec![EMAIL, EMAIL, TEXT, TEXT, TEXT]);
+        assert_eq!(nullable_flags(&cols), vec![false, false, true, false, false]);
+
+        let cols = result_columns("SELECT * FROM users", &["id", "email", "name", "bio", "status"]);
+        assert_eq!(types(&cols), vec![INT, EMAIL, TEXT, TEXT, TEXT]);
+        let cols = result_columns(
+            "SELECT t.*, u.* FROM users u JOIN teams t ON t.id = u.id",
+            &["id", "name", "slug", "id", "email", "name", "bio", "status"],
+        );
+        assert_eq!(types(&cols), vec![INT, TEXT, TEXT, INT, EMAIL, TEXT, TEXT, TEXT]);
+
+        let cols = result_columns(
+            "WITH c AS (SELECT email, id AS user_id FROM users) SELECT email, user_id FROM c",
+            &["email", "user_id"],
+        );
+        assert_eq!(types(&cols), vec![EMAIL, INT]);
+        let cols = result_columns("SELECT s.email FROM (SELECT * FROM users) s", &["email"]);
+        assert_eq!(types(&cols), vec![EMAIL]);
+        let cols = result_columns(
+            "SELECT (SELECT email FROM users LIMIT 1) AS email, e.email AS direct \
+             FROM invites i, LATERAL (SELECT u.email FROM users u WHERE u.id = i.id) e",
+            &["email", "direct"],
+        );
+        // A scalar subquery is an expression; the LATERAL column is a column.
+        assert_eq!(types(&cols), vec![TEXT, EMAIL]);
+
+        // A CTE named like a table is not that table.
+        let cols = result_columns("WITH users AS (SELECT 'x'::text AS email) SELECT email FROM users", &["email"]);
+        assert_eq!(cols, vec![("email".to_string(), false, TEXT)]);
+
+        // Both arms the same column type: kept. Different: as prepared.
+        let cols = result_columns("SELECT email FROM users UNION ALL SELECT email FROM users", &["email"]);
+        assert_eq!(types(&cols), vec![EMAIL]);
+        let cols = result_columns("SELECT email FROM users UNION ALL SELECT email FROM invites", &["email"]);
+        assert_eq!(types(&cols), vec![TEXT]);
+
+        // A USING column: its sides agree on `int`; unqualified `email` is
+        // owned by both tables, so it is not resolved.
+        let cols = result_columns("SELECT id FROM users JOIN invites USING (id)", &["id"]);
+        assert_eq!(types(&cols), vec![INT]);
+        let cols = result_columns("SELECT i.email, u.email FROM users u JOIN invites i USING (id)", &["email", "email"]);
+        assert_eq!(types(&cols), vec![TEXT, EMAIL]);
+    }
+
+    #[test]
+    fn select_columns_follow_the_search_path() {
+        let sql = "SELECT label, code FROM widget";
+        let cols = result_columns_in(&Fixture::with_search_path(&["core", "audit"]), sql, &["label", "code"]);
+        assert_eq!((cols[0].1, cols[1].2), (false, INT));
+        let cols = result_columns_in(&Fixture::with_search_path(&["audit", "core"]), sql, &["label", "code"]);
+        assert_eq!((cols[0].1, cols[1].2), (true, TEXT));
+        let cols = result_columns(sql, &["label", "code"]);
+        assert_eq!((cols[0].1, cols[1].2), (true, TEXT));
     }
 }

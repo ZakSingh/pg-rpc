@@ -27,7 +27,7 @@ fn test_code_generation(conn_string: &str, schemas: &[&str]) -> HashMap<String, 
         let entry = entry.expect("Should read directory entry");
         let path = entry.path();
 
-        if path.extension().map_or(false, |ext| ext == "rs") {
+        if path.extension().is_some_and(|ext| ext == "rs") {
             let filename = path.file_name().unwrap().to_string_lossy().to_string();
             let content = read_pretty(&path);
             generated_files.insert(filename, content);

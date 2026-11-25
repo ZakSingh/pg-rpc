@@ -1,15 +1,17 @@
 use clap::Parser;
-use clio::{ClioPath, Output};
 use pgrpc::PgrpcBuilder;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[clap(name = "pgrpc")]
 struct Opt {
-    #[clap(long, short, value_parser = clap::value_parser!(ClioPath).exists().is_file(), default_value = "pgrpc.toml")]
-    config_path: ClioPath,
+    /// Path to the pgrpc config file
+    #[clap(long, short, default_value = "pgrpc.toml")]
+    config_path: PathBuf,
 
-    #[clap(long, short, value_parser)]
-    output: Option<Output>,
+    /// Output directory for the generated code (overrides `output_path` in the config)
+    #[clap(long, short)]
+    output: Option<PathBuf>,
 }
 
 pub fn main() -> anyhow::Result<()> {
@@ -17,11 +19,10 @@ pub fn main() -> anyhow::Result<()> {
 
     println!("Generating PgRPC functions...");
 
-    let mut builder = PgrpcBuilder::from_config_file(opt.config_path.path())?;
+    let mut builder = PgrpcBuilder::from_config_file(&opt.config_path)?;
 
-    // If CLI output is provided, it overrides config
     if let Some(output) = opt.output {
-        builder = builder.output_path(output.path().to_path_buf());
+        builder = builder.output_path(output);
     }
 
     builder.build()?;

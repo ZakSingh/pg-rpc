@@ -1,24 +1,23 @@
-use crate::annotations;
-use crate::config::Config;
-use crate::constraint_analysis::{applicable_constraints, extract_queries, get_rel_deps, RelDep};
+use crate::config::{Config, ErrorsConfig};
+use crate::constraint_analysis::{extract_queries, RelDep};
 use crate::ident::sql_to_rs_ident;
 use crate::ident::CaseType::Pascal;
-use crate::pg_constraint::Constraint;
 use crate::sql_state::{SqlState, SYM_SQL_STATE_TO_CODE};
-use crate::trigger_index::TriggerIndex;
-use itertools::Itertools;
 use jsonpath_rust::JsonPath;
+use pg_query::protobuf::node::Node;
+use pg_query::protobuf::FuncCall;
+use pg_query::ParseResult;
 use proc_macro2::TokenStream;
-use quote::ToTokens;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+/// Something a function or query can raise other than a constraint
+/// violation. Constraint violations are derived from the relations written
+/// (see [`crate::constraint_analysis::applicable_constraints`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PgException {
     Explicit(SqlState),
-    Constraint(Constraint),
     CustomError(String), // Name of the error type from errors schema
-                         // Cast(String, String), // parsed from 'cannot cast x to y' IntegerStringCast
 }
 
 impl PgException {
@@ -30,92 +29,40 @@ impl PgException {
                 Some(description) => sql_to_rs_ident(description, Pascal),
                 None => ex.rs_name(),
             },
-            PgException::Constraint(c) => c.to_token_stream(),
             PgException::CustomError(name) => sql_to_rs_ident(name, Pascal),
         }
     }
 }
 
-/// Get exceptions from a function body JSON parse (without trigger analysis)
-pub fn get_exceptions(
-    parsed: &Value,
-    comment: Option<&String>,
-    rel_index: &crate::rel_index::RelIndex,
-    scope: &str,
-) -> anyhow::Result<Vec<PgException>> {
-    get_exceptions_with_triggers(parsed, comment, rel_index, None, None, scope)
-}
-
-/// Get exceptions from a function body JSON parse with optional trigger analysis
-pub fn get_exceptions_with_triggers(
-    parsed: &Value,
-    comment: Option<&String>,
-    rel_index: &crate::rel_index::RelIndex,
-    trigger_index: Option<&TriggerIndex>,
-    errors_config: Option<&crate::config::ErrorsConfig>,
-    scope: &str,
-) -> anyhow::Result<Vec<PgException>> {
-    let queries = extract_queries(parsed, scope);
-
-    let mut rel_deps = get_rel_deps(&queries, rel_index, scope);
-
-    // Populate trigger exceptions if trigger index is available
-    if let Some(trigger_idx) = trigger_index {
-        crate::pg_fn::populate_trigger_exceptions(&mut rel_deps, trigger_idx);
-    }
-
-    get_exceptions_from_deps(parsed, &rel_deps, comment, rel_index, errors_config, scope)
-}
-
 /// Get exceptions from a function body JSON parse, given the relation
 /// dependencies already extracted from it (with trigger exceptions populated
 /// if the caller wants them).
+///
+/// Constraint violations are not part of the result: callers derive those
+/// from `rel_deps` directly. `_rel_index` is unused and kept only so existing
+/// call sites keep compiling.
 pub fn get_exceptions_from_deps(
     parsed: &Value,
     rel_deps: &[RelDep],
-    comment: Option<&String>,
-    rel_index: &crate::rel_index::RelIndex,
-    errors_config: Option<&crate::config::ErrorsConfig>,
+    _rel_index: &crate::rel_index::RelIndex,
+    errors_config: Option<&ErrorsConfig>,
     scope: &str,
 ) -> anyhow::Result<Vec<PgException>> {
-    let constraints: Vec<Constraint> = rel_deps
-        .iter()
-        .flat_map(|dep| applicable_constraints(dep, rel_index))
-        .map(|(_, c)| c)
-        // NOT NULL can't be attributed to a statement without null tracking.
-        .filter(|c| cfg!(feature = "null_tracking") || !matches!(c, Constraint::NotNull(..)))
-        .collect();
-
     let (raised_sql_states, custom_errors) =
         get_raised_sql_states_and_custom_errors(parsed, errors_config, scope)?;
 
-    let raised_exceptions = raised_sql_states
-        .into_iter()
-        .map(|sql_state| PgException::Explicit(sql_state));
-
-    let custom_error_exceptions = custom_errors
-        .into_iter()
-        .map(|error_name| PgException::CustomError(error_name));
-
-    let comment_exceptions = comment
-        .map(|c| get_comment_exceptions(c))
-        .unwrap_or_default();
-
     // Collect trigger exceptions from all relation dependencies
-    let trigger_exceptions: Vec<PgException> = rel_deps
+    let trigger_exceptions = rel_deps
         .iter()
-        .flat_map(|dep| dep.trigger_exceptions.iter().cloned())
-        .collect();
+        .flat_map(|dep| dep.trigger_exceptions.iter().cloned());
 
-    let exceptions: Vec<PgException> = constraints
+    let exceptions: Vec<PgException> = raised_sql_states
         .into_iter()
-        .unique_by(|c| c.name())
-        .map(PgException::Constraint)
-        .chain(raised_exceptions)
-        .chain(custom_error_exceptions)
-        .chain(get_strict_exceptions(parsed).into_iter())
-        .chain(comment_exceptions.into_iter())
-        .chain(trigger_exceptions.into_iter())
+        .map(PgException::Explicit)
+        .chain(custom_errors.into_iter().map(PgException::CustomError))
+        .chain(get_strict_exceptions(parsed)?)
+        .chain(get_assert_exceptions(parsed)?)
+        .chain(trigger_exceptions)
         .collect();
 
     Ok(exceptions)
@@ -124,7 +71,7 @@ pub fn get_exceptions_from_deps(
 /// Collect all explicit raise sqlstate codes and custom error types
 fn get_raised_sql_states_and_custom_errors(
     fn_json: &Value,
-    errors_config: Option<&crate::config::ErrorsConfig>,
+    errors_config: Option<&ErrorsConfig>,
     scope: &str,
 ) -> anyhow::Result<(BTreeSet<SqlState>, BTreeSet<String>)> {
     let sql_states = raised_sql_states(fn_json)?;
@@ -132,21 +79,11 @@ fn get_raised_sql_states_and_custom_errors(
     // Detect custom errors if errors_config is provided using AST parsing
     let mut custom_errors = BTreeSet::new();
     if let Some(config) = errors_config {
-        // Extract queries from the function JSON and parse them
-        let queries = crate::pg_fn::extract_queries(fn_json, scope);
-
-        // Use AST-based detection to find custom errors (and their optional SQLSTATEs)
-        let found_errors = crate::pg_fn::extract_custom_errors_from_queries(&queries, config);
-
-        #[cfg(test)]
-        eprintln!("Custom errors found via AST: {:?}", found_errors);
-
-        // Add all found custom errors
-        for error_type in found_errors {
-            custom_errors.insert(error_type);
-            // Note: We no longer automatically add a specific SQLSTATE here
-            // The SQLSTATE will be determined by the raise_error call or RAISE statement
-        }
+        // Every statement *and* bare expression of the body: the raise helper
+        // may be called from an assignment or a condition as well as from
+        // `CALL` / `PERFORM`.
+        let queries = extract_queries(fn_json, scope);
+        custom_errors.extend(extract_custom_errors_from_queries(&queries, config));
 
         // A hand-written `RAISE ... USING HINT = 'application/json', MESSAGE =
         // jsonb_build_object('type', 'some_error', ...)` is the same contract
@@ -155,6 +92,118 @@ fn get_raised_sql_states_and_custom_errors(
     }
 
     Ok((sql_states, custom_errors))
+}
+
+/// The typed errors raised through the configured raise function
+/// (`errors.raise_function`) anywhere in the given statements: every call to
+/// it, at any nesting depth (`CALL`, a select target, a `CASE` branch, a
+/// `WHERE` clause, a CTE, ...), whose argument is cast to a type in the
+/// errors schema, e.g. `core.raise_error(ROW(1, 'x')::errors.validation_error)`.
+///
+/// Returns the error type names.
+pub fn extract_custom_errors_from_queries(
+    queries: &[ParseResult],
+    errors_config: &ErrorsConfig,
+) -> BTreeSet<String> {
+    let raise_function = RaiseFunction::new(errors_config.get_raise_function());
+    let errors_schema = errors_config.schema.as_str();
+    let mut custom_errors = BTreeSet::new();
+
+    let mut visit = |call: &FuncCall| {
+        if raise_function.is_called_by(call) {
+            custom_errors.extend(
+                call.args
+                    .iter()
+                    .filter_map(|arg| error_type_of_arg(arg, errors_schema)),
+            );
+        }
+    };
+    for query in queries {
+        for (node, _, _, _) in query.protobuf.nodes() {
+            match node.to_enum() {
+                Node::FuncCall(call) => visit(&call),
+                Node::CallStmt(stmt) => {
+                    if let Some(call) = &stmt.funccall {
+                        visit(call);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    custom_errors
+}
+
+/// The configured raise function, split into schema and name.
+struct RaiseFunction<'a> {
+    schema: Option<&'a str>,
+    name: &'a str,
+}
+
+impl<'a> RaiseFunction<'a> {
+    fn new(configured: &'a str) -> Self {
+        match configured.rsplit_once('.') {
+            Some((schema, name)) => Self {
+                // `db.schema.name` -> `schema`
+                schema: Some(schema.rsplit('.').next().unwrap_or(schema)),
+                name,
+            },
+            None => Self {
+                schema: None,
+                name: configured,
+            },
+        }
+    }
+
+    /// Whether `call` invokes the raise function. A schema-qualified call
+    /// must name the configured schema. An unqualified call (resolved by
+    /// `search_path` at runtime) matches on the bare name alone, as does any
+    /// call when the configured name is itself unqualified: mistaking a
+    /// same-named function for the raise helper only adds a variant.
+    fn is_called_by(&self, call: &FuncCall) -> bool {
+        let parts: Vec<&str> = call
+            .funcname
+            .iter()
+            .filter_map(|n| match &n.node {
+                Some(Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        match parts.as_slice() {
+            [name] => *name == self.name,
+            [.., schema, name] => {
+                *name == self.name && self.schema.is_none_or(|expected| expected == *schema)
+            }
+            [] => false,
+        }
+    }
+}
+
+/// The error type an argument of the raise function is cast to, if it is a
+/// type in the errors schema: `ROW(...)::errors.some_error`, possibly passed
+/// by name (`p_error => ROW(...)::errors.some_error`) or cast again.
+fn error_type_of_arg(arg: &pg_query::protobuf::Node, errors_schema: &str) -> Option<String> {
+    match arg.node.as_ref()? {
+        Node::NamedArgExpr(named) => error_type_of_arg(named.arg.as_deref()?, errors_schema),
+        Node::TypeCast(cast) => {
+            let type_parts: Vec<&str> = cast
+                .type_name
+                .as_ref()?
+                .names
+                .iter()
+                .filter_map(|n| match &n.node {
+                    Some(Node::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            match type_parts.as_slice() {
+                [schema, name] if *schema == errors_schema => Some((*name).to_string()),
+                _ => error_type_of_arg(cast.arg.as_deref()?, errors_schema),
+            }
+        }
+        _ => None,
+    }
 }
 
 /// SQLSTATEs statically raised by `RAISE EXCEPTION` statements in a function.
@@ -265,30 +314,36 @@ fn sql_state_from_literal(s: &str) -> SqlState {
     }
 }
 
-/// `SELECT ... INTO STRICT` raises `no_data_found` (P0002) for zero rows and
-/// `too_many_rows` (P0003) for more than one.
-fn get_strict_exceptions(parsed: &Value) -> Vec<PgException> {
-    let has_strict = parsed
-        .query("$..PLpgSQL_stmt_execsql")
-        .unwrap()
-        .into_iter()
-        .any(|stmt| stmt.get("strict").and_then(Value::as_bool) == Some(true));
+/// `SELECT ... INTO STRICT` and `EXECUTE ... INTO STRICT` raise
+/// `no_data_found` (P0002) for zero rows and `too_many_rows` (P0003) for more
+/// than one.
+fn get_strict_exceptions(parsed: &Value) -> anyhow::Result<Vec<PgException>> {
+    let mut has_strict = false;
+    for path in ["$..PLpgSQL_stmt_execsql", "$..PLpgSQL_stmt_dynexecute"] {
+        has_strict |= parsed
+            .query(path)?
+            .into_iter()
+            .any(|stmt| stmt.get("strict").and_then(Value::as_bool) == Some(true));
+    }
 
-    if has_strict {
+    Ok(if has_strict {
         vec![
             PgException::Explicit(SqlState::from_code("P0002")),
             PgException::Explicit(SqlState::from_code("P0003")),
         ]
     } else {
         Vec::new()
-    }
+    })
 }
 
-pub fn get_comment_exceptions(comment: &str) -> Vec<PgException> {
-    annotations::parse_throws(comment)
-        .into_iter()
-        .map(|code| PgException::Explicit(SqlState::from_code(&code)))
-        .collect()
+/// `ASSERT condition` raises `assert_failure` (P0004) when the condition is
+/// false or null (unless `plpgsql.check_asserts` is off).
+fn get_assert_exceptions(parsed: &Value) -> anyhow::Result<Vec<PgException>> {
+    Ok(if parsed.query("$..PLpgSQL_stmt_assert")?.is_empty() {
+        Vec::new()
+    } else {
+        vec![PgException::Explicit(SqlState::from_code("P0004"))]
+    })
 }
 
 #[cfg(test)]
@@ -361,7 +416,7 @@ mod test {
         $$ language plpgsql;
         "#;
 
-        let s = get_strict_exceptions(&parse_plpgsql(fn_def).unwrap());
+        let s = get_strict_exceptions(&parse_plpgsql(fn_def).unwrap()).unwrap();
         assert!(s.contains(&PgException::Explicit(SqlState::from_code("P0002"))), "{s:?}");
         assert!(s.contains(&PgException::Explicit(SqlState::from_code("P0003"))), "{s:?}");
     }
@@ -380,8 +435,146 @@ mod test {
         $$ language plpgsql;
         "#;
 
-        let s = get_strict_exceptions(&parse_plpgsql(fn_def).unwrap());
+        let s = get_strict_exceptions(&parse_plpgsql(fn_def).unwrap()).unwrap();
         assert!(s.is_empty(), "{s:?}");
+    }
+
+    fn plpgsql(body: &str) -> Value {
+        parse_plpgsql(&format!(
+            "create function f() returns void language plpgsql as $$ declare x int; r record; begin {body} end $$;"
+        ))
+        .unwrap()
+    }
+
+    fn codes(exceptions: Vec<PgException>) -> BTreeSet<String> {
+        exceptions
+            .into_iter()
+            .map(|e| match e {
+                PgException::Explicit(s) => s.code().to_string(),
+                PgException::CustomError(name) => name,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn execute_into_strict_raises_like_select_into_strict() {
+        let strict = plpgsql("execute 'select id from t where id = $1' into strict x using 1;");
+        assert_eq!(
+            codes(get_strict_exceptions(&strict).unwrap()),
+            BTreeSet::from(["P0002".to_string(), "P0003".to_string()])
+        );
+
+        let lax = plpgsql("execute 'select id from t' into x;");
+        assert!(get_strict_exceptions(&lax).unwrap().is_empty());
+    }
+
+    #[test]
+    fn assert_raises_assert_failure() {
+        let with_assert = plpgsql("assert x > 0, 'x must be positive';");
+        assert_eq!(
+            codes(get_assert_exceptions(&with_assert).unwrap()),
+            BTreeSet::from(["P0004".to_string()])
+        );
+        assert!(get_assert_exceptions(&plpgsql("x := 1;")).unwrap().is_empty());
+    }
+
+    fn errors_config(raise_function: &str) -> ErrorsConfig {
+        ErrorsConfig {
+            schema: "errors".to_string(),
+            raise_function: Some(raise_function.to_string()),
+        }
+    }
+
+    fn custom_errors_of(body: &str, raise_function: &str) -> BTreeSet<String> {
+        get_raised_sql_states_and_custom_errors(
+            &plpgsql(body),
+            Some(&errors_config(raise_function)),
+            "test",
+        )
+        .unwrap()
+        .1
+    }
+
+    fn names(expected: &[&str]) -> BTreeSet<String> {
+        expected.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn raise_function_is_found_at_any_depth() {
+        // None of these is a `CALL` or a bare select target.
+        let found = custom_errors_of(
+            r#"
+            x := core.raise_error(ROW(1)::errors.in_assignment);
+            if core.raise_error(ROW(1)::errors.in_condition) then null; end if;
+            perform 1 where core.raise_error(ROW(1)::errors.in_where) is null;
+            select case when x > 0 then core.raise_error(ROW(1)::errors.in_case) end into x;
+            perform coalesce(x, core.raise_error(ROW(1)::errors.in_coalesce));
+            with c as (select core.raise_error(ROW(1)::errors.in_cte)) select 1 from c into x;
+            return core.raise_error(ROW(1)::errors.in_return);
+            "#,
+            "core.raise_error",
+        );
+        assert_eq!(
+            found,
+            names(&[
+                "in_assignment",
+                "in_case",
+                "in_coalesce",
+                "in_condition",
+                "in_cte",
+                "in_return",
+                "in_where"
+            ])
+        );
+    }
+
+    #[test]
+    fn unqualified_raise_call_matches_by_bare_name() {
+        // `core` on the search_path: the call carries no schema.
+        let found = custom_errors_of(
+            "perform raise_error(ROW(1)::errors.not_found); call raise_error(ROW(1)::errors.forbidden);",
+            "core.raise_error",
+        );
+        assert_eq!(found, names(&["forbidden", "not_found"]));
+    }
+
+    #[test]
+    fn raise_call_in_another_schema_is_not_the_raise_function() {
+        let found = custom_errors_of(
+            "perform other.raise_error(ROW(1)::errors.not_found); perform core.something_else(ROW(1)::errors.forbidden);",
+            "core.raise_error",
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn unqualified_configured_name_matches_qualified_calls() {
+        let found = custom_errors_of(
+            "perform core.raise_error(ROW(1)::errors.not_found);",
+            "raise_error",
+        );
+        assert_eq!(found, names(&["not_found"]));
+    }
+
+    #[test]
+    fn named_and_recast_error_arguments_are_recognised() {
+        let found = custom_errors_of(
+            "perform core.raise_error(p_sqlstate => 'M0422', p_error => ROW(1)::errors.by_name);
+             perform core.raise_error((ROW(1)::errors.recast)::record);
+             perform core.raise_error(ROW(1)::other.not_an_error);",
+            "core.raise_error",
+        );
+        assert_eq!(found, names(&["by_name", "recast"]));
+    }
+
+    #[test]
+    fn raise_function_in_sql_statement() {
+        let parsed = pg_query::parse(
+            "select id from t where id = $1 or raise_error(ROW($1)::errors.missing_thing) is null",
+        )
+        .unwrap();
+        let found = extract_custom_errors_from_queries(&[parsed], &errors_config("core.raise_error"));
+        assert_eq!(found, names(&["missing_thing"]));
     }
 
     #[test]
@@ -429,7 +622,7 @@ mod test {
 
         let parsed = parse_plpgsql(fn_def)?;
 
-        let errors_config = crate::config::ErrorsConfig {
+        let errors_config = ErrorsConfig {
             schema: "errors".to_string(),
             raise_function: Some("core.raise_error".to_string()),
         };
@@ -466,7 +659,7 @@ mod test {
 
         let parsed = parse_plpgsql(fn_def)?;
 
-        let errors_config = crate::config::ErrorsConfig {
+        let errors_config = ErrorsConfig {
             schema: "errors".to_string(),
             raise_function: Some("core.raise_error".to_string()),
         };
@@ -498,7 +691,7 @@ mod test {
 
         let parsed = parse_plpgsql(fn_def)?;
 
-        let errors_config = crate::config::ErrorsConfig {
+        let errors_config = ErrorsConfig {
             schema: "errors".to_string(),
             raise_function: Some("core.raise_error".to_string()),
         };
@@ -529,7 +722,7 @@ mod test {
 
         let parsed = parse_plpgsql(fn_def)?;
 
-        let errors_config = crate::config::ErrorsConfig {
+        let errors_config = ErrorsConfig {
             schema: "errors".to_string(),
             raise_function: Some("my_app.throw_error".to_string()),
         };

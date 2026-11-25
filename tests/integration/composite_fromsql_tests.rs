@@ -1,7 +1,6 @@
 use super::*;
 use indoc::indoc;
 use pgrpc::PgrpcBuilder;
-use crate::integration::compile_helpers::read_pretty;
 
 #[test]
 fn test_composite_type_fromsql_generation() {
@@ -134,11 +133,11 @@ fn test_composite_type_fromsql_generation() {
             }
         "#};
 
-        add_test_binary(&project_dir.path(), "test_composite", &test_code);
+        add_test_binary(project_dir.path(), "test_composite", test_code);
 
         // Compile and run the test
         let output =
-            compile_and_run_with_args(&project_dir.path(), "test_composite", &[conn_string]);
+            compile_and_run_with_args(project_dir.path(), "test_composite", &[conn_string]);
 
         // First check if compilation succeeded
         if !output.status.success() {
@@ -260,10 +259,10 @@ fn test_nested_composite_extraction() {
             }
         "#};
 
-        add_test_binary(&project_dir.path(), "test_nested", &test_code);
+        add_test_binary(project_dir.path(), "test_nested", test_code);
 
         // Compile and run the test
-        let output = compile_and_run_with_args(&project_dir.path(), "test_nested", &[conn_string]);
+        let output = compile_and_run_with_args(project_dir.path(), "test_nested", &[conn_string]);
 
         if !output.status.success() {
             print_output(&output);

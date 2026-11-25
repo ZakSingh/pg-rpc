@@ -27,16 +27,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Use the generated functions
-    // After generating code with pgrpc CLI, you would use it like:
-    // let user = api::get_user(&client, 123).await?;
-    // match user {
+    // After generating code with the pgrpc CLI, you would use it like:
+    // match api::get_user(&client, 123).await {
     //     Ok(user) => println!("User: {:?}", user),
-    //     Err(PgRpcError::UserNotFound(_)) => println!("User not found"),
     //     Err(e) => return Err(e.into()),
     // }
 
     println!("This is just an example of how to structure your code.");
-    println!("Run 'pgrpc generate' first to generate the actual modules.");
+    println!("Run 'pgrpc_cli -c pgrpc.toml' first to generate the actual modules.");
 
     Ok(())
 }

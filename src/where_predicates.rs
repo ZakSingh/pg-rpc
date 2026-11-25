@@ -15,46 +15,45 @@ use crate::parse_check_facts::{Literal, Predicate};
 use pg_query::protobuf::{AExprKind, BoolExprType, NullTestType};
 use pg_query::{Node, NodeEnum};
 
-/// Walk a WHERE expression tree and return the atomic predicates it AND-implies.
+/// A predicate together with the table qualifier its column was written with
+/// (`alias.col` → `Some("alias")`, bare `col` → `None`).
 ///
-/// `qualified_alias` is the table alias the WHERE predicate is being attributed
-/// to. If a column reference is qualified (`alias.col`), only references whose
-/// qualifier matches will produce a predicate. Unqualified references always
-/// match — at the call site, the SELECT must have a single FROM table for this
-/// to be safe (otherwise the column could come from anywhere).
-pub fn extract_predicates(where_clause: &Node, qualified_alias: Option<&str>) -> Vec<Predicate> {
+/// Deciding which table reference the predicate is about is the caller's job:
+/// it knows what is in scope. A qualified column belongs to the relation with
+/// that alias and no other; an unqualified one to whichever relation in scope
+/// has a column of that name.
+#[derive(Debug, Clone)]
+pub struct ScopedPredicate {
+    pub qualifier: Option<String>,
+    pub predicate: Predicate,
+}
+
+/// Walk a WHERE expression tree and return the atomic predicates it AND-implies.
+pub fn extract_predicates(where_clause: &Node) -> Vec<ScopedPredicate> {
     let mut out = Vec::new();
-    walk(where_clause, qualified_alias, &mut out);
+    walk(where_clause, &mut out);
     out
 }
 
-fn walk(node: &Node, qualified_alias: Option<&str>, out: &mut Vec<Predicate>) {
+fn walk(node: &Node, out: &mut Vec<ScopedPredicate>) {
     if let Some(NodeEnum::BoolExpr(b)) = &node.node {
-        match b.boolop() {
-            BoolExprType::AndExpr => {
-                for arg in &b.args {
-                    walk(arg, qualified_alias, out);
-                }
-                return;
+        // OR / NOT branches don't yield definite facts. Drop and move on.
+        if b.boolop() == BoolExprType::AndExpr {
+            for arg in &b.args {
+                walk(arg, out);
             }
-            // OR / NOT branches don't yield definite facts. Drop and move on.
-            _ => return,
         }
-    }
-
-    if let Some(pred) = recognize_equality(node, qualified_alias) {
-        out.push(pred);
         return;
     }
 
-    if let Some(pred) = recognize_is_not_null(node, qualified_alias) {
+    if let Some(pred) = recognize_equality(node).or_else(|| recognize_is_not_null(node)) {
         out.push(pred);
     }
 }
 
 /// Match `col IS NOT NULL`. Symmetric to [`recognize_equality`] for the NULL-
 /// keyed predicate family.
-fn recognize_is_not_null(node: &Node, qualified_alias: Option<&str>) -> Option<Predicate> {
+fn recognize_is_not_null(node: &Node) -> Option<ScopedPredicate> {
     let nt = match &node.node {
         Some(NodeEnum::NullTest(nt)) => nt,
         _ => return None,
@@ -62,17 +61,14 @@ fn recognize_is_not_null(node: &Node, qualified_alias: Option<&str>) -> Option<P
     if nt.nulltesttype() != NullTestType::IsNotNull {
         return None;
     }
-    let arg = nt.arg.as_deref()?;
-    let (col_name, col_qualifier) = extract_column_ref(arg)?;
-    if let (Some(want), Some(got)) = (qualified_alias, col_qualifier.as_deref()) {
-        if want != got {
-            return None;
-        }
-    }
-    Some(Predicate::IsNotNull { column: col_name })
+    let (column, qualifier) = extract_column_ref(nt.arg.as_deref()?)?;
+    Some(ScopedPredicate {
+        qualifier,
+        predicate: Predicate::IsNotNull { column },
+    })
 }
 
-fn recognize_equality(node: &Node, qualified_alias: Option<&str>) -> Option<Predicate> {
+fn recognize_equality(node: &Node) -> Option<ScopedPredicate> {
     let a = match &node.node {
         Some(NodeEnum::AExpr(a)) => a,
         _ => return None,
@@ -85,27 +81,18 @@ fn recognize_equality(node: &Node, qualified_alias: Option<&str>) -> Option<Pred
     let l = a.lexpr.as_deref()?;
     let r = a.rexpr.as_deref()?;
 
-    if let Some(p) = build_predicate(l, r, qualified_alias) {
-        return Some(p);
-    }
-    build_predicate(r, l, qualified_alias)
+    build_predicate(l, r).or_else(|| build_predicate(r, l))
 }
 
-fn build_predicate(
-    col_side: &Node,
-    lit_side: &Node,
-    qualified_alias: Option<&str>,
-) -> Option<Predicate> {
-    let (col_name, col_qualifier) = extract_column_ref(col_side)?;
-    if let (Some(want), Some(got)) = (qualified_alias, col_qualifier.as_deref()) {
-        if want != got {
-            return None;
-        }
-    }
+fn build_predicate(col_side: &Node, lit_side: &Node) -> Option<ScopedPredicate> {
+    let (column, qualifier) = extract_column_ref(col_side)?;
     let lit = extract_string_literal(lit_side)?;
-    Some(Predicate::Eq {
-        column: col_name,
-        value: Literal::Text(lit),
+    Some(ScopedPredicate {
+        qualifier,
+        predicate: Predicate::Eq {
+            column,
+            value: Literal::Text(lit),
+        },
     })
 }
 
@@ -121,39 +108,34 @@ fn is_equality_op(name: &[Node]) -> bool {
 
 /// Returns `(column_name, qualifier)`. Qualifier is the alias/table name if the
 /// reference was `alias.col`; None for bare `col`. Strips TypeCast wrappers.
+///
+/// Longer references are rejected: `schema.table.col` and `alias.col.attr`
+/// look alike here, and reading the latter as a column of a table named
+/// `col` would be wrong.
 fn extract_column_ref(node: &Node) -> Option<(String, Option<String>)> {
     let inner = match &node.node {
         Some(NodeEnum::TypeCast(tc)) => tc.arg.as_deref()?,
         _ => node,
     };
-    let col_ref = if let Some(NodeEnum::ColumnRef(c)) = &inner.node {
-        c
-    } else {
+    let Some(NodeEnum::ColumnRef(col_ref)) = &inner.node else {
         return None;
     };
-    let mut names: Vec<String> = col_ref
-        .fields
-        .iter()
-        .filter_map(|f| {
-            if let Some(NodeEnum::String(s)) = &f.node {
-                Some(s.sval.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-    let column = names.pop()?;
-    let qualifier = names.pop(); // schema is below this; we ignore schema-qualified refs
-    Some((column, qualifier))
+    let name = |f: &Node| match &f.node {
+        Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+        _ => None,
+    };
+    match col_ref.fields.as_slice() {
+        [column] => Some((name(column)?, None)),
+        [qualifier, column] => Some((name(column)?, Some(name(qualifier)?))),
+        _ => None,
+    }
 }
 
 fn extract_string_literal(node: &Node) -> Option<String> {
     match &node.node {
         Some(NodeEnum::AConst(c)) => {
-            if let Some(val) = &c.val {
-                if let pg_query::protobuf::a_const::Val::Sval(s) = val {
-                    return Some(s.sval.clone());
-                }
+            if let Some(pg_query::protobuf::a_const::Val::Sval(s)) = &c.val {
+                return Some(s.sval.clone());
             }
             None
         }
@@ -181,9 +163,10 @@ mod tests {
     #[test]
     fn extracts_single_equality() {
         let w = parse_where("SELECT * FROM t WHERE product_type = 'paint'");
-        let preds = extract_predicates(&w, None);
+        let preds = extract_predicates(&w);
         assert_eq!(preds.len(), 1);
-        match &preds[0] {
+        assert_eq!(preds[0].qualifier, None);
+        match &preds[0].predicate {
             Predicate::Eq { column, value } => {
                 assert_eq!(column, "product_type");
                 assert_eq!(value, &Literal::Text("paint".into()));
@@ -195,48 +178,61 @@ mod tests {
     #[test]
     fn handles_literal_on_left() {
         let w = parse_where("SELECT * FROM t WHERE 'paint' = product_type");
-        let preds = extract_predicates(&w, None);
+        let preds = extract_predicates(&w);
         assert_eq!(preds.len(), 1);
     }
 
     #[test]
     fn splits_and_conjuncts() {
         let w = parse_where("SELECT * FROM t WHERE a = 'x' AND b = 'y' AND c > 0");
-        let preds = extract_predicates(&w, None);
+        let preds = extract_predicates(&w);
         // c > 0 is dropped (not equality)
         assert_eq!(preds.len(), 2);
     }
 
     #[test]
-    fn drops_or_branches() {
+    fn drops_or_and_not_branches() {
         let w = parse_where("SELECT * FROM t WHERE a = 'x' OR a = 'y'");
-        let preds = extract_predicates(&w, None);
-        assert!(preds.is_empty(), "OR must not yield definite facts");
+        assert!(
+            extract_predicates(&w).is_empty(),
+            "OR must not yield definite facts"
+        );
+        let w = parse_where("SELECT * FROM t WHERE NOT (a = 'x')");
+        assert!(extract_predicates(&w).is_empty());
+        let w = parse_where("SELECT * FROM t WHERE b = 'y' AND (a = 'x' OR a IS NOT NULL)");
+        assert_eq!(extract_predicates(&w).len(), 1);
     }
 
     #[test]
-    fn respects_qualifier() {
-        let w = parse_where("SELECT * FROM t p WHERE p.product_type = 'paint'");
-        let matched = extract_predicates(&w, Some("p"));
-        assert_eq!(matched.len(), 1);
-        let mismatched = extract_predicates(&w, Some("other"));
-        assert!(mismatched.is_empty());
+    fn reports_qualifier() {
+        let w = parse_where(
+            "SELECT * FROM t p JOIN u ON true \
+             WHERE p.product_type = 'paint' AND u.x IS NOT NULL AND y IS NOT NULL",
+        );
+        let qualifiers: Vec<Option<String>> = extract_predicates(&w)
+            .into_iter()
+            .map(|p| p.qualifier)
+            .collect();
+        assert_eq!(
+            qualifiers,
+            vec![Some("p".to_string()), Some("u".to_string()), None]
+        );
     }
 
     #[test]
-    fn unqualified_column_accepted_with_any_alias() {
-        let w = parse_where("SELECT * FROM t WHERE product_type = 'paint'");
-        let with_alias = extract_predicates(&w, Some("anything"));
-        assert_eq!(with_alias.len(), 1);
+    fn rejects_references_longer_than_alias_dot_column() {
+        // `a.b.c` is either schema.table.column or alias.column.attribute.
+        let w = parse_where("SELECT * FROM t WHERE a.b.c IS NOT NULL AND a.b.c = 'x'");
+        assert!(extract_predicates(&w).is_empty());
     }
 
     #[test]
     fn handles_typecast_literals() {
         // pg_query usually leaves user input alone; this just verifies the cast peeler.
         let w = parse_where("SELECT * FROM t WHERE product_type = 'paint'::text");
-        let preds = extract_predicates(&w, None);
+        let preds = extract_predicates(&w);
         assert_eq!(preds.len(), 1);
-        match &preds[0] {
+        match &preds[0].predicate {
             Predicate::Eq { value, .. } => {
                 assert_eq!(value, &Literal::Text("paint".into()));
             }
@@ -247,21 +243,12 @@ mod tests {
     #[test]
     fn extracts_is_not_null() {
         let w = parse_where("SELECT * FROM t WHERE sync_src IS NOT NULL");
-        let preds = extract_predicates(&w, None);
+        let preds = extract_predicates(&w);
         assert_eq!(preds.len(), 1);
-        match &preds[0] {
+        match &preds[0].predicate {
             Predicate::IsNotNull { column } => assert_eq!(column, "sync_src"),
             other => panic!("expected IsNotNull predicate, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn extracts_is_not_null_with_qualifier() {
-        let w = parse_where("SELECT * FROM t i WHERE i.sync_src IS NOT NULL");
-        let preds = extract_predicates(&w, Some("i"));
-        assert_eq!(preds.len(), 1);
-        let no_match = extract_predicates(&w, Some("other"));
-        assert!(no_match.is_empty());
     }
 
     #[test]
@@ -270,7 +257,7 @@ mod tests {
         // IS NOT NULL. Adding it would require modeling "column IS NULL" facts
         // (e.g., "given product_type = 'paint', mini_material IS NULL").
         let w = parse_where("SELECT * FROM t WHERE sync_src IS NULL");
-        let preds = extract_predicates(&w, None);
+        let preds = extract_predicates(&w);
         assert!(preds.is_empty());
     }
 
@@ -279,7 +266,7 @@ mod tests {
         let w = parse_where(
             "SELECT * FROM t WHERE product_type = 'paint' AND sync_src IS NOT NULL",
         );
-        let preds = extract_predicates(&w, None);
+        let preds = extract_predicates(&w);
         assert_eq!(preds.len(), 2);
     }
 }

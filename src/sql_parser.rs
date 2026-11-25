@@ -1,9 +1,11 @@
 use crate::annotations;
 use anyhow::{anyhow, Result};
+use pg_query::protobuf::{KeywordKind, ScanToken, Token};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum QueryType {
@@ -19,8 +21,10 @@ pub enum QueryType {
     ExecRows,
 }
 
-impl QueryType {
-    pub fn from_str(s: &str) -> Result<Self> {
+impl FromStr for QueryType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
         match s {
             "one" => Ok(QueryType::One),
             "opt" => Ok(QueryType::Opt),
@@ -43,8 +47,7 @@ pub enum ParameterSpec {
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
     pub name: String,
-    pub query_type: QueryType,
-    /// Explicitly specified query type (None if inferred)
+    /// Explicitly specified query type (None if it is to be inferred)
     pub explicit_query_type: Option<QueryType>,
     /// Original SQL as written in file
     pub original_sql: String,
@@ -58,8 +61,6 @@ pub struct ParsedQuery {
     pub line_number: usize,
     /// Column names annotated as NOT NULL with @pgrpc_not_null(col1, col2)
     pub not_null_annotations: HashSet<String>,
-    /// SQL state codes that this query can throw via @pgrpc_throws XXXXX
-    pub throws_annotations: Vec<String>,
     /// Parameter names annotated as nullable with @pgrpc_nullable(param1, param2)
     pub nullable_param_annotations: HashSet<String>,
 }
@@ -67,8 +68,65 @@ pub struct ParsedQuery {
 pub struct SqlParser {
     /// Regex for matching -- name: FunctionName :type
     annotation_regex: Regex,
-    /// Regex for matching named parameters :param_name
-    named_param_regex: Regex,
+}
+
+/// PostgreSQL's wire protocol carries the parameter count in 16 bits.
+const MAX_PARAMETERS: usize = 65535;
+
+/// Whether `text` is usable as a `:name` parameter name.
+fn is_param_name(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether a token can be the last token of an expression. A `:` directly
+/// after one is an operator between two expressions (an array slice bound,
+/// `arr[lo:hi]`, or a JSON constructor's `key : value`), not the start of a
+/// `:name` parameter.
+///
+/// Keywords are the ambiguous case: `ORDER BY :sort` and `arr[start:n]` both
+/// put an unreserved keyword in front of the colon. Inside a subscript a
+/// non-reserved keyword is taken to be a column name (so the colon is a slice
+/// separator); elsewhere it is taken to be syntax.
+fn ends_expression(token: &ScanToken, in_subscript: bool) -> bool {
+    match token.token() {
+        Token::Ident
+        | Token::Uident
+        | Token::Sconst
+        | Token::Usconst
+        | Token::Iconst
+        | Token::Fconst
+        | Token::Bconst
+        | Token::Xconst
+        | Token::Param
+        | Token::Ascii41
+        | Token::Ascii93
+        | Token::NullP
+        | Token::TrueP
+        | Token::FalseP
+        | Token::EndP
+        | Token::CurrentCatalog
+        | Token::CurrentDate
+        | Token::CurrentRole
+        | Token::CurrentSchema
+        | Token::CurrentTime
+        | Token::CurrentTimestamp
+        | Token::CurrentUser
+        | Token::Localtime
+        | Token::Localtimestamp
+        | Token::SessionUser
+        | Token::User => true,
+        _ => {
+            in_subscript
+                && matches!(
+                    token.keyword_kind(),
+                    KeywordKind::UnreservedKeyword
+                        | KeywordKind::ColNameKeyword
+                        | KeywordKind::TypeFuncNameKeyword
+                )
+        }
+    }
 }
 
 impl SqlParser {
@@ -77,7 +135,6 @@ impl SqlParser {
             // Query type is now optional - (?::([a-z]+))? makes the :type part optional
             annotation_regex: Regex::new(r"^--\s*name:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?::([a-z]+))?\s*$")
                 .unwrap(),
-            named_param_regex: Regex::new(r":([a-zA-Z_][a-zA-Z0-9_]*)").unwrap(),
         }
     }
 
@@ -142,9 +199,6 @@ impl SqlParser {
                     None
                 };
 
-                // Use explicit type or placeholder (Many) - will be replaced during introspection
-                let query_type = explicit_query_type.clone().unwrap_or(QueryType::Many);
-
                 let line_number = i + 1;
 
                 // Collect comment lines (for @pgrpc annotations) and SQL query lines
@@ -181,17 +235,28 @@ impl SqlParser {
                     ));
                 }
 
-                // Parse @pgrpc_not_null, @pgrpc_throws, and @pgrpc_nullable annotations from comments
-                let (not_null_annotations, throws_annotations, nullable_param_annotations) =
-                    self.parse_annotations(&comment_lines);
+                // Parse @pgrpc_not_null and @pgrpc_nullable annotations from comments
+                let (not_null_annotations, nullable_param_annotations) = self
+                    .parse_annotations(&comment_lines)
+                    .map_err(|e| {
+                        anyhow!("Query '{}' at {}:{}: {}", name, file_path.display(), line_number, e)
+                    })?;
 
                 // Transform parameters and extract specifications
-                let (postgres_sql, parameters) =
-                    self.transform_parameters(&original_sql, &nullable_param_annotations)?;
+                let (postgres_sql, parameters) = self
+                    .transform_parameters(&original_sql, &nullable_param_annotations)
+                    .map_err(|e| {
+                        anyhow!(
+                            "Query '{}' at {}:{}: {}",
+                            name,
+                            file_path.display(),
+                            line_number,
+                            e
+                        )
+                    })?;
 
                 queries.push(ParsedQuery {
                     name,
-                    query_type,
                     explicit_query_type,
                     original_sql,
                     postgres_sql,
@@ -199,7 +264,6 @@ impl SqlParser {
                     file_path: file_path.clone(),
                     line_number,
                     not_null_annotations,
-                    throws_annotations,
                     nullable_param_annotations,
                 });
             } else {
@@ -210,114 +274,169 @@ impl SqlParser {
         Ok(queries)
     }
 
-    /// Parse @pgrpc_not_null, @pgrpc_throws, and @pgrpc_nullable annotations from comment lines
+    /// Parse the `@pgrpc_not_null(cols)` and `@pgrpc_nullable(params)`
+    /// annotations in a query's comment lines. Anything else tagged `@pgrpc_`
+    /// is an error.
     fn parse_annotations(
         &self,
         comment_lines: &[&str],
-    ) -> (HashSet<String>, Vec<String>, HashSet<String>) {
-        let mut not_null_annotations = HashSet::new();
-        let mut throws_annotations = Vec::new();
-        let mut nullable_param_annotations = HashSet::new();
-
-        for line in comment_lines {
-            // Parse @pgrpc_not_null(col1, col2, ...)
-            not_null_annotations.extend(annotations::parse_not_null(line));
-
-            // Parse @pgrpc_throws XXXXX
-            throws_annotations.extend(annotations::parse_throws(line));
-
-            // Parse @pgrpc_nullable(param1, param2, ...)
-            nullable_param_annotations.extend(annotations::parse_nullable(line));
+    ) -> Result<(HashSet<String>, HashSet<String>)> {
+        let comment = comment_lines.join("\n");
+        let (parsed, mut problems) = annotations::parse(&comment);
+        problems.extend(parsed.misplaced(annotations::Site::Query));
+        if !problems.is_empty() {
+            return Err(anyhow!("{}", problems.join("; ")));
         }
-
-        (not_null_annotations, throws_annotations, nullable_param_annotations)
+        Ok((
+            parsed.not_null.into_iter().collect(),
+            parsed.nullable.into_iter().collect(),
+        ))
     }
 
     /// Transform named parameters (:param) to positional ($N) and extract parameter specs.
     /// Parameters in `nullable_annotations` will be marked as nullable.
+    ///
+    /// Works on the token stream rather than the raw text, so that only real
+    /// parameters are rewritten: a `:word` or `$N` inside a string literal
+    /// (`'HH24:MI:SS'`), a quoted identifier, a dollar-quoted body or a comment
+    /// is left alone, `::` is a cast, and `arr[1:n]` is a slice.
+    ///
+    /// Named parameters are numbered in order of first appearance. `$N` and
+    /// `$N?` (nullable) are kept as written; a query may mix the two styles
+    /// only if the explicit numbers don't land on a number a named parameter
+    /// was given.
     fn transform_parameters(
         &self,
         sql: &str,
         nullable_annotations: &HashSet<String>,
     ) -> Result<(String, Vec<ParameterSpec>)> {
-        let mut position = 1;
-        let mut parameters = Vec::new();
-        let mut seen_params: std::collections::HashMap<String, (usize, bool)> =
-            std::collections::HashMap::new();
+        let scan = pg_query::scan(sql).map_err(|e| anyhow!("failed to tokenize SQL: {}", e))?;
+        // Comments carry no meaning for what precedes or follows a token.
+        let tokens: Vec<&ScanToken> = scan
+            .tokens
+            .iter()
+            .filter(|t| !matches!(t.token(), Token::SqlComment | Token::CComment))
+            .collect();
+        let text = |t: &ScanToken| &sql[t.start as usize..t.end as usize];
 
-        // Temporarily replace :: (type cast operator) with a placeholder to avoid matching it.
-        // The placeholder MUST contain a character that is not part of `[a-zA-Z0-9_]`, otherwise
-        // the named-parameter regex will greedily extend across it and swallow the cast type
-        // (e.g. `:xs::bigint[]` -> `:xs<placeholder>bigint[]` would match `:xs<placeholder>bigint`
-        // as a single param name when the placeholder contains only word characters).
-        const TYPECAST_PLACEHOLDER: &str = "\x01PGRPC_TYPECAST\x01";
-        let sql_with_placeholder = sql.replace("::", TYPECAST_PLACEHOLDER);
+        // Named parameters in order of first appearance; position = index + 1.
+        let mut named: Vec<String> = Vec::new();
+        // Explicit `$N` parameters -> whether any occurrence was `$N?`.
+        let mut positional: BTreeMap<usize, bool> = BTreeMap::new();
 
-        // Process named parameters (:param_name)
-        let sql_after_named = self.named_param_regex.replace_all(&sql_with_placeholder, |caps: &regex::Captures| {
-            let param_name = caps[1].to_string();
+        let mut out = String::with_capacity(sql.len());
+        let mut copied = 0usize; // bytes of `sql` already written to `out`
+        let mut open: Vec<Token> = Vec::new(); // unclosed `(` / `[`
 
-            // Check if we've seen this parameter name before
-            if let Some(&(existing_pos, _)) = seen_params.get(&param_name) {
-                // Reuse the same position for duplicate parameter names
-                format!("${}", existing_pos)
-            } else {
-                // Check if this parameter is marked nullable via @pgrpc_nullable annotation
-                let is_nullable = nullable_annotations.contains(&param_name);
+        let mut i = 0;
+        while i < tokens.len() {
+            let token = tokens[i];
+            let next = tokens
+                .get(i + 1)
+                .filter(|next| next.start == token.end)
+                .copied();
 
-                // New parameter, assign a position
-                seen_params.insert(param_name.clone(), (position, is_nullable));
-                parameters.push(ParameterSpec::Named {
-                    name: param_name,
-                    position,
-                    nullable: is_nullable,
-                });
-
-                let replacement = format!("${}", position);
-                position += 1;
-                replacement
-            }
-        }).to_string();
-
-        // Check for any existing $N or $N? parameters in the ORIGINAL SQL
-        let positional_regex = Regex::new(r"\$(\d+)(\?)?").unwrap();
-        let mut positional_params: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
-
-        for cap in positional_regex.captures_iter(sql) {
-            let num: usize = cap[1].parse().unwrap();
-            let nullable = cap.get(2).is_some();
-            positional_params.insert(num, nullable);
-        }
-
-        // Transform $N? to $N in the SQL
-        let sql_after_positional = Regex::new(r"\$(\d+)\?").unwrap().replace_all(&sql_after_named, "$$1").to_string();
-
-        // Restore :: type cast operator
-        let final_sql = sql_after_positional.replace(TYPECAST_PLACEHOLDER, "::");
-
-        // Add positional parameters that weren't already handled as named parameters
-        for (&num, &nullable) in &positional_params {
-            // Check if this position is already covered by a named parameter
-            if !parameters.iter().any(|p| matches!(p, ParameterSpec::Named { position: pos, .. } if *pos == num)) {
-                // This is a bare positional parameter, add it
-                while parameters.len() < num {
-                    let pos = parameters.len() + 1;
-                    if !parameters.iter().any(|p| match p {
-                        ParameterSpec::Named { position, .. } => *position == pos,
-                        ParameterSpec::Positional { position, .. } => *position == pos,
-                    }) {
-                        // Use the nullable flag if we have it, otherwise default to false
-                        let is_nullable = positional_params.get(&pos).copied().unwrap_or(false);
-                        parameters.push(ParameterSpec::Positional {
-                            position: pos,
-                            nullable: is_nullable,
-                        });
+            match token.token() {
+                Token::Ascii40 | Token::Ascii91 => open.push(token.token()),
+                Token::Ascii41 | Token::Ascii93 => {
+                    open.pop();
+                }
+                Token::Ascii58 => {
+                    let in_subscript = open.last() == Some(&Token::Ascii91);
+                    let after_expression = i
+                        .checked_sub(1)
+                        .is_some_and(|prev| ends_expression(tokens[prev], in_subscript));
+                    if let Some(name_token) = next.filter(|n| is_param_name(text(n))) {
+                        if !after_expression {
+                            let name = text(name_token);
+                            let position = match named.iter().position(|n| n == name) {
+                                Some(index) => index + 1,
+                                None => {
+                                    named.push(name.to_string());
+                                    named.len()
+                                }
+                            };
+                            out.push_str(&sql[copied..token.start as usize]);
+                            out.push_str(&format!("${}", position));
+                            copied = name_token.end as usize;
+                            i += 2;
+                            continue;
+                        }
                     }
                 }
+                Token::Param => {
+                    let written = text(token);
+                    let number = written[1..]
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| (1..=MAX_PARAMETERS).contains(n))
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "invalid parameter '{}': parameter numbers run from $1 to ${}",
+                                written,
+                                MAX_PARAMETERS
+                            )
+                        })?;
+                    // `$N?` marks the parameter nullable; the `?` is ours, not SQL.
+                    let marker = next.filter(|n| n.token() == Token::Op && text(n) == "?");
+                    *positional.entry(number).or_insert(false) |= marker.is_some();
+                    if let Some(marker) = marker {
+                        out.push_str(&sql[copied..marker.start as usize]);
+                        copied = marker.end as usize;
+                        i += 2;
+                        continue;
+                    }
+                }
+                _ => {}
             }
+            i += 1;
+        }
+        out.push_str(&sql[copied..]);
+
+        // A named parameter was numbered without regard to the explicit `$N`s.
+        // If one of those has the same number, the two would silently become
+        // one parameter.
+        if let Some((&number, _)) = positional.iter().find(|(&n, _)| n <= named.len()) {
+            return Err(anyhow!(
+                "positional parameter ${} collides with named parameter :{}, which is also \
+                 numbered ${}. Use only named or only positional parameters, or number the \
+                 positional ones after the {} named one(s)",
+                number,
+                named[number - 1],
+                number,
+                named.len()
+            ));
         }
 
-        Ok((final_sql, parameters))
+        if let Some(unknown) = nullable_annotations.iter().find(|n| !named.contains(n)) {
+            return Err(anyhow!(
+                "@pgrpc_nullable names `{}`, which is not a parameter of the query",
+                unknown
+            ));
+        }
+
+        let count = positional
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0)
+            .max(named.len());
+        let parameters = (1..=count)
+            .map(|position| match named.get(position - 1) {
+                Some(name) => ParameterSpec::Named {
+                    name: name.clone(),
+                    position,
+                    nullable: nullable_annotations.contains(name),
+                },
+                // A number that never appears still occupies its position.
+                None => ParameterSpec::Positional {
+                    position,
+                    nullable: positional.get(&position).copied().unwrap_or(false),
+                },
+            })
+            .collect();
+
+        Ok((out, parameters))
     }
 }
 
@@ -350,11 +469,11 @@ DELETE FROM authors WHERE id = :author_id;
         assert_eq!(queries.len(), 3);
 
         assert_eq!(queries[0].name, "GetAuthor");
-        assert_eq!(queries[0].query_type, QueryType::One);
+        assert_eq!(queries[0].explicit_query_type, Some(QueryType::One));
         assert_eq!(queries[1].name, "ListAuthors");
-        assert_eq!(queries[1].query_type, QueryType::Many);
+        assert_eq!(queries[1].explicit_query_type, Some(QueryType::Many));
         assert_eq!(queries[2].name, "DeleteAuthor");
-        assert_eq!(queries[2].query_type, QueryType::Exec);
+        assert_eq!(queries[2].explicit_query_type, Some(QueryType::Exec));
     }
 
     #[test]
@@ -371,7 +490,7 @@ DELETE FROM authors WHERE id = :author_id;
             ParameterSpec::Named { name, position, nullable } => {
                 assert_eq!(name, "user_id");
                 assert_eq!(*position, 1);
-                assert_eq!(*nullable, false);
+                assert!(!*nullable);
             }
             _ => panic!("Expected named parameter"),
         }
@@ -380,7 +499,7 @@ DELETE FROM authors WHERE id = :author_id;
             ParameterSpec::Named { name, position, nullable } => {
                 assert_eq!(name, "status");
                 assert_eq!(*position, 2);
-                assert_eq!(*nullable, false);
+                assert!(!*nullable);
             }
             _ => panic!("Expected named parameter"),
         }
@@ -460,7 +579,7 @@ RETURNING *;
             match param {
                 ParameterSpec::Positional { position, nullable } => {
                     assert_eq!(*position, i + 1);
-                    assert_eq!(*nullable, false);
+                    assert!(!*nullable);
                 }
                 _ => panic!("Expected positional parameter"),
             }
@@ -482,7 +601,7 @@ RETURNING *;
             ParameterSpec::Named { name, position, nullable } => {
                 assert_eq!(name, "user_id");
                 assert_eq!(*position, 1);
-                assert_eq!(*nullable, false);
+                assert!(!*nullable);
             }
             _ => panic!("Expected named parameter"),
         }
@@ -505,7 +624,7 @@ RETURNING *;
             ParameterSpec::Named { name, position, nullable } => {
                 assert_eq!(name, "user_id");
                 assert_eq!(*position, 1);
-                assert_eq!(*nullable, false);
+                assert!(!*nullable);
             }
             _ => panic!("Expected named parameter"),
         }
@@ -514,7 +633,7 @@ RETURNING *;
             ParameterSpec::Named { name, position, nullable } => {
                 assert_eq!(name, "email");
                 assert_eq!(*position, 2);
-                assert_eq!(*nullable, true);
+                assert!(*nullable);
             }
             _ => panic!("Expected named parameter"),
         }
@@ -533,7 +652,7 @@ RETURNING *;
         match &params[0] {
             ParameterSpec::Positional { position, nullable } => {
                 assert_eq!(*position, 1);
-                assert_eq!(*nullable, true);
+                assert!(*nullable);
             }
             _ => panic!("Expected positional parameter"),
         }
@@ -541,7 +660,7 @@ RETURNING *;
         match &params[1] {
             ParameterSpec::Positional { position, nullable } => {
                 assert_eq!(*position, 2);
-                assert_eq!(*nullable, false);
+                assert!(!*nullable);
             }
             _ => panic!("Expected positional parameter"),
         }
@@ -564,7 +683,7 @@ RETURNING *;
             ParameterSpec::Named { name, position, nullable } => {
                 assert_eq!(name, "user_id");
                 assert_eq!(*position, 1);
-                assert_eq!(*nullable, true);
+                assert!(*nullable);
             }
             _ => panic!("Expected named parameter"),
         }
@@ -572,7 +691,7 @@ RETURNING *;
         match &params[1] {
             ParameterSpec::Positional { position, nullable } => {
                 assert_eq!(*position, 2);
-                assert_eq!(*nullable, false);
+                assert!(!*nullable);
             }
             _ => panic!("Expected positional parameter"),
         }
@@ -594,9 +713,9 @@ SELECT * FROM users WHERE id = :id;
         assert_eq!(queries.len(), 2);
 
         assert_eq!(queries[0].name, "FindUserByEmail");
-        assert_eq!(queries[0].query_type, QueryType::Opt);
+        assert_eq!(queries[0].explicit_query_type, Some(QueryType::Opt));
         assert_eq!(queries[1].name, "GetUserRequired");
-        assert_eq!(queries[1].query_type, QueryType::One);
+        assert_eq!(queries[1].explicit_query_type, Some(QueryType::One));
     }
 
     #[test]
@@ -605,13 +724,11 @@ SELECT * FROM users WHERE id = :id;
 
         let content = r#"
 -- name: CreateUser :one
--- @pgrpc_not_null(id, created_at)
--- @pgrpc_throws 23505
+-- @pgrpc_not_null(id)
+-- @pgrpc_not_null(created_at)
 INSERT INTO users (email, name) VALUES (:email, :name) RETURNING *;
 
 -- name: UpdateUser :exec
--- @pgrpc_throws P0001
--- @pgrpc_throws 23503
 UPDATE users SET name = :name WHERE id = :id;
         "#;
 
@@ -623,12 +740,29 @@ UPDATE users SET name = :name WHERE id = :id;
         assert!(queries[0].not_null_annotations.contains("id"));
         assert!(queries[0].not_null_annotations.contains("created_at"));
         assert_eq!(queries[0].not_null_annotations.len(), 2);
-        assert_eq!(queries[0].throws_annotations, vec!["23505"]);
 
         // Check second query annotations
         assert_eq!(queries[1].name, "UpdateUser");
         assert!(queries[1].not_null_annotations.is_empty());
-        assert_eq!(queries[1].throws_annotations, vec!["P0001", "23503"]);
+    }
+
+    #[test]
+    fn bad_query_annotations_are_errors() {
+        let parser = SqlParser::new();
+        for (annotation, expected) in [
+            ("@pgrpc_throws 23505", "has been removed"),
+            ("@pgrpc_not_nul(id)", "unknown annotation"),
+            ("@pgrpc_not_null", "does not apply to a query"),
+            ("@pgrpc_nullable(nope)", "not a parameter"),
+        ] {
+            let content = format!("-- name: GetUser :one\n-- {annotation}\nSELECT * FROM users WHERE id = :id;");
+            let err = parser
+                .parse_content(&content, PathBuf::from("test.sql"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{annotation}: {err}");
+            assert!(err.contains("GetUser"), "{err}");
+        }
     }
 
     #[test]
@@ -712,16 +846,176 @@ INSERT INTO users (name) VALUES (:name) RETURNING *;
         // First query - no explicit type, should have None for explicit_query_type
         assert_eq!(queries[0].name, "InferredQuery");
         assert!(queries[0].explicit_query_type.is_none());
-        // Default placeholder is Many when not specified
-        assert_eq!(queries[0].query_type, QueryType::Many);
 
         // Second query - explicit :one type
         assert_eq!(queries[1].name, "ExplicitOneQuery");
         assert_eq!(queries[1].explicit_query_type, Some(QueryType::One));
-        assert_eq!(queries[1].query_type, QueryType::One);
 
         // Third query - no explicit type
         assert_eq!(queries[2].name, "InferredInsert");
         assert!(queries[2].explicit_query_type.is_none());
+    }
+
+    fn transform(sql: &str) -> (String, Vec<String>) {
+        let (transformed, params) = SqlParser::new()
+            .transform_parameters(sql, &HashSet::new())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let names = params
+            .iter()
+            .map(|p| match p {
+                ParameterSpec::Named { name, .. } => name.clone(),
+                ParameterSpec::Positional { position, .. } => format!("${position}"),
+            })
+            .collect();
+        (transformed, names)
+    }
+
+    #[test]
+    fn test_colon_inside_string_literal_is_not_a_parameter() {
+        let sql = "SELECT to_char(ts, 'HH24:MI:SS'), E'a:b', $$ :c $1 $$, $tag$ :d $tag$ FROM t WHERE id = :id";
+        let (transformed, names) = transform(sql);
+        assert_eq!(
+            transformed,
+            "SELECT to_char(ts, 'HH24:MI:SS'), E'a:b', $$ :c $1 $$, $tag$ :d $tag$ FROM t WHERE id = $1"
+        );
+        assert_eq!(names, vec!["id"]);
+    }
+
+    #[test]
+    fn test_positional_inside_string_literal_is_not_a_parameter() {
+        let (transformed, names) = transform("SELECT 'costs $5', '$2?' WHERE a = $1");
+        assert_eq!(transformed, "SELECT 'costs $5', '$2?' WHERE a = $1");
+        assert_eq!(names, vec!["$1"]);
+    }
+
+    #[test]
+    fn test_colon_inside_quoted_identifier_is_not_a_parameter() {
+        let (transformed, names) = transform(r#"SELECT "a:b" FROM t WHERE "x:y" = :val"#);
+        assert_eq!(transformed, r#"SELECT "a:b" FROM t WHERE "x:y" = $1"#);
+        assert_eq!(names, vec!["val"]);
+    }
+
+    #[test]
+    fn test_colon_inside_comment_is_not_a_parameter() {
+        let sql = "SELECT a -- pick :one of $3\n, b /* or :two */ FROM t WHERE id = :id";
+        let (transformed, names) = transform(sql);
+        assert_eq!(
+            transformed,
+            "SELECT a -- pick :one of $3\n, b /* or :two */ FROM t WHERE id = $1"
+        );
+        assert_eq!(names, vec!["id"]);
+    }
+
+    #[test]
+    fn test_array_slice_is_not_a_parameter() {
+        // A colon directly after an expression is a slice separator.
+        for sql in [
+            "SELECT arr[1:n] FROM t",
+            "SELECT arr[lo:hi] FROM t",
+            "SELECT arr[1 :n] FROM t",
+            "SELECT (arr)[f(x):n] FROM t",
+            "SELECT arr[a[1]:n] FROM t",
+            "SELECT arr[$1:n] FROM t",
+            // `start` is a keyword, but in a subscript it is a column.
+            "SELECT arr[start:n] FROM t",
+        ] {
+            let (transformed, names) = transform(sql);
+            assert_eq!(transformed, sql);
+            let expected: Vec<String> = if sql.contains("$1") { vec!["$1".into()] } else { vec![] };
+            assert_eq!(names, expected, "{sql}");
+        }
+
+        // Parameters as slice bounds: after `[`, after the separator, or parenthesized.
+        let (transformed, names) = transform("SELECT arr[:lo::int : :hi], arr[1:(:n)], arr[1: :m] FROM t");
+        assert_eq!(transformed, "SELECT arr[$1::int : $2], arr[1:($3)], arr[1: $4] FROM t");
+        assert_eq!(names, vec!["lo", "hi", "n", "m"]);
+    }
+
+    #[test]
+    fn test_named_parameter_contexts() {
+        let sql = "SELECT :a, f(:b), -:c, x = :d, y IN (:e, :f) FROM t \
+                   WHERE z BETWEEN :g AND :h AND w LIKE :i ORDER BY :j LIMIT :k OFFSET :a";
+        let (transformed, names) = transform(sql);
+        assert_eq!(
+            transformed,
+            "SELECT $1, f($2), -$3, x = $4, y IN ($5, $6) FROM t \
+             WHERE z BETWEEN $7 AND $8 AND w LIKE $9 ORDER BY $10 LIMIT $11 OFFSET $1"
+        );
+        assert_eq!(names.len(), 11);
+    }
+
+    #[test]
+    fn test_keyword_named_parameters() {
+        // Parameter names that happen to be SQL keywords.
+        let (transformed, names) =
+            transform("SELECT * FROM t WHERE name = :name AND type = :type LIMIT :limit");
+        assert_eq!(transformed, "SELECT * FROM t WHERE name = $1 AND type = $2 LIMIT $3");
+        assert_eq!(names, vec!["name", "type", "limit"]);
+    }
+
+    #[test]
+    fn test_colon_equals_and_json_key_separator() {
+        let (transformed, names) = transform("SELECT f(a := :x), json_object('k' : :v, k2 : v2)");
+        assert_eq!(transformed, "SELECT f(a := $1), json_object('k' : $2, k2 : v2)");
+        assert_eq!(names, vec!["x", "v"]);
+    }
+
+    #[test]
+    fn test_oversized_positional_parameter_is_an_error() {
+        let parser = SqlParser::new();
+        for sql in [
+            "SELECT $99999999999999999999999",
+            "SELECT $65536",
+            "SELECT $0",
+        ] {
+            let err = parser
+                .transform_parameters(sql, &HashSet::new())
+                .expect_err(sql);
+            assert!(err.to_string().contains("invalid parameter"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_named_and_positional_collision_is_an_error() {
+        let parser = SqlParser::new();
+        // `:id` is numbered $1, the same as the explicit $1.
+        let err = parser
+            .transform_parameters("SELECT * FROM t WHERE a = $1 AND b = :id", &HashSet::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("collides"), "{err}");
+        assert!(err.to_string().contains(":id"), "{err}");
+
+        // Reported with the query's name and location.
+        let content = "-- name: Clash :many\nSELECT * FROM t WHERE a = :x AND b = :y AND c = $2;\n";
+        let err = parser
+            .parse_content(content, PathBuf::from("clash.sql"))
+            .unwrap_err();
+        assert!(err.to_string().contains("Clash"), "{err}");
+        assert!(err.to_string().contains("clash.sql:1"), "{err}");
+    }
+
+    #[test]
+    fn test_positional_gap_keeps_positions() {
+        let (_, names) = transform("SELECT $3::int, $1?::text");
+        assert_eq!(names, vec!["$1", "$2", "$3"]);
+
+        let (_, params) = SqlParser::new()
+            .transform_parameters("SELECT $3::int, $1?::text, $1", &HashSet::new())
+            .unwrap();
+        let nullable: Vec<bool> = params
+            .iter()
+            .map(|p| match p {
+                ParameterSpec::Positional { nullable, .. } => *nullable,
+                ParameterSpec::Named { nullable, .. } => *nullable,
+            })
+            .collect();
+        assert_eq!(nullable, vec![true, false, false]);
+    }
+
+    #[test]
+    fn test_query_type_from_str() {
+        assert_eq!("one".parse::<QueryType>().unwrap(), QueryType::One);
+        assert_eq!("execrows".parse::<QueryType>().unwrap(), QueryType::ExecRows);
+        assert!("several".parse::<QueryType>().is_err());
     }
 }

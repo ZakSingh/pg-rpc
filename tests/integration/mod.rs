@@ -11,7 +11,7 @@ use uuid::Uuid;
 ///
 /// Used for two cleanup paths:
 ///   * Startup scrub — removes any containers left behind by a previous run that exited
-///     abnormally (panic in `main`, SIGINT, OOM kill, etc.).
+///     abnormally (panic in `main`, SIGINT, OOM kill, etc.), i.e. whose pid is gone.
 ///   * `libc::atexit` hook — removes the container started by the current run, since
 ///     storing it in a `static` means its `Drop` never fires.
 const HARNESS_LABEL: &str = "pgrpc-test-harness=1";
@@ -47,6 +47,17 @@ pub mod view_nullability_tests;
 pub mod view_query_nullability_test;
 pub mod workflow_tests;
 pub mod prepared_cache_bench;
+pub mod constraint_scope_tests;
+pub mod function_signature_tests;
+pub mod group_field_dedupe_tests;
+pub mod ident_sanitizer_tests;
+pub mod query_runtime_tests;
+pub mod run_helpers;
+pub mod search_path_tests;
+pub mod shared_modules_tests;
+pub mod tsvector_roundtrip_tests;
+pub mod type_mapping_tests;
+pub mod view_optional_group_tests;
 
 /// Global container instance that's shared across all tests
 static INIT: Once = Once::new();
@@ -127,35 +138,62 @@ impl PostgresTestContainer {
     }
 }
 
-/// Remove every container tagged with [`HARNESS_LABEL`], together with its anonymous
-/// data volume (`-v`); without that flag each removed container strands a volume.
+/// Remove harness containers (named `pgrpc-test-<pid>`, tagged [`HARNESS_LABEL`]) together
+/// with their anonymous data volumes (`-v`); without that flag each removed container
+/// strands a volume.
+///
+/// Only containers selected by `should_remove(owner_pid)` are touched, so a test run in
+/// another checkout keeps its database.
 ///
 /// Idempotent and best-effort: failures (Docker not running, no matches, etc.) are
 /// silently ignored. The caller never needs to care whether anything was actually removed.
-fn scrub_labeled_containers() {
-    // `docker ps -aq --filter label=...` prints one container ID per line, or nothing.
+fn scrub_labeled_containers(should_remove: impl Fn(u32) -> bool) {
+    // One container name per line, or nothing.
     let list = match Command::new("docker")
-        .args(["ps", "-aq", "--filter", &format!("label={}", HARNESS_LABEL)])
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={}", HARNESS_LABEL),
+            "--format",
+            "{{.Names}}",
+        ])
         .output()
     {
         Ok(o) if o.status.success() => o.stdout,
         _ => return,
     };
-    let ids: Vec<&str> = std::str::from_utf8(&list)
+    let names: Vec<&str> = std::str::from_utf8(&list)
         .unwrap_or("")
         .split_whitespace()
+        .filter(|name| {
+            name.strip_prefix("pgrpc-test-")
+                .and_then(|pid| pid.parse::<u32>().ok())
+                // A container we can't attribute to a process is treated as stale.
+                .is_none_or(&should_remove)
+        })
         .collect();
-    if ids.is_empty() {
+    if names.is_empty() {
         return;
     }
-    let _ = Command::new("docker").args(["rm", "-f", "-v"]).args(&ids).output();
+    let _ = Command::new("docker")
+        .args(["rm", "-f", "-v"])
+        .args(&names)
+        .output();
+}
+
+/// True if a process with this pid exists (signal 0 probes without delivering).
+fn process_is_alive(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 has no effect beyond the existence check.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 /// `atexit` callback. Runs on normal process termination (`main` returns, `exit()` is
 /// called, all `#[test]`s finish). Will not run on SIGKILL or `std::process::abort` —
 /// the startup scrub catches those cases on the next run.
 extern "C" fn cleanup_on_exit() {
-    scrub_labeled_containers();
+    let own_pid = std::process::id();
+    scrub_labeled_containers(|pid| pid == own_pid);
 }
 
 /// Get the shared test container instance.
@@ -166,7 +204,9 @@ extern "C" fn cleanup_on_exit() {
 pub fn get_test_container() -> &'static PostgresTestContainer {
     INIT.call_once(|| {
         // Sweep up anything left over from a previous run that didn't shut down cleanly.
-        scrub_labeled_containers();
+        // Containers whose owning test process is still running belong to a concurrent
+        // run and are left alone.
+        scrub_labeled_containers(|pid| !process_is_alive(pid));
 
         // SAFETY: `libc::atexit` only requires the callback to be a valid `extern "C" fn`,
         // which it is. The callback runs without any Rust runtime invariants to preserve.
@@ -264,12 +304,12 @@ where
     setup_test_schema(&mut client).expect("Failed to setup test schema");
 
     // Run the test
-    let result = test_fn(&mut client);
+    
 
     // Note: Database will be cleaned up when container shuts down
     // No explicit cleanup needed since each test gets its own database
 
-    result
+    test_fn(&mut client)
 }
 
 /// Create a test database connection with isolated database and provide container access
@@ -293,13 +333,13 @@ where
     setup_test_schema(&mut client).expect("Failed to setup test schema");
 
     // Run the test with access to client, container, and connection string
-    let result = test_fn(
+    
+
+    test_fn(
         &mut client,
         container,
         &container.database_connection_string(&db_name),
-    );
-
-    result
+    )
 }
 
 #[cfg(test)]

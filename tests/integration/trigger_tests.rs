@@ -615,3 +615,110 @@ fn test_trigger_exception_error_codes() {
         // (The specific mapping depends on the unified error implementation)
     });
 }
+
+/// Triggers on views (`INSTEAD OF`), on partitioned tables, and
+/// statement-level triggers all fail the statement that fires them.
+#[test]
+fn triggers_on_views_and_partitioned_tables_are_indexed() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        execute_sql(
+            client,
+            indoc! {"
+            CREATE SCHEMA trg;
+            CREATE SCHEMA trg_api;
+
+            CREATE TABLE trg.doc (
+                id INT PRIMARY KEY,
+                title TEXT CONSTRAINT doc_title_present CHECK (length(title) > 0)
+            );
+
+            -- Not auto-updatable (a join): writable only through the trigger.
+            CREATE VIEW trg.doc_summary AS
+                SELECT d.id, upper(d.title) AS title
+                FROM trg.doc d JOIN trg.doc d2 ON d2.id = d.id;
+
+            CREATE FUNCTION trg.doc_summary_insert() RETURNS TRIGGER
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.title IS NULL THEN
+                    RAISE EXCEPTION 'title required' USING ERRCODE = 'P0801';
+                END IF;
+                INSERT INTO trg.doc (id, title) VALUES (NEW.id, NEW.title);
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER doc_summary_insert INSTEAD OF INSERT ON trg.doc_summary
+                FOR EACH ROW EXECUTE FUNCTION trg.doc_summary_insert();
+
+            CREATE TABLE trg.log (id INT, at DATE NOT NULL) PARTITION BY RANGE (at);
+            CREATE TABLE trg.log_2024 PARTITION OF trg.log
+                FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+            CREATE FUNCTION trg.log_guard() RETURNS TRIGGER
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'log is read-only' USING ERRCODE = 'P0802';
+            END $$;
+            CREATE TRIGGER log_guard BEFORE INSERT ON trg.log
+                FOR EACH ROW EXECUTE FUNCTION trg.log_guard();
+
+            CREATE FUNCTION trg.doc_delete_guard() RETURNS TRIGGER
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'no bulk deletes' USING ERRCODE = 'P0803';
+            END $$;
+            CREATE TRIGGER doc_delete_guard AFTER DELETE ON trg.doc
+                FOR EACH STATEMENT EXECUTE FUNCTION trg.doc_delete_guard();
+
+            CREATE FUNCTION trg_api.add_summary(p_id INT, p_title TEXT) RETURNS VOID
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                INSERT INTO trg.doc_summary (id, title) VALUES (p_id, p_title);
+            END $$;
+
+            CREATE FUNCTION trg_api.add_log(p_id INT, p_at DATE) RETURNS VOID
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                INSERT INTO trg.log (id, at) VALUES (p_id, p_at);
+            END $$;
+
+            CREATE FUNCTION trg_api.clear_docs() RETURNS VOID
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                DELETE FROM trg.doc;
+            END $$;
+        "},
+        )
+        .expect("setup");
+
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("generated");
+        PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .schema("trg_api")
+            .output_path(&output_path)
+            .build()
+            .expect("build");
+        let api = read_pretty(output_path.join("trg_api.rs"));
+
+        let enum_block = |name: &str| -> String {
+            let start = api
+                .find(&format!("pub enum {name} {{"))
+                .unwrap_or_else(|| panic!("enum {name} not found"));
+            let end = api[start..].find("\n}\n").unwrap() + start;
+            api[start..end].to_string()
+        };
+
+        // INSTEAD OF trigger on a view: its raise, and the table it writes.
+        let add_summary = enum_block("AddSummaryError");
+        assert!(add_summary.contains("P0801("), "{add_summary}");
+        assert!(add_summary.contains("DocConstraint("), "{add_summary}");
+
+        // Row trigger declared on a partitioned table.
+        let add_log = enum_block("AddLogError");
+        assert!(add_log.contains("P0802("), "{add_log}");
+
+        // Statement-level AFTER trigger.
+        let clear_docs = enum_block("ClearDocsError");
+        assert!(clear_docs.contains("P0803("), "{clear_docs}");
+    });
+}

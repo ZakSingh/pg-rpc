@@ -196,8 +196,8 @@ fn get_expected_nullability() -> HashMap<&'static str, Vec<(&'static str, bool)>
             ("always_number", true),   // Number literal
             ("always_true", true),     // Boolean literal
             ("always_false", true),    // Boolean literal
-            ("always_null", true),     // NULL literal - detected as constant (non-null)
-            ("maybe_null_case", true), // CASE without ELSE - conservatively non-null
+            ("always_null", false),    // NULL literal
+            ("maybe_null_case", false), // CASE without ELSE yields NULL when no branch matches
             ("never_null_case", true), // CASE with ELSE
             ("int_array", true),       // Array constructor
             ("empty_array", true),     // Empty array literal

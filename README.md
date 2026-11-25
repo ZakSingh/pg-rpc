@@ -117,6 +117,119 @@ pgrpc generates separate files for each schema, which provides:
 
 This is especially beneficial for large databases with many schemas and functions.
 
+## Configuration reference
+
+All keys of `pgrpc.toml` (each has a matching `PgrpcBuilder` method). Unknown keys are
+rejected, so a typo fails loudly instead of being ignored.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `connection_string` | `DATABASE_URL` env var | Database to introspect |
+| `output_path` | required (or `-o`) | Directory for the generated files |
+| `schemas` | required | Schemas to generate bindings for. Every user schema is still *analyzed*, so calls into helpers elsewhere are followed |
+| `infer_view_nullability` | `true` | Infer NOT NULL for view columns, query results and SQL-function `OUT` columns |
+| `disable_deserialize` | `[]` | `"schema.type"` names that should not derive `serde::Deserialize` |
+| `strict_domains` | `[]` | `"schema.domain"` names generated as validated newtypes (see [Strict domain types](#strict-domain-types)) |
+| `builders` | `[]` | `"schema.type"` names of composite types and views that also derive `bon::Builder` |
+| `[types]` | | Map a Postgres type name to a Rust type path, e.g. `ltree = "String"` |
+| `[exceptions]` | | Name a SQLSTATE: `P0001 = "Custom application error"` |
+| `[queries] paths` | | Glob patterns of SQL query files (see [SQL Query Files](#sql-query-files)) |
+| `[task_queue]` | | `schema`, `task_name_column`, `payload_column`, optional `table_schema`/`table_name` (see [Task Queue Integration](#task-queue-integration)) |
+| `[errors]` | | `schema` and optional `raise_function` (see [Typed errors](#typed-errors)) |
+| `[tracing] enabled` | `false` | Wrap generated functions in `tracing` spans named `schema.function` / `queries.name`. Arguments are never recorded. Requires `tracing = "0.1"` |
+
+A schema whose module name collides with a module pgrpc generates itself (`errors`,
+`nullable`, `composite`, `schema_cache`, `tsvector`, `datetime_serde`, and `tasks` /
+`queries` / `custom_errors` when those features are on) is rejected, as are two schemas
+that map to the same module name. The generated modules refer to each other as
+`super::<module>`, so keep them together in one directory.
+
+Unqualified table, view and function names in analyzed SQL are resolved along the
+connection's `search_path`, as Postgres does. A function's own `SET search_path` clause is
+not taken into account.
+
+### Annotations
+
+Annotations go in `COMMENT ON ...` text (or in `--` comment lines above a query in a
+query file):
+
+| Annotation | Where | Effect |
+|---|---|---|
+| `@pgrpc_not_null` | view column, composite attribute, function returning a single value | This column / the return value is never NULL |
+| `@pgrpc_not_null(a, b)` | view, composite type, function (`OUT` / `TABLE` params), query | The named columns are never NULL |
+| `@pgrpc_not_null(*)` | standalone composite type | Every attribute is never NULL |
+| `@pgrpc_nullable` | composite attribute | Exception to the type's `@pgrpc_not_null(*)` |
+| `@pgrpc_nullable(a, b)` | query; composite type | Query: make the named parameters `Option<T>`. Type: exceptions to its `@pgrpc_not_null(*)` |
+| `@pgrpc_message`, `@pgrpc_field(...)` | constraint, error payload type | User-facing message (see [User-facing constraint messages](#user-facing-constraint-messages)) |
+
+The rule for the two forms: bare means "this object", a list names its children.
+
+Annotations state facts about the database that pgrpc cannot see for itself.
+Preferences about the generated Rust (`strict_domains`, `builders`,
+`disable_deserialize`, `[types]`) live in the config instead.
+
+Annotations are checked. Generation fails, listing every problem and where it
+is, on a tag that is unknown (`@pgrpc_not_nul`), malformed, on an object where it
+means nothing (bare `@pgrpc_not_null` on a set-returning function), or that names
+something that does not exist (a column the type does not have, a parameter the
+query does not take). This covers functions in every analyzed schema, not only
+the ones bindings are generated for.
+
+`@pgrpc_not_null` is trusted, not verified: a wrong annotation surfaces as a decode
+error at runtime. pgrpc warns at generation time in the one case it can prove wrong, a
+column that comes from the nullable side of an outer join.
+
+It also warns when an annotation is redundant, that is, when the analysis already
+proves the view column, SQL-function `OUT` column or query column NOT NULL. A
+redundant annotation changes nothing today and would hide a later schema change
+that makes it wrong, so delete it. The run prints the number of redundant
+annotations; `RUST_LOG=pgrpc=warn` lists each one.
+
+### Dependencies of the generated code
+
+The generated modules expect these crates in the consuming crate:
+
+```toml
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-time-0_3"] }
+postgres-types = { version = "0.2", features = ["derive"] }
+deadpool-postgres = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }
+rust_decimal = "1"
+uuid = { version = "1", features = ["serde"] }
+thiserror = "2"
+bon = "3"
+derive_more = { version = "2", features = ["full"] }
+# only if used by your schema:
+# postgis-butmaintained = "0.12"   # geometry / geography
+# pgvector = { version = "0.4", features = ["postgres"] }
+# tracing = "0.1"                  # with [tracing] enabled = true
+```
+
+### Type support
+
+`timestamptz` maps to `time::OffsetDateTime`, `timestamp` to `time::PrimitiveDateTime`,
+`date` to `time::Date`, `numeric` to `rust_decimal::Decimal`, `oid` to `u32`, `"char"` to
+`i8`. Types with no binary codec in the dependencies above (ranges and multiranges,
+`interval`, `money`, `cidr`, `macaddr`, `bit`, `xml`, `timetz`) are not supported:
+functions and queries that use them are skipped, and columns of those types are dropped
+from composites and views, each with a warning naming the object.
+
+`[types]` replaces the Rust type for any Postgres type, by bare name or `schema.name`,
+including the unsupported ones above:
+
+```toml
+[types]
+macaddr = "crate::net::Mac"
+```
+
+The Rust type must implement `FromSql`/`ToSql` for that Postgres type, plus `Clone`,
+`Debug` and serde's traits; the path is used verbatim inside the generated modules.
+
+Functions with unnamed arguments get `arg1`, `arg2`, …; `VARIADIC` arguments are passed
+as a slice.
+
 ## Task Queue Integration
 
 PgRPC can generate type-safe Rust enums for PostgreSQL-based message queue systems. This feature allows you to define task types as PostgreSQL composite types and automatically generate corresponding Rust enums with serde support.
@@ -324,23 +437,23 @@ PgRPC can generate type-safe Rust functions directly from SQL query files, simil
 -- queries/authors.sql
 
 -- name: GetAuthor :one
-SELECT * FROM authors WHERE id = @author_id LIMIT 1;
+SELECT * FROM authors WHERE id = :author_id LIMIT 1;
 
 -- name: ListAuthors :many
 SELECT * FROM authors ORDER BY name;
 
 -- name: CreateAuthor :one
 INSERT INTO authors (name, bio)
-VALUES (@name, @bio)
+VALUES (:name, :bio)
 RETURNING *;
 
 -- name: UpdateAuthor :exec
 UPDATE authors
-SET name = @name, bio = @bio
-WHERE id = @author_id;
+SET name = :name, bio = :bio
+WHERE id = :author_id;
 
 -- name: DeleteAuthor :execrows
-DELETE FROM authors WHERE id = @author_id;
+DELETE FROM authors WHERE id = :author_id;
 ```
 
 2. **Configure in `pgrpc.toml`:**
@@ -355,18 +468,38 @@ paths = ["queries/**/*.sql"]  # Glob patterns for SQL files
 **Format:** `-- name: FunctionName :type`
 
 **Query Types:**
-- `:one` - Returns `Result<Option<T>, Error>` for single row queries (uses `query_opt`)
-- `:many` - Returns `Result<Vec<T>, Error>` for multiple row queries (uses `query`)
+- `:one` - Returns `Result<T, Error>`; exactly one row is expected. No row is an error
+  (`PgRpcError::NoRows`, reachable through the query error enum's `Other` variant), not a panic.
+- `:opt` - Returns `Result<Option<T>, Error>` for zero-or-one row queries
+- `:many` - Returns `Result<Vec<T>, Error>` for multiple row queries
 - `:exec` - Returns `Result<(), Error>` for commands with no return value
 - `:execrows` - Returns `Result<u64, Error>` for commands returning affected row count
 
+The `:type` is optional. Without it the cardinality is inferred from the query: a filter
+that pins a primary key or unique constraint gives `:opt`, an aggregate without `GROUP BY`
+gives `:one`, a statement without a result gives `:exec`, and anything unproven is `:many`.
+The inference never claims fewer rows than the query can return (partial unique indexes,
+`OR` between different key values, window functions and set-returning functions all fall
+back to `:many`).
+
+A query name may be defined only once across all query files; a duplicate is a generation
+error listing every definition.
+
+**Other annotations** (comment lines above the query):
+- `-- @pgrpc_not_null(col1, col2)` - assert result columns NOT NULL where the analysis
+  cannot prove it. Naming a column that is not in the result is an error. A warning is
+  logged if the column provably comes from the nullable side of an outer join, or if
+  the analysis already proves it NOT NULL (the annotation is redundant).
+- `-- @pgrpc_nullable(param1, param2)` - make parameters `Option<T>`. Naming something
+  that is not a `:parameter` of the query is an error.
+
 ### Parameter Syntax
 
-**Named Parameters (Recommended):** Use `@param_name` for explicit parameter names:
+**Named Parameters (Recommended):** Use `:param_name` for explicit parameter names:
 
 ```sql
 -- name: GetUserByEmail :one
-SELECT id, name, email FROM users WHERE email = @user_email;
+SELECT id, name, email FROM users WHERE email = :user_email;
 ```
 
 Generates:
@@ -374,7 +507,7 @@ Generates:
 pub async fn get_user_by_email(
     client: &impl deadpool_postgres::GenericClient,
     user_email: &str,
-) -> Result<Option<GetUserByEmailRow>, tokio_postgres::Error>
+) -> Result<GetUserByEmailRow, GetUserByEmailError>
 ```
 
 **Positional Parameters:** Use `$1, $2, ...` for PostgreSQL standard syntax:
@@ -385,6 +518,11 @@ UPDATE users SET name = $1 WHERE id = $2;
 ```
 
 Parameter names will be inferred from context or use `param_1`, `param_2` as fallbacks.
+
+Parameters are found by tokenizing the query, so a `:word` inside a string literal
+(`to_char(ts, 'HH24:MI:SS')`), a comment, or an array slice (`arr[1:n]`) is left alone. To
+use a parameter as a slice bound, parenthesize it: `arr[1:(:n)]`. Mixing named and
+positional parameters so that they land on the same `$N` is an error.
 
 ### Nullability Analysis
 
@@ -430,7 +568,7 @@ pub struct GetUserPostsRow {
 
 pub async fn get_user_posts(
     client: &impl deadpool_postgres::GenericClient,
-) -> Result<Vec<GetUserPostsRow>, tokio_postgres::Error> {
+) -> Result<Vec<GetUserPostsRow>, GetUserPostsError> {
     // Generated implementation
 }
 ```
@@ -439,7 +577,7 @@ pub async fn get_user_posts(
 
 For each query, PgRPC generates:
 
-1. **Row Struct** (for `:one` and `:many` queries):
+1. **Row Struct** (for `:one`, `:opt` and `:many` queries returning more than one column):
    - Named after the query (e.g., `GetAuthorRow`)
    - Fields with proper nullability from analysis
    - `TryFrom<tokio_postgres::Row>` implementation
@@ -451,51 +589,66 @@ For each query, PgRPC generates:
    - Appropriate return type based on query type
    - SQL included in doc comments
 
-**Example Generated Code:**
+**Example Generated Code** (abridged) for `-- name: GetAuthor :opt`:
 
 ```rust
 /// Query: GetAuthor
-///
-/// SQL:
-/// ```sql
-/// SELECT * FROM authors WHERE id = $1 LIMIT 1
-/// ```
 pub async fn get_author(
     client: &impl deadpool_postgres::GenericClient,
     author_id: i32,
-) -> Result<Option<GetAuthorRow>, tokio_postgres::Error> {
-    let query = "SELECT id, name, bio FROM authors WHERE id = $1 LIMIT 1";
-    let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![&author_id];
-
-    let row = client.query_opt(query, &params).await?;
-    match row {
-        Some(row) => Ok(Some(row.try_into()?)),
-        None => Ok(None),
-    }
+) -> Result<Option<GetAuthorRow>, GetAuthorError> {
+    // prepares (cached) and runs the statement, then decodes the row by column name
 }
 ```
+
+Each query gets its own error enum (`GetAuthorError`) carrying the constraint and
+SQLSTATE variants the statement can raise, plus `Other(PgRpcError)`.
+
+### Column groups
+
+Result columns named `{prefix}__{field}` (double underscore) are grouped into a nested
+struct. This works for query rows, views, and `OUT`/`RETURNS TABLE` columns of SQL
+functions:
+
+```sql
+select i.title,
+       p.name as product__name,
+       p.msrp as product__msrp
+from item i
+left join product p using (product_id)
+```
+
+```rust
+pub struct ItemRow {
+    pub title: String,
+    pub product: Option<ItemRowProduct>,  // None when the LEFT JOIN finds no row
+}
+
+pub struct ItemRowProduct {
+    pub name: String,            // NOT NULL on product
+    pub msrp: Option<Decimal>,   // nullable on product
+}
+```
+
+The group is `Option<Struct>` when its columns come from the nullable side of an outer
+join; inside the struct, fields keep the nullability of their base table.
 
 ### Usage
 
 ```rust
 use crate::generated::queries;
 
-// Query single row
-let author = queries::get_author(&client, 123).await?;
-if let Some(author) = author {
+// :opt
+if let Some(author) = queries::get_author(&client, 123).await? {
     println!("Author: {}", author.name);
 }
 
-// Query multiple rows
-let authors = queries::list_authors(&client).await?;
-for author in authors {
+// :many
+for author in queries::list_authors(&client).await? {
     println!("{}: {}", author.id, author.name);
 }
 
-// Execute command
-queries::delete_author(&client, 123).await?;
-
-// Execute with row count
+// :execrows
 let deleted = queries::delete_author(&client, 123).await?;
 println!("Deleted {} rows", deleted);
 ```
@@ -504,7 +657,7 @@ println!("Deleted {} rows", deleted);
 
 - **Type Safety:** Compile-time verification of query parameters and results
 - **Nullability Analysis:** Superior to most SQL generators - analyzes JOINs, views, expressions
-- **Named Parameters:** Clear, self-documenting parameter names with `@param`
+- **Named Parameters:** Clear, self-documenting parameter names with `:param`
 - **View Composition:** Queries on views get correct nullability transitively
 - **SQL First:** Write idiomatic SQL, not ORM abstractions
 - **Documentation:** SQL queries included in generated doc comments
@@ -611,12 +764,14 @@ A call is followed when it is a static, direct call: `perform s.f(...)`,
 `v := s.f(...)`, `select s.f(...) into ...`, `select * from s.f(...)`,
 `call s.p(...)`, or a call nested inside one of those expressions. The callee is
 resolved by name: a schema-qualified call directly, an unqualified call first in
-the caller's schema and then in `public`. Dynamic SQL (`execute`), overload
-selection by argument type, and functions from extensions are not followed.
+the caller's schema and then along the connection's `search_path`. Dynamic SQL
+(`execute`), overload selection by argument type, and functions from extensions
+are not followed. When a function is overloaded, one overload is bound (fewest
+arguments first) and a warning names the ones skipped.
 
 The same applies to [SQL query files](#sql-query-files): a query such as
 `select core.reserve_stock(:listing_id, :qty)` gets the helper's variants on its
-error enum. An unqualified call in a query file resolves in `public`.
+error enum. An unqualified call in a query file resolves along the `search_path`.
 
 Triggers are followed the same way: the triggers that fire for a function's
 DML contribute their raises, the raises of the functions they call, and the
@@ -627,10 +782,29 @@ those tables' enums, since that is where Postgres reports the violation. An
 `update` that sets a referenced key column does the same for the foreign keys
 whose `ON UPDATE` action is `RESTRICT` or `NO ACTION`.
 
+The statement-level rules:
+
+- `insert` contributes every constraint of the target table (omitted columns get
+  defaults, which are checked too). `on conflict (cols)` removes the unique key
+  it names; `do update` adds the constraints on the columns it sets.
+- `update` and `delete` contribute the constraints on the columns written, and
+  `merge` contributes whichever of the three its `when` clauses perform.
+- `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and `SET DEFAULT` are followed
+  as writes to the referencing table, with that table's triggers and foreign
+  keys, to any depth.
+- Partial and expression unique indexes are included. A write to a partitioned
+  table also counts as a write to its partitions, and a write through a
+  single-table view reaches the base table.
+- `select ... into strict` and `execute ... into strict` add
+  `no_data_found`/`too_many_rows`; `assert` adds `P0004`.
+
+Exception handlers are not modelled: an error a function catches still appears
+on its enum.
+
 Because the analysis over-approximates, a helper used by many functions makes
-its callers' error enums larger. If a specific function needs an extra variant
-that the analysis cannot see (a `raise` behind `execute`, for example), put
-`@pgrpc_throws XXXXX` in the function's comment.
+its callers' error enums larger. Errors raised from dynamic SQL (a `raise`
+behind `execute`) are not seen; they arrive through the enum's `Other`
+variant.
 
 ## User-facing constraint messages
 
@@ -797,8 +971,8 @@ Columns marked NOT NULL in tables are non-null in the generated Rust code.
 Composite types aren't so simple: Postgres doesn't allow NOT NULL on the attributes of
 a composite type. An attribute is treated as non-null when either
 
-- its comment carries `@pgrpc_not_null` (or the type's comment carries
-  `@pgrpc_not_null(a, b, ...)`), or
+- its comment carries `@pgrpc_not_null`, or the type's comment carries
+  `@pgrpc_not_null(a, b, ...)` or `@pgrpc_not_null(*)`, or
 - a domain over the composite has a CHECK constraint proving `(value).attr is not null`
   for every non-null value.
 
@@ -832,13 +1006,8 @@ pub struct Zip(pub String);
 
 Nothing stops Rust code from constructing or deserializing a value that violates
 the domain's CHECK constraint — `Zip("not a zip".into())` compiles fine. Mark a
-domain "strict" to opt into validation:
-
-```sql
-COMMENT ON DOMAIN zip IS '@pgrpc_strict';
-```
-
-or equivalently in `pgrpc.toml` (or via `PgrpcBuilder::strict_domain`):
+domain "strict" in `pgrpc.toml` (or via `PgrpcBuilder::strict_domain`) to opt into
+validation:
 
 ```toml
 strict_domains = ["public.zip"]

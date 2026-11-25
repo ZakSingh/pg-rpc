@@ -1,12 +1,12 @@
 //! Tests for strict (validated) domain newtypes.
 //!
-//! A domain marked `@pgrpc_strict` (or listed in `strict_domains`) generates a
+//! A domain listed in `strict_domains` generates a
 //! newtype with a private inner field whose `Deserialize` impl routes through a
 //! user-provided `TryFrom<Inner>` impl via `#[serde(try_from = "...")]`.
 
 use super::*;
 use crate::integration::compile_helpers::{
-    add_test_binary, assert_execution_success, compile_and_run, create_test_cargo_project,
+    add_test_binary, assert_execution_success, compile_and_run, create_test_cargo_project_with,
     read_pretty,
 };
 use tempfile::TempDir;
@@ -15,7 +15,7 @@ const STRICT_SCHEMA: &str = r#"
     CREATE SCHEMA strict_test;
 
     CREATE DOMAIN strict_test.zip AS text CHECK (VALUE ~ '^[0-9]{5}$');
-    COMMENT ON DOMAIN strict_test.zip IS 'US zip code. @pgrpc_strict';
+    COMMENT ON DOMAIN strict_test.zip IS 'US zip code.';
 
     CREATE DOMAIN strict_test.loose AS text;
 
@@ -33,7 +33,7 @@ const STRICT_SCHEMA: &str = r#"
 "#;
 
 #[test]
-fn test_strict_domain_via_annotation() {
+fn test_strict_domain_via_config() {
     with_isolated_database_and_container(|client, _container, conn_string| {
         execute_sql(client, STRICT_SCHEMA).expect("Should create test schema");
 
@@ -43,6 +43,7 @@ fn test_strict_domain_via_annotation() {
         pgrpc::PgrpcBuilder::new()
             .connection_string(conn_string)
             .schema("strict_test")
+            .strict_domain("strict_test.zip")
             .output_path(output_path)
             .build()
             .expect("Should generate code");
@@ -75,51 +76,6 @@ pub struct Loose"#));
     });
 }
 
-#[test]
-fn test_strict_domain_via_config() {
-    with_isolated_database_and_container(|client, _container, conn_string| {
-        execute_sql(
-            client,
-            r#"
-            CREATE SCHEMA strict_test;
-            CREATE DOMAIN strict_test.zip AS text CHECK (VALUE ~ '^[0-9]{5}$');
-            CREATE TABLE strict_test.addresses (
-                id SERIAL PRIMARY KEY,
-                zip strict_test.zip NOT NULL
-            );
-
-            -- Types are only generated when referenced by a function.
-            CREATE FUNCTION strict_test.get_zip(p_id INT)
-            RETURNS strict_test.zip AS $$
-                SELECT zip FROM strict_test.addresses WHERE id = p_id
-            $$ LANGUAGE sql;
-        "#,
-        )
-        .expect("Should create test schema");
-
-        let temp_dir = TempDir::new().expect("Should create temp directory");
-        let output_path = temp_dir.path();
-
-        pgrpc::PgrpcBuilder::new()
-            .connection_string(conn_string)
-            .schema("strict_test")
-            .strict_domain("strict_test.zip")
-            .output_path(output_path)
-            .build()
-            .expect("Should generate code");
-
-        let code = read_pretty(output_path.join("strict_test.rs"));
-
-        assert!(
-            code.contains("pub struct Zip(String);"),
-            "config-marked strict domain should have a private inner field. Got:\n{}",
-            code
-        );
-        assert!(code.contains(r#"#[serde(try_from = "String")]"#));
-        assert!(code.contains("pub fn new_unchecked(value: String) -> Self"));
-    });
-}
-
 /// End-to-end: a consumer crate provides the `TryFrom` impl, and serde
 /// deserialization actually routes through it at runtime.
 #[test]
@@ -127,7 +83,9 @@ fn test_strict_domain_end_to_end() {
     with_isolated_database_and_container(|client, _container, conn_string| {
         execute_sql(client, STRICT_SCHEMA).expect("Should create test schema");
 
-        let project = create_test_cargo_project(conn_string, vec!["strict_test"]);
+        let project = create_test_cargo_project_with(conn_string, |builder| {
+            builder.schema("strict_test").strict_domain("strict_test.zip")
+        });
 
         // The TryFrom impl must live in the same crate as the generated struct
         // (serde's try_from bound is checked where Deserialize is derived). This
@@ -199,7 +157,6 @@ fn test_strict_domain_query_param_unwrap() {
             client,
             r#"
             CREATE DOMAIN zip AS text CHECK (VALUE ~ '^[0-9]{5}$');
-            COMMENT ON DOMAIN zip IS '@pgrpc_strict';
             CREATE TABLE addresses (
                 id SERIAL PRIMARY KEY,
                 zip zip NOT NULL
@@ -221,6 +178,7 @@ fn test_strict_domain_query_param_unwrap() {
         pgrpc::PgrpcBuilder::new()
             .connection_string(conn_string)
             .schema("public")
+            .strict_domain("public.zip")
             .output_path(&output_dir)
             .queries_config(pgrpc::QueriesConfig {
                 paths: vec![sql_file.to_string_lossy().to_string()],

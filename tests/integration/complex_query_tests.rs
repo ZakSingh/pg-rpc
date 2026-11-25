@@ -18,11 +18,11 @@
 
 use super::*;
 use crate::integration::compile_helpers::{
+    regenerate_test_cargo_project,
     assert_compilation_success, compile_project, create_test_cargo_project, read_pretty,
 };
 use indoc::indoc;
 use pgrpc::PgrpcBuilder;
-use std::path::Path;
 use tempfile::TempDir;
 
 /// When `PGRPC_DUMP_QUERIES=1` is set, every test prints the generated row/fn
@@ -682,23 +682,11 @@ fn test_complex_queries_generated_code_compiles() {
         .unwrap();
 
         // Regenerate so the project picks up the new queries.
-        PgrpcBuilder::new()
-            .connection_string(conn_string)
-            .schema("public")
-            .output_path(project.path().join("src/generated"))
-            .queries_config(pgrpc::QueriesConfig {
+        regenerate_test_cargo_project(project.path(), conn_string, |builder| {
+            builder.schema("public").queries_config(pgrpc::QueriesConfig {
                 paths: vec![sql_file.to_string_lossy().to_string()],
             })
-            .build()
-            .expect("regen should succeed");
-
-        // Pull queries.rs into the lib so cargo check sees it.
-        let lib_rs: &Path = &project.path().join("src/lib.rs");
-        let mut lib = std::fs::read_to_string(lib_rs).unwrap();
-        if !lib.contains("pub use generated::queries") {
-            lib.push_str("\n#[allow(unused_imports)] pub use generated::queries::*;\n");
-            std::fs::write(lib_rs, lib).unwrap();
-        }
+        });
 
         let output = compile_project(project.path());
         assert_compilation_success(output);
@@ -873,7 +861,7 @@ fn test_cast_to_domain_in_other_schema() {
             })
             .build()
             .expect("codegen should succeed");
-        let code = read_pretty(&output_dir.join("queries.rs"));
+        let code = read_pretty(output_dir.join("queries.rs"));
 
         // Resolved to the `finance` domain, not its base composite.
         assert!(
@@ -1033,7 +1021,7 @@ fn test_cross_schema_name_collision_preserves_scalar_type() {
             })
             .build()
             .expect("codegen should succeed");
-        let code = read_pretty(&output_dir.join("queries.rs"));
+        let code = read_pretty(output_dir.join("queries.rs"));
 
         // `core.widget.label` is scalar `text` — must be String, never Vec<String>.
         assert!(
@@ -1058,7 +1046,7 @@ fn test_cross_schema_name_collision_preserves_scalar_type() {
 /// PGRPC_BUG_REPORT follow-up.)
 #[test]
 fn test_name_type_is_scalar_not_array() {
-    with_isolated_database_and_container(|client, _container, conn_string| {
+    with_isolated_database_and_container(|_client, _container, conn_string| {
         let sql = indoc! {r#"
             -- name: NameTypedColumn :many
             SELECT 'x'::name AS label;

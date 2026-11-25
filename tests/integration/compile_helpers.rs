@@ -62,35 +62,7 @@ pub fn create_test_cargo_project_with(
 
     builder.build().expect("Code generation should succeed");
 
-    // Re-export only the schemas that actually got a file written. Hardcoding
-    // `public` / `api` breaks tests whose schema list doesn't include both.
-    let mut lib_rs = String::from("pub mod generated;\npub use generated::*;\n");
-    if pgrpc_dir.join("errors.rs").exists() {
-        lib_rs.push_str("pub use generated::errors::PgRpcError;\n");
-    }
-    for entry in std::fs::read_dir(&pgrpc_dir).expect("read generated dir") {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        let stem = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s,
-            None => continue,
-        };
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        // `mod.rs` is the umbrella; `errors` is already handled above;
-        // `composite` and `schema_cache` are shared helpers with generic
-        // names (`read`, `write`, `clear`) that have no business in the
-        // crate root.
-        if matches!(stem, "mod" | "errors" | "composite" | "schema_cache") {
-            continue;
-        }
-        lib_rs.push_str(&format!(
-            "#[allow(unused_imports)] pub use generated::{}::*;\n",
-            stem
-        ));
-    }
-    std::fs::write(src_dir.join("lib.rs"), lib_rs).expect("Should write lib.rs");
+    write_lib_rs(project_dir);
 
     // Create Cargo.toml with all required dependencies
     let cargo_toml_content = indoc! {r#"
@@ -121,11 +93,63 @@ pub fn create_test_cargo_project_with(
     temp_dir
 }
 
+/// Write `src/lib.rs` so that it re-exports every generated module.
+fn write_lib_rs(project_dir: &Path) {
+    let src_dir = project_dir.join("src");
+    let pgrpc_dir = src_dir.join("generated");
+
+    // Re-export only the schemas that actually got a file written. Hardcoding
+    // `public` / `api` breaks tests whose schema list doesn't include both.
+    let mut lib_rs = String::from("pub mod generated;\npub use generated::*;\n");
+    if pgrpc_dir.join("errors.rs").exists() {
+        lib_rs.push_str("pub use generated::errors::PgRpcError;\n");
+    }
+    let mut stems: Vec<String> = std::fs::read_dir(&pgrpc_dir)
+        .expect("read generated dir")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .filter_map(|path| path.file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect();
+    stems.sort();
+    for stem in stems {
+        // `mod.rs` is the umbrella; `errors` is already handled above;
+        // `composite` and `schema_cache` are shared helpers with generic
+        // names (`read`, `write`, `clear`) that have no business in the
+        // crate root.
+        if matches!(stem.as_str(), "mod" | "errors" | "composite" | "schema_cache") {
+            continue;
+        }
+        lib_rs.push_str(&format!(
+            "#[allow(unused_imports)] pub use generated::{}::*;\n",
+            stem
+        ));
+    }
+    std::fs::write(src_dir.join("lib.rs"), lib_rs).expect("Should write lib.rs");
+}
+
+/// Run code generation again for a project made by
+/// [`create_test_cargo_project_with`] (say, after writing query files into
+/// it) and refresh `lib.rs` so newly generated modules are re-exported.
+pub fn regenerate_test_cargo_project(
+    project_dir: &Path,
+    conn_string: &str,
+    configure: impl FnOnce(pgrpc::PgrpcBuilder) -> pgrpc::PgrpcBuilder,
+) {
+    configure(
+        pgrpc::PgrpcBuilder::new()
+            .connection_string(conn_string)
+            .output_path(project_dir.join("src/generated")),
+    )
+    .build()
+    .expect("Code generation should succeed");
+    write_lib_rs(project_dir);
+}
+
 /// Add a test binary to the project
 pub fn add_test_binary(project_dir: &Path, test_name: &str, test_code: &str) {
     let src_dir = project_dir.join("src");
     let test_file = src_dir.join(format!("{}.rs", test_name));
-    std::fs::write(&test_file, test_code).expect(&format!("Should write {}.rs", test_name));
+    std::fs::write(&test_file, test_code).unwrap_or_else(|_| panic!("Should write {}.rs", test_name));
 
     // Update Cargo.toml to include the new binary
     let cargo_toml_path = project_dir.join("Cargo.toml");
@@ -155,27 +179,7 @@ pub fn compile_project(project_dir: &Path) -> Output {
 
 /// Compile and run a specific binary in the test project
 pub fn compile_and_run(project_dir: &Path, binary_name: &str) -> Output {
-    // First compile
-    let compile_output = Command::new("cargo")
-        .arg("build")
-        .arg("--bin")
-        .arg(binary_name)
-        .current_dir(project_dir)
-        .output()
-        .expect("Should run cargo build");
-
-    if !compile_output.status.success() {
-        return compile_output;
-    }
-
-    // Then run
-    Command::new("cargo")
-        .arg("run")
-        .arg("--bin")
-        .arg(binary_name)
-        .current_dir(project_dir)
-        .output()
-        .expect("Should run binary")
+    compile_and_run_with_args(project_dir, binary_name, &[])
 }
 
 /// Compile and run a specific binary in the test project with arguments

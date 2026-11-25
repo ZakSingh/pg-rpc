@@ -178,7 +178,7 @@ fn test_task_queue_generation(conn_string: &str) -> HashMap<String, String> {
         let entry = entry.expect("Should read directory entry");
         let path = entry.path();
 
-        if path.extension().map_or(false, |ext| ext == "rs") {
+        if path.extension().is_some_and(|ext| ext == "rs") {
             let filename = path.file_name().unwrap().to_string_lossy().to_string();
             let content = read_pretty(&path);
             generated_files.insert(filename, content);
@@ -188,6 +188,52 @@ fn test_task_queue_generation(conn_string: &str) -> HashMap<String, String> {
     generated_files
 }
 
+/// Compile and run `main_rs` in a throwaway crate holding the generated
+/// `tasks.rs` and the shared `datetime_serde.rs` it refers to (so `main_rs`
+/// declares `mod tasks; mod datetime_serde;`); returns the program's stdout.
+fn run_tasks_crate(tasks_content: &str, datetime_serde: &str, main_rs: &str) -> String {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let project_dir = temp_dir.path();
+
+    let cargo_toml = indoc! {"
+        [package]
+        name = \"test_tasks\"
+        version = \"0.1.0\"
+        edition = \"2021\"
+
+        [dependencies]
+        serde = { version = \"1.0\", features = [\"derive\"] }
+        serde_json = \"1.0\"
+        uuid = { version = \"1.0\", features = [\"v4\", \"serde\"] }
+        rust_decimal = \"1.0\"
+        time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
+    "};
+    std::fs::write(project_dir.join("Cargo.toml"), cargo_toml).expect("Should write Cargo.toml");
+
+    let src_dir = project_dir.join("src");
+    std::fs::create_dir(&src_dir).expect("Should create src directory");
+    std::fs::write(src_dir.join("tasks.rs"), tasks_content).expect("Should write tasks.rs");
+    std::fs::write(src_dir.join("datetime_serde.rs"), datetime_serde)
+        .expect("Should write datetime_serde.rs");
+    std::fs::write(src_dir.join("main.rs"), main_rs).expect("Should write main.rs");
+
+    let output = std::process::Command::new("cargo")
+        .arg("run")
+        .current_dir(project_dir)
+        .output()
+        .expect("Should run cargo run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.status.success() {
+        panic!(
+            "Generated task code failed to compile or run:\nstdout: {}\nstderr: {}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    stdout
+}
+
 #[test]
 fn test_task_queue_schema_introspection() {
     with_isolated_database(|client| {
@@ -195,7 +241,7 @@ fn test_task_queue_schema_introspection() {
         setup_task_queue_schema(client).expect("Should setup task queue schema");
 
         // Test that we can introspect the task types
-        let query = include_str!("../../src/queries/task_introspection.sql");
+        let query = include_str!("../../src/queries/composite_schema_introspection.sql");
         let rows = client
             .query(query, &[&"tasks"])
             .expect("Should execute task introspection query");
@@ -208,7 +254,7 @@ fn test_task_queue_schema_introspection() {
         // Verify we found our expected task types
         let task_names: Vec<String> = rows
             .iter()
-            .map(|row| row.get::<_, String>("task_name"))
+            .map(|row| row.get::<_, String>("name"))
             .collect();
 
         assert!(task_names.contains(&"send_welcome_email".to_string()));
@@ -219,7 +265,7 @@ fn test_task_queue_schema_introspection() {
         // Test field introspection for one task type
         let send_email_row = rows
             .iter()
-            .find(|row| row.get::<_, String>("task_name") == "send_welcome_email")
+            .find(|row| row.get::<_, String>("name") == "send_welcome_email")
             .expect("Should find send_welcome_email task");
 
         let fields_json: serde_json::Value = send_email_row.get("fields");
@@ -330,37 +376,9 @@ fn test_generated_task_enum_compiles() {
         let generated = test_task_queue_generation(conn_string);
         let tasks_content = generated.get("tasks.rs").unwrap();
 
-        // Create a temporary Rust project to test compilation
-        let temp_dir = TempDir::new().expect("Failed to create temp directory");
-        let project_dir = temp_dir.path();
-
-        // Create Cargo.toml
-        let cargo_toml = indoc! {"
-            [package]
-            name = \"test_tasks\"
-            version = \"0.1.0\"
-            edition = \"2021\"
-
-            [dependencies]
-            serde = { version = \"1.0\", features = [\"derive\"] }
-            serde_json = \"1.0\"
-            uuid = { version = \"1.0\", features = [\"v4\", \"serde\"] }
-            rust_decimal = \"1.0\"
-            time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
-        "};
-
-        std::fs::write(project_dir.join("Cargo.toml"), cargo_toml)
-            .expect("Should write Cargo.toml");
-
-        // Create src directory
-        let src_dir = project_dir.join("src");
-        std::fs::create_dir(&src_dir).expect("Should create src directory");
-
-        // Write the generated tasks code
-        std::fs::write(src_dir.join("tasks.rs"), tasks_content).expect("Should write tasks.rs");
-
         // Create main.rs that uses the tasks
         let main_rs = indoc! {"
+            mod datetime_serde;
             mod tasks;
             use tasks::TaskPayload;
 
@@ -403,37 +421,7 @@ fn test_generated_task_enum_compiles() {
             }
         "};
 
-        std::fs::write(src_dir.join("main.rs"), main_rs).expect("Should write main.rs");
-
-        // Try to compile the project
-        let output = std::process::Command::new("cargo")
-            .arg("check")
-            .current_dir(project_dir)
-            .output()
-            .expect("Should run cargo check");
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!("Generated code failed to compile:\n{}", stderr);
-        }
-
-        // Also try to build and run it
-        let output = std::process::Command::new("cargo")
-            .arg("run")
-            .current_dir(project_dir)
-            .output()
-            .expect("Should run cargo run");
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            panic!(
-                "Generated code failed to run:\nstdout: {}\nstderr: {}",
-                stdout, stderr
-            );
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = run_tasks_crate(tasks_content, generated.get("datetime_serde.rs").expect("datetime_serde.rs is generated"), main_rs);
         assert!(
             stdout.contains("All tests passed!"),
             "Runtime tests should pass: {}",
@@ -548,10 +536,10 @@ fn test_task_queue_type_mapping() {
             tasks_content.contains("data") && tasks_content.contains("Option<serde_json::Value>"),
             "JSONB -> Option<serde_json::Value>"
         );
-        // timestamp without timezone and with timezone both map to time::OffsetDateTime
+        // timestamptz -> OffsetDateTime; timestamp without time zone -> PrimitiveDateTime
         assert!(
-            tasks_content.contains("created_at") && tasks_content.contains("Option<time::OffsetDateTime>"),
-            "TIMESTAMP -> Option<time::OffsetDateTime>"
+            tasks_content.contains("Option<time::OffsetDateTime>"),
+            "TIMESTAMPTZ -> Option<time::OffsetDateTime>"
         );
         assert!(
             tasks_content.contains("created_at_tz") && tasks_content.contains("Option<time::OffsetDateTime>"),
@@ -600,7 +588,7 @@ fn test_custom_table_configuration() {
             let entry = entry.expect("Should read directory entry");
             let path = entry.path();
 
-            if path.extension().map_or(false, |ext| ext == "rs") {
+            if path.extension().is_some_and(|ext| ext == "rs") {
                 let filename = path.file_name().unwrap().to_string_lossy().to_string();
                 let content = read_pretty(&path);
                 generated_files.insert(filename, content);
@@ -689,37 +677,9 @@ fn test_custom_table_compilation() {
         let tasks_content =
             read_pretty(&tasks_file_path);
 
-        // Create a temporary Rust project to test compilation
-        let test_dir = TempDir::new().expect("Failed to create temp directory");
-        let project_dir = test_dir.path();
-
-        // Create Cargo.toml
-        let cargo_toml = indoc! {"
-            [package]
-            name = \"test_custom_tasks\"
-            version = \"0.1.0\"
-            edition = \"2021\"
-
-            [dependencies]
-            serde = { version = \"1.0\", features = [\"derive\"] }
-            serde_json = \"1.0\"
-            time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
-            uuid = { version = \"1.0\", features = [\"serde\"] }
-            rust_decimal = \"1.0\"
-        "};
-
-        std::fs::write(project_dir.join("Cargo.toml"), cargo_toml)
-            .expect("Should write Cargo.toml");
-
-        // Create src directory
-        let src_dir = project_dir.join("src");
-        std::fs::create_dir(&src_dir).expect("Should create src directory");
-
-        // Write the generated tasks code
-        std::fs::write(src_dir.join("tasks.rs"), tasks_content).expect("Should write tasks.rs");
-
         // Create main.rs that uses the custom configuration
         let main_rs = indoc! {"
+            mod datetime_serde;
             mod tasks;
             use tasks::TaskPayload;
 
@@ -767,37 +727,7 @@ fn test_custom_table_compilation() {
             }
         "};
 
-        std::fs::write(src_dir.join("main.rs"), main_rs).expect("Should write main.rs");
-
-        // Try to compile the project
-        let output = std::process::Command::new("cargo")
-            .arg("check")
-            .current_dir(project_dir)
-            .output()
-            .expect("Should run cargo check");
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!("Generated code failed to compile:\n{}", stderr);
-        }
-
-        // Also try to build and run it
-        let output = std::process::Command::new("cargo")
-            .arg("run")
-            .current_dir(project_dir)
-            .output()
-            .expect("Should run cargo run");
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            panic!(
-                "Generated code failed to run:\nstdout: {}\nstderr: {}",
-                stdout, stderr
-            );
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = run_tasks_crate(&tasks_content, &read_pretty(output_path.join("datetime_serde.rs")), main_rs);
         assert!(
             stdout.contains("All custom configuration tests passed!"),
             "Runtime tests should pass: {}",
@@ -861,38 +791,9 @@ fn test_timestamptz_serialization_deserialization() {
             "Should map timestamptz to Option<time::OffsetDateTime> (nullable) or time::OffsetDateTime"
         );
 
-        // Create a test project to verify serialization/deserialization works
-        let temp_dir = TempDir::new().expect("Failed to create temp directory");
-        let project_dir = temp_dir.path();
-
-        // Create Cargo.toml with all necessary dependencies
-        let cargo_toml = indoc! {"
-            [package]
-            name = \"test_timestamptz_serde\"
-            version = \"0.1.0\"
-            edition = \"2021\"
-
-            [dependencies]
-            serde = { version = \"1.0\", features = [\"derive\"] }
-            serde_json = \"1.0\"
-            time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
-            uuid = { version = \"1.0\", features = [\"serde\"] }
-            rust_decimal = \"1.0\"
-        "};
-
-        std::fs::write(project_dir.join("Cargo.toml"), cargo_toml)
-            .expect("Should write Cargo.toml");
-
-        // Create src directory
-        let src_dir = project_dir.join("src");
-        std::fs::create_dir(&src_dir).expect("Should create src directory");
-
-        // Write the generated tasks code
-        std::fs::write(src_dir.join("tasks.rs"), tasks_content)
-            .expect("Should write tasks.rs");
-
         // Create main.rs that tests serialization/deserialization
         let main_rs = indoc! {r#"
+            mod datetime_serde;
             mod tasks;
 
             use serde_json;
@@ -954,26 +855,7 @@ fn test_timestamptz_serialization_deserialization() {
             }
         "#};
 
-        std::fs::write(src_dir.join("main.rs"), main_rs)
-            .expect("Should write main.rs");
-
-        // Try to compile and run the test
-        let output = std::process::Command::new("cargo")
-            .arg("run")
-            .current_dir(project_dir)
-            .output()
-            .expect("Should run cargo run");
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            panic!(
-                "Timestamptz serialization test failed to run:\nstdout: {}\nstderr: {}",
-                stdout, stderr
-            );
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = run_tasks_crate(tasks_content, generated.get("datetime_serde.rs").expect("datetime_serde.rs is generated"), main_rs);
         assert!(
             stdout.contains("All timestamptz serialization/deserialization tests passed!"),
             "Timestamptz tests should pass: {}",
@@ -1010,38 +892,9 @@ fn test_date_serialization_deserialization() {
             "Should map DATE to time::Date"
         );
 
-        // Create a test project to verify serialization/deserialization works
-        let temp_dir = TempDir::new().expect("Failed to create temp directory");
-        let project_dir = temp_dir.path();
-
-        // Create Cargo.toml with all necessary dependencies
-        let cargo_toml = indoc! {"
-            [package]
-            name = \"test_date_serde\"
-            version = \"0.1.0\"
-            edition = \"2021\"
-
-            [dependencies]
-            serde = { version = \"1.0\", features = [\"derive\"] }
-            serde_json = \"1.0\"
-            time = { version = \"0.3\", features = [\"serde-well-known\", \"macros\", \"formatting\", \"parsing\"] }
-            uuid = { version = \"1.0\", features = [\"serde\"] }
-            rust_decimal = \"1.0\"
-        "};
-
-        std::fs::write(project_dir.join("Cargo.toml"), cargo_toml)
-            .expect("Should write Cargo.toml");
-
-        // Create src directory
-        let src_dir = project_dir.join("src");
-        std::fs::create_dir(&src_dir).expect("Should create src directory");
-
-        // Write the generated tasks code
-        std::fs::write(src_dir.join("tasks.rs"), tasks_content)
-            .expect("Should write tasks.rs");
-
         // Create main.rs that tests serialization/deserialization
         let main_rs = indoc! {r#"
+            mod datetime_serde;
             mod tasks;
 
             use serde_json;
@@ -1102,30 +955,66 @@ fn test_date_serialization_deserialization() {
             }
         "#};
 
-        std::fs::write(src_dir.join("main.rs"), main_rs)
-            .expect("Should write main.rs");
-
-        // Try to compile and run the test
-        let output = std::process::Command::new("cargo")
-            .arg("run")
-            .current_dir(project_dir)
-            .output()
-            .expect("Should run cargo run");
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            panic!(
-                "Date serialization test failed to run:\nstdout: {}\nstderr: {}",
-                stdout, stderr
-            );
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = run_tasks_crate(tasks_content, generated.get("datetime_serde.rs").expect("datetime_serde.rs is generated"), main_rs);
         assert!(
             stdout.contains("All Date serialization/deserialization tests passed!"),
             "Date tests should pass: {}",
             stdout
         );
+    });
+}
+
+/// Only standalone composite types in the task schema are tasks: a table
+/// living there is not, a composite with no fields is, and `@pgrpc_not_null`
+/// decides which payload fields are optional.
+#[test]
+fn test_task_types_are_standalone_composites_only() {
+    with_isolated_database_and_container(|client, _container, conn_string| {
+        setup_task_queue_schema(client).expect("Should setup task queue schema");
+        execute_sql(
+            client,
+            indoc! {"
+            CREATE TABLE tasks.audit_trail (id INTEGER, note TEXT);
+            CREATE VIEW tasks.recent_audit AS SELECT id, note FROM tasks.audit_trail;
+            CREATE TYPE tasks.ping AS ();
+            CREATE TYPE tasks.notify_user AS (user_id INTEGER, channel TEXT, note TEXT);
+            COMMENT ON TYPE tasks.notify_user IS '@pgrpc_not_null(user_id)';
+            COMMENT ON COLUMN tasks.notify_user.channel IS '@pgrpc_not_null';
+        "},
+        )
+        .expect("Should add extra relations to the tasks schema");
+
+        // The shared introspection query sees exactly the composite types.
+        let query = include_str!("../../src/queries/composite_schema_introspection.sql");
+        let names: Vec<String> = client
+            .query(query, &[&"tasks"])
+            .expect("Should execute composite introspection query")
+            .iter()
+            .map(|row| row.get::<_, String>("name"))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "cleanup_files",
+                "notify_user",
+                "ping",
+                "process_payment",
+                "resize_image",
+                "send_welcome_email"
+            ]
+        );
+
+        let generated = test_task_queue_generation(conn_string);
+        let tasks = generated.get("tasks.rs").expect("tasks.rs");
+        let squashed: String = tasks.split_whitespace().collect();
+
+        assert!(!tasks.contains("AuditTrail"), "{tasks}");
+        assert!(!tasks.contains("RecentAudit"), "{tasks}");
+        assert!(squashed.contains("pubstructPingPayload{}"), "{tasks}");
+        assert!(squashed.contains("Ping(PingPayload)"), "{tasks}");
+
+        assert!(squashed.contains("pubuser_id:i32"), "{tasks}");
+        assert!(squashed.contains("pubchannel:String"), "{tasks}");
+        assert!(squashed.contains("pubnote:Option<String>"), "{tasks}");
     });
 }

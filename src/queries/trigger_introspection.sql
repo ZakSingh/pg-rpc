@@ -1,35 +1,33 @@
--- Introspect triggers on user tables and their associated functions
--- This query finds all triggers on tables in user schemas and gets details
+-- Introspect triggers on user relations and their associated functions
+-- This query finds all triggers on relations in user schemas and gets details
 -- about the trigger functions that could raise exceptions
 
 with user_tables as (
-    -- Get all user tables (excluding system tables)
+    -- Every user relation that can carry a trigger: ordinary, partitioned and
+    -- foreign tables, and views (INSTEAD OF triggers).
     select c.oid as table_oid,
            n.nspname as schema_name,
            c.relname as table_name
     from pg_class c
     join pg_namespace n on n.oid = c.relnamespace
     where n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
-      and c.relkind = 'r'  -- only regular tables
+      and c.relkind in ('r', 'p', 'f', 'v')
 ),
 trigger_details as (
-    -- Get trigger information with decoded trigger types
+    -- Get trigger information with the events decoded from tgtype
+    -- (bit 4 INSERT, 8 DELETE, 16 UPDATE). Timing and level (bit 1 ROW, 2
+    -- BEFORE, 64 INSTEAD OF) are not decoded: a trigger of any timing or level
+    -- can fail the statement that fires it. TRUNCATE triggers (bit 32) are not
+    -- reported: TRUNCATE is not analyzed.
     select t.oid as trigger_oid,
            t.tgname as trigger_name,
            t.tgrelid as table_oid,
            t.tgfoid as function_oid,
-           t.tgtype as trigger_type_raw,
-           -- Decode trigger timing (BEFORE/AFTER)
-           case when (t.tgtype & 1) = 0 then 'BEFORE' else 'AFTER' end as timing,
-           -- Decode trigger events
            array_remove(array[
                case when (t.tgtype & 4) != 0 then 'INSERT' end,
                case when (t.tgtype & 8) != 0 then 'DELETE' end,
-               case when (t.tgtype & 16) != 0 then 'UPDATE' end,
-               case when (t.tgtype & 32) != 0 then 'TRUNCATE' end
+               case when (t.tgtype & 16) != 0 then 'UPDATE' end
            ], null) as events,
-           -- Check if trigger is row-level or statement-level
-           case when (t.tgtype & 1) = 0 then 'ROW' else 'STATEMENT' end as level,
            t.tgenabled as is_enabled
     from pg_trigger t
     where not t.tgisinternal  -- exclude internal constraint triggers
@@ -50,9 +48,7 @@ select ut.schema_name,
        ut.table_oid,
        td.trigger_name,
        td.trigger_oid,
-       td.timing,
        td.events,
-       td.level,
        td.is_enabled,
        tf.function_oid,
        tf.function_name,
